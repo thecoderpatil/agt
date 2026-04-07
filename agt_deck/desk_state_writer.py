@@ -109,6 +109,22 @@ def generate_desk_state(
                          f" (trigger: {t.get('trigger_rule', '—')})")
         lines.append(f"")
 
+    # Handoff doc freshness
+    lines.append(f"## Handoff Docs")
+    lines.append(f"")
+    _handoffs_dir = Path(__file__).resolve().parent.parent / "reports" / "handoffs"
+    for label, fname in [
+        ("Architect", "HANDOFF_ARCHITECT_latest.md"),
+        ("Coder", "HANDOFF_CODER_latest.md"),
+    ]:
+        fp = _handoffs_dir / fname
+        if fp.exists():
+            mtime = datetime.fromtimestamp(fp.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            lines.append(f"- {label}: reports/handoffs/{fname} (modified: {mtime})")
+        else:
+            lines.append(f"- {label}: reports/handoffs/{fname} (not found)")
+    lines.append(f"")
+
     return "\n".join(lines)
 
 

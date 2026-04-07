@@ -746,6 +746,14 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
         except Exception as ds_exc:
             logger.error("desk_state.md regeneration failed (non-fatal): %s", ds_exc)
 
+        # Friday EOD: archive handoff docs before git push
+        try:
+            if datetime.utcnow().weekday() == 4:  # Friday
+                from scripts.archive_handoffs import archive_handoffs
+                archive_handoffs()
+        except Exception as arch_exc:
+            logger.warning("handoff archive failed: %s", arch_exc)
+
         # Git auto-commit + push after successful sync
         try:
             import subprocess
