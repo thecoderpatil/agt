@@ -10,14 +10,12 @@ logger = logging.getLogger(__name__)
 ACCOUNT_ALIAS = {
     "U21971297": "Yash Ind",
     "U22076329": "Yash Roth",
-    "U22076184": "Yash Trad",
     "U22388499": "Vikram",
 }
 
 HOUSEHOLD_MAP = {
     "U21971297": "Yash_Household",
     "U22076329": "Yash_Household",
-    "U22076184": "Yash_Household",
     "U22388499": "Vikram_Household",
 }
 

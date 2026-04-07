@@ -38,14 +38,12 @@ WHITE          = "#ffffff"
 
 ACCOUNT_ALIAS = {
     "U21971297": "Individual",
-    "U22076184": "Trad",
     "U22076329": "Roth",
     "U22388499": "Vikram IND",
 }
 
 HOUSEHOLD_MAP = {
     "U21971297": "Yash_Household",
-    "U22076184": "Yash_Household",
     "U22076329": "Yash_Household",
     "U22388499": "Vikram_Household",
 }
@@ -327,7 +325,7 @@ def render_performance_card(conn: sqlite3.Connection, output_path: str,
     periods = _get_period_bounds()
     period_names = list(periods.keys())
 
-    # Gather data — include Trad (U22076184) for offsets even though not displayed
+    # U22076184 dormant — retained for Fidelity historical offset aggregation only (Inception/2025 periods)
     ALL_ACCOUNTS = DISPLAY_ACCOUNTS + ["U22076184"]
 
     rows_data = []

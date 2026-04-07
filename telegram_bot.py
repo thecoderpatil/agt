@@ -1295,14 +1295,10 @@ _ACCOUNT_MAP = {
     "brother's brokerage": "U22388499",
     "client account":  "U22388499",
     "client":          "U22388499",
-    "trad":            "U22076184",
-    "traditional":     "U22076184",
-    "traditional ira": "U22076184",
     # Also allow raw account IDs
     "u21971297":     "U21971297",
     "u22076329":     "U22076329",
     "u22388499":     "U22388499",
-    "u22076184":     "U22076184",
 }
 
 # LEG pattern: STO/BTO  Qty x  YYYY-MM-DD  StrikeC/P
@@ -1475,7 +1471,6 @@ async def parse_and_stage_order(text: str) -> str:
 ACCOUNT_LABELS = {
     "U21971297": "Individual",
     "U22076329": "Roth IRA",
-    "U22076184": "U22076184",
     "U22388499": "Vikram",
 }
 
@@ -9478,6 +9473,7 @@ async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 b_div += 1
 
         # Cross-check C
+        # Iterates all 4 accounts incl. dormant U22076184 — Bucket 2 historical NAV deltas remain in scope for cross-check C
         c_ok = c_div = 0
         c_details = []
         for acct in ['U21971297', 'U22388499', 'U22076329', 'U22076184']:

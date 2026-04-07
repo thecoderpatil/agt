@@ -342,7 +342,7 @@ async def command_deck(request: Request):
         # Account pills
         nav_by_acct = top["nav_by_acct"]
         pills = []
-        for acct in ["U21971297", "U22076329", "U22076184", "U22388499"]:
+        for acct in ["U21971297", "U22076329", "U22388499"]:
             pills.append({
                 "account_id": acct,
                 "alias": queries.ACCOUNT_ALIAS.get(acct, acct),

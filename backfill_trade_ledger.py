@@ -31,14 +31,12 @@ log = logging.getLogger(__name__)
 # ── Account → Household mapping ──────────────────────────────────
 HOUSEHOLD_MAP = {
     "U21971297": "Yash_Household",   # Individual
-    "U22076184": "Yash_Household",   # Trad IRA
     "U22076329": "Yash_Household",   # Roth IRA
     "U22388499": "Vikram_Household", # Vikram IND
 }
 
 ACCOUNT_ALIAS = {
     "U21971297": "Individual",
-    "U22076184": "Trad",
     "U22076329": "Roth",
     "U22388499": "Vikram IND",
 }
