@@ -698,6 +698,9 @@ def register_master_log_tables(conn) -> None:
                 CHECK (final_status IN ('PENDING', 'STAGED', 'ATTESTED',
                                         'TRANSMITTED', 'CANCELLED',
                                         'DRIFT_BLOCKED', 'ABANDONED')),
+            source TEXT NOT NULL DEFAULT 'scheduled_watchdog'
+                CHECK (source IN ('scheduled_watchdog', 'manual_inspection',
+                                  'cc_overweight', 'manual_stage')),
             fill_ts REAL,
             fill_price REAL,
             last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
