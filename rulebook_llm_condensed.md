@@ -1,6 +1,6 @@
 # AGT Equities — Rulebook Reference (LLM Context)
-# Condensed from Portfolio_Risk_Rulebook_v8.md
-# This is NOT the governing document — the full v8 Rulebook is authoritative.
+# Condensed from Portfolio_Risk_Rulebook_v9.md
+# This is NOT the governing document — the full v9 Rulebook is authoritative.
 
 ## Rule Precedence (when rules conflict)
 1. Avoid forced broker liquidation (Rule 6) — overrides everything
@@ -27,16 +27,16 @@ EL measured across margin accounts only (Individual + Vikram IND). Roth excluded
 - Drawdown exception: extends to 30% if stock fell ≥30% from basis.
 - Breach (decline or appreciation): Freeze (no new shares, no CSPs). Continue CCs. No forced selling.
 
-## Rule 2: EL by VIX
+## Rule 2: EL by VIX (v9: 5 tiers, 60% max deploy cap)
 | VIX | Min EL Retain | Max Deploy |
 |---|---|---|
 | <20 | 80% | 20% |
 | 20-25 | 70% | 30% |
 | 25-30 | 60% | 40% |
-| 30-35 | 50% | 50% |
-| 35-40 | 40% | 60% |
-| 40-50 | 30% | 70% |
-| 50+ | 25% | 75% |
+| 30-40 | 50% | 50% |
+| 40+ | 40% | 60% |
+
+EL denominator = margin-eligible NLV only (Individual + Vikram IND). Roth IRA NLV excluded. The last 40% of EL is the survival bunker — no VIX level unlocks it.
 
 ## Rule 3: Sector — max 2 names per Yahoo Finance industry bucket.
 ## Rule 4: Correlation — max 0.6 rolling 6-month pairwise at entry.
@@ -102,6 +102,13 @@ target_shares = floor((household_nlv × 0.15) / price). Excess = current − tar
 - **SPX box spreads:** excluded from ALL calculations (NLV, EL, concentration, sector, correlation).
 - **Legacy picks (SLS, GTLB):** excluded from Wheel procedures, sector, correlation. Included in NLV for Rule 1.
 - **Negligible holdings (IBKR fractional, TRAW.CVR):** excluded from everything.
+
+## Rule 11: Portfolio Circuit Breaker (v9.0)
+- Gross beta-weighted equity notional may not exceed **1.50x** of household NLV.
+- `leverage = sum(qty * beta * spot) / household_NLV` (beta = trailing 6-month vs SPY)
+- If breached: block `/scan` (new CSPs). Existing positions managed normally. Mode 1 CC harvest continues.
+- Release: leverage must drop below **1.40x** (10% hysteresis buffer).
+- Rationale: tail-event protection. Correlation goes to 1, beta dominates. Prevents IBKR forced liquidation at VIX 40+.
 
 ## Prohibited
 - Mode 1 CCs within 3% of current price

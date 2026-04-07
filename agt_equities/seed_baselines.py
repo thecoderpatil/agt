@@ -54,16 +54,51 @@ def seed_glide_paths(conn: sqlite3.Connection) -> int:
 
         # Rule 3: Sector (Software - Application has 3 tickers — after UBER override, should clear)
         # No glide path needed for Rule 3 — UBER sector override fixes it immediately.
+
+        # Rule 2: EL Retention (Phase 3A.5a triage — breaches surfaced by denominator fix)
+        # R2 glide paths DECOUPLED from R11 by design. R11 cures fast (assignment-driven
+        # exposure reduction). R2 cures slow (cash accumulation at reduced deployment velocity).
+        # End-of-Q4-2026 target per Architect decision 2026-04-07.
+        ("Vikram_Household", "rule_2", None, 0.542, 0.70, START_DATE,
+         "2026-12-31", None,
+         "R2 EL retention 54.2% vs 70% required at VIX 22. DECOUPLED from R11 12w glide. "
+         "Cures via cash accumulation at reduced redeployment velocity over 38 weeks.",
+         "thesis_deterioration"),
+        ("Yash_Household", "rule_2", None, 0.421, 0.70, START_DATE,
+         "2026-12-31", None,
+         "R2 EL retention 42.1% vs 70% required at VIX 22. Known heavy deployment posture. "
+         "DECOUPLED from R11 4w glide. Cures via sustained reduced deployment velocity.",
+         "thesis_deterioration"),
+
+        # Rule 4: Pairwise Correlation — ADBE-CRM
+        # ticker=None because R4 evaluations are pair-level (ev.ticker is None).
+        # The first R4 eval alphabetically is ADBE-CRM (the breaching pair).
+        # Linked to ADBE concentration 20w glide — correlation cures as
+        # concentration cures (both Software-Application).
+        ("Yash_Household", "rule_4", None, 0.6915, 0.55, START_DATE,
+         (date.fromisoformat(START_DATE) + timedelta(weeks=20)).isoformat(), None,
+         "ADBE-CRM pairwise correlation 0.69 > 0.60 limit. Both Software-Application. "
+         "Linked to ADBE concentration 20w glide. Resolves as ADBE rotates to target."),
+        ("Vikram_Household", "rule_4", None, 0.6915, 0.55, START_DATE,
+         (date.fromisoformat(START_DATE) + timedelta(weeks=20)).isoformat(), None,
+         "ADBE-CRM pairwise correlation 0.69 > 0.60 limit. Both Software-Application. "
+         "Linked to ADBE concentration 20w glide."),
     ]
 
     inserted = 0
-    for (hh, rule, ticker, baseline, target, start, target_dt, pause, notes) in paths:
+    for row in paths:
+        # Support 9-element (legacy) or 10-element (with accelerator_clause) tuples
+        if len(row) == 9:
+            hh, rule, ticker, baseline, target, start, target_dt, pause, notes = row
+            accel = None
+        else:
+            hh, rule, ticker, baseline, target, start, target_dt, pause, notes, accel = row
         conn.execute(
             "INSERT OR REPLACE INTO glide_paths "
             "(household_id, rule_id, ticker, baseline_value, target_value, "
-            "start_date, target_date, pause_conditions, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (hh, rule, ticker, baseline, target, start, target_dt, pause, notes),
+            "start_date, target_date, pause_conditions, notes, accelerator_clause) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (hh, rule, ticker, baseline, target, start, target_dt, pause, notes, accel),
         )
         inserted += 1
 

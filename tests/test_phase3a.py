@@ -80,6 +80,7 @@ def _get_test_db():
         baseline_value REAL NOT NULL, target_value REAL NOT NULL,
         start_date TEXT NOT NULL, target_date TEXT NOT NULL,
         pause_conditions TEXT, created_at TEXT DEFAULT (datetime('now')), notes TEXT,
+        accelerator_clause TEXT,
         UNIQUE(household_id, rule_id, ticker))""")
     conn.execute("""CREATE TABLE mode_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,23 +157,92 @@ class TestEvaluateRule1(unittest.TestCase):
 
 
 class TestEvaluateRule2(unittest.TestCase):
+    """Rule 2 tests — denominator = margin-eligible NLV only (Reading 2).
+
+    v9 lines 709-712: 'Roth IRA net liquidation value is excluded.'
+    Phase 3A.5a triage: tests updated from Reading 1 (household NLV)
+    to Reading 2 (margin-only NLV via account_el / account_nlv).
+    """
 
     def test_el_unavailable(self):
+        """No EL data anywhere -> PENDING.
+        OLD: used household_el=None. NEW: same behavior via fallback.
+        """
         ps = _make_ps(household_el={'Yash_Household': None})
         result = evaluate_rule_2(ps, 'Yash_Household')
         self.assertEqual(result.status, "PENDING")
 
-    def test_el_sufficient(self):
-        ps = _make_ps(household_el={'Yash_Household': 180000.0},
-                      household_nlv={'Yash_Household': 200000}, vix=15.0)
+    def test_el_sufficient_reading_2(self):
+        """Reading 2: EL/margin_NLV ratio, not EL/household_NLV.
+        OLD: household_el=180K / household_nlv=200K = 90% >= 80% -> GREEN
+        NEW: account_el margin_nlv=100K, margin_el=90K -> 90% >= 80% -> GREEN
+        Same outcome, but denominator is now margin-only.
+        """
+        from agt_equities.rule_engine import AccountELSnapshot
+        snap = AccountELSnapshot(
+            excess_liquidity=90000.0, net_liquidation=100000.0,
+            timestamp="2026-04-07T10:00:00", stale=False,
+        )
+        ps = _make_ps(
+            household_nlv={'Yash_Household': 200000},  # includes Roth
+            account_el={"U21971297": snap},
+            vix=15.0,
+        )
         result = evaluate_rule_2(ps, 'Yash_Household')
         self.assertEqual(result.status, "GREEN")  # 90% >= 80% retain
+        self.assertAlmostEqual(result.raw_value, 0.90, places=2)
 
-    def test_el_insufficient(self):
-        ps = _make_ps(household_el={'Yash_Household': 50000.0},
-                      household_nlv={'Yash_Household': 200000}, vix=15.0)
+    def test_el_insufficient_reading_2(self):
+        """Reading 2: margin-only denominator.
+        OLD: household_el=50K / household_nlv=200K = 25% < 80% -> RED
+        NEW: account_el margin_nlv=100K, margin_el=25K -> 25% < 80% -> RED
+        Same outcome, but denominator is now margin-only.
+        """
+        from agt_equities.rule_engine import AccountELSnapshot
+        snap = AccountELSnapshot(
+            excess_liquidity=25000.0, net_liquidation=100000.0,
+            timestamp="2026-04-07T10:00:00", stale=False,
+        )
+        ps = _make_ps(
+            household_nlv={'Yash_Household': 200000},  # includes Roth
+            account_el={"U21971297": snap},
+            vix=15.0,
+        )
         result = evaluate_rule_2(ps, 'Yash_Household')
         self.assertEqual(result.status, "RED")  # 25% < 80% retain
+
+    def test_reading_2_vs_reading_1_divergence(self):
+        """Demonstrate the Reading 1 vs Reading 2 difference.
+        Yash margin account EL=70K, margin NLV=100K -> 70%.
+        Yash household NLV=250K (including 150K Roth).
+        Reading 1 (old, WRONG): 70K/250K = 28% < 80% -> RED
+        Reading 2 (new, CORRECT): 70K/100K = 70% < 80% -> RED at VIX<20
+        But at VIX 25-30: retain=60%, and 70% >= 60% -> GREEN
+        """
+        from agt_equities.rule_engine import AccountELSnapshot
+        snap = AccountELSnapshot(
+            excess_liquidity=70000.0, net_liquidation=100000.0,
+            timestamp="2026-04-07T10:00:00", stale=False,
+        )
+        # At VIX 28: retain = 60%. Reading 2: 70% >= 60% -> GREEN
+        ps = _make_ps(
+            household_nlv={'Yash_Household': 250000},
+            account_el={"U21971297": snap},
+            vix=28.0,
+        )
+        result = evaluate_rule_2(ps, 'Yash_Household')
+        self.assertEqual(result.status, "GREEN")  # Reading 2: 70% >= 60%
+
+    def test_fallback_to_household_el(self):
+        """When no account_el data, falls back to household_el + account_nlv."""
+        ps = _make_ps(
+            household_el={'Yash_Household': 80000.0},
+            household_nlv={'Yash_Household': 200000},
+            account_nlv={"U21971297": 100000.0},
+            vix=15.0,
+        )
+        result = evaluate_rule_2(ps, 'Yash_Household')
+        self.assertEqual(result.status, "GREEN")  # 80K/100K = 80% >= 80%
 
 
 class TestEvaluateRule3(unittest.TestCase):
@@ -238,9 +308,10 @@ class TestEvaluateRule11(unittest.TestCase):
 class TestStubEvaluators(unittest.TestCase):
 
     def test_all_stubs_return_pending(self):
+        """R7/R8/R9/R10 remain PENDING stubs. R4/R5/R6 are now real evaluators."""
         ps = _make_ps()
-        for evaluator in [evaluate_rule_4, evaluate_rule_5, evaluate_rule_7,
-                          evaluate_rule_8, evaluate_rule_9, evaluate_rule_10]:
+        for evaluator in [evaluate_rule_7, evaluate_rule_8,
+                          evaluate_rule_9, evaluate_rule_10]:
             result = evaluator(ps, 'Yash_Household')
             self.assertEqual(result.status, "PENDING", f"{result.rule_id} not PENDING")
 

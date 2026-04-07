@@ -1171,22 +1171,19 @@ async def _check_rule_11_leverage(household: str) -> tuple[bool, str]:
         tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE' and c.shares_held > 0})
         spots = {}
         betas = {}
+        # MIGRATED 2026-04-07 Phase 3A.5c1 — replaced direct yfinance call
+        # with IBKRPriceVolatilityProvider.get_spot() per Architect decision.
+        # Original yfinance call preserved for 1 sprint as reference.
+        # Delete in 3A.5c2 if no issues surface.
+        # OLD: data = yf.download(tickers, period="1d", ...); betas from yf.Ticker.info
         try:
-            import yfinance as yf
-            data = yf.download(tickers, period="1d", progress=False) if tickers else None
-            if data is not None and not data.empty:
-                close = data["Close"]
-                last = close.iloc[-1]
-                for tk in tickers:
-                    try:
-                        spots[tk] = float(last[tk])
-                    except Exception:
-                        pass
+            from agt_equities.providers.ibkr_price_volatility import IBKRPriceVolatilityProvider
+            _price_prov = IBKRPriceVolatilityProvider(ib, market_data_mode="delayed")
             for tk in tickers:
-                try:
-                    betas[tk] = float(yf.Ticker(tk).info.get('beta', 1.0) or 1.0)
-                except Exception:
-                    betas[tk] = 1.0
+                spot = _price_prov.get_spot(tk)
+                if spot is not None:
+                    spots[tk] = spot
+                betas[tk] = 1.0  # beta=1.0 per existing evaluator convention
         except Exception:
             pass
 
@@ -2972,12 +2969,11 @@ def _calculate_walk_away_profit(
     premium: float,
     adjusted_basis: float,
 ) -> float:
-    """
-    Calculate the net profit/loss per share if assigned below the adjusted basis.
-    Net = Premium Collected + (Strike Price - Adjusted Basis)
-    """
-    capital_loss = strike - adjusted_basis
-    return premium + capital_loss
+    """Walk-away P&L per share. Delegates to walker.compute_walk_away_pnl().
+    Kept as thin wrapper for backward compatibility with existing call sites."""
+    from agt_equities.walker import compute_walk_away_pnl
+    result = compute_walk_away_pnl(adjusted_basis, strike, premium, quantity=1, multiplier=1)
+    return result.walk_away_pnl_per_share
 
 
 def _prob_itm(
@@ -6789,29 +6785,20 @@ async def cmd_rollcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 spot_map = await _ibkr_get_spots_batch(unique_tickers)
         except Exception:
             pass
-        # yfinance fallback for any missed (DISPLAY_ONLY)
+        # MIGRATED 2026-04-07 Phase 3A.5c1 — replaced yfinance fallback
+        # with IBKRPriceVolatilityProvider.get_spot() per Architect decision.
+        # OLD: df = yf.download(" ".join(missed_tickers), period="1d", ...)
         missed_tickers = [t for t in unique_tickers if t not in spot_map]
-        try:
-            if missed_tickers:
-                df = yf.download(
-                    " ".join(missed_tickers),
-                    period="1d",
-                    progress=False,
-                    threads=True,
-                )
-                if not df.empty:
-                    if len(missed_tickers) == 1:
-                        close_val = df["Close"].iloc[-1]
-                        spot_map[missed_tickers[0]] = round(float(close_val), 2) if close_val == close_val else 0.0
-                    else:
-                        for tkr in unique_tickers:
-                            try:
-                                val = df["Close"][tkr].iloc[-1]
-                                spot_map[tkr] = round(float(val), 2) if val == val else 0.0
-                            except Exception:
-                                pass
-        except Exception as yf_exc:
-            logger.warning("Batch spot fetch for rollcheck failed: %s", yf_exc)
+        if missed_tickers:
+            try:
+                from agt_equities.providers.ibkr_price_volatility import IBKRPriceVolatilityProvider
+                _prov = IBKRPriceVolatilityProvider(ib, market_data_mode="delayed")
+                for tkr in missed_tickers:
+                    spot = _prov.get_spot(tkr)
+                    if spot is not None:
+                        spot_map[tkr] = round(spot, 2)
+            except Exception as exc:
+                logger.warning("IBKR fallback spot fetch for rollcheck failed: %s", exc)
 
         for r in rows:
             try:
@@ -8279,24 +8266,18 @@ async def _discover_positions(
             spot_prices = await _ibkr_get_spots_batch(unique_tickers)
         except Exception as exc:
             logger.warning("_discover_positions: IBKR batch spots failed: %s", exc)
-        # Fallback for missed tickers (DISPLAY_ONLY — acceptable)
+        # MIGRATED 2026-04-07 Phase 3A.5c1 — replaced yfinance fallback
+        # with IBKRPriceVolatilityProvider.get_spot() per Architect decision.
+        # OLD: data = yf.download(" ".join(missed), period="1d", ...)
         missed = [t for t in unique_tickers if t not in spot_prices]
         if missed:
             try:
-                data = yf.download(" ".join(missed), period="1d", progress=False)
-                if not data.empty:
-                    close_col = data.get("Close")
-                    if close_col is not None and not close_col.empty:
-                        if len(missed) == 1:
-                            spot_prices[missed[0]] = round(float(close_col.iloc[-1]), 2)
-                        else:
-                            for tkr in missed:
-                                try:
-                                    val = close_col[tkr].iloc[-1]
-                                    if pd.notna(val):
-                                        spot_prices[tkr] = round(float(val), 2)
-                                except (KeyError, IndexError):
-                                    pass
+                from agt_equities.providers.ibkr_price_volatility import IBKRPriceVolatilityProvider
+                _prov = IBKRPriceVolatilityProvider(ib, market_data_mode="delayed")
+                for tkr in missed:
+                    spot = _prov.get_spot(tkr)
+                    if spot is not None:
+                        spot_prices[tkr] = round(spot, 2)
             except Exception:
                 pass
 

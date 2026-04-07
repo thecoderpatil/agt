@@ -609,6 +609,149 @@ def register_master_log_tables(conn) -> None:
     # R5: Order state machine — extend pending_orders with lifecycle fields
     _extend_pending_orders(conn)
 
+    # Phase 3A.5a: Add accelerator_clause to glide_paths
+    _extend_glide_paths(conn)
+
+    # Phase 3A.5b: Red Alert state (R9 hysteresis)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS red_alert_state (
+            household        TEXT PRIMARY KEY,
+            current_state    TEXT NOT NULL CHECK (current_state IN ('OFF', 'ON'))
+                             DEFAULT 'OFF',
+            activated_at     TEXT,
+            activation_reason TEXT,
+            conditions_met_count INTEGER NOT NULL DEFAULT 0,
+            conditions_met_list  TEXT,
+            last_updated     TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    # Seed both households OFF on first run (idempotent via INSERT OR IGNORE)
+    conn.execute(
+        "INSERT OR IGNORE INTO red_alert_state (household, current_state) "
+        "VALUES ('Yash_Household', 'OFF')"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO red_alert_state (household, current_state) "
+        "VALUES ('Vikram_Household', 'OFF')"
+    )
+
+    # Phase 3A.5c1: IV history for IV rank computation (252-day bootstrap)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bucket3_macro_iv_history (
+            ticker      TEXT NOT NULL,
+            trade_date  TEXT NOT NULL,
+            iv_30       REAL NOT NULL,
+            sample_source TEXT NOT NULL DEFAULT 'eod_macro_sync',
+            created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ticker, trade_date)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_iv_hist_ticker_date
+        ON bucket3_macro_iv_history(ticker, trade_date DESC)
+    """)
+
+    # Phase 3A.5c1: Corporate intelligence cache (Bucket 3)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bucket3_corporate_cache (
+            ticker      TEXT PRIMARY KEY,
+            data_json   TEXT NOT NULL,
+            fetched_at  TEXT NOT NULL,
+            source      TEXT NOT NULL DEFAULT 'yfinance'
+        )
+    """)
+
+    # Phase 3A.5c2-alpha: Dynamic Exit audit log + campaigns + earnings overrides
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bucket3_dynamic_exit_log (
+            audit_id TEXT PRIMARY KEY,
+            trade_date TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            household TEXT NOT NULL,
+            desk_mode TEXT NOT NULL CHECK (desk_mode IN ('PEACETIME', 'AMBER', 'WARTIME')),
+            action_type TEXT NOT NULL CHECK (action_type IN ('CC', 'STK_SELL')),
+            household_nlv REAL NOT NULL,
+            underlying_spot_at_render REAL NOT NULL,
+            gate1_freed_margin REAL,
+            gate1_realized_loss REAL,
+            gate1_conviction_tier TEXT,
+            gate1_conviction_modifier REAL,
+            gate1_ratio REAL,
+            gate2_target_contracts INTEGER,
+            gate2_max_per_cycle INTEGER,
+            walk_away_pnl_per_share REAL,
+            strike REAL,
+            expiry TEXT,
+            contracts INTEGER,
+            shares INTEGER,
+            limit_price REAL,
+            campaign_id TEXT,
+            operator_thesis TEXT,
+            attestation_value_typed TEXT,
+            checkbox_state_json TEXT,
+            render_ts REAL,
+            staged_ts REAL,
+            transmitted INTEGER NOT NULL DEFAULT 0,
+            transmitted_ts REAL,
+            re_validation_count INTEGER NOT NULL DEFAULT 0,
+            final_status TEXT NOT NULL DEFAULT 'PENDING'
+                CHECK (final_status IN ('PENDING', 'STAGED', 'ATTESTED',
+                                        'TRANSMITTED', 'CANCELLED',
+                                        'DRIFT_BLOCKED', 'ABANDONED')),
+            fill_ts REAL,
+            fill_price REAL,
+            last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (campaign_id) REFERENCES bucket3_dynamic_exit_campaigns(campaign_id)
+        ) WITHOUT ROWID
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dyn_exit_status
+        ON bucket3_dynamic_exit_log(final_status, household)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dyn_exit_ticker_date
+        ON bucket3_dynamic_exit_log(ticker, trade_date DESC)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dyn_exit_household
+        ON bucket3_dynamic_exit_log(household, trade_date DESC)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bucket3_dynamic_exit_campaigns (
+            campaign_id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            household TEXT NOT NULL,
+            inception_date TEXT NOT NULL,
+            locked_target_shares INTEGER NOT NULL,
+            locked_conviction_modifier REAL NOT NULL,
+            locked_conviction_tier TEXT NOT NULL
+                CHECK (locked_conviction_tier IN ('HIGH', 'NEUTRAL', 'LOW')),
+            status TEXT NOT NULL DEFAULT 'ACTIVE'
+                CHECK (status IN ('ACTIVE', 'COMPLETE', 'ABANDONED')),
+            shares_exited_cumulative INTEGER NOT NULL DEFAULT 0,
+            last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ) WITHOUT ROWID
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_campaigns_active
+        ON bucket3_dynamic_exit_campaigns(ticker, household)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bucket3_earnings_overrides (
+            ticker TEXT PRIMARY KEY,
+            override_value TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
+            created_by TEXT NOT NULL DEFAULT 'manual_override'
+        ) WITHOUT ROWID
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_earnings_overrides_expires
+        ON bucket3_earnings_overrides(expires_at)
+    """)
+
     # R5: Orphan order events table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS orphan_order_events (
@@ -732,3 +875,17 @@ def _extend_pending_orders(conn) -> None:
     for col_name, col_type in extensions:
         if col_name not in existing:
             conn.execute(f"ALTER TABLE pending_orders ADD COLUMN {col_name} {col_type}")
+
+
+def _extend_glide_paths(conn) -> None:
+    """Phase 3A.5a: Add accelerator_clause column to glide_paths if missing."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if 'glide_paths' not in tables:
+        return
+    gp_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(glide_paths)").fetchall()
+    }
+    if "accelerator_clause" not in gp_cols:
+        conn.execute("ALTER TABLE glide_paths ADD COLUMN accelerator_clause TEXT")

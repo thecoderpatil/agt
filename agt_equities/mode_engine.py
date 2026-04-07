@@ -59,6 +59,22 @@ class LeverageHysteresisTracker:
 # Glide path evaluation
 # ---------------------------------------------------------------------------
 
+# Glide path noise tolerance per rule.
+# Phase 3A.5a triage 2026-04-07: sub-percent intraday NLV drift was
+# triggering 'worsened' status on Day 0 baselines, blocking PEACETIME.
+# These tolerances reject measurement noise without masking real
+# trajectory deterioration. Tolerances are FLAT ABSOLUTE values, not
+# percentage of baseline, because the noise floor of each metric type
+# is approximately constant regardless of baseline magnitude.
+# Worsened only fires when actual exceeds baseline by MORE than tolerance.
+GLIDE_PATH_TOLERANCE: dict[str, float] = {
+    "rule_1":  0.01,   # 1 percentage point on concentration ratio
+    "rule_2":  0.01,   # 1 percentage point on EL retention ratio
+    "rule_4":  0.02,   # 2 basis points on correlation
+    "rule_6":  0.01,   # 1 percentage point on Vikram EL ratio
+    "rule_11": 0.02,   # 2 basis points of leverage
+}
+
 @dataclass(frozen=True)
 class GlidePath:
     """A single glide path record from the glide_paths table."""
@@ -70,6 +86,7 @@ class GlidePath:
     start_date: str          # YYYY-MM-DD
     target_date: str         # YYYY-MM-DD
     pause_conditions: str | None  # JSON or None
+    accelerator_clause: str | None = None  # Phase 3A.5a: e.g. "thesis_deterioration"
 
 
 def evaluate_glide_path(
@@ -114,18 +131,29 @@ def evaluate_glide_path(
     weekly_rate = abs(gp.target_value - gp.baseline_value) / total_days * 7
     two_weeks_worth = weekly_rate * 2
 
-    # Worsening check: actual went past baseline in the wrong direction
+    # Tolerance: per-rule flat absolute noise rejection band.
+    # Applied symmetrically to BOTH worsened (RED) and behind (AMBER) checks.
+    # A sub-tolerance drift in either direction is NOT a mode transition.
+    # Phase 3A.5a triage 2026-04-07: intraday NLV drift was triggering
+    # mode transitions on Day 0. Tolerance is noise rejection, not leniency.
+    tolerance = GLIDE_PATH_TOLERANCE.get(gp.rule_id, 0.01)
     is_reduction = gp.baseline_value > gp.target_value
-    if is_reduction:
-        worsened = actual_value > gp.baseline_value
-        behind = delta > 0  # actual higher than expected for reduction
-    else:
-        worsened = actual_value < gp.baseline_value
-        behind = delta < 0
 
-    if worsened or (behind and abs(delta) >= two_weeks_worth):
+    if is_reduction:
+        # Must decrease. Worsened = rose above (baseline + tolerance).
+        worsened = actual_value > (gp.baseline_value + tolerance)
+        # Behind = actual > (expected + tolerance). Sub-tolerance drift = on track.
+        behind = actual_value > (expected_today + tolerance + 1e-9)
+    else:
+        # Must increase. Worsened = dropped below (baseline - tolerance).
+        worsened = actual_value < (gp.baseline_value - tolerance)
+        # Behind = actual < (expected - tolerance). Sub-tolerance drift = on track.
+        behind = actual_value < (expected_today - tolerance - 1e-9)
+
+    # WORSENED takes precedence over BEHIND when both fire.
+    if worsened:
         status = "RED"
-    elif behind and abs(delta) > 0:
+    elif behind:
         status = "AMBER"
     else:
         status = "GREEN"
@@ -212,6 +240,34 @@ def get_recent_transitions(conn: sqlite3.Connection, limit: int = 5) -> list[dic
 
 
 # ---------------------------------------------------------------------------
+# Programmatic WARTIME definition (Gemini Q10 + ADR-004)
+# ---------------------------------------------------------------------------
+
+def is_wartime_condition_met(
+    yash_leverage: float,
+    vikram_leverage: float,
+    vikram_el_ratio: float,
+) -> tuple[bool, list[str]]:
+    """Programmatic WARTIME definition per Gemini Q10 + ADR-004.
+
+    Returns (is_wartime, reasons_list).
+
+    DOCUMENTATION ONLY in 3A.5c2-alpha. This function is callable
+    and tested but is NOT wired to automatic mode flips. Manual
+    /declare_wartime remains the only entry path until Phase 3B
+    automated mode pipeline.
+    """
+    reasons: list[str] = []
+    if yash_leverage > 1.50 or vikram_leverage > 1.50:
+        reasons.append(
+            f"Leverage breach: Yash {yash_leverage:.2f}x, Vik {vikram_leverage:.2f}x"
+        )
+    if vikram_el_ratio < 0.15:
+        reasons.append(f"Vikram EL critical: {vikram_el_ratio:.1%}")
+    return (len(reasons) > 0, reasons)
+
+
+# ---------------------------------------------------------------------------
 # Glide path DB helpers
 # ---------------------------------------------------------------------------
 
@@ -229,6 +285,7 @@ def load_glide_paths(conn: sqlite3.Connection) -> list[GlidePath]:
                 start_date=r["start_date"],
                 target_date=r["target_date"],
                 pause_conditions=r["pause_conditions"],
+                accelerator_clause=r["accelerator_clause"] if "accelerator_clause" in r.keys() else None,
             )
             for r in rows
         ]

@@ -740,3 +740,49 @@ def walk_cycles(
 def get_walker_warnings() -> list[WalkerWarning]:
     """Return warnings from the most recent walk_cycles() call."""
     return list(_walker_warnings)
+
+
+# ---------------------------------------------------------------------------
+# Walk-away P&L — pure computation for Rule 8 Dynamic Exit
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WalkAwayResult:
+    """Result of walk-away P&L computation for a candidate exit."""
+    walk_away_pnl_per_share: float   # positive = profitable, negative = loss
+    walk_away_pnl_total: float       # per_share * 100 * contracts (or * shares)
+    adjusted_cost_basis: float
+    is_profitable: bool              # P&L >= 0
+
+
+def compute_walk_away_pnl(
+    adjusted_cost_basis: float,
+    proposed_exit_strike: float,
+    proposed_exit_premium: float,
+    quantity: int,
+    multiplier: int = 100,
+) -> WalkAwayResult:
+    """Pure function. Computes walk-away P&L for a candidate exit.
+
+    Walk-Away P&L per Share = Strike + Premium - Adjusted Cost Basis
+
+    Per v10 Rule 8: "Walk-Away P&L > 0: profitable exit. Walk-Away P&L < 0:
+    capital liberation trade."
+
+    Walker stays pure: no I/O, no DB writes, no side effects.
+
+    Args:
+        adjusted_cost_basis: paper_basis - (accumulated_premium / shares)
+        proposed_exit_strike: option strike price
+        proposed_exit_premium: option premium (mid or bid)
+        quantity: number of contracts (for CC) or shares (for STK_SELL)
+        multiplier: 100 for options, 1 for stock
+    """
+    pnl_per_share = proposed_exit_strike + proposed_exit_premium - adjusted_cost_basis
+    pnl_total = pnl_per_share * multiplier * quantity
+    return WalkAwayResult(
+        walk_away_pnl_per_share=round(pnl_per_share, 4),
+        walk_away_pnl_total=round(pnl_total, 2),
+        adjusted_cost_basis=adjusted_cost_basis,
+        is_profitable=pnl_per_share >= 0,
+    )
