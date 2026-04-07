@@ -1,0 +1,50 @@
+# Secrets
+.env
+.env.*
+*.env
+litestream.yml
+litestream.exe
+
+# Databases
+*.db
+*.db-wal
+*.db-shm
+*.db.phase*_baseline_*
+*.backup
+
+# IBKR Flex XML fixtures (contain account data)
+tests/fixtures/master_log_*.xml
+*flex*.xml
+
+# Archive (may contain old credentials, CSVs with account data)
+Archive/
+
+# Audit bundles
+audit_bundles/
+
+# Test framework artifacts
+.hypothesis/
+
+# Data files with account info
+data/inception_carryin.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Dashboard output
+dashboard_output/
