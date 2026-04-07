@@ -308,10 +308,9 @@ class TestEvaluateRule11(unittest.TestCase):
 class TestStubEvaluators(unittest.TestCase):
 
     def test_all_stubs_return_pending(self):
-        """R7/R8/R9/R10 remain PENDING stubs. R4/R5/R6 are now real evaluators."""
+        """R8/R10 remain PENDING stubs. R7 is now real (fail-closed). R9 is real (compositor)."""
         ps = _make_ps()
-        for evaluator in [evaluate_rule_7, evaluate_rule_8,
-                          evaluate_rule_9, evaluate_rule_10]:
+        for evaluator in [evaluate_rule_8, evaluate_rule_10]:
             result = evaluator(ps, 'Yash_Household')
             self.assertEqual(result.status, "PENDING", f"{result.rule_id} not PENDING")
 
@@ -694,6 +693,151 @@ class TestModeTransitionFlow(unittest.TestCase):
             log_mode_transition(self.conn, 'A', 'B', notes=f'test_{i}')
         recent = get_recent_transitions(self.conn, limit=3)
         self.assertEqual(len(recent), 3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Rule 7: Earnings Window (fail-closed)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRule7EarningsWindow(unittest.TestCase):
+
+    def _make_ps_with_tickers(self, tickers):
+        cycles = [_mock_cycle(ticker=t) for t in tickers]
+        return _make_ps(
+            active_cycles=cycles,
+            spots={t: 100.0 for t in tickers},
+            industries={t: 'Tech' for t in tickers},
+        )
+
+    def test_fail_closed_no_data(self):
+        """No override, no cache → RED per ticker with R7_FAIL_CLOSED_NO_DATA."""
+        ps = self._make_ps_with_tickers(["AAPL", "MSFT"])
+        results = evaluate_rule_7(ps, "Yash_Household")
+        self.assertEqual(len(results), 2)
+        for r in results:
+            self.assertEqual(r.rule_id, "rule_7")
+            self.assertEqual(r.status, "RED")
+            self.assertIn("FAIL-CLOSED", r.message)
+            self.assertIn("R7_FAIL_CLOSED", r.detail.get("reason", ""))
+
+    def test_returns_list(self):
+        """R7 returns list[RuleEvaluation], one per ticker."""
+        ps = self._make_ps_with_tickers(["AAPL", "MSFT", "GOOG"])
+        results = evaluate_rule_7(ps, "Yash_Household")
+        self.assertIsInstance(results, list)
+        self.assertEqual(len(results), 3)
+        tickers_in_results = {r.ticker for r in results}
+        self.assertEqual(tickers_in_results, {"AAPL", "MSFT", "GOOG"})
+
+    def test_no_active_tickers_returns_green(self):
+        """No active cycles → single GREEN result."""
+        ps = self._make_ps_with_tickers([])
+        results = evaluate_rule_7(ps, "Yash_Household")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "GREEN")
+
+    def test_override_wins_over_no_data(self):
+        """Active override → uses override date, not fail-closed."""
+        import sqlite3
+        from datetime import datetime, timedelta
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+            CREATE TABLE bucket3_earnings_overrides (
+                ticker TEXT PRIMARY KEY,
+                override_value TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                created_by TEXT DEFAULT 'manual_override',
+                reason TEXT
+            )
+        """)
+        # Override: earnings 30 days out (outside 14-day window → GREEN)
+        future_date = (date.today() + timedelta(days=30)).isoformat()
+        expires = (datetime.now() + timedelta(hours=168)).isoformat()
+        conn.execute(
+            "INSERT INTO bucket3_earnings_overrides (ticker, override_value, expires_at, reason) "
+            "VALUES (?, ?, ?, ?)",
+            ("AAPL", future_date, expires, "verified IR page"),
+        )
+        conn.commit()
+
+        ps = self._make_ps_with_tickers(["AAPL"])
+        results = evaluate_rule_7(ps, "Yash_Household", conn=conn)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "GREEN")
+        self.assertEqual(results[0].detail["source"], "operator_override")
+
+    def test_override_within_window_returns_red(self):
+        """Override with earnings 5 days out → RED (within 14-day window)."""
+        import sqlite3
+        from datetime import datetime, timedelta
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+            CREATE TABLE bucket3_earnings_overrides (
+                ticker TEXT PRIMARY KEY,
+                override_value TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                created_by TEXT DEFAULT 'manual_override',
+                reason TEXT
+            )
+        """)
+        near_date = (date.today() + timedelta(days=5)).isoformat()
+        expires = (datetime.now() + timedelta(hours=168)).isoformat()
+        conn.execute(
+            "INSERT INTO bucket3_earnings_overrides (ticker, override_value, expires_at, reason) "
+            "VALUES (?, ?, ?, ?)",
+            ("AAPL", near_date, expires, "confirmed Q2 report"),
+        )
+        conn.commit()
+
+        ps = self._make_ps_with_tickers(["AAPL"])
+        results = evaluate_rule_7(ps, "Yash_Household", conn=conn)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "RED")
+        self.assertEqual(results[0].detail["days_to_earnings"], 5)
+
+    def test_expired_override_ignored(self):
+        """Expired override → falls through to fail-closed (no cache)."""
+        import sqlite3
+        from datetime import datetime, timedelta
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+            CREATE TABLE bucket3_earnings_overrides (
+                ticker TEXT PRIMARY KEY,
+                override_value TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                created_by TEXT DEFAULT 'manual_override',
+                reason TEXT
+            )
+        """)
+        future_date = (date.today() + timedelta(days=30)).isoformat()
+        expired = "2020-01-01T00:00:00"  # clearly expired
+        conn.execute(
+            "INSERT INTO bucket3_earnings_overrides (ticker, override_value, expires_at) "
+            "VALUES (?, ?, ?)",
+            ("AAPL", future_date, expired),
+        )
+        conn.commit()
+
+        ps = self._make_ps_with_tickers(["AAPL"])
+        results = evaluate_rule_7(ps, "Yash_Household", conn=conn)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "RED")
+        self.assertIn("FAIL-CLOSED", results[0].message)
+
+    def test_evaluate_all_includes_r7(self):
+        """evaluate_all() returns rule_7 results after .extend() change."""
+        cycles = [_mock_cycle(ticker='AAPL')]
+        ps = _make_ps(active_cycles=cycles, spots={'AAPL': 100.0},
+                      industries={'AAPL': 'Tech'})
+        results = evaluate_all(ps, 'Yash_Household')
+        r7_results = [r for r in results if r.rule_id == "rule_7"]
+        self.assertGreater(len(r7_results), 0)
+        # R7 should be RED (fail-closed, no earnings cache in test env)
+        for r in r7_results:
+            self.assertEqual(r.status, "RED")
 
 
 if __name__ == '__main__':

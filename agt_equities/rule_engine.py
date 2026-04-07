@@ -558,7 +558,7 @@ def evaluate_rule_5_sell_gate(
       - Sell is below adjusted cost basis without a qualifying exception
 
     Integration points (discovery — NOT wired in 3A.5a):
-      - telegram_bot.py /exit command handler
+      - Smart Friction UI (Phase 3B) or /sell_shares command
       - Any future sell-shares code path
       - Cure Console force-sell action (Phase 3C)
     """
@@ -817,10 +817,187 @@ def evaluate_rule_6(ps: PortfolioState, household: str) -> RuleEvaluation:
         detail=detail,
     )
 
-def evaluate_rule_7(ps: PortfolioState, household: str) -> RuleEvaluation:
-    """Rule 7: CC/CSP procedure. Procedural — not evaluable."""
-    return _stub_rule("rule_7", "CC/CSP Procedure", household,
-                       "procedural rule, not a compliance metric")
+R7_EARNINGS_WINDOW_DAYS = 14   # Block CSP entry within 14 days of earnings (v9 spec)
+R7_CACHE_STALE_DAYS = 7        # Cached earnings data older than 7 days = stale
+
+
+def _get_active_earnings_override(ticker: str, conn: sqlite3.Connection) -> dict | None:
+    """Check for a non-expired earnings override. Returns dict or None."""
+    try:
+        row = conn.execute(
+            "SELECT override_value, expires_at, reason FROM bucket3_earnings_overrides "
+            "WHERE ticker = ? AND expires_at > datetime('now')",
+            (ticker,),
+        ).fetchone()
+        if row:
+            from datetime import date as _date
+            return {
+                "earnings_date": _date.fromisoformat(row[0] if isinstance(row, tuple) else row["override_value"]),
+                "expires_at": row[1] if isinstance(row, tuple) else row["expires_at"],
+                "reason": row[2] if isinstance(row, tuple) else row["reason"],
+            }
+    except Exception as exc:
+        logger.warning("Failed to check earnings override for %s: %s", ticker, exc)
+    return None
+
+
+def _get_cached_earnings_date(ticker: str) -> dict | None:
+    """Read cached earnings date from YFinance corporate intel cache.
+
+    Returns {"earnings_date": date, "source": str, "stale": bool} or None.
+    Reads the file cache directly (no yfinance call — cold path only).
+    """
+    import json as _json
+    from datetime import date as _date, datetime as _dt, timezone as _tz
+    from pathlib import Path
+
+    cache_path = Path("agt_desk_cache/corporate_intel") / f"{ticker}_calendar.json"
+    if not cache_path.exists():
+        return None
+
+    try:
+        data = _json.loads(cache_path.read_text())
+        cached_at = _dt.fromisoformat(data["cached_at"])
+        age_hours = (_dt.now(_tz.utc) - cached_at).total_seconds() / 3600
+        stale = age_hours > (R7_CACHE_STALE_DAYS * 24)
+
+        next_earnings_str = data.get("next_earnings")
+        if not next_earnings_str:
+            return None
+
+        return {
+            "earnings_date": _date.fromisoformat(next_earnings_str),
+            "source": data.get("data_source", "yfinance_cache"),
+            "stale": stale,
+        }
+    except Exception as exc:
+        logger.warning("Failed to read earnings cache for %s: %s", ticker, exc)
+        return None
+
+
+def evaluate_rule_7(
+    ps: PortfolioState, household: str,
+    conn: sqlite3.Connection | None = None,
+) -> list[RuleEvaluation]:
+    """Rule 7: Earnings window gating. FAIL-CLOSED.
+
+    For each active cycle's ticker, checks if earnings fall within
+    R7_EARNINGS_WINDOW_DAYS. Missing/stale/unavailable data → RED.
+
+    Data sources (priority order):
+      1. bucket3_earnings_overrides — operator override (highest)
+      2. YFinance corporate intel cache file
+      3. Neither → RED (R7_FAIL_CLOSED_NO_DATA)
+
+    Returns list[RuleEvaluation], one per ticker in the household.
+    """
+    from datetime import date as _date
+
+    tickers = sorted(set(
+        c.ticker for c in ps.active_cycles
+        if getattr(c, 'household_id', None) == household
+        and getattr(c, 'status', 'ACTIVE') == 'ACTIVE'
+    ))
+
+    if not tickers:
+        return [RuleEvaluation(
+            rule_id="rule_7", rule_name="Earnings Window",
+            household=household, ticker=None,
+            raw_value=None, status="GREEN",
+            message="No active tickers to evaluate.",
+        )]
+
+    results: list[RuleEvaluation] = []
+    today = _date.today()
+
+    for ticker in tickers:
+        try:
+            earnings_date = None
+            source = None
+
+            # Branch 1: Check for active override
+            if conn is not None:
+                override = _get_active_earnings_override(ticker, conn)
+                if override:
+                    earnings_date = override["earnings_date"]
+                    source = "operator_override"
+
+            # Branch 2: Try cached earnings
+            if earnings_date is None:
+                cached = _get_cached_earnings_date(ticker)
+                if cached and not cached["stale"]:
+                    earnings_date = cached["earnings_date"]
+                    source = cached["source"]
+                elif cached and cached["stale"]:
+                    # Stale cache = fail-closed (data older than R7_CACHE_STALE_DAYS)
+                    results.append(RuleEvaluation(
+                        rule_id="rule_7", rule_name="Earnings Window",
+                        household=household, ticker=ticker,
+                        raw_value=None, status="RED",
+                        message=(
+                            f"R7 FAIL-CLOSED: earnings data for {ticker} is stale "
+                            f"(>{R7_CACHE_STALE_DAYS}d old). "
+                            f"Use /override_earnings to attest."
+                        ),
+                        detail={"reason": "R7_FAIL_CLOSED_STALE_DATA"},
+                    ))
+                    continue
+
+            # Branch 3: No data at all → FAIL-CLOSED
+            if earnings_date is None:
+                results.append(RuleEvaluation(
+                    rule_id="rule_7", rule_name="Earnings Window",
+                    household=household, ticker=ticker,
+                    raw_value=None, status="RED",
+                    message=(
+                        f"R7 FAIL-CLOSED: no earnings data for {ticker}. "
+                        f"Use /override_earnings to attest."
+                    ),
+                    detail={"reason": "R7_FAIL_CLOSED_NO_DATA"},
+                ))
+                continue
+
+            # Evaluate: is earnings within window?
+            days_to_earnings = (earnings_date - today).days
+            if 0 <= days_to_earnings <= R7_EARNINGS_WINDOW_DAYS:
+                results.append(RuleEvaluation(
+                    rule_id="rule_7", rule_name="Earnings Window",
+                    household=household, ticker=ticker,
+                    raw_value=float(days_to_earnings), status="RED",
+                    message=(
+                        f"Earnings in {days_to_earnings}d ({earnings_date}). "
+                        f"CSP entry blocked. Source: {source}"
+                    ),
+                    detail={"days_to_earnings": days_to_earnings, "source": source},
+                ))
+            else:
+                results.append(RuleEvaluation(
+                    rule_id="rule_7", rule_name="Earnings Window",
+                    household=household, ticker=ticker,
+                    raw_value=float(days_to_earnings) if days_to_earnings >= 0 else None,
+                    status="GREEN",
+                    message=(
+                        f"No earnings within {R7_EARNINGS_WINDOW_DAYS}d window. "
+                        f"Next: {earnings_date} ({days_to_earnings}d). Source: {source}"
+                    ),
+                    detail={"days_to_earnings": days_to_earnings, "source": source},
+                ))
+
+        except Exception as exc:
+            # Any exception during evaluation → FAIL-CLOSED
+            logger.warning("R7 evaluation failed for %s: %s", ticker, exc)
+            results.append(RuleEvaluation(
+                rule_id="rule_7", rule_name="Earnings Window",
+                household=household, ticker=ticker,
+                raw_value=None, status="RED",
+                message=(
+                    f"R7 FAIL-CLOSED: evaluation error for {ticker}: {exc}. "
+                    f"Use /override_earnings to attest."
+                ),
+                detail={"reason": "R7_FAIL_CLOSED_EXCEPTION", "error": str(exc)},
+            ))
+
+    return results
 
 def evaluate_rule_8(ps: PortfolioState, household: str) -> RuleEvaluation:
     """Rule 8: Dynamic Exit Matrix. NOT IMPLEMENTED as evaluator."""
@@ -1262,7 +1439,7 @@ def evaluate_all(ps: PortfolioState, household: str) -> list[RuleEvaluation]:
     results.extend(evaluate_rule_4(ps, household))   # returns list (pairs)
     results.append(evaluate_rule_5(ps, household))
     results.append(evaluate_rule_6(ps, household))
-    results.append(evaluate_rule_7(ps, household))
+    results.extend(evaluate_rule_7(ps, household))
     results.append(evaluate_rule_8(ps, household))
     results.append(evaluate_rule_9(ps, household))
     results.append(evaluate_rule_10(ps, household))

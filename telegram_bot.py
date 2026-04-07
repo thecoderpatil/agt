@@ -934,7 +934,7 @@ COVERED CALL LADDER:
 
 STAGING CONFIRMED TRADES:
   Trade execution is handled by deterministic commands (/approve,
-  /exit), not by conversational tools. Do NOT attempt to stage
+  /approve), not by conversational tools. Do NOT attempt to stage
   trades directly.
 
   For structured options orders that are already written in execution
@@ -2636,7 +2636,7 @@ async def get_top_news(ticker: str) -> str:
 
 # INTERNAL ONLY — removed from LLM tools in security audit.
 # Can still be called manually via Python console if needed.
-# All trade execution flows through /approve and /exit commands.
+# All trade execution flows through /approve command.
 async def stage_ratio_spread(account_id: str,
                              ticker: str,
                              long_strike: float,
@@ -2815,7 +2815,7 @@ async def stage_ratio_spread(account_id: str,
 
 # INTERNAL ONLY — removed from LLM tools in security audit.
 # Can still be called manually via Python console if needed.
-# All trade execution flows through /approve and /exit commands.
+# All trade execution flows through /approve command.
 async def stage_trade_for_execution(account_id: str,
                                     ticker: str,
                                     action: str,
@@ -4999,7 +4999,7 @@ async def _send_command_menu(update: Update) -> None:
         "  /scan \u2014 CSP candidate pipeline\n"
         "  /dynamic_exit \u2014 evaluate exit\n"
         "  /approve \u00b7 /reject \u2014 manage staged\n"
-        "  /exit \u2014 execute CIO-approved exit\n"
+        "  /override_earnings \u2014 attest earnings date\n"
         "\n"
         "<b>Monitor</b>\n"
         "  /health \u2014 portfolio diagnostic\n"
@@ -7747,257 +7747,6 @@ async def cmd_dynamic_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
 
 
-async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Execute a CIO-authorized Dynamic Exit.
-    Format: /exit TICKER STRIKE EXPIRY CONTRACTS HOUSEHOLD
-    Example: /exit ADBE 260 2026-05-01 1 vikram
-    """
-    if not is_authorized(update):
-        return
-    try:
-        if not context.args or len(context.args) < 5:
-            await update.message.reply_text(
-                "Format: /exit TICKER STRIKE EXPIRY QTY HOUSEHOLD [LIMIT_PRICE]\n"
-                "Example: /exit ADBE 260 2026-05-01 1 vikram 1.28"
-            )
-            return
-
-        ticker = context.args[0].upper()
-        strike = float(context.args[1])
-        expiry = context.args[2]
-        contracts = int(context.args[3])
-        hh_arg = context.args[4].lower()
-
-        if strike <= 0:
-            await update.message.reply_text(
-                f"\u274c Invalid strike: ${strike}. Must be positive."
-            )
-            return
-
-        # Optional 6th arg: limit price (from CIO payload)
-        if len(context.args) >= 6:
-            try:
-                limit_price = float(context.args[5])
-            except (ValueError, IndexError):
-                limit_price = 0.01
-        else:
-            limit_price = 0.01
-
-        if limit_price < 0.05:
-            await update.message.reply_text(
-                f"\u26a0\ufe0f Limit price ${limit_price:.2f} is below $0.05. "
-                f"This will likely fill at market bid.\n"
-                f"Add the bid price from the CIO payload as the 6th argument:\n"
-                f"  /exit {ticker} {strike:.0f} {expiry} {contracts} "
-                f"{hh_arg} [LIMIT_PRICE]"
-            )
-            return
-
-        if hh_arg in ("yash", "y"):
-            hh_filter = "Yash_Household"
-        elif hh_arg in ("vikram", "vik", "v"):
-            hh_filter = "Vikram_Household"
-        else:
-            await update.message.reply_text(f"Unknown household: {hh_arg}")
-            return
-
-        # Validate against portfolio
-        disco = await _discover_positions(hh_filter)
-        position = None
-        hh_data = None
-        for hh_name, hd in disco["households"].items():
-            for p in hd["positions"]:
-                if p["ticker"] == ticker:
-                    position = p
-                    hh_data = hd
-                    break
-
-        if not position:
-            await update.message.reply_text(f"{ticker} not found in {hh_filter}.")
-            return
-
-        spot = position["spot_price"]
-
-        # Validate contracts against excess
-        hh_nlv = hh_data["household_nlv"]
-        scope = _compute_overweight_scope(
-            position["total_shares"], spot, hh_nlv, "RULE_1",
-            available_contracts=position.get("available_contracts"),
-            adjusted_basis=position.get("adjusted_basis", 0),
-        )
-
-        if contracts > scope["excess_contracts"]:
-            await update.message.reply_text(
-                f"Requested {contracts}c exceeds excess of "
-                f"{scope['excess_contracts']}c. Max allowed: {scope['excess_contracts']}"
-            )
-            return
-
-        if contracts < 1:
-            await update.message.reply_text("Contracts must be >= 1.")
-            return
-
-        # ── Additional validations ──
-
-        # Check available contracts (not just excess)
-        if position.get("available_contracts", 0) < contracts:
-            await update.message.reply_text(
-                f"\u274c {ticker} has {position['available_contracts']}c available "
-                f"but {contracts}c requested. "
-                f"Existing CCs encumber {position.get('covered_contracts', 0)}c. "
-                f"Wait for expiry or close existing CCs first."
-            )
-            return
-
-        # Check that strike is below adjusted basis (Dynamic Exit = below basis assignment)
-        adj_basis = position.get("adjusted_basis", 0)
-        if strike >= adj_basis and adj_basis > 0:
-            await update.message.reply_text(
-                f"\u274c Strike ${strike:.0f} is at/above adjusted basis "
-                f"${adj_basis:.2f}. "
-                f"This is a Mode 2 trade, not a Dynamic Exit. "
-                f"Use /cc for above-basis CCs."
-            )
-            return
-
-        # Check that strike is reasonable (not more than 20% below spot)
-        if spot > 0 and strike < spot * 0.80:
-            await update.message.reply_text(
-                f"\u26a0\ufe0f Strike ${strike:.0f} is more than 20% below "
-                f"spot ${spot:.2f}. Unusually aggressive exit. "
-                f"Confirm with CIO and retry."
-            )
-            return
-
-        # Verify the expiry exists in the options chain
-        try:
-            valid_expiries = set(await _ibkr_get_expirations(ticker))
-            if expiry not in valid_expiries:
-                await update.message.reply_text(
-                    f"\u274c Expiry {expiry} not found in {ticker} options chain."
-                )
-                return
-        except Exception:
-            pass  # Don't block on IBKR failure — IBKR will reject bad expiries at order time
-
-        # Allocate contracts across accounts by available shares
-        exit_tickets = []
-        remaining = contracts
-        working_pa = position.get("working_per_account", {})
-        staged_pa = position.get("staged_per_account", {})
-
-        for aid, ainfo in position["accounts_with_shares"].items():
-            if remaining <= 0:
-                break
-            acct_shares = ainfo["shares"]
-
-            # Per-account encumbrance
-            acct_filled = sum(
-                sc["contracts"]
-                for sc in position.get("existing_short_calls", [])
-                if sc.get("account") == aid
-            )
-            acct_working = working_pa.get(f"{aid}|{ticker}", 0)
-            acct_staged = staged_pa.get(f"{aid}|{ticker}", 0)
-            acct_encumbered = acct_filled + acct_working + acct_staged
-
-            uncovered_shares = max(0, acct_shares - (acct_encumbered * 100))
-            acct_contracts = min(uncovered_shares // 100, remaining)
-            if acct_contracts < 1:
-                continue
-            remaining -= acct_contracts
-            exit_tickets.append({
-                "account_id": aid,
-                "contracts": acct_contracts,
-            })
-
-        if remaining > 0:
-            await update.message.reply_text(
-                f"\u274c Insufficient shares across all accounts. "
-                f"Need {contracts * 100} shares but only "
-                f"{sum(a['shares'] for a in position['accounts_with_shares'].values())} available."
-            )
-            return
-
-        if not exit_tickets:
-            await update.message.reply_text(
-                f"\u274c No account has enough shares for even 1 contract."
-            )
-            return
-
-        # Place orders across accounts
-        ib_conn = await ensure_ib_connected()
-        expiry_fmt = expiry.replace("-", "")
-
-        results = []
-        for ticket in exit_tickets:
-            t_acct = ticket["account_id"]
-            t_qty = ticket["contracts"]
-            t_label = ACCOUNT_LABELS.get(t_acct, t_acct)
-
-            contract_obj = ib_async.Option(
-                symbol=ticker,
-                lastTradeDateOrContractMonth=expiry_fmt,
-                strike=strike,
-                right="C",
-                exchange="SMART",
-            )
-            order = _build_adaptive_sell_order(t_qty, limit_price, t_acct)
-
-            try:
-                trade = ib_conn.placeOrder(contract_obj, order)
-                ib_oid = trade.order.orderId if trade else 0
-                ib_pid = trade.order.permId if trade else 0
-                results.append(f"\u2705 -{t_qty}c ${strike:.0f}C | {t_label} | IB#{ib_oid}")
-            except Exception as place_exc:
-                ib_oid = 0
-                ib_pid = 0
-                results.append(f"\u274c {t_label}: {place_exc}")
-
-            # Log to pending_orders with R5 state machine
-            try:
-                await asyncio.to_thread(append_pending_tickets, [{
-                    "account_id": t_acct,
-                    "household": hh_filter,
-                    "ticker": ticker,
-                    "action": "SELL",
-                    "sec_type": "OPT",
-                    "right": "C",
-                    "strike": strike,
-                    "expiry": expiry,
-                    "quantity": t_qty,
-                    "limit_price": round(limit_price, 2),
-                    "mode": "DYNAMIC_EXIT",
-                    "status": "sent",
-                }])
-                # R5: store IBKR IDs on the newly created row
-                if ib_oid or ib_pid:
-                    with _get_db_connection() as _conn:
-                        _conn.execute(
-                            "UPDATE pending_orders SET ib_order_id = ?, ib_perm_id = ? "
-                            "WHERE id = (SELECT MAX(id) FROM pending_orders)",
-                            (ib_oid, ib_pid),
-                        )
-            except Exception:
-                pass
-
-        output = (
-            f"\u2501\u2501 Dynamic Exit Placed \u2501\u2501\n"
-            f"{ticker} ${strike:.0f}C {expiry}\n"
-            f"Limit: ${limit_price:.2f}\n\n"
-            + "\n".join(results)
-        )
-        await update.message.reply_text(output)
-
-    except Exception as exc:
-        logger.exception("cmd_exit failed")
-        try:
-            await update.message.reply_text(f"Exit failed: {exc}")
-        except Exception:
-            pass
-
-
 async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Override conviction tier for a ticker.
@@ -8081,6 +7830,101 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     except Exception as exc:
         logger.exception("cmd_override failed")
+        try:
+            await update.message.reply_text(f"Override failed: {exc}")
+        except Exception:
+            pass
+
+
+async def cmd_override_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Attest an earnings date for R7 fail-closed override.
+    Usage: /override_earnings TICKER YYYY-MM-DD [TTL_HOURS] [reason...]
+    Example: /override_earnings PYPL 2026-04-29 168 verified investor relations page
+    """
+    if not is_authorized(update):
+        return
+    try:
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "Usage: /override_earnings TICKER YYYY-MM-DD [TTL_HOURS] [reason...]\n"
+                "Example: /override_earnings PYPL 2026-04-29 168 verified IR page\n"
+                "Default TTL: 168 hours (7 days). Max: 720 hours (30 days)."
+            )
+            return
+
+        ticker = context.args[0].upper()
+        if not ticker.isalpha() or len(ticker) > 5:
+            await update.message.reply_text(f"Invalid ticker: {ticker}")
+            return
+
+        date_str = context.args[1]
+        try:
+            earnings_date = _date.fromisoformat(date_str)
+        except ValueError:
+            await update.message.reply_text(
+                f"Invalid date format: {date_str}. Use YYYY-MM-DD."
+            )
+            return
+
+        if earnings_date < _date.today():
+            await update.message.reply_text(
+                f"Earnings date {earnings_date} is in the past. "
+                f"Attest future earnings dates only."
+            )
+            return
+
+        # TTL hours (optional, default 168)
+        ttl_hours = 168
+        reason_args_start = 2
+        if len(context.args) > 2:
+            try:
+                ttl_hours = int(context.args[2])
+                reason_args_start = 3
+            except ValueError:
+                # Not a number — treat as start of reason
+                pass
+
+        if ttl_hours <= 0:
+            await update.message.reply_text("TTL must be positive.")
+            return
+
+        if ttl_hours > 720:
+            await update.message.reply_text(
+                f"TTL {ttl_hours}h exceeds 720h (30 days) maximum. "
+                f"Override should never be a permanent bypass."
+            )
+            return
+
+        # Reason (optional free text)
+        reason = " ".join(context.args[reason_args_start:]).strip() or None
+
+        expires_at = (
+            _datetime.now() + _timedelta(hours=ttl_hours)
+        ).isoformat()
+
+        try:
+            with _get_db_connection() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO bucket3_earnings_overrides "
+                    "(ticker, override_value, expires_at, created_by, reason) "
+                    "VALUES (?, ?, ?, 'manual_override', ?)",
+                    (ticker, earnings_date.isoformat(), expires_at, reason),
+                )
+        except Exception as db_exc:
+            await update.message.reply_text(f"DB write failed: {db_exc}")
+            return
+
+        await update.message.reply_text(
+            f"\u2705 Earnings override set for {ticker}\n"
+            f"  Earnings date: {earnings_date}\n"
+            f"  Expires: {expires_at[:16]} ({ttl_hours}h)\n"
+            f"  Reason: {reason or '(none)'}\n"
+            f"  R7 will fail-closed again after expiry."
+        )
+
+    except Exception as exc:
+        logger.exception("cmd_override_earnings failed")
         try:
             await update.message.reply_text(f"Override failed: {exc}")
         except Exception:
@@ -9081,7 +8925,7 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
     """
     Unified CC pipeline — stages both Defensive (Mode 1) and Harvest
     (Mode 2 / Fully Amortized) covered calls in a single pass.
-    Returns dict with "main_text" (str), "cio_payload" (str), and "exit_commands" (list[str]).
+    Returns dict with "main_text" (str).
     """
     # Retry discovery once on IB failure
     disco = await _discover_positions(household_filter)
@@ -9107,8 +8951,6 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
     if not defensive_targets and not harvest_targets:
         return {
             "main_text": "No positions with uncovered shares for CC staging.",
-            "cio_payload": "",
-            "exit_commands": [],
         }
 
     staged_defensive: list[dict] = []
@@ -9439,25 +9281,8 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
     lines.append(f"Defensive: {len(staged_defensive)} | Harvest: {len(staged_harvest)} | Total: {total}")
     lines.append("/approve to send \u00b7 /reject to clear")
 
-    # Extract raw /exit commands and strip them from the CIO payload
-    exit_commands: list[str] = []
-    cleaned_payloads: list[str] = []
-    for dep in dynamic_exit_payloads:
-        clean_lines = []
-        for line in dep.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("/exit "):
-                exit_commands.append(stripped)
-                continue
-            if stripped.startswith("CIO: If approved"):
-                continue
-            clean_lines.append(line)
-        cleaned_payloads.append("\n".join(clean_lines).rstrip())
-
     return {
         "main_text": "\n".join(lines),
-        "cio_payload": "\n\n".join(cleaned_payloads) if cleaned_payloads else "",
-        "exit_commands": exit_commands,
     }
 
 
@@ -9501,28 +9326,6 @@ async def cmd_cc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await status_msg.delete()
             for i in range(0, len(result_text), 4000):
                 await update.message.reply_text(result_text[i:i+4000])
-
-        # Message 2: Single combined CIO payload for Oracle
-        cio_payload = result.get("cio_payload", "")
-        if cio_payload:
-            try:
-                header = "\U0001f4cb CIO Payload \u2014 copy & paste to Oracle:"
-                full_payload = f"{header}\n\n{cio_payload}"
-                if len(full_payload) <= 4000:
-                    await update.message.reply_text(full_payload)
-                else:
-                    for i in range(0, len(full_payload), 4000):
-                        chunk = full_payload[i:i + 4000]
-                        await update.message.reply_text(chunk)
-            except Exception as payload_exc:
-                logger.warning("Failed to send CIO payload: %s", payload_exc)
-
-        # Message 3+: Raw /exit commands (one per message, no decoration)
-        for cmd_text in result.get("exit_commands", []):
-            try:
-                await update.message.reply_text(cmd_text)
-            except Exception as cmd_exc:
-                logger.warning("Failed to send exit command: %s", cmd_exc)
 
     except Exception as exc:
         logger.exception("cmd_cc failed")
@@ -9982,30 +9785,6 @@ async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML",
         )
 
-        # Message 2: Single combined CIO payload for Oracle
-        cio_payload = result.get("cio_payload", "")
-        if cio_payload:
-            try:
-                header = "\U0001f4cb CIO Payload \u2014 copy & paste to Oracle:"
-                full_payload = f"{header}\n\n{cio_payload}"
-                if len(full_payload) <= 4000:
-                    await context.bot.send_message(
-                        chat_id=AUTHORIZED_USER_ID, text=full_payload)
-                else:
-                    for i in range(0, len(full_payload), 4000):
-                        await context.bot.send_message(
-                            chat_id=AUTHORIZED_USER_ID,
-                            text=full_payload[i:i + 4000])
-            except Exception as payload_exc:
-                logger.warning("Failed to send CIO payload: %s", payload_exc)
-
-        # Message 3+: Raw /exit commands (one per message, no decoration)
-        for cmd_text in result.get("exit_commands", []):
-            try:
-                await context.bot.send_message(
-                    chat_id=AUTHORIZED_USER_ID, text=cmd_text)
-            except Exception as cmd_exc:
-                logger.warning("Failed to send exit command: %s", cmd_exc)
     except Exception as exc:
         logger.exception("Scheduled CC failed")
         try:
@@ -10450,8 +10229,8 @@ def main() -> None:
     app.add_handler(CommandHandler("fills", cmd_fills))
     app.add_handler(CommandHandler("ledger", cmd_ledger))
     app.add_handler(CommandHandler("dynamic_exit", cmd_dynamic_exit))
-    app.add_handler(CommandHandler("exit", cmd_exit))
     app.add_handler(CommandHandler("override", cmd_override))
+    app.add_handler(CommandHandler("override_earnings", cmd_override_earnings))
     app.add_handler(CommandHandler("reconcile", cmd_reconcile))
     app.add_handler(CommandHandler("declare_wartime", cmd_declare_wartime))
     app.add_handler(CommandHandler("declare_peacetime", cmd_declare_peacetime))

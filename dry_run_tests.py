@@ -421,11 +421,7 @@ test("10.1 No raw shares in CC allocation",
      len(raw_alloc) == 0,
      f"found {len(raw_alloc)} instances of acct_shares // 100")
 
-exit_func = code.split("def cmd_exit")[1].split("\nasync def ")[0] if "def cmd_exit" in code else ""
-raw_exit = re.findall(r"acct_shares\s*//\s*100", exit_func)
-test("10.2 No raw shares in /exit allocation",
-     len(raw_exit) == 0,
-     f"found {len(raw_exit)} instances of acct_shares // 100")
+# 10.2 /exit command removed in Phase 3A.5c2-alpha Task 11
 
 # 10.3 Staged orders parsed as JSON
 staged_block = code.split("staged_sell_calls")[1][:800] if "staged_sell_calls" in code else ""
@@ -434,7 +430,7 @@ test("10.3 Staged orders use json.loads",
      "Still using string parser!")
 
 # 10.4 No transmit=False in order placement
-for func_name in ["_place_single_order", "cmd_exit"]:
+for func_name in ["_place_single_order"]:
     if f"def {func_name}" in code:
         func_body = code.split(f"def {func_name}")[1].split("\nasync def ")[0]
         has_false = "transmit=False" in func_body

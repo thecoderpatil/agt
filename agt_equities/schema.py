@@ -741,15 +741,31 @@ def register_master_log_tables(conn) -> None:
         ON bucket3_dynamic_exit_campaigns(ticker, household)
     """)
 
+    # Phase 3A.5c2-alpha Task 6: add source column to dynamic_exit_log
+    # Idempotent — ALTER TABLE is a no-op if column already exists (caught by try/except)
+    try:
+        conn.execute("""
+            ALTER TABLE bucket3_dynamic_exit_log
+            ADD COLUMN source TEXT NOT NULL DEFAULT 'scheduled_watchdog'
+        """)
+    except Exception:
+        pass  # Column already exists
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bucket3_earnings_overrides (
             ticker TEXT PRIMARY KEY,
             override_value TEXT NOT NULL,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             expires_at TIMESTAMP NOT NULL,
-            created_by TEXT NOT NULL DEFAULT 'manual_override'
+            created_by TEXT NOT NULL DEFAULT 'manual_override',
+            reason TEXT
         ) WITHOUT ROWID
     """)
+    # Phase 3A.5c2-alpha Task 9: add reason column (idempotent)
+    try:
+        conn.execute("ALTER TABLE bucket3_earnings_overrides ADD COLUMN reason TEXT")
+    except Exception:
+        pass
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_earnings_overrides_expires
         ON bucket3_earnings_overrides(expires_at)
