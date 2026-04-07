@@ -39,6 +39,7 @@ class WalkerWarning:
 HOUSEHOLD_MAP: dict[str, str] = {
     "U21971297": "Yash_Household",      # Yash Individual
     "U22076329": "Yash_Household",      # Yash Roth IRA
+    # U22076184 (Trad IRA) dormant — retained for Walker historical reconstruction of pre-dormancy trades in master_log_trades
     "U22076184": "Yash_Household",      # Yash Trad IRA
     "U22388499": "Vikram_Household",    # Vikram Individual
 }

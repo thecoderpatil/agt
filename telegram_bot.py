@@ -75,6 +75,7 @@ IB_TWS_FALLBACK = 7496    # TWS direct (fallback if Gateway is down)
 IB_CLIENT_ID    = 1
 
 HOUSEHOLD_MAP = {
+    # U22076184 (Trad IRA) dormant — retained in HOUSEHOLD_MAP for Walker historical reconstruction; not in active routing (see ACCOUNT_LABELS, ACCOUNT_ALIAS)
     "Yash_Household": ["U21971297", "U22076329", "U22076184"],
     "Vikram_Household": ["U22388499"],
 }
@@ -655,6 +656,7 @@ def init_db() -> None:
             VALUES ('U22076329', 'Yash_Household', '2025', 25605.37,
                     'Fidelity 231-598209 Roth IRA Jan-Sep 2025')
         """)
+        # U22076184 inception_carry_in: dormant account historical baseline, required by Walker for cycle reconstruction
         conn.execute("""
             INSERT OR IGNORE INTO historical_offsets
                 (account_id, household_id, period, total_offset, note)
