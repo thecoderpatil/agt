@@ -7554,6 +7554,7 @@ async def _stage_dynamic_exit_candidate(
                     "summary": f"{ticker} ({hh_short}): no viable expiry in 14-30 DTE",
                 }
 
+            yf_tkr = yf.Ticker(ticker)
             chain = await _with_timeout_async(yf_tkr.option_chain, candidate_exp, timeout=15)
             if chain is None:
                 return {
