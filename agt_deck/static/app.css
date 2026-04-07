@@ -1,0 +1,4 @@
+/* AGT Command Deck — minimal overrides */
+* { box-sizing: border-box; }
+table { border-collapse: collapse; }
+.htmx-settling { opacity: 0.8; transition: opacity 0.3s ease; }

@@ -1,0 +1,304 @@
+{% extends "base.html" %}
+{% block content %}
+
+{# ── TOP STRIP ─────────────────────────────────────────────── #}
+<header class="sticky top-0 z-50 bg-slate-900 border-b border-slate-800 px-4 py-2">
+  <div class="flex items-center justify-between gap-4 max-w-[1920px] mx-auto">
+
+    <div class="flex items-center gap-2">
+      <span class="font-mono font-bold text-emerald-400 text-lg tracking-tight">AGT</span>
+    </div>
+
+    <div class="flex items-center gap-1.5 text-xs" title="VIX · Rule 2 EL retain band">
+      <span class="text-slate-500">VIX</span>
+      <span class="num font-semibold {% if top.vix and top.vix > 25 %}text-rose-400{% elif top.vix and top.vix > 20 %}text-amber-400{% else %}text-slate-200{% endif %}">
+        {{ "%.1f"|format(top.vix) if top.vix else "—" }}
+      </span>
+      {% if top.el_retain_pct %}
+      <span class="text-slate-600">·</span>
+      <span class="text-slate-400">{{ "%.0f"|format(top.el_retain_pct * 100) }}% retain</span>
+      {% endif %}
+    </div>
+
+    <div class="flex items-center gap-1.5 text-xs" title="Portfolio NAV (4 accounts)">
+      <span class="text-slate-500">NAV</span>
+      <span class="num font-semibold text-slate-100">{{ money(top.total_nav) }}</span>
+    </div>
+
+    <div class="flex items-center gap-1.5 text-xs" title="NAV {{ money(top.total_nav) }} − net deposits {{ money(top.net_inflows) }}">
+      <span class="text-slate-500">Inception</span>
+      <span class="num font-semibold {{ pnl_color(top.inception_pnl) }}">
+        {{ money(top.inception_pnl, plus=True) }}
+      </span>
+      {% if top.inception_pnl_pct is not none %}
+      <span class="num {{ pnl_color(top.inception_pnl_pct) }}">
+        {{ pct(top.inception_pnl_pct, plus=True) }}
+      </span>
+      {% else %}
+      <span class="num text-slate-500">—</span>
+      {% endif %}
+    </div>
+
+    <div class="flex items-center gap-1.5 text-xs" title="EL gauge (Individual + Vikram)">
+      <span class="text-slate-500">EL</span>
+      <span class="num text-slate-500">—</span>
+    </div>
+
+    <div class="flex items-center gap-1.5 text-xs" title="Vikram EL % (Rule 6)">
+      <span class="text-slate-500">Vik EL</span>
+      <span class="num text-slate-500">—</span>
+    </div>
+
+    <div class="flex items-center gap-1.5 text-xs" title="Largest position % of household NLV (Rule 1)">
+      <span class="text-slate-500">Conc</span>
+      <span class="num {{ concentration_color(top.conc_pct) }}">
+        {% if top.conc_ticker %}{{ top.conc_ticker }}/{{ top.conc_hh }} {{ "%.1f"|format(top.conc_pct) }}%{% else %}—{% endif %}
+      </span>
+    </div>
+
+    <a href="/cure?t={{ token }}" class="flex items-center gap-1.5 text-xs no-underline" title="Rule 11: Beta-weighted leverage per household (limit 1.50x) — click for Cure Console">
+      <span class="text-slate-500">Lev</span>
+      {% if top.leverage %}
+      <span class="num text-xs">
+        {% for hh, (lev, status) in top.leverage.items() %}
+        <span class="{% if status == 'BREACHED' %}text-rose-400 font-semibold{% elif status == 'AMBER' %}text-amber-400{% else %}text-emerald-400{% endif %}">{{ hh[0] }} {{ "%.2f"|format(lev) }}x</span>{% if not loop.last %} {% endif %}
+        {% endfor %}
+      </span>
+      {% else %}
+      <span class="text-slate-500">—</span>
+      {% endif %}
+    </a>
+
+    <div class="flex items-center gap-1.5 text-xs"
+         title="{% if top.sector_violations %}Rule 3: {% for ig, tickers in top.sector_violations %}{{ ig }}: {{ tickers|join(', ') }} ({{ tickers|length }}){% if not loop.last %}; {% endif %}{% endfor %}{% else %}Rule 3: No industry with >2 names{% endif %}">
+      <span class="text-slate-500">Sector</span>
+      {% if top.sector_violations %}
+      <span class="text-rose-400">
+        {% for ig, tickers in top.sector_violations %}
+        {{ ig|replace('Software - ', 'SW-') }}: {{ tickers|join(', ') }}{% if not loop.last %}; {% endif %}
+        {% endfor %}
+      </span>
+      {% else %}
+      <span class="text-emerald-400">OK</span>
+      {% endif %}
+    </div>
+
+    <div class="flex items-center gap-1.5 text-xs"
+         title="Walker warnings from latest sync run">
+      <span class="text-slate-500">Warn</span>
+      {% if top.walker_warning_count is not none %}
+      <span class="num font-semibold {% if top.walker_worst_severity == 'ERROR' %}text-rose-400{% elif top.walker_worst_severity == 'WARN' %}text-amber-400{% elif top.walker_warning_count > 0 %}text-slate-300{% else %}text-emerald-400{% endif %}">
+        {{ top.walker_warning_count }}
+      </span>
+      {% else %}
+      <span class="text-slate-500">&mdash;</span>
+      {% endif %}
+    </div>
+
+    <a href="/cure?t={{ token }}" class="flex items-center gap-1.5 text-xs no-underline"
+       title="Desk mode — click for Cure Console">
+      <span class="text-slate-500">Mode</span>
+      {% if top.desk_mode == 'WARTIME' %}
+      <span class="num font-bold text-rose-400 animate-pulse">WAR</span>
+      {% elif top.desk_mode == 'AMBER' %}
+      <span class="num font-semibold text-amber-400">AMBER</span>
+      {% else %}
+      <span class="num text-emerald-400">PEACE</span>
+      {% endif %}
+    </a>
+
+    <div class="flex items-center gap-1.5 text-xs" title="Last flex_sync">
+      <span class="text-slate-500">Sync</span>
+      <span class="text-slate-400">{{ time_ago(top.last_sync.finished_at) if top.last_sync else "never" }}</span>
+    </div>
+
+  </div>
+</header>
+
+{# ── MAIN GRID ─────────────────────────────────────────────── #}
+<main class="flex-1 p-4 max-w-[1920px] mx-auto w-full">
+  <div class="grid grid-cols-12 gap-4">
+
+    {# ── ACTIVE CYCLES TABLE (8 cols) ── #}
+    <div class="col-span-12 xl:col-span-8">
+      <div class="bg-slate-900 rounded-lg border border-slate-800 overflow-hidden">
+        <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-slate-200">Active Cycles</h2>
+          <span class="text-xs text-slate-500">{{ cycles|length }} positions</span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-xs">
+            <thead>
+              <tr class="text-slate-500 border-b border-slate-800">
+                <th class="px-3 py-2 text-left font-medium">Ticker</th>
+                <th class="px-2 py-2 text-left font-medium">HH</th>
+                <th class="px-2 py-2 text-right font-medium">Qty</th>
+                <th class="px-2 py-2 text-right font-medium">Basis</th>
+                <th class="px-2 py-2 text-right font-medium">Spot</th>
+                <th class="px-2 py-2 text-right font-medium">Unreal $</th>
+                <th class="px-2 py-2 text-right font-medium">Unreal %</th>
+                <th class="px-2 py-2 text-right font-medium">DTE</th>
+                <th class="px-2 py-2 text-left font-medium">Leg</th>
+                <th class="px-2 py-2 text-right font-medium">Prem</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for c in cycles %}
+              <tr class="border-b border-slate-800/50 hover:bg-slate-800/50 transition-colors
+                {% if c.unreal_pct is not none and c.unreal_pct < -20 %}bg-rose-950/30
+                {% elif c.nearest_dte is not none and c.nearest_dte <= 3 %}bg-amber-950/30
+                {% endif %}">
+                <td class="px-3 py-2 font-semibold text-slate-100">{{ c.ticker }}</td>
+                <td class="px-2 py-2 text-slate-500">{{ c.household }}</td>
+                <td class="px-2 py-2 text-right num text-slate-300">{{ c.shares }}</td>
+                <td class="px-2 py-2 text-right num text-slate-300">{{ money(c.paper_basis, decimals=2) if c.paper_basis else "—" }}</td>
+                <td class="px-2 py-2 text-right num text-slate-300">{{ money(c.spot, decimals=2) if c.spot else "—" }}</td>
+                <td class="px-2 py-2 text-right num {{ pnl_color(c.unreal_dollar) }}">{{ money(c.unreal_dollar, plus=True) if c.unreal_dollar is not none else "—" }}</td>
+                <td class="px-2 py-2 text-right num {{ pnl_color(c.unreal_pct) }}">{{ pct(c.unreal_pct, plus=True) if c.unreal_pct is not none else "—" }}</td>
+                <td class="px-2 py-2 text-right num {% if c.nearest_dte is not none and c.nearest_dte <= 3 %}text-amber-400 font-semibold{% elif c.nearest_dte is not none and c.nearest_dte <= 7 %}text-amber-400{% else %}text-slate-400{% endif %}">
+                  {{ c.nearest_dte if c.nearest_dte is not none else "—" }}
+                </td>
+                <td class="px-2 py-2 text-slate-400">{{ c.leg }}</td>
+                <td class="px-2 py-2 text-right num text-emerald-400/70">{{ money(c.premium_total) }}</td>
+              </tr>
+              {% endfor %}
+              {% if not cycles %}
+              <tr><td colspan="10" class="px-4 py-8 text-center text-slate-600">No active cycles</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    {# ── RIGHT COLUMN (4 cols) ── #}
+    <div class="col-span-12 xl:col-span-4 flex flex-col gap-4">
+
+      {# ── ATTENTION PANEL ── #}
+      <div class="bg-slate-900 rounded-lg border border-slate-800">
+        <div class="px-4 py-3 border-b border-slate-800">
+          <h2 class="text-sm font-semibold text-slate-200">Needs Attention</h2>
+        </div>
+        <div class="p-3">
+          {% if attention %}
+          {% for a in attention %}
+          <div class="flex items-center justify-between py-1.5 text-xs border-b border-slate-800/50 last:border-0">
+            <span class="font-semibold text-slate-200">{{ a.ticker }}</span>
+            <span class="num {% if a.nearest_dte is not none and a.nearest_dte <= 3 %}text-amber-400{% endif %}">
+              {% if a.nearest_dte is not none %}DTE {{ a.nearest_dte }}{% endif %}
+            </span>
+            <span class="num {{ pnl_color(a.unreal_pct) }}">
+              {{ pct(a.unreal_pct, plus=True) if a.unreal_pct is not none else "" }}
+            </span>
+          </div>
+          {% endfor %}
+          {% else %}
+          <p class="text-slate-600 text-xs py-2">All clear</p>
+          {% endif %}
+        </div>
+      </div>
+
+      {# ── FILLS PANEL ── #}
+      <div class="bg-slate-900 rounded-lg border border-slate-800">
+        <div class="px-4 py-3 border-b border-slate-800">
+          <h2 class="text-sm font-semibold text-slate-200">Recent Fills</h2>
+        </div>
+        <div class="p-3">
+          {% for f in fills %}
+          <div class="flex items-center gap-2 py-1 text-xs border-b border-slate-800/50 last:border-0">
+            <span class="text-slate-600 num w-16 shrink-0">{{ f.date_time[4:8] if f.date_time else "" }}</span>
+            <span class="font-medium text-slate-300 w-12 shrink-0">{{ (f.symbol or "")[:6] }}</span>
+            <span class="w-8 shrink-0 {% if f.buy_sell == 'SELL' %}text-emerald-400{% else %}text-rose-400{% endif %}">
+              {{ f.buy_sell or "" }}
+            </span>
+            <span class="num text-slate-400 w-8 text-right shrink-0">{{ f.quantity or "" }}</span>
+            <span class="num text-slate-400 flex-1 text-right">{{ money(f.net_cash|float if f.net_cash else 0, decimals=0, plus=True) }}</span>
+          </div>
+          {% endfor %}
+          {% if not fills %}
+          <p class="text-slate-600 text-xs py-2">No recent fills</p>
+          {% endif %}
+        </div>
+      </div>
+
+      {# ── RECON PANEL ── #}
+      <div class="bg-slate-900 rounded-lg border border-slate-800">
+        <div class="px-4 py-3 border-b border-slate-800">
+          <h2 class="text-sm font-semibold text-slate-200">Reconciliation</h2>
+        </div>
+        <div class="p-3 flex flex-col gap-2">
+          <div class="flex items-center gap-3 text-xs">
+            <span class="text-slate-500">A</span>
+            <span class="text-emerald-400">{{ recon.a_status }}</span>
+          </div>
+          <div class="flex items-center gap-3 text-xs">
+            <span class="text-slate-500">B</span>
+            <span class="text-emerald-400">{{ recon.b_status }}</span>
+          </div>
+          <div class="flex items-center gap-3 text-xs">
+            <span class="text-slate-500">C</span>
+            <span class="text-amber-400">{{ recon.c_status }}</span>
+          </div>
+          <div class="text-xs text-slate-600 pt-1 border-t border-slate-800">
+            Sync #{{ recon.sync.sync_id if recon.sync else "—" }} ·
+            {{ time_ago(recon.sync.finished_at) if recon.sync else "never" }} ·
+            {{ recon.trade_count }} trades
+          </div>
+        </div>
+      </div>
+
+      {# ── ORDERS PANEL ── #}
+      <div class="bg-slate-900 rounded-lg border border-slate-800">
+        <div class="px-4 py-3 border-b border-slate-800">
+          <h2 class="text-sm font-semibold text-slate-200">Recent Orders</h2>
+        </div>
+        <div class="p-3">
+          {% for o in recent_orders %}
+          <div class="flex items-center gap-2 py-1 text-xs border-b border-slate-800/50 last:border-0">
+            <span class="text-slate-600 num w-8 shrink-0">#{{ o.id }}</span>
+            <span class="font-medium text-slate-300 w-10 shrink-0">{{ o.ticker }}</span>
+            <span class="w-8 shrink-0 {% if o.action == 'SELL' %}text-emerald-400{% else %}text-rose-400{% endif %}">
+              {{ o.action }}
+            </span>
+            <span class="flex-1">
+              {% if o.status == 'filled' or o.status == 'partially_filled' %}
+              <span class="text-emerald-400">{{ o.status }}</span>
+              {% elif o.status == 'rejected' or o.status == 'failed' %}
+              <span class="text-rose-400">{{ o.status }}</span>
+              {% elif o.status == 'sent' or o.status == 'acked' or o.status == 'working' %}
+              <span class="text-sky-400">{{ o.status }}</span>
+              {% elif o.status == 'staged' %}
+              <span class="text-amber-400">{{ o.status }}</span>
+              {% else %}
+              <span class="text-slate-500">{{ o.status }}</span>
+              {% endif %}
+            </span>
+            <span class="text-slate-600 text-xs">{{ time_ago(o.created_at) }}</span>
+          </div>
+          {% endfor %}
+          {% if not recent_orders %}
+          <p class="text-slate-600 text-xs py-2">No orders</p>
+          {% endif %}
+        </div>
+      </div>
+
+    </div>
+  </div>
+</main>
+
+{# ── BOTTOM STRIP (account pills) ──────────────────────────── #}
+<footer class="sticky bottom-0 z-50 bg-slate-900 border-t border-slate-800 px-4 py-2">
+  <div class="flex items-center justify-around gap-3 max-w-[1920px] mx-auto">
+    {% for p in pills %}
+    <div class="flex items-center gap-2 bg-slate-800 rounded-full px-4 py-1.5 text-xs">
+      <span class="text-slate-400">{{ p.alias }}</span>
+      <span class="num font-semibold text-slate-200">{{ money(p.nav) if p.nav else "—" }}</span>
+      {% if p.el_pct is not none %}
+      <span class="num text-emerald-400">{{ pct(p.el_pct) }}</span>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</footer>
+
+{% endblock %}

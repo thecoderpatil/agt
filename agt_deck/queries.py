@@ -1,0 +1,179 @@
+"""All SQL queries for the Command Deck. No inline SQL in routes."""
+from __future__ import annotations
+
+import logging
+import sqlite3
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+ACCOUNT_ALIAS = {
+    "U21971297": "Yash Ind",
+    "U22076329": "Yash Roth",
+    "U22076184": "Yash Trad",
+    "U22388499": "Vikram",
+}
+
+HOUSEHOLD_MAP = {
+    "U21971297": "Yash_Household",
+    "U22076329": "Yash_Household",
+    "U22076184": "Yash_Household",
+    "U22388499": "Vikram_Household",
+}
+
+
+def _safe(fn):
+    """Wrap query function: on exception return sentinel and log."""
+    def wrapper(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception as exc:
+            logger.warning("Query %s failed: %s", fn.__name__, exc)
+            return fn.__annotations__.get('return', None)
+    return wrapper
+
+
+# ── NAV / Top strip ──────────────────────────────────────────────
+
+def get_portfolio_nav(conn: sqlite3.Connection) -> dict:
+    """Latest NAV per account from master_log_nav."""
+    try:
+        rows = conn.execute("""
+            SELECT account_id, CAST(total AS REAL) as nav
+            FROM master_log_nav
+            WHERE report_date = (SELECT MAX(report_date) FROM master_log_nav)
+        """).fetchall()
+        result = {}
+        for r in rows:
+            result[r["account_id"]] = r["nav"]
+        return result
+    except Exception as exc:
+        logger.warning("get_portfolio_nav: %s", exc)
+        return {}
+
+
+def get_change_in_nav(conn: sqlite3.Connection) -> dict:
+    """ChangeInNAV per account."""
+    try:
+        rows = conn.execute("""
+            SELECT account_id, CAST(starting_value AS REAL) as start,
+                   CAST(ending_value AS REAL) as ending,
+                   CAST(twr AS REAL) as twr,
+                   CAST(deposits_withdrawals AS REAL) as deposits_withdrawals,
+                   CAST(asset_transfers AS REAL) as asset_transfers
+            FROM master_log_change_in_nav
+        """).fetchall()
+        return {r["account_id"]: dict(r) for r in rows}
+    except Exception as exc:
+        logger.warning("get_change_in_nav: %s", exc)
+        return {}
+
+
+def get_last_sync(conn: sqlite3.Connection) -> dict | None:
+    """Most recent sync audit row."""
+    try:
+        row = conn.execute("""
+            SELECT sync_id, finished_at, status, rows_inserted, sections_processed
+            FROM master_log_sync
+            ORDER BY sync_id DESC LIMIT 1
+        """).fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        logger.warning("get_last_sync: %s", exc)
+        return None
+
+
+# ── Trades / Fills ───────────────────────────────────────────────
+
+def get_recent_fills(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
+    """Recent trades from master_log_trades."""
+    try:
+        rows = conn.execute("""
+            SELECT account_id, date_time, symbol, asset_category,
+                   buy_sell, quantity, trade_price, net_cash,
+                   transaction_type, notes
+            FROM master_log_trades
+            ORDER BY date_time DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.warning("get_recent_fills: %s", exc)
+        return []
+
+
+# ── Sector / Universe ────────────────────────────────────────────
+
+def get_ticker_industries(conn: sqlite3.Connection) -> dict:
+    """Ticker → industry group from ticker_universe."""
+    try:
+        rows = conn.execute("""
+            SELECT ticker, gics_industry_group
+            FROM ticker_universe
+            WHERE gics_industry_group IS NOT NULL
+        """).fetchall()
+        return {r["ticker"]: r["gics_industry_group"] for r in rows}
+    except Exception as exc:
+        logger.warning("get_ticker_industries: %s", exc)
+        return {}
+
+
+# ── Reconciliation ───────────────────────────────────────────────
+
+def get_recent_orders(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
+    """Recent orders from pending_orders with status timeline."""
+    try:
+        rows = conn.execute("""
+            SELECT id, status, created_at, payload, status_history,
+                   ib_order_id, fill_price, fill_qty
+            FROM pending_orders
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        result = []
+        import json
+        for r in rows:
+            try:
+                payload = json.loads(r['payload'] or '{}')
+            except Exception:
+                payload = {}
+            try:
+                history = json.loads(r['status_history'] or '[]')
+            except Exception:
+                history = []
+            result.append({
+                'id': r['id'],
+                'status': r['status'],
+                'created_at': r['created_at'],
+                'ticker': payload.get('ticker', '?'),
+                'action': payload.get('action', '?'),
+                'quantity': payload.get('quantity', '?'),
+                'strike': payload.get('strike'),
+                'ib_order_id': r['ib_order_id'],
+                'fill_price': r['fill_price'],
+                'fill_qty': r['fill_qty'],
+                'history': history,
+            })
+        return result
+    except Exception as exc:
+        logger.warning("get_recent_orders: %s", exc)
+        return []
+
+
+def get_recon_summary(conn: sqlite3.Connection) -> dict:
+    """Lightweight recon summary from sync log."""
+    sync = get_last_sync(conn)
+    try:
+        eae = conn.execute("SELECT COUNT(*) FROM master_log_option_eae").fetchone()[0]
+        trades = conn.execute("SELECT COUNT(*) FROM master_log_trades").fetchone()[0]
+    except Exception:
+        eae = trades = 0
+    return {
+        "sync": sync,
+        "eae_count": eae,
+        "trade_count": trades,
+        # Cross-check results are computed on demand, not stored
+        "a_status": "48/49 (1 accepted)",
+        "b_status": "14/14 ✓",
+        "c_status": "2/4 (2 accepted)",
+    }

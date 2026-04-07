@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+
+{# ── TOP STRIP (shared with command_deck) ──────────────────────── #}
+<header class="sticky top-0 z-50 bg-slate-900 border-b border-slate-800 px-4 py-2">
+  <div class="flex items-center justify-between gap-4 max-w-[1920px] mx-auto flex-wrap">
+    <a href="/?t={{ token }}" class="flex items-center gap-2 no-underline">
+      <span class="font-mono font-bold text-emerald-400 text-lg tracking-tight">AGT</span>
+      <span class="text-slate-500 text-xs hidden sm:inline">Cure Console</span>
+    </a>
+
+    <div class="flex items-center gap-3 flex-wrap">
+      {# Mode badge #}
+      <div class="flex items-center gap-1.5 text-xs">
+        <span class="text-slate-500">Mode</span>
+        {% if mode == 'WARTIME' %}
+        <span class="num font-bold text-rose-400 animate-pulse px-2 py-0.5 bg-rose-900/30 rounded">WAR</span>
+        {% elif mode == 'AMBER' %}
+        <span class="num font-semibold text-amber-400 px-2 py-0.5 bg-amber-900/30 rounded">AMBER</span>
+        {% else %}
+        <span class="num text-emerald-400 px-2 py-0.5 bg-emerald-900/20 rounded">PEACE</span>
+        {% endif %}
+      </div>
+
+      {# NAV #}
+      <div class="flex items-center gap-1.5 text-xs">
+        <span class="text-slate-500">NAV</span>
+        <span class="num font-semibold text-slate-100">{{ money(top.total_nav) }}</span>
+      </div>
+
+      {# Lev #}
+      {% if top.leverage %}
+      <div class="flex items-center gap-1.5 text-xs">
+        <span class="text-slate-500">Lev</span>
+        <span class="num text-xs">
+          {% for hh, (lev, status) in top.leverage.items() %}
+          <span class="{% if status == 'BREACHED' %}text-rose-400 font-semibold{% elif status == 'AMBER' %}text-amber-400{% else %}text-emerald-400{% endif %}">{{ hh[0] }} {{ "%.2f"|format(lev) }}x</span>{% if not loop.last %} {% endif %}
+          {% endfor %}
+        </span>
+      </div>
+      {% endif %}
+
+      <a href="/?t={{ token }}" class="text-xs text-slate-500 hover:text-slate-300">&larr; Deck</a>
+    </div>
+  </div>
+</header>
+
+{# ── CURE BODY (HTMX refreshable) ─────────────────────────────── #}
+<main id="cure-body" class="flex-1 p-4 max-w-[1920px] mx-auto w-full"
+      hx-get="/api/cure?t={{ token }}" hx-trigger="every 60s" hx-swap="innerHTML">
+  {% include "cure_partial.html" %}
+</main>
+
+{% endblock %}

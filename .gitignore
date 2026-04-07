@@ -48,3 +48,17 @@ Thumbs.db
 
 # Dashboard output
 dashboard_output/
+
+# Litestream WAL segments
+.agt_desk.db-litestream/
+
+# Unknown archives
+files.zip
+
+# Claude Code local settings
+.claude/
+
+# Superseded rulebook versions (v9 is canonical)
+Portfolio_Risk_Rulebook_v6.md
+Portfolio_Risk_Rulebook_v7.md
+Portfolio_Risk_Rulebook_v8.md

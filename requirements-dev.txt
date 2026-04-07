@@ -1,0 +1,2 @@
+# Dev/test dependencies only — not required for production runtime.
+hypothesis>=6.150,<7
