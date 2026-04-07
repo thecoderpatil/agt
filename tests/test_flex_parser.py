@@ -85,8 +85,8 @@ class TestFlexParser(unittest.TestCase):
         self.assertAlmostEqual(float(row['position']), 300.0, places=0)
         self.assertAlmostEqual(float(row['cost_basis_price']), 73.99, delta=0.01)
 
-    def test_change_in_nav_four_accounts(self):
-        """ChangeInNAV present for all 4 accounts."""
+    def test_change_in_nav_all_statements(self):
+        """ChangeInNAV present for all 4 Flex statements (3 active + 1 dormant)."""
         self.assertEqual(self._count('master_log_change_in_nav'), 4)
 
     def test_attribute_only_sections_parsed(self):

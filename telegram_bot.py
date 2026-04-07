@@ -983,7 +983,7 @@ RECONNAISSANCE & REPRICING (Live Order Management):
 
 ACCOUNTS:
   U21971297 = Individual  |  U22076329 = Roth IRA  |  U22388499 = Vikram
-  Skip U22076184 (Traditional IRA, $0)
+  U22076184 dormant — history-only, not in active routing
   Aliases: 'Vikram', 'Brother', 'Brother's Brokerage' all map to U22388499.
 
 RISK ASSESSMENT — SPX BOX SPREADS:

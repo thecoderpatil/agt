@@ -33,7 +33,7 @@ This project was designed over multiple rounds of review with Codex and Gemini a
 | Account | Type | Household |
 |---|---|---|
 | U21971297 | Individual | Yash_Household |
-| U22076184 | Traditional IRA | Yash_Household |
+| U22076184 | Traditional IRA (Dormant) | Yash_Household |
 | U22076329 | Roth IRA | Yash_Household |
 | U22388499 | Vikram Individual | Vikram_Household |
 
@@ -1651,7 +1651,7 @@ def pull_flex() -> ET.Element:
         xml_body = r.read().decode()
     return ET.fromstring(xml_body)
 
-# Iterate 4 accounts
+# Iterate accounts (3 active + 1 dormant)
 root = pull_flex()
 for fs in root.findall("FlexStatements/FlexStatement"):
     account_id = fs.attrib["accountId"]
