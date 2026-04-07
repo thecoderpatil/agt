@@ -746,6 +746,27 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
         except Exception as ds_exc:
             logger.error("desk_state.md regeneration failed (non-fatal): %s", ds_exc)
 
+        # Git auto-commit + push after successful sync
+        try:
+            import subprocess
+            _git_cwd = r"C:\AGT_Telegram_Bridge"
+            subprocess.run(
+                ["git", "add", "reports/", "*.md", "schema.py",
+                 "agt_equities/", "agt_deck/", "telegram_bot.py"],
+                cwd=_git_cwd, check=False, timeout=30,
+            )
+            subprocess.run(
+                ["git", "commit", "-m",
+                 f"auto: EOD {datetime.utcnow().strftime('%Y-%m-%d')}"],
+                cwd=_git_cwd, check=False, timeout=30,
+            )
+            subprocess.run(
+                ["git", "push", "origin", "main"],
+                cwd=_git_cwd, check=False, timeout=60,
+            )
+        except Exception as git_exc:
+            logger.warning("git auto-push failed: %s", git_exc)
+
     except Exception as exc:
         result.status = 'error'
         result.error_message = str(exc)
