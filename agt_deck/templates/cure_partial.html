@@ -1,0 +1,168 @@
+{# cure_partial.html — HTMX-refreshable body for Cure Console #}
+
+{# ── GLIDE PATHS ──────────────────────────────────────────────── #}
+{% if glide_paths %}
+<section class="mb-6">
+  <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">Glide Paths</h2>
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    {% for gp in glide_paths %}
+    <div class="bg-slate-900 rounded-lg border border-slate-800 p-4">
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-2">
+          <span class="text-sm font-semibold text-slate-100">
+            {{ gp.household.replace("_Household", "") }}
+            <span class="text-slate-500">/</span>
+            {{ gp.rule_id.replace("rule_", "R") }}
+            {% if gp.ticker %}<span class="text-slate-500">/</span>{{ gp.ticker }}{% endif %}
+          </span>
+        </div>
+        {# Status pill #}
+        {% if gp.is_paused %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">PAUSED</span>
+        {% elif gp.status == 'GREEN' %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-900/40 text-emerald-400">GREEN</span>
+        {% elif gp.status == 'AMBER' %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-amber-900/40 text-amber-400">AMBER</span>
+        {% elif gp.status == 'RED' %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-rose-900/40 text-rose-400">RED</span>
+        {% endif %}
+      </div>
+
+      {# Progress bar #}
+      <div class="w-full bg-slate-800 rounded-full h-2 mb-2">
+        <div class="h-2 rounded-full transition-all duration-500
+          {% if gp.is_paused %}bg-slate-600
+          {% elif gp.status == 'GREEN' %}bg-emerald-500
+          {% elif gp.status == 'AMBER' %}bg-amber-500
+          {% else %}bg-rose-500{% endif %}"
+          style="width: {{ gp.progress_pct }}%"></div>
+      </div>
+
+      {# Metrics row #}
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs mb-2">
+        <div>
+          <span class="text-slate-500">Baseline</span>
+          <span class="num text-slate-300 ml-1">{{ "%.2f"|format(gp.baseline) }}</span>
+        </div>
+        <div>
+          <span class="text-slate-500">Target</span>
+          <span class="num text-slate-300 ml-1">{{ "%.2f"|format(gp.target) }}</span>
+        </div>
+        <div>
+          <span class="text-slate-500">Expected</span>
+          <span class="num text-slate-300 ml-1">{{ "%.2f"|format(gp.expected) }}</span>
+        </div>
+        <div>
+          <span class="text-slate-500">Actual</span>
+          <span class="num font-semibold ml-1
+            {% if gp.is_paused %}text-slate-400
+            {% elif gp.status == 'GREEN' %}text-emerald-400
+            {% elif gp.status == 'AMBER' %}text-amber-400
+            {% else %}text-rose-400{% endif %}">{{ "%.2f"|format(gp.actual) }}</span>
+        </div>
+      </div>
+
+      {# Timeline #}
+      <div class="flex items-center justify-between text-xs text-slate-500">
+        {% if gp.is_paused %}
+        <span>Paused: {{ gp.pause_reason or "—" }}</span>
+        {% else %}
+        <span>Day {{ gp.days_elapsed }} of {{ gp.days_elapsed + gp.days_remaining }}</span>
+        <span>{{ gp.days_remaining }}d remaining</span>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{# ── PER-HOUSEHOLD SECTIONS ───────────────────────────────────── #}
+{% for hh, data in households.items() %}
+<section class="mb-6">
+  <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
+    {{ hh.replace("_Household", "") }}
+    <span class="text-slate-600 font-normal ml-2">NAV {{ money(data.nlv) }} &middot; Lev {{ "%.2f"|format(data.leverage) }}x &middot; {{ data.active_cycles }} cycles</span>
+  </h2>
+
+  {# Concentrations bar chart #}
+  {% if data.concentrations %}
+  <div class="bg-slate-900 rounded-lg border border-slate-800 p-4 mb-4">
+    <h3 class="text-xs text-slate-500 uppercase mb-2">Position Concentration (Rule 1: 20% limit)</h3>
+    {% for c in data.concentrations %}
+    <div class="flex items-center gap-2 mb-1.5">
+      <span class="text-xs text-slate-300 w-12 text-right font-mono">{{ c.ticker }}</span>
+      <div class="flex-1 bg-slate-800 rounded-full h-3 relative">
+        <div class="h-3 rounded-full transition-all
+          {% if c.pct > 20 %}bg-rose-500/70{% elif c.pct > 18 %}bg-amber-500/70{% else %}bg-emerald-500/70{% endif %}"
+          style="width: {{ [c.pct, 100]|min }}%"></div>
+        {# 20% limit marker #}
+        <div class="absolute top-0 bottom-0 w-px bg-slate-500" style="left: 20%"></div>
+      </div>
+      <span class="text-xs num w-14 text-right
+        {% if c.pct > 20 %}text-rose-400{% else %}text-slate-400{% endif %}">{{ "%.1f"|format(c.pct) }}%</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {# Rule evaluations table #}
+  <div class="bg-slate-900 rounded-lg border border-slate-800 overflow-x-auto">
+    <table class="w-full text-xs">
+      <thead>
+        <tr class="border-b border-slate-800">
+          <th class="text-left text-slate-500 font-medium px-3 py-2">Rule</th>
+          <th class="text-left text-slate-500 font-medium px-3 py-2 hidden sm:table-cell">Ticker</th>
+          <th class="text-right text-slate-500 font-medium px-3 py-2">Value</th>
+          <th class="text-center text-slate-500 font-medium px-3 py-2">Status</th>
+          <th class="text-left text-slate-500 font-medium px-3 py-2 hidden md:table-cell">Message</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ev in data.evals %}
+        <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
+          <td class="px-3 py-1.5 text-slate-300">{{ ev.rule_name }}</td>
+          <td class="px-3 py-1.5 text-slate-400 num hidden sm:table-cell">{{ ev.ticker or "—" }}</td>
+          <td class="px-3 py-1.5 text-right num
+            {% if ev.status == 'RED' %}text-rose-400{% elif ev.status == 'AMBER' %}text-amber-400{% elif ev.status == 'PENDING' %}text-slate-500{% else %}text-slate-300{% endif %}">
+            {% if ev.raw_value is not none %}{{ "%.2f"|format(ev.raw_value) }}{% else %}—{% endif %}
+          </td>
+          <td class="px-3 py-1.5 text-center">
+            {% if ev.status == 'GREEN' %}
+            <span class="inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+            {% elif ev.status == 'AMBER' %}
+            <span class="inline-block w-2 h-2 rounded-full bg-amber-400"></span>
+            {% elif ev.status == 'RED' %}
+            <span class="inline-block w-2 h-2 rounded-full bg-rose-400 animate-pulse"></span>
+            {% else %}
+            <span class="inline-block w-2 h-2 rounded-full bg-slate-600"></span>
+            {% endif %}
+          </td>
+          <td class="px-3 py-1.5 text-slate-500 hidden md:table-cell truncate max-w-xs">{{ ev.message }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endfor %}
+
+{# ── MODE TRANSITIONS ─────────────────────────────────────────── #}
+{% if transitions %}
+<section class="mb-6">
+  <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">Recent Mode Transitions</h2>
+  <div class="bg-slate-900 rounded-lg border border-slate-800 p-4">
+    {% for t in transitions[:5] %}
+    <div class="flex items-center gap-2 text-xs {% if not loop.last %}mb-1.5{% endif %}">
+      <span class="text-slate-500 num">{{ t.timestamp[:16] if t.timestamp else "?" }}</span>
+      <span class="text-slate-400">{{ t.old_mode }}</span>
+      <span class="text-slate-600">&rarr;</span>
+      <span class="{% if t.new_mode == 'WARTIME' %}text-rose-400{% elif t.new_mode == 'AMBER' %}text-amber-400{% else %}text-emerald-400{% endif %}">{{ t.new_mode }}</span>
+      {% if t.trigger_rule %}
+      <span class="text-slate-600">({{ t.trigger_rule }})</span>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}

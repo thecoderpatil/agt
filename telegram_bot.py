@@ -163,6 +163,58 @@ def _get_db_connection() -> sqlite3.Connection:
     return conn
 
 
+# ---------------------------------------------------------------------------
+# Phase 3A: Mode engine helpers for Telegram commands
+# ---------------------------------------------------------------------------
+
+def _get_current_desk_mode() -> str:
+    """Read current desk mode from mode_history. Returns 'PEACETIME' on any error."""
+    try:
+        from agt_equities.mode_engine import get_current_mode
+        with _get_db_connection() as conn:
+            return get_current_mode(conn)
+    except Exception:
+        return "PEACETIME"
+
+
+def _check_mode_gate(required_mode_max: str) -> tuple[bool, str]:
+    """Check if current mode allows the operation.
+
+    required_mode_max: the highest mode in which the operation is allowed.
+    'PEACETIME' = only allowed in peacetime
+    'AMBER'     = allowed in peacetime and amber (blocked in wartime)
+    'WARTIME'   = always allowed
+
+    Returns (allowed: bool, message: str).
+    """
+    mode = _get_current_desk_mode()
+    mode_rank = {"PEACETIME": 0, "AMBER": 1, "WARTIME": 2}
+    allowed_rank = mode_rank.get(required_mode_max, 2)
+    current_rank = mode_rank.get(mode, 0)
+
+    if current_rank > allowed_rank:
+        return False, (
+            f"\u26d4 Mode {mode}: this command is blocked.\n"
+            f"Current desk mode is {mode}. "
+            f"Use /cure to view the Cure Console for next steps."
+        )
+    return True, ""
+
+
+async def _push_mode_transition(app, old_mode: str, new_mode: str,
+                                  trigger: str = "", notes: str = "") -> None:
+    """Push mode transition alert to Telegram."""
+    try:
+        emoji = {"PEACETIME": "\u2705", "AMBER": "\u26a0\ufe0f", "WARTIME": "\U0001f6a8"}.get(new_mode, "\u2753")
+        text = (
+            f"{emoji} DESK MODE: {old_mode} \u2192 {new_mode}\n"
+            f"{trigger}\n{notes}".strip()
+        )
+        await app.bot.send_message(chat_id=AUTHORIZED_USER_ID, text=text)
+    except Exception as exc:
+        logger.error("Mode transition push failed: %s", exc)
+
+
 def init_db() -> None:
     with _get_db_connection() as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -5289,6 +5341,12 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
 
+    # Phase 3A: Mode gate — /scan blocked in AMBER and WARTIME (CSP entry)
+    mode_ok, mode_msg = _check_mode_gate("PEACETIME")
+    if not mode_ok:
+        await update.message.reply_text(mode_msg)
+        return
+
     # Rule 11 leverage check — block CSP scanning if household over cap
     for hh in HOUSEHOLD_MAP:
         ok, msg = await _check_rule_11_leverage(hh)
@@ -9383,6 +9441,13 @@ async def cmd_cc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Unified /cc command — stages both Defensive and Harvest CCs."""
     if not is_authorized(update):
         return
+
+    # Phase 3A: Mode gate — /cc blocked in WARTIME only (exits/rolls allowed in AMBER)
+    mode_ok, mode_msg = _check_mode_gate("AMBER")
+    if not mode_ok:
+        await update.message.reply_text(mode_msg)
+        return
+
     try:
         hh_filter = None
         if context.args:
@@ -9713,6 +9778,125 @@ async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as exc:
         logger.exception("/reconcile failed: %s", exc)
         await update.message.reply_text(f"Reconciliation failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: Mode commands
+# ---------------------------------------------------------------------------
+
+async def cmd_declare_wartime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/declare_wartime [reason] — manually escalate to WARTIME mode."""
+    if not is_authorized(update):
+        return
+    try:
+        from agt_equities.mode_engine import get_current_mode, log_mode_transition, MODE_WARTIME
+        reason = " ".join(context.args) if context.args else ""
+        if not reason:
+            await update.message.reply_text(
+                "\u26d4 Reason required for audit trail.\n"
+                "Usage: /declare_wartime <reason for escalation>"
+            )
+            return
+        with _get_db_connection() as conn:
+            old_mode = get_current_mode(conn)
+            if old_mode == MODE_WARTIME:
+                await update.message.reply_text(f"Already in WARTIME mode.")
+                return
+            log_mode_transition(conn, old_mode, MODE_WARTIME,
+                                trigger_rule="manual", notes=f"/declare_wartime: {reason}")
+        await _push_mode_transition(context.application, old_mode, MODE_WARTIME,
+                                     trigger=f"Manual: {reason}")
+        await update.message.reply_text(
+            f"\U0001f6a8 WARTIME declared.\n"
+            f"Previous mode: {old_mode}\n"
+            f"Reason: {reason}\n\n"
+            f"All commands blocked except Cure Console actions.\n"
+            f"Use /declare_peacetime to revert (requires audit memo)."
+        )
+    except Exception as exc:
+        logger.exception("/declare_wartime failed: %s", exc)
+        await update.message.reply_text(f"Failed: {exc}")
+
+
+async def cmd_declare_peacetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/declare_peacetime <audit_memo> — revert from WARTIME/AMBER to PEACETIME."""
+    if not is_authorized(update):
+        return
+    try:
+        from agt_equities.mode_engine import get_current_mode, log_mode_transition, MODE_PEACETIME
+        memo = " ".join(context.args) if context.args else ""
+        with _get_db_connection() as conn:
+            old_mode = get_current_mode(conn)
+            if old_mode == MODE_PEACETIME:
+                await update.message.reply_text(f"Already in PEACETIME mode.")
+                return
+            if old_mode == "WARTIME" and not memo:
+                await update.message.reply_text(
+                    f"\u26d4 WARTIME \u2192 PEACETIME requires an audit memo.\n"
+                    f"Usage: /declare_peacetime <reason why wartime conditions have cleared>"
+                )
+                return
+            log_mode_transition(conn, old_mode, MODE_PEACETIME,
+                                trigger_rule="manual",
+                                notes=f"/declare_peacetime: {memo}" if memo else "/declare_peacetime")
+        await _push_mode_transition(context.application, old_mode, MODE_PEACETIME,
+                                     trigger=f"Manual revert" + (f": {memo}" if memo else ""))
+        await update.message.reply_text(
+            f"\u2705 PEACETIME restored.\n"
+            f"Previous mode: {old_mode}\n"
+            + (f"Audit memo: {memo}\n" if memo else "")
+        )
+    except Exception as exc:
+        logger.exception("/declare_peacetime failed: %s", exc)
+        await update.message.reply_text(f"Failed: {exc}")
+
+
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mode — show current desk mode and reasoning."""
+    if not is_authorized(update):
+        return
+    try:
+        from agt_equities.mode_engine import get_current_mode, get_recent_transitions
+        with _get_db_connection() as conn:
+            mode = get_current_mode(conn)
+            transitions = get_recent_transitions(conn, limit=3)
+
+        emoji = {"PEACETIME": "\u2705", "AMBER": "\u26a0\ufe0f", "WARTIME": "\U0001f6a8"}.get(mode, "\u2753")
+        lines = [f"{emoji} Current mode: {mode}"]
+        if transitions:
+            lines.append("")
+            lines.append("Recent transitions:")
+            for t in transitions:
+                ts = t.get("timestamp", "?")[:16]
+                lines.append(f"  {ts}: {t.get('old_mode')} \u2192 {t.get('new_mode')}"
+                             f" ({t.get('trigger_rule', '\u2014')})")
+                if t.get("notes"):
+                    lines.append(f"    {t['notes'][:80]}")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as exc:
+        logger.exception("/mode failed: %s", exc)
+        await update.message.reply_text(f"Failed: {exc}")
+
+
+async def cmd_cure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cure — returns link to the Deck Cure Console."""
+    if not is_authorized(update):
+        return
+    try:
+        deck_token = os.environ.get("AGT_DECK_TOKEN", "")
+        mode = _get_current_desk_mode()
+        emoji = {"PEACETIME": "\u2705", "AMBER": "\u26a0\ufe0f", "WARTIME": "\U0001f6a8"}.get(mode, "\u2753")
+        url = f"http://127.0.0.1:8787/cure"
+        if deck_token:
+            url += f"?t={deck_token}"
+        await update.message.reply_text(
+            f"{emoji} Mode: {mode}\n\n"
+            f"Cure Console: {url}\n\n"
+            f"(Tailscale: replace 127.0.0.1 with your Tailscale IP)"
+        )
+    except Exception as exc:
+        logger.exception("/cure failed: %s", exc)
+        await update.message.reply_text(f"Failed: {exc}")
 
 
 async def cmd_clear_quarantine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10241,6 +10425,10 @@ def main() -> None:
     app.add_handler(CommandHandler("exit", cmd_exit))
     app.add_handler(CommandHandler("override", cmd_override))
     app.add_handler(CommandHandler("reconcile", cmd_reconcile))
+    app.add_handler(CommandHandler("declare_wartime", cmd_declare_wartime))
+    app.add_handler(CommandHandler("declare_peacetime", cmd_declare_peacetime))
+    app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("cure", cmd_cure))
     app.add_handler(CommandHandler("clear_quarantine", cmd_clear_quarantine))
     app.add_handler(CallbackQueryHandler(handle_cc_ladder_callback, pattern=r"^cc:"))
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
