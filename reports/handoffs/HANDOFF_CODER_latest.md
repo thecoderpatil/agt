@@ -1,8 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
 **Last updated:** 2026-04-07
-**Status:** Phase 3A.5c2-alpha partial. Surgery tasks (6,9,10,11) deferred to next session.
-**Tests:** 319/319 passing. Runtime: ~17s.
+**Status:** Phase 3A.5c2-α COMPLETE. All 17 tasks shipped. Live IBKR verified.
+**Tests:** 327/327 passing. Runtime: ~24s.
+**Next:** Pre-β checklist, then Phase 3A.5c2-β (Smart Friction UI).
 
 ---
 
@@ -19,6 +20,7 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 6. Never write to `master_log_*` (Bucket 2 pristine — only `flex_sync.py` does that).
 7. Never commit secrets. `.env`, `*.db`, `audit_bundles/` are gitignored.
 8. Status format: `<Phase> done | tests: X/Y | <key metric> | STOP | <report path>`
+9. **Invariant deviations require STOP-and-surface BEFORE shipping, not after.** If during execution you encounter a locked invariant that you believe is incorrect, halt, surface with reasoning, wait for greenlight. This applies even when the deviation is obviously correct.
 
 ---
 
@@ -27,13 +29,17 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 `C:\AGT_Telegram_Bridge\`
 
 **Key files you touch most:**
-- `telegram_bot.py` — main bot entry, ~10300 lines (pruning target ~4500 in Phase 3D)
+- `telegram_bot.py` — main bot entry, ~9700 lines (pruning target ~4500 in Phase 3D)
 - `agt_equities/walker.py` — pure function, source of truth for cycles
-- `agt_equities/rule_engine.py` — pure rule evaluators (R1/R2/R3/R11 real, R4-R10 PENDING stubs)
+- `agt_equities/rule_engine.py` — rule evaluators (R1/R2/R3/R4/R5/R6/R7/R9/R11 real, R8/R10 PENDING stubs)
 - `agt_equities/mode_engine.py` — 3-mode state machine + LeverageHysteresisTracker + glide path math
 - `agt_equities/seed_baselines.py` — glide path + sector override + initial mode seed data
 - `agt_equities/flex_sync.py` — EOD master log writer + walker warnings persist + desk_state regen + git auto-push
 - `agt_equities/schema.py` — all SQLite migrations, idempotent DDL
+- `agt_equities/data_provider.py` — DEPRECATED IBKRProvider + MarketDataProvider ABC (retained for state_builder)
+- `agt_equities/market_data_interfaces.py` — 4-way ISP ABCs (IPriceAndVolatility, IOptionsChain, ICorporateIntelligence)
+- `agt_equities/providers/` — ibkr_price_volatility.py, ibkr_options_chain.py, yfinance_corporate_intelligence.py
+- `agt_equities/state_builder.py` — upstream populator for PortfolioState (correlation matrix, EL snapshots, NLV)
 - `agt_deck/main.py` — FastAPI Command Deck + Cure Console routes
 - `agt_deck/risk.py` — leverage, EL, concentration, sector helpers
 - `agt_deck/queries.py` — DB read layer
@@ -42,9 +48,12 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 - `agt_deck/templates/command_deck.html` — main deck with Mode Badge + Lev links
 - `tests/test_walker.py` — 91 walker unit + W3.6 tests
 - `tests/property/test_walker_properties.py` — 23 Hypothesis property tests
-- `tests/test_phase3a.py` — 56 Phase 3A tests (rule engine + mode engine + glide paths + gates)
+- `tests/test_phase3a.py` — 65 Phase 3A tests (rule engine + mode engine + glide paths + gates + R7)
 - `tests/test_phase3a5a.py` — 63 Phase 3A.5a tests (R4 correlation, R5 sell gate, R6 refinement, data provider, tolerance band)
 - `tests/test_rule_9.py` — 20 Phase 3A.5b tests (R9 Red Alert compositor, hysteresis, composition logic)
+- `tests/test_phase3a5c2_alpha.py` — 36 Phase 3A.5c2-α tests (Gate 1/2, orchestrator, sweeper, STK_SELL)
+- `tests/test_providers.py` — 18 provider tests (IBKRPriceVol, OptionsChain, YFinance, NLV, deprecation)
+- `tests/test_market_data_dtos.py` — 10 DTO tests
 - `scripts/archive_handoffs.py` — Friday handoff archiver
 
 ---
@@ -54,7 +63,7 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 **3-Bucket data model (LOCKED):**
 1. Real-time API — TWS via ib_async, no persistence
 2. `master_log_*` tables (12 tables) — immutable, only `flex_sync.py` writes
-3. Operational state — everything else (pending_orders, glide_paths, mode_history, el_snapshots, sector_overrides, walker_warnings_log, etc.)
+3. Operational state — everything else (pending_orders, glide_paths, mode_history, el_snapshots, sector_overrides, walker_warnings_log, bucket3_dynamic_exit_log, bucket3_earnings_overrides, etc.)
 
 **3-mode state machine:**
 - PEACETIME (all glide paths GREEN) -> normal ops
@@ -72,20 +81,33 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 
 **Day 1 must compute GREEN.** Baselines == current values → delta == 0 → GREEN. If any rule computes AMBER or RED on baseline, that's a math/baseline error — STOP.
 
+**Dynamic Exit Pipeline (Task 6, α):**
+```
+_stage_dynamic_exit_candidate(ticker, hh_name, hh_data, position, source)
+  → conviction lookup → escalation → overweight scope → Gate 1 chain walk
+  → INSERT bucket3_dynamic_exit_log (final_status='STAGED', source=<caller>)
+  → 15-min TTL → sweep_stale_dynamic_exit_stages() → ABANDONED
+```
+Sources: `scheduled_watchdog`, `manual_inspection`, `cc_overweight`.
+Consumer surface (Smart Friction UI) ships in Phase β.
+
+**`_run_cc_logic()` return contract:** `{"main_text": str}` — single key only (Task 11 removed `cio_payload` and `exit_commands`).
+
 ---
 
 ## Current State
 
-- **Tests:** 319/319 (91 walker + 23 property + 58 phase3a + 63 phase3a5a + 21 rule_9 + 10 dto + 17 providers + 36 phase3a5c2_alpha)
-- **Mode:** PEACETIME (verified on live DB — all glide paths GREEN at Day 0)
+- **Tests:** 327/327 (91 walker + 23 property + 65 phase3a + 63 phase3a5a + 21 rule_9 + 10 dto + 18 providers + 36 phase3a5c2_alpha)
+- **Mode:** PEACETIME (verified on live IBKR, Task 16)
 - **Walker:** fully closed through W3.8 + W3.6 (WalkerWarning dataclass + UI) + W3.7 (18 Hypothesis properties)
 - **Cure Console:** live at `/cure`, mobile-responsive, HTMX 60s refresh, Tailscale-exposed at `0.0.0.0:8787`
 - **Mode Badge:** live on Command Deck + Cure Console top strip, clickable to `/cure`
 - **Lev cells:** linkified to `/cure` on Command Deck
-- **Telegram commands:** `/declare_wartime <reason>` (required), `/declare_peacetime <memo>` (required from WARTIME), `/mode`, `/cure`
+- **Telegram commands:** `/declare_wartime <reason>`, `/declare_peacetime <memo>`, `/mode`, `/cure`, `/cc`, `/scan`, `/dynamic_exit`, `/override`, `/override_earnings`
 - **Push alerts:** mode transitions → emoji-coded Telegram message to AUTHORIZED_USER_ID
 - **GitLab:** `git@gitlab.com:agt-group2/agt-equities-desk.git` (SSH `@yashpatil1`), daily auto-push
 - **Litestream:** continuous DB replication to Cloudflare R2
+- **IBKR accounts:** U21971297 (Yash Individual), U22076329 (Yash Roth IRA), U22388499 (Vikram). U22076184 (Yash Trad IRA) dormant/closed — cleanup grep pending pre-β.
 
 **Household state (2026-04-06 Flex):**
 
@@ -96,10 +118,23 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 
 **Glide paths seeded:** 10 rows (2 leverage, 8 concentration). PYPL paused (earnings-gated).
 **Sector override:** UBER → Consumer Cyclical (fixes SW-App 3→2 violation).
+**Earnings overrides:** 10 active (all held tickers, set during Task 16 verification, 7-day TTL).
 
 ---
 
-## Completed Work (this session)
+## Completed Work (α surgery sprint, this session)
+
+| Task | SHA | Tests | Report |
+|------|-----|-------|--------|
+| Task 10: IBKRProvider DeprecationWarning | `46b43d4` | 320 (+1) | `reports/task_10_closeout_20260407.md` |
+| Task 6: Watchdog → STAGED rows | `b7ea360` | 320 (+0) | `reports/task_6_implementation_20260407.md` |
+| Task 11+9: /exit removal + R7 fail-closed | `9c60d3f` | 327 (+7) | `reports/task_11_implementation_20260407.md`, `reports/task_9_implementation_20260407.md` |
+| Fix: yf_tkr initialization | `85b24a6` | 327 (+0) | In Task 16 verification report |
+| Task 15: Test audit | (no commit) | 327 | `reports/task_15_test_audit_20260407.md` |
+| Task 16: Live IBKR verification | (no commit) | 327 | `reports/task_16_verification_20260407.md` |
+| Task 17: Final report | `ec0ea3a` | 327 | `reports/phase_3a_5c2_alpha_complete_20260407.md` |
+
+**Prior session (pre-compaction, 13 tasks):**
 
 | Task | Tests | Report |
 |------|-------|--------|
@@ -116,27 +151,31 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 
 ## In Flight
 
-**Phase 3A.5c2-alpha: PARTIAL — surgery tasks deferred**
-Shipped: walker extraction, schemas (3), Gate 1/2, orchestrator, R9 condition D (2-of-4), R5 stage helper, sweeper, is_wartime helper, v10 changelog.
-Deferred to next session (telegram_bot.py surgery with commit checkpoints):
-- Task 6: Watchdog CIO payload refactor (~120 lines removed, STAGED row writes)
-- Task 9: R7 earnings fail-closed + /override_earnings command
-- Task 10: IBKRProvider migration to 4-way ABCs
-- Task 11: /exit command removal (BLOCKED by Task 6 — hidden coupling at line 9402)
+**Phase 3A.5c2-α: COMPLETE.**
 
-**Phase 3A.5c2-beta: Smart Friction UI** (after alpha surgery completes)
+**Pre-β checklist (before any β code):**
+1. v10 upload
+2. `rulebook_llm_condensed.md` refresh
+3. Bot restart with committed code on production machine
+4. 3-account cleanup grep (remove dormant U22076184 references)
+5. `HANDOFF_ARCHITECT_v3.md` + this file refresh
+
+**Phase 3A.5c2-β: Smart Friction UI** (next phase)
 - Cure Console Dynamic Exit panel template
 - Smart Friction widget (PEACETIME checkbox + WARTIME Integer Lock)
 - Telegram [TRANSMIT] [CANCEL] inline keyboard handler
 - JIT re-validation at TRANSMIT
 - 3-strike retry budget + 5-minute ticker lock
-- /sell_shares command
+- `/sell_shares` command
+- Adaptive thesis prompt (CIO Oracle replacement)
+
+β v0 draft does NOT exist as a standalone file. Scope is across: `HANDOFF_CODER_latest.md` (this section), `reports/phase_3a_5c2_discovery_20260407.md` Sections 3-11, `ADR-004`.
 
 ---
 
 ## Phase Backlog (do NOT start without Architect prompt)
 
-- **Phase 3B:** desk_state.md full integration (5-min APScheduler, EL snapshots from IBKR live API, automated mode pipeline)
+- **Phase 3B:** desk_state.md full integration (5-min APScheduler, EL snapshots from IBKR live API, automated mode pipeline, R7 earnings cache scheduled job)
 - **Phase 3C:** LLM CIO Oracle advisory injection above Smart Friction widget (additive, not destructive)
 - **Phase 3D:** Telegram pruning to ~4500 lines, kill display commands, replace text approvals with inline buttons
 - **Phase 3E:** Mobile responsive polish
@@ -145,42 +184,42 @@ Deferred to next session (telegram_bot.py surgery with commit checkpoints):
 
 ## Active Gotchas / Don't-Touch List
 
-1. **R8 stub** — returns PENDING (gray pill), do not implement until Phase 3A.5c
-1z. **R9 (Red Alert compositor)** — REAL evaluator (Phase 3A.5b). Post-softening compositor reading R1/R2/R6 softened statuses. Reads SOFTENED statuses, not raw — a rule on an on-track glide path is NOT in violation. 3-condition (A/B/C), condition D deferred to 3A.5c. 2-of-3 fire, all-3 clear (asymmetric hysteresis). Persists to `red_alert_state` table. REPORTING ONLY — does NOT trigger mode transitions. See ADR-003.
-1a. **R4 (correlation)** — REAL evaluator (Phase 3A.5a). Reads `ps.correlations`. ADBE-CRM 0.69 raw RED, glide-pathed to GREEN (20w linked to ADBE concentration glide).
-1b. **R5 (sell gate)** — REAL evaluator (Phase 3A.5a). Status grid = GREEN always. Real gate via `evaluate_rule_5_sell_gate()` — NOT wired to commands yet (Phase 3A.5b/c).
-1c. **R6 (Vikram EL)** — REAL evaluator (Phase 3A.5a). 4-tier: GREEN >=25%, AMBER 20-25%, RED 10-20%, RED+CRITICAL <10%. R6 <10% returns `detail["severity"]="CRITICAL"` — consumers checking Rule 5 override read this field, not the status enum.
-1d. **Data provider** — `agt_equities/data_provider.py`. IBKRProvider (2 real methods: `get_historical_daily_bars`, `get_account_summary`; 3 stubs: option_chain, fundamentals, earnings_date -> NotImplementedError, Phase 3A.5c). State builder at `agt_equities/state_builder.py`.
-2. **EL data source** — IBKR live `ExcessLiquidity` via IBKRProvider `get_account_summary()`. `el_snapshots` table (Bucket 3) writer not yet wired (Phase 3B).
-3. **`gross_beta_leverage()`** — impure, has module-level hysteresis dict. Use `compute_leverage_pure()` from rule_engine
-4. **UBER sector** — `sector_overrides` table, manual override to Consumer Cyclical
-5. **`/cc` AMBER behavior** — allowed (exits/rolls), only block in WARTIME
-6. **`/declare_wartime` and `/declare_peacetime`** — both require reason/memo (mandatory audit trail)
-7. **`/exit_math`** — never implemented (W3.8 deferred), merging into Cure Console in Phase 3C
-8. **CORP_ACTION handler** — synthetic-tested only, Flex shape verification needed on first real one
-9. **ADBE/PYPL Dynamic Exits** — Yash handles personally, don't touch
-10. **Git auto-push hook** — wrapped in try/except, never blocks flex_sync. Don't break this.
-11. **Hardcoded account numbers** in queries.py, main.py — routing keys, not secrets, OK to commit
-12. **Production DB is `agt_desk.db`** — the `agt_equities/` package name does NOT match the DB filename. Never `sqlite3.connect("agt_equities.db")` — that creates an empty file via SQLite's auto-create behavior.
-13. **Prompt worked-examples are illustrative** — Ground-truth quantitative inputs ALWAYS come from `master_log_*` tables or live IBKR calls, never from the Architect prompt body. If a prompt number disagrees with the authoritative data source, STOP and report the divergence. Phase 3A.5a Day 1 baseline failed because a 4400-share illustrative example was treated as ground truth instead of pulling 500 shares from `master_log_open_positions`.
-14. **R2 denominator = margin-eligible NLV only (Reading 2)** — per v9 lines 709-712. Excludes Roth IRA NLV from denominator (not just from EL numerator). Yash margin accounts = [U21971297] (Individual only). Vikram = [U22388499] (single account). Do NOT use `household.total_nlv` for R2. See ADR-001.
-15. **R11 denominator = all-account NLV** — per v9 Definitions. This is intentional, not a bug. R2 (deployment governor) and R11 (portfolio leverage cap) use different denominators on purpose. Logged for v10 stress audit review. Do NOT change without rulebook amendment.
-16. **R2 glide paths DECOUPLED from R11** — R11 cures fast (assignment-driven exposure reduction). R2 cures slow (cash accumulation requiring reduced redeployment velocity). Yash R2 baseline 42.1% and Vikram R2 baseline 54.2% are both EXPECTED conditions, not alarms. Both cure to 70% by end of Q4 2026 (38 weeks). Accelerator clause: fundamentals deterioration triggers Rule 5 thesis-deterioration compressed cure path.
-17. **Glide path tolerance band** — `evaluate_glide_path()` applies per-rule flat absolute tolerance to BOTH worsened (RED) and behind (AMBER) checks. 1pp on ratio rules (R1/R2/R6), 2bp on leverage (R11), 2bp on correlation (R4). Sub-tolerance drift is NOT a mode transition. Do NOT widen to mask real movement. See ADR-002.
-18. **Rule 10 sector exclusions** — R3 excludes legacy picks (SLS, GTLB), SPX box spreads, and negligible holdings (IBKR fractional, TRAW.CVR) from sector counts per v9 lines 502-514. R4 similarly excludes via `CORRELATION_EXCLUDED_TICKERS`.
-19. **R9 reads SOFTENED statuses** — R9 (Red Alert compositor) reads RuleResult.status AFTER glide path softening, NOT raw evaluator output. A rule on an on-track glide path is by design NOT in violation. R9 fires only on real deviations from intended posture. See ADR-003.
-20. **R9 is REPORTING-ONLY in 3A.5b** — R9 computes Red Alert status and persists to `red_alert_state` table, but does NOT trigger automatic mode transitions. Manual `/declare_wartime` remains the only WARTIME path until Phase 3B automated pipeline lands. See ADR-003.
-21. **R9 condition D deferred** — R9 condition D (all-positions-Mode-1) is DEFERRED to Phase 3A.5c pending `IBKRProvider.get_option_chain()`. R9 currently fires on 2-of-3 conditions (A/B/C). When condition D lands, threshold becomes 2-of-4 per v9 spec.
-22. **4-way ABC split for market data (3A.5c1)** — IPriceAndVolatility, IOptionsChain, ICorporateIntelligence, IAccountState. Account state owned by state_builder.py (NOT a separate provider class). Market data providers MUST NOT bleed PortfolioState into their interfaces. New ABCs at `agt_equities/market_data_interfaces.py`, implementations at `agt_equities/providers/`.
-23. **Stock spot via modelGreeks.undPrice (10089 workaround)** — Default IBKR plan returns error 10089 on streaming stock reqMktData. Workaround: extract spot from option modelGreeks.undPrice (~80% hit rate) or fallback to reqHistoricalData last close (always marked is_extrinsic_stale). Monitor extrinsic_fallback_rate.
-24. **IV rank operational ETA April 2027** — bucket3_macro_iv_history starts populating on first run of `jobs/eod_macro_sync.py`. 252 trading days to bootstrap. iv_rank=None until then. /scan must handle gracefully.
-25. **yfinance is COLD PATH only** — NEVER in /cc, /health, /scan hot paths. ICorporateIntelligence wraps yfinance with 24h TTL cache. All calls marked `# DEPLOYMENT: replace with paid feed`.
-26. **jobs/eod_macro_sync.py is standalone** — NOT inside flex_sync.py. Windows Task Scheduler at 5:00 PM AST daily. Failure must NOT block flex_sync.
-27. **walker.compute_walk_away_pnl() is the single source of truth** — Extracted from 2 inline telegram_bot.py implementations in 3A.5c2-alpha. Line 2967 wrapper delegates to walker. Lines 7590 and 9019 will migrate when Task 6 (watchdog refactor) ships. Do NOT add new inline walk-away computations.
-28. **Gate 1 conviction modifier is HARDCODED** — HIGH=0.20, NEUTRAL=0.30, LOW=0.40. Do NOT query live VRP or /scan output. The modifier IS the yield proxy per v10 + Gemini Q1. See `CONVICTION_MODIFIERS` in rule_engine.py.
-29. **/exit command has hidden coupling** — Line 9402 in `_run_cc_logic()` parses `/exit` commands from dynamic exit payloads. /exit removal MUST follow watchdog refactor (Task 6). Do not remove independently.
-30. **R8 stub remains PENDING in evaluate_all()** — The R8 evaluator stub returns PENDING. The real R8 infrastructure (Gate 1/2, orchestrator, campaigns) lives alongside but is reporting-only via STAGED rows in bucket3_dynamic_exit_log. No execution path exists until beta ships the Smart Friction UI + Telegram JIT handler.
-31. **bucket3_dynamic_exit_log is BOTH staging queue AND audit log** — Per Patch 1, there is NO separate staging table. Lifecycle managed via final_status column: PENDING -> STAGED -> ATTESTED -> TRANSMITTED -> FILLED (or ABANDONED/DRIFT_BLOCKED/CANCELLED). Permanent retention for Act 60 compliance.
+1. **R8 stub** — returns PENDING (gray pill). Real R8 infrastructure (Gate 1/2, orchestrator, campaigns) lives alongside but is reporting-only via STAGED rows. No execution path until β ships Smart Friction UI.
+2. **R9 (Red Alert compositor)** — REAL evaluator (Phase 3A.5b). Post-softening compositor. 4-condition (A/B/C/D), 2-of-4 fire, all-4 clear (asymmetric hysteresis). REPORTING ONLY — does NOT trigger mode transitions. See ADR-003.
+3. **R7 (Earnings Window)** — REAL evaluator (Task 9). FAIL-CLOSED: missing/stale data → RED. Override via `/override_earnings TICKER YYYY-MM-DD [TTL_HOURS] [reason]`. Override is per-ticker GLOBAL, max 720h TTL. No scheduled cache yet — all R7 GREEN requires manual override. Phase 3B scope: wire YFinance cache into daily job.
+4. **R4 (correlation)** — REAL evaluator (Phase 3A.5a). Reads `ps.correlations`. ADBE-CRM 0.69 raw RED, glide-pathed to GREEN.
+5. **R5 (sell gate)** — REAL evaluator (Phase 3A.5a). Status grid = GREEN always. Real gate via `evaluate_rule_5_sell_gate()`.
+6. **R6 (Vikram EL)** — REAL evaluator (Phase 3A.5a). 4-tier: GREEN >=25%, AMBER 20-25%, RED 10-20%, RED+CRITICAL <10%.
+7. **IBKRProvider DEPRECATED** — DeprecationWarning fires on `__init__()`. New code must use 4-way ISP providers. `MarketDataProvider` ABC retained for `state_builder.py`. Deletion scheduled Phase 3B.
+8. **EL data source** — IBKR live `ExcessLiquidity` via IBKRProvider `get_account_summary()`. `el_snapshots` table (Bucket 3) writer not yet wired (Phase 3B).
+9. **`gross_beta_leverage()`** — impure, has module-level hysteresis dict. Use `compute_leverage_pure()` from rule_engine.
+10. **UBER sector** — `sector_overrides` table, manual override to Consumer Cyclical.
+11. **`/cc` AMBER behavior** — allowed (exits/rolls), only block in WARTIME.
+12. **`/declare_wartime` and `/declare_peacetime`** — both require reason/memo (mandatory audit trail).
+13. **`/exit_math`** — never implemented (W3.8 deferred), merging into Cure Console in Phase 3C. `/exit` command DELETED in Task 11.
+14. **CORP_ACTION handler** — synthetic-tested only, Flex shape verification needed on first real one.
+15. **ADBE/PYPL Dynamic Exits** — Yash handles personally, don't touch.
+16. **Git auto-push hook** — wrapped in try/except, never blocks flex_sync. Don't break this.
+17. **Hardcoded account numbers** in queries.py, main.py — routing keys, not secrets, OK to commit. U22076184 dormant — cleanup grep pending pre-β.
+18. **Production DB is `agt_desk.db`** — the `agt_equities/` package name does NOT match the DB filename. Never `sqlite3.connect("agt_equities.db")`.
+19. **Prompt worked-examples are illustrative** — Ground-truth inputs ALWAYS come from `master_log_*` tables or live IBKR calls. If a prompt number disagrees with the authoritative data source, STOP and report.
+20. **R2 denominator = margin-eligible NLV only (Reading 2)** — per v9. Excludes Roth IRA. Yash margin = [U21971297]. Vikram = [U22388499]. See ADR-001.
+21. **R11 denominator = all-account NLV** — intentional, different from R2.
+22. **R2 glide paths DECOUPLED from R11** — R11 cures fast, R2 cures slow. Yash R2 42.1%, Vikram R2 54.2% are expected.
+23. **Glide path tolerance band** — per-rule flat absolute tolerance. 1pp ratio, 2bp leverage/correlation. See ADR-002.
+24. **Rule 10 sector exclusions** — R3 excludes legacy picks (SLS, GTLB), SPX box spreads, negligible holdings.
+25. **R9 reads SOFTENED statuses** — after glide path softening, not raw. See ADR-003.
+26. **R9 is REPORTING-ONLY** — does NOT trigger automatic mode transitions.
+27. **4-way ABC split (3A.5c1)** — IPriceAndVolatility, IOptionsChain, ICorporateIntelligence, IAccountState (state_builder). New ABCs at `agt_equities/market_data_interfaces.py`, implementations at `agt_equities/providers/`.
+28. **Stock spot via modelGreeks.undPrice (10089 workaround)** — fallback to reqHistoricalData last close.
+29. **IV rank ETA April 2027** — 252 trading days to bootstrap. iv_rank=None until then.
+30. **yfinance is COLD PATH only** — NEVER in hot paths. 24h TTL cache.
+31. **jobs/eod_macro_sync.py is standalone** — NOT inside flex_sync.py. Windows Task Scheduler 5:00 PM.
+32. **walker.compute_walk_away_pnl() is single source of truth** — extracted from inline implementations in α.
+33. **Gate 1 conviction modifier is HARDCODED** — HIGH=0.20, NEUTRAL=0.30, LOW=0.40.
+34. **bucket3_dynamic_exit_log is BOTH staging queue AND audit log** — lifecycle via final_status column. Permanent retention for Act 60 compliance. `source` column tracks origin (`scheduled_watchdog`, `manual_inspection`, `cc_overweight`, `manual_stage`).
+35. **`_run_cc_logic()` returns `{"main_text": str}` only** — `cio_payload` and `exit_commands` keys removed in Task 11. Do NOT add them back.
+36. **`_stage_dynamic_exit_candidate()` requires `yf.Ticker(ticker)` before chain walk** — Bug fix `85b24a6`. Do not remove the `yf_tkr = yf.Ticker(ticker)` line.
 
 ---
 
@@ -190,6 +229,7 @@ Deferred to next session (telegram_bot.py surgery with commit checkpoints):
 - **Auto-push** at end of every successful `flex_sync.py` run
 - **DB -> Cloudflare R2** via Litestream, continuous, 30-day retention
 - **Friday handoff archive** via `scripts/archive_handoffs.py`
+- **Rollback tag:** `task16-pre-verification` at `9c60d3f` (pre-yf_tkr-fix point)
 - **NEVER commit:** `.env`, `*.db`, `*.db-wal`, `*.db-shm`, `audit_bundles/`, `data/inception_carryin.csv`, `Archive/`, `.venv/`, `.hypothesis/`, `.claude/`, Litestream WAL segments
 
 ---
@@ -197,7 +237,7 @@ Deferred to next session (telegram_bot.py surgery with commit checkpoints):
 ## Hard Stops
 
 Always stop and report (do NOT auto-fix) on:
-- Any rule disagrees with Rulebook v9 spec (including denominator semantics, not just tier values — R2 Reading 1 vs Reading 2 was a denominator bug not caught by tier verification alone)
+- Any rule disagrees with Rulebook v9/v10 spec (including denominator semantics)
 - Walker purity would be violated
 - Bucket 2 would be written by anything other than `flex_sync.py`
 - Day 1 baseline computes AMBER or RED
@@ -205,6 +245,7 @@ Always stop and report (do NOT auto-fix) on:
 - Audit narrowing — do not reduce scope to protect prior work
 - Secret found in staged files
 - SSH/git auth fails
+- **Invariant deviation discovered during execution** — STOP and surface BEFORE shipping
 
 ---
 
@@ -212,7 +253,7 @@ Always stop and report (do NOT auto-fix) on:
 
 1. Read this file end-to-end.
 2. Read `desk_state.md` at `C:\AGT_Telegram_Bridge\desk_state.md`.
-3. Read latest report in `reports/` to know what just finished.
+3. Read `reports/phase_3a_5c2_alpha_complete_20260407.md` for α close-out state.
 4. Wait for Architect prompt. Do not start work autonomously.
 
 End of handoff.
