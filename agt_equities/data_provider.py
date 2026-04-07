@@ -7,11 +7,22 @@ The provider populates PortfolioState upstream before evaluators run.
 
 Default provider: IBKRProvider (ib_async).
 Test provider: FakeProvider (deterministic, no network).
+
+DEPRECATION NOTICE (Phase 3A.5c2-alpha, 2026-04-07):
+  IBKRProvider is deprecated. New code should use the 4-way ISP providers:
+    - IPriceAndVolatility  (agt_equities.providers.ibkr_price_volatility)
+    - IOptionsChain        (agt_equities.providers.ibkr_options_chain)
+    - ICorporateIntelligence (agt_equities.providers.yfinance_corporate_intelligence)
+    - IAccountState        (state_builder.py — not a separate class)
+  MarketDataProvider ABC remains as a transitional interface for state_builder.py
+  until Phase 3B wires the new providers into the automated pipeline.
+  Scheduled for removal in Phase 3B.
 """
 from __future__ import annotations
 
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -107,6 +118,14 @@ class IBKRProvider(MarketDataProvider):
 
     def __init__(self, host: str = "127.0.0.1", port: int = 4001,
                  client_id: int = 99, market_data_mode: str = "delayed"):
+        warnings.warn(
+            "IBKRProvider is deprecated. Use IPriceAndVolatility / "
+            "IOptionsChain / ICorporateIntelligence from "
+            "agt_equities.providers, or state_builder for account data. "
+            "Scheduled for removal in Phase 3B.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._host = host
         self._port = port
         self._client_id = client_id

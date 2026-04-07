@@ -365,5 +365,30 @@ class TestEODMacroSync(unittest.TestCase):
         self.assertEqual(count, 1)  # only 2026-04-07 remains
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# IBKRProvider Deprecation Warning
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestIBKRProviderDeprecation(unittest.TestCase):
+
+    def test_ibkr_provider_emits_deprecation_warning(self):
+        """IBKRProvider.__init__ must fire DeprecationWarning (Phase 3A.5c2-alpha)."""
+        import warnings
+        from agt_equities.data_provider import IBKRProvider
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            # Instantiation will fail to connect (no TWS), but the warning
+            # fires before _connect() — we only need the __init__ path.
+            try:
+                IBKRProvider(host="127.0.0.1", port=1, client_id=999)
+            except Exception:
+                pass
+            deprecation_warnings = [
+                x for x in w if issubclass(x.category, DeprecationWarning)
+            ]
+            self.assertEqual(len(deprecation_warnings), 1)
+            self.assertIn("IBKRProvider is deprecated", str(deprecation_warnings[0].message))
+
+
 if __name__ == '__main__':
     unittest.main()

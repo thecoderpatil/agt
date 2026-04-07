@@ -1096,7 +1096,7 @@ def evaluate_rule_10(ps: PortfolioState, household: str) -> RuleEvaluation:
 # R9 fires only on real deviations from intended posture.
 #
 # Condition D (all-positions-Mode-1) is DEFERRED to Phase 3A.5c
-# pending IBKRProvider.get_option_chain() implementation.
+# pending IOptionsChain.get_chain_slice() implementation.
 # See ADR-003 for scope and wiring decisions.
 # ---------------------------------------------------------------------------
 
@@ -1190,7 +1190,7 @@ def evaluate_rule_9_composite(
         condition_c = False  # R6 doesn't apply to Yash
 
     # Condition D: DEFERRED to Phase 3A.5c
-    # TODO(3A.5c): Implement using IBKRProvider.get_option_chain().
+    # TODO(3A.5c): Implement using IOptionsChain.get_chain_slice().
     # Logic: for each position, check if a Mode 2 CC at >=30% annualized
     # Condition D: No position can generate 30% annualized at strike at/above
     # cost basis (all names in Mode 1). Implemented in Phase 3A.5c2-alpha.
