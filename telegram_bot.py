@@ -6370,12 +6370,13 @@ async def handle_dex_callback(
     # ── CANCEL branch ──────────────────────────────────────────────────
     if action == "cancel":
         with closing(_get_db_connection()) as conn:
-            result = conn.execute(
-                "UPDATE bucket3_dynamic_exit_log "
-                "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
-                "WHERE audit_id = ? AND final_status = 'ATTESTED'",
-                (audit_id,),
-            )
+            with conn:
+                result = conn.execute(
+                    "UPDATE bucket3_dynamic_exit_log "
+                    "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
+                    "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+                    (audit_id,),
+                )
         if result.rowcount == 0:
             logger.warning("CANCEL_RACE_LOST: audit_id=%s", audit_id)
             try:
@@ -6429,12 +6430,13 @@ async def handle_dex_callback(
     if not is_wartime and row["re_validation_count"] >= 3:
         # Transition to DRIFT_BLOCKED terminal
         with closing(_get_db_connection()) as conn:
-            conn.execute(
-                "UPDATE bucket3_dynamic_exit_log "
-                "SET final_status = 'DRIFT_BLOCKED', last_updated = CURRENT_TIMESTAMP "
-                "WHERE audit_id = ? AND final_status = 'ATTESTED'",
-                (audit_id,),
-            )
+            with conn:
+                conn.execute(
+                    "UPDATE bucket3_dynamic_exit_log "
+                    "SET final_status = 'DRIFT_BLOCKED', last_updated = CURRENT_TIMESTAMP "
+                    "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+                    (audit_id,),
+                )
         logger.warning(
             "3_STRIKE_LOCKED: audit_id=%s ticker=%s re_validation_count=%d source=row",
             audit_id, ticker, row["re_validation_count"],
@@ -6563,12 +6565,13 @@ async def handle_dex_callback(
     # Step 6: Atomic ATTESTED → TRANSMITTING lock
     now_ts = _time_mod.time()
     with closing(_get_db_connection()) as conn:
-        lock_result = conn.execute(
-            "UPDATE bucket3_dynamic_exit_log "
-            "SET final_status = 'TRANSMITTING', last_updated = CURRENT_TIMESTAMP "
-            "WHERE audit_id = ? AND final_status = 'ATTESTED'",
-            (audit_id,),
-        )
+        with conn:
+            lock_result = conn.execute(
+                "UPDATE bucket3_dynamic_exit_log "
+                "SET final_status = 'TRANSMITTING', last_updated = CURRENT_TIMESTAMP "
+                "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+                (audit_id,),
+            )
         if lock_result.rowcount == 0:
             logger.warning(
                 "TRANSMIT_RACE_LOST: audit_id=%s expected_status=ATTESTED",
@@ -6637,13 +6640,14 @@ async def handle_dex_callback(
 
     # Step 8: TRANSMITTING → TRANSMITTED
     with closing(_get_db_connection()) as conn:
-        conn.execute(
-            "UPDATE bucket3_dynamic_exit_log "
-            "SET final_status = 'TRANSMITTED', transmitted = 1, "
-            "    transmitted_ts = ?, last_updated = CURRENT_TIMESTAMP "
-            "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
-            (now_ts, audit_id),
-        )
+        with conn:
+            conn.execute(
+                "UPDATE bucket3_dynamic_exit_log "
+                "SET final_status = 'TRANSMITTED', transmitted = 1, "
+                "    transmitted_ts = ?, last_updated = CURRENT_TIMESTAMP "
+                "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+                (now_ts, audit_id),
+            )
 
     _dispatched_audits.discard(audit_id)
     logger.info(
