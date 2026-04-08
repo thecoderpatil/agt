@@ -235,6 +235,43 @@ def get_staged_dynamic_exits(conn: sqlite3.Connection) -> list[dict]:
     return list(grouped.values())
 
 
+def attest_staged_exit(
+    conn: sqlite3.Connection,
+    audit_id: str,
+    operator_thesis: str | None,
+    attestation_value_typed: str | None,
+    checkbox_state_json: str | None,
+    attested_limit_price: float | None,
+) -> int:
+    """Transition a STAGED row to ATTESTED. Returns cursor.rowcount.
+
+    Caller owns conn.commit() / conn.rollback().
+    Returns 0 if audit_id not found or row is no longer STAGED (race/stale).
+
+    checkbox_state_json shape (PEACETIME):
+        {"ack_loss": true, "ack_cure": true, "ack_ts": <epoch float>}
+    attestation_value_typed (WARTIME):
+        The exact integer (or ticker for $0/$1 loss) the operator typed.
+    """
+    try:
+        cursor = conn.execute(
+            "UPDATE bucket3_dynamic_exit_log "
+            "SET final_status = 'ATTESTED', "
+            "    operator_thesis = ?, "
+            "    attestation_value_typed = ?, "
+            "    checkbox_state_json = ?, "
+            "    limit_price = ?, "
+            "    last_updated = CURRENT_TIMESTAMP "
+            "WHERE audit_id = ? AND final_status = 'STAGED'",
+            (operator_thesis, attestation_value_typed, checkbox_state_json,
+             attested_limit_price, audit_id),
+        )
+        return cursor.rowcount
+    except Exception as exc:
+        logger.warning("attest_staged_exit(%s) failed: %s", audit_id, exc)
+        raise
+
+
 def get_staged_exit_by_audit_id(conn: sqlite3.Connection, audit_id: str) -> dict | None:
     """Fetch a single STAGED row by audit_id for Smart Friction modal render.
 

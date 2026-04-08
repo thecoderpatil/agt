@@ -19,7 +19,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 # Add project root to path for agt_equities imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agt_deck.db import get_ro_conn
+from agt_deck.db import get_ro_conn, get_rw_conn
 from agt_deck import queries, risk, formatters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -607,6 +607,174 @@ async def smart_friction_modal(request: Request, audit_id: str):
         "loss_whole": loss_whole,
         "token": token,
     })
+
+
+def _htmx_error(html: str, status_code: int) -> HTMLResponse:
+    """Error response that HTMX will swap into target despite 4xx/5xx status."""
+    return HTMLResponse(
+        content=html,
+        status_code=status_code,
+        headers={"HX-Reswap": "innerHTML"},
+    )
+
+
+@app.post("/api/cure/dynamic_exit/{audit_id}/attest", response_class=HTMLResponse)
+async def smart_friction_submit(request: Request, audit_id: str):
+    """POST handler for Smart Friction attestation. Transitions STAGED → ATTESTED."""
+    # ── Parse form BEFORE acquiring DB lock (no await while holding conn) ──
+    try:
+        form = await request.form()
+    except Exception as exc:
+        logger.warning("smart_friction_submit: form parse failed for %s: %s", audit_id, exc)
+        return _htmx_error(
+            '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+            "MALFORMED_FORM: could not parse request body. Retry."
+            "</div>",
+            422,
+        )
+
+    conn = get_rw_conn()
+    try:
+        # ── Read staged row ──────────────────────────────────────
+        row = queries.get_staged_exit_by_audit_id(conn, audit_id)
+        if not row:
+            return _htmx_error(
+                '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+                "Row not found or no longer STAGED. Refresh Cure Console."
+                "</div>",
+                409,
+            )
+
+        # ── JIT check 1: mode drift ─────────────────────────────
+        live_mode = _get_desk_mode(conn)
+        if live_mode != row["desk_mode"]:
+            conn.rollback()
+            return _htmx_error(
+                '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+                f'Mode changed since staging: was {row["desk_mode"]}, now {live_mode}. '
+                "Re-stage from Cure Console."
+                "</div>",
+                409,
+            )
+
+        # ── Validate form fields ─────────────────────────────────
+        desk_mode = row["desk_mode"]
+        loss_whole = round(row.get("gate1_realized_loss") or 0)
+
+        if desk_mode == "WARTIME":
+            # ── WARTIME: Integer Lock validation ─────────────────
+            realized_loss = row.get("gate1_realized_loss") or 0
+            if realized_loss < 0:
+                conn.rollback()
+                logger.warning(
+                    "ANOMALY: WARTIME attestation on profitable exit audit_id=%s loss=%s",
+                    audit_id, realized_loss,
+                )
+                return _htmx_error(
+                    '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+                    "INVALID_WARTIME_PROFIT: Dynamic Exit on profitable trade should not "
+                    "reach WARTIME attestation. Contact Architect."
+                    "</div>",
+                    422,
+                )
+
+            # Determine expected value: integer or ticker fallback
+            if loss_whole <= 1:
+                expected_value = row["ticker"]  # case-sensitive exact match
+            else:
+                expected_value = str(loss_whole)
+
+            typed_value = form.get("attestation_value_typed", "")
+            if typed_value != expected_value:
+                conn.rollback()
+                return _htmx_error(
+                    '<div class="bg-amber-900/40 border border-amber-700 text-amber-200 p-4 rounded-lg">'
+                    "INTEGER_LOCK_FAIL: typed value does not match expected. "
+                    "Close and retry."
+                    "</div>",
+                    422,
+                )
+
+            operator_thesis = None
+            checkbox_json = None
+            attestation_typed = typed_value
+
+        else:
+            # ── PEACETIME: checkbox + thesis validation ──────────
+            ack_loss = form.get("ack_loss")
+            ack_cure = form.get("ack_cure")
+            thesis_raw = form.get("operator_thesis", "")
+            operator_thesis = thesis_raw.strip() if thesis_raw else ""
+
+            if ack_loss != "on" or ack_cure != "on":
+                conn.rollback()
+                return _htmx_error(
+                    '<div class="bg-amber-900/40 border border-amber-700 text-amber-200 p-4 rounded-lg">'
+                    "Both acknowledgment checkboxes are required."
+                    "</div>",
+                    422,
+                )
+
+            if len(operator_thesis) < 30:
+                conn.rollback()
+                return _htmx_error(
+                    '<div class="bg-amber-900/40 border border-amber-700 text-amber-200 p-4 rounded-lg">'
+                    "Strategic rationale must be at least 30 characters."
+                    "</div>",
+                    422,
+                )
+
+            checkbox_json = json.dumps({
+                "ack_loss": True,
+                "ack_cure": True,
+                "ack_ts": time.time(),
+            })
+            attestation_typed = None
+
+        # ── Write: STAGED → ATTESTED ─────────────────────────────
+        attested_limit_price = row.get("limit_price")
+        rowcount = queries.attest_staged_exit(
+            conn,
+            audit_id=audit_id,
+            operator_thesis=operator_thesis,
+            attestation_value_typed=attestation_typed,
+            checkbox_state_json=checkbox_json,
+            attested_limit_price=attested_limit_price,
+        )
+        if rowcount == 0:
+            conn.rollback()
+            return _htmx_error(
+                '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+                "STALE_ROW: row changed between read and write. Refresh Cure Console."
+                "</div>",
+                409,
+            )
+
+        conn.commit()
+        logger.info("Attested audit_id=%s ticker=%s household=%s mode=%s",
+                     audit_id, row["ticker"], row["household"], desk_mode)
+
+        return _render("cure_attest_success.html", {
+            "row": row,
+            "audit_id": audit_id,
+            "attested_limit_price": attested_limit_price,
+            "token": request.query_params.get("t", ""),
+        })
+
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.exception("smart_friction_submit failed for audit_id=%s: %s", audit_id, exc)
+        return _htmx_error(
+            '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+            "Server error during attestation. Check logs and retry."
+            "</div>",
+            500,
+        )
+    finally:
+        conn.close()
 
 
 # ── Entry point ───────────────────────────────────────────────────

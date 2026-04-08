@@ -17,3 +17,11 @@ def get_ro_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON;")
     return conn
+
+
+def get_rw_conn() -> sqlite3.Connection:
+    """Open a read-write SQLite connection. Caller owns commit/rollback/close."""
+    uri = f"file:{DB_PATH}"
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    return conn

@@ -1,5 +1,5 @@
 {# Smart Friction modal — PEACETIME checkbox flow + WARTIME Integer Lock branch #}
-{# Rendered into #modal-root via hx-get. POST handler ships in β Impl 2b. #}
+{# Rendered into #modal-root via hx-get. POST via hx-post swaps result back. #}
 <div class="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"
      onclick="if(event.target===this) htmx.ajax('GET','/api/cure/empty?t={{ token }}',{target:'#modal-root',swap:'innerHTML'})">
   <div class="bg-slate-900 border border-slate-700 rounded-lg max-w-2xl w-full p-6 max-h-[90vh] overflow-y-auto"
@@ -41,13 +41,27 @@
       </div>
     </div>
 
-    {# ── Attestation form (POST handler is β Impl 2b) ────────────── #}
-    <form id="smart-friction-form">
+    {# ── Attestation form ────────────────────────────────────────── #}
+    <form id="smart-friction-form"
+          hx-post="/api/cure/dynamic_exit/{{ row.audit_id }}/attest?t={{ token }}"
+          hx-target="#modal-root" hx-swap="innerHTML">
       <input type="hidden" name="audit_id" value="{{ row.audit_id }}">
       <input type="hidden" name="render_ts" value="{{ row.render_ts }}">
 
       {% if row.desk_mode == 'WARTIME' %}
       {# ── WARTIME Integer Lock — no thesis, no checkboxes ────── #}
+      {# ADR-004 §5: $0/$1 loss falls back to ticker symbol #}
+      {% if loss_whole <= 1 %}
+      <div class="mb-4">
+        <label class="block text-xs text-slate-400 mb-2">
+          Type the ticker symbol exactly (<span class="font-mono text-amber-400">{{ row.ticker }}</span>) to authorize Gate 3 bypass:
+        </label>
+        <input type="text" name="attestation_value_typed" id="integer-lock-input"
+               class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-slate-100 font-mono"
+               autocomplete="off"
+               oninput="document.getElementById('sf-stage-btn').disabled = (this.value !== '{{ row.ticker }}')">
+      </div>
+      {% else %}
       <div class="mb-4">
         <label class="block text-xs text-slate-400 mb-2">
           Type the exact integer <span class="font-mono text-amber-400">{{ loss_whole }}</span> to authorize Gate 3 bypass:
@@ -57,11 +71,11 @@
                autocomplete="off"
                oninput="document.getElementById('sf-stage-btn').disabled = (this.value !== '{{ loss_whole }}')">
       </div>
-      <button type="button" id="sf-stage-btn" disabled
+      {% endif %}
+      <button type="submit" id="sf-stage-btn" disabled
               class="w-full bg-rose-700 hover:bg-rose-600 disabled:bg-slate-800 disabled:text-slate-600 text-white py-2 rounded font-semibold cursor-not-allowed disabled:cursor-not-allowed">
         STAGE EMERGENCY EXIT
       </button>
-      <p class="text-xs text-slate-600 mt-2 text-center">POST handler pending &beta; Impl 2b</p>
 
       {% else %}
       {# ── PEACETIME — checkboxes + thesis ────────────────────── #}
@@ -84,11 +98,10 @@
                   oninput="sfUpdateButton()"
                   placeholder="{{ row.ticker }} is currently above the 20% R1 ceiling. Explain the strategic thesis..."></textarea>
       </div>
-      <button type="button" id="sf-stage-btn" disabled
+      <button type="submit" id="sf-stage-btn" disabled
               class="w-full bg-emerald-700 hover:bg-emerald-600 disabled:bg-slate-800 disabled:text-slate-600 text-white py-2 rounded font-semibold cursor-not-allowed disabled:cursor-not-allowed">
         STAGE
       </button>
-      <p class="text-xs text-slate-600 mt-2 text-center">POST handler pending &beta; Impl 2b</p>
       <script>
         function sfUpdateButton() {
           var ack1 = document.getElementById('sf-ack-loss').checked;

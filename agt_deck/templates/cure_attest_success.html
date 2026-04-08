@@ -1,0 +1,45 @@
+{# Attestation success confirmation — replaces modal in #modal-root #}
+<div class="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"
+     onclick="if(event.target===this) htmx.ajax('GET','/api/cure/empty?t={{ token }}',{target:'#modal-root',swap:'innerHTML'})">
+  <div class="bg-slate-900 border border-emerald-700 rounded-lg max-w-lg w-full p-6"
+       onclick="event.stopPropagation()">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="text-2xl">&#x2705;</span>
+      <h3 class="text-lg font-semibold text-emerald-400">Attestation Complete</h3>
+    </div>
+    <div class="bg-slate-950 rounded-lg p-3 text-xs space-y-1 mb-4">
+      <div class="flex justify-between">
+        <span class="text-slate-500">Ticker</span>
+        <span class="text-slate-200">{{ row.ticker }}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-500">Household</span>
+        <span class="text-slate-200">{{ row.household }}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-500">Audit ID</span>
+        <span class="text-slate-400 font-mono">{{ audit_id[:12] }}…</span>
+      </div>
+      {% if attested_limit_price is not none %}
+      <div class="flex justify-between">
+        <span class="text-slate-500">Limit price</span>
+        <span class="text-slate-200">${{ "%.2f"|format(attested_limit_price) }}</span>
+      </div>
+      {% endif %}
+      <div class="flex justify-between">
+        <span class="text-slate-500">Status</span>
+        <span class="text-emerald-400 font-semibold">ATTESTED</span>
+      </div>
+    </div>
+    <p class="text-xs text-slate-400 mb-4">
+      This row will appear in Telegram for <span class="text-slate-200">[TRANSMIT]</span> /
+      <span class="text-slate-200">[CANCEL]</span> confirmation.
+      JIT re-validation runs at transmission time.
+    </p>
+    <button type="button"
+            class="w-full bg-slate-800 hover:bg-slate-700 text-slate-300 py-2 rounded text-sm"
+            hx-get="/api/cure/empty?t={{ token }}" hx-target="#modal-root" hx-swap="innerHTML">
+      Close
+    </button>
+  </div>
+</div>
