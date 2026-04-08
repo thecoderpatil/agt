@@ -1,9 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
 **Last updated:** 2026-04-07
-**Status:** Phase 3A.5c2-α COMPLETE. All 17 tasks shipped. Live IBKR verified.
-**Tests:** 327/327 passing. Runtime: ~24s.
-**Next:** Pre-β checklist, then Phase 3A.5c2-β (Smart Friction UI).
+**Status:** Phase 3A.5c2-β IN PROGRESS. Pre-β checklist complete. β Impl 1 (Dynamic Exit panel) shipped.
+**Tests:** 327/327 passing. Runtime: ~25s.
+**Next:** β Impl 2 (Smart Friction PEACETIME modal), then β Impl 3 (WARTIME Integer Lock).
 
 ---
 
@@ -100,14 +100,14 @@ Consumer surface (Smart Friction UI) ships in Phase β.
 - **Tests:** 327/327 (91 walker + 23 property + 65 phase3a + 63 phase3a5a + 21 rule_9 + 10 dto + 18 providers + 36 phase3a5c2_alpha)
 - **Mode:** PEACETIME (verified on live IBKR, Task 16)
 - **Walker:** fully closed through W3.8 + W3.6 (WalkerWarning dataclass + UI) + W3.7 (18 Hypothesis properties)
-- **Cure Console:** live at `/cure`, mobile-responsive, HTMX 60s refresh, Tailscale-exposed at `0.0.0.0:8787`
+- **Cure Console:** live at `/cure`, mobile-responsive, HTMX 60s refresh, Tailscale-exposed at `0.0.0.0:8787`. Dynamic Exit panel (β Impl 1) displays STAGED rows as card-per-ticker with option ladder table.
 - **Mode Badge:** live on Command Deck + Cure Console top strip, clickable to `/cure`
 - **Lev cells:** linkified to `/cure` on Command Deck
 - **Telegram commands:** `/declare_wartime <reason>`, `/declare_peacetime <memo>`, `/mode`, `/cure`, `/cc`, `/scan`, `/dynamic_exit`, `/override`, `/override_earnings`
 - **Push alerts:** mode transitions → emoji-coded Telegram message to AUTHORIZED_USER_ID
 - **GitLab:** `git@gitlab.com:agt-group2/agt-equities-desk.git` (SSH `@yashpatil1`), daily auto-push
 - **Litestream:** continuous DB replication to Cloudflare R2
-- **IBKR accounts:** U21971297 (Yash Individual), U22076329 (Yash Roth IRA), U22388499 (Vikram). U22076184 (Yash Trad IRA) dormant/closed — cleanup grep pending pre-β.
+- **IBKR accounts:** U21971297 (Yash Individual), U22076329 (Yash Roth IRA), U22388499 (Vikram). U22076184 (Yash Trad IRA) dormant — cleanup complete (A1/A2/A3 at `c49e431`..`a43654d`).
 
 **Household state (2026-04-06 Flex):**
 
@@ -119,10 +119,25 @@ Consumer surface (Smart Friction UI) ships in Phase β.
 **Glide paths seeded:** 10 rows (2 leverage, 8 concentration). PYPL paused (earnings-gated).
 **Sector override:** UBER → Consumer Cyclical (fixes SW-App 3→2 violation).
 **Earnings overrides:** 10 active (all held tickers, set during Task 16 verification, 7-day TTL).
+**Rulebook:** v10 in force. `rulebook_llm_condensed.md` regenerated from v10 at `bb29103` (210 lines, 10/10 required strings, 6/6 forbidden strings validated).
 
 ---
 
-## Completed Work (α surgery sprint, this session)
+## Completed Work (pre-β + β session)
+
+| Task | SHA | Tests | Report |
+|------|-----|-------|--------|
+| Task B: v10 condensed refresh | `bb29103` | 327 | In-conversation validation |
+| Task A1: 3-account config removes | `c49e431` | 327 | In-conversation triage table |
+| Task A2: doc/comment phrasing | `a077a18` | 327 | — |
+| Task A3: preserve-list comments | `a43654d` | 327 | — |
+| Task C: β v0 consolidation | `ba9a6ae` | 327 | `reports/phase_3a_5c2_beta_v0.md` |
+| β prep 1: walk-away P&L delegation | `16cd244` | 327 | — |
+| β v0 §4.4 RESOLVED | `4fc487c` | 327 | — |
+| β v0 §4.2 RULED (JIT precedence) | `25ea42f` | 327 | — |
+| β Impl 1: Dynamic Exit panel | `5f36e00` | 327 | — |
+
+## Completed Work (α surgery sprint, prior session)
 
 | Task | SHA | Tests | Report |
 |------|-----|-------|--------|
@@ -151,25 +166,31 @@ Consumer surface (Smart Friction UI) ships in Phase β.
 
 ## In Flight
 
-**Phase 3A.5c2-α: COMPLETE.**
+**Phase 3A.5c2-α: COMPLETE** at `ec0ea3a`.
+**Pre-β checklist: COMPLETE** (v10 condensed, 3-account cleanup, β v0 consolidation).
 
-**Pre-β checklist (before any β code):**
-1. v10 upload
-2. `rulebook_llm_condensed.md` refresh
-3. Bot restart with committed code on production machine
-4. 3-account cleanup grep (remove dormant U22076184 references)
-5. `HANDOFF_ARCHITECT_v3.md` + this file refresh
+**Phase 3A.5c2-β: Smart Friction UI — IN PROGRESS**
 
-**Phase 3A.5c2-β: Smart Friction UI** (next phase)
-- Cure Console Dynamic Exit panel template
-- Smart Friction widget (PEACETIME checkbox + WARTIME Integer Lock)
-- Telegram [TRANSMIT] [CANCEL] inline keyboard handler
-- JIT re-validation at TRANSMIT
-- 3-strike retry budget + 5-minute ticker lock
-- `/sell_shares` command
-- Adaptive thesis prompt (CIO Oracle replacement)
+Governing doc: `reports/phase_3a_5c2_beta_v0.md`. ADR-004 binding.
 
-β v0 draft does NOT exist as a standalone file. Scope is across: `HANDOFF_CODER_latest.md` (this section), `reports/phase_3a_5c2_discovery_20260407.md` Sections 3-11, `ADR-004`.
+Completed:
+- ✅ Walk-away P&L delegation (β prep 1, `16cd244`) — §4.4 RESOLVED
+- ✅ JIT precedence ruling (§4.2 RULED) — 3-check fail-fast, 5 failure codes
+- ✅ Cure Console Dynamic Exit panel (β Impl 1, `5f36e00`) — read-only STAGED row display
+
+Remaining (per β v0 §5 impl order):
+- Smart Friction modal (PEACETIME checkbox flow) — β Impl 2
+- Smart Friction modal (WARTIME Integer Lock) — β Impl 3
+- HTTP 409 staleness check on form submission
+- Telegram `[TRANSMIT] [CANCEL]` inline keyboard handler
+- JIT Gate 1 re-validation (3-check precedence per §4.2 ruling)
+- 3-strike retry budget (PEACETIME) + WARTIME bypass
+- Drift block (`abs(live_bid - attested_limit_price) > 0.10`)
+- R5 sell gate wiring to attestation flow
+- AMBER button semantics across Deck + Telegram
+- Tests (~58 new, target ~385 total)
+- Day 1 verification
+- TRANSMIT handler dedicated audit pass (gated on Gemini reserve spend)
 
 ---
 
@@ -200,7 +221,7 @@ Consumer surface (Smart Friction UI) ships in Phase β.
 14. **CORP_ACTION handler** — synthetic-tested only, Flex shape verification needed on first real one.
 15. **ADBE/PYPL Dynamic Exits** — Yash handles personally, don't touch.
 16. **Git auto-push hook** — wrapped in try/except, never blocks flex_sync. Don't break this.
-17. **Hardcoded account numbers** in queries.py, main.py — routing keys, not secrets, OK to commit. U22076184 dormant — cleanup grep pending pre-β.
+17. **Hardcoded account numbers** in queries.py, main.py — routing keys, not secrets, OK to commit. U22076184 dormant — cleanup complete (A1 removed from active routing, A3 documented preserve-list rationale).
 18. **Production DB is `agt_desk.db`** — the `agt_equities/` package name does NOT match the DB filename. Never `sqlite3.connect("agt_equities.db")`.
 19. **Prompt worked-examples are illustrative** — Ground-truth inputs ALWAYS come from `master_log_*` tables or live IBKR calls. If a prompt number disagrees with the authoritative data source, STOP and report.
 20. **R2 denominator = margin-eligible NLV only (Reading 2)** — per v9. Excludes Roth IRA. Yash margin = [U21971297]. Vikram = [U22388499]. See ADR-001.
@@ -220,6 +241,11 @@ Consumer surface (Smart Friction UI) ships in Phase β.
 34. **bucket3_dynamic_exit_log is BOTH staging queue AND audit log** — lifecycle via final_status column. Permanent retention for Act 60 compliance. `source` column tracks origin (`scheduled_watchdog`, `manual_inspection`, `cc_overweight`, `manual_stage`).
 35. **`_run_cc_logic()` returns `{"main_text": str}` only** — `cio_payload` and `exit_commands` keys removed in Task 11. Do NOT add them back.
 36. **`_stage_dynamic_exit_candidate()` requires `yf.Ticker(ticker)` before chain walk** — Bug fix `85b24a6`. Do not remove the `yf_tkr = yf.Ticker(ticker)` line.
+37. **Walk-away P&L canonical source is `walker.compute_walk_away_pnl()`** at `walker.py:759`. 3 former inline sites now delegate (`16cd244`). Do not re-inline.
+38. **`get_staged_dynamic_exits()` in `queries.py` returns STAGED only** — ATTESTED rows live on Telegram TRANSMIT/CANCEL surface. Do NOT query ATTESTED in Cure Console (race window risk).
+39. **JIT re-validation precedence is RULED** — 3-check fail-fast: mode → R7 override → Gate 1+drift. 5 failure codes. 3-strike applies to GATE1_FAIL/DRIFT_BLOCK only (PEACETIME). See β v0 §4.2.
+40. **`cure_dynamic_exit_panel.html` uses `money()` from `_FMT_CONTEXT`** — not a Jinja2 global. Tests must pass `_FMT_CONTEXT` when rendering standalone.
+41. **v10 doc gap logged** — R7 fail-closed semantics + `/override_earnings` not in v10 rulebook body. For v10.1 or supplementary ops doc. Do not paper over in condensed.
 
 ---
 
@@ -253,7 +279,7 @@ Always stop and report (do NOT auto-fix) on:
 
 1. Read this file end-to-end.
 2. Read `desk_state.md` at `C:\AGT_Telegram_Bridge\desk_state.md`.
-3. Read `reports/phase_3a_5c2_alpha_complete_20260407.md` for α close-out state.
+3. Read `reports/phase_3a_5c2_beta_v0.md` for β scope, resolved concerns, and impl order.
 4. Wait for Architect prompt. Do not start work autonomously.
 
 End of handoff.
