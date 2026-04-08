@@ -638,6 +638,8 @@ async def smart_friction_submit(request: Request, audit_id: str):
         # ── Read staged row ──────────────────────────────────────
         row = queries.get_staged_exit_by_audit_id(conn, audit_id)
         if not row:
+            conn.rollback()
+            logger.info("ROW_NOT_STAGED: audit_id=%s", audit_id)
             return _htmx_error(
                 '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
                 "Row not found or no longer STAGED. Refresh Cure Console."
@@ -649,6 +651,8 @@ async def smart_friction_submit(request: Request, audit_id: str):
         live_mode = _get_desk_mode(conn)
         if live_mode != row["desk_mode"]:
             conn.rollback()
+            logger.warning("MODE_CHANGED: audit_id=%s staged_mode=%s live_mode=%s",
+                           audit_id, row["desk_mode"], live_mode)
             return _htmx_error(
                 '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
                 f'Mode changed since staging: was {row["desk_mode"]}, now {live_mode}. '
@@ -687,6 +691,7 @@ async def smart_friction_submit(request: Request, audit_id: str):
             typed_value = form.get("attestation_value_typed", "")
             if typed_value != expected_value:
                 conn.rollback()
+                logger.warning("INTEGER_LOCK_FAIL: audit_id=%s ticker=%s", audit_id, row["ticker"])
                 return _htmx_error(
                     '<div class="bg-amber-900/40 border border-amber-700 text-amber-200 p-4 rounded-lg">'
                     "INTEGER_LOCK_FAIL: typed value does not match expected. "
@@ -708,6 +713,8 @@ async def smart_friction_submit(request: Request, audit_id: str):
 
             if ack_loss != "on" or ack_cure != "on":
                 conn.rollback()
+                missing = [k for k, v in [("ack_loss", ack_loss), ("ack_cure", ack_cure)] if v != "on"]
+                logger.info("ACK_MISSING: audit_id=%s missing=%s", audit_id, ",".join(missing))
                 return _htmx_error(
                     '<div class="bg-amber-900/40 border border-amber-700 text-amber-200 p-4 rounded-lg">'
                     "Both acknowledgment checkboxes are required."
@@ -717,6 +724,7 @@ async def smart_friction_submit(request: Request, audit_id: str):
 
             if len(operator_thesis) < 30:
                 conn.rollback()
+                logger.info("THESIS_TOO_SHORT: audit_id=%s length=%d", audit_id, len(operator_thesis))
                 return _htmx_error(
                     '<div class="bg-amber-900/40 border border-amber-700 text-amber-200 p-4 rounded-lg">'
                     "Strategic rationale must be at least 30 characters."
@@ -744,6 +752,7 @@ async def smart_friction_submit(request: Request, audit_id: str):
         )
         if rowcount == 0:
             conn.rollback()
+            logger.warning("STALE_ROW: audit_id=%s", audit_id)
             return _htmx_error(
                 '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
                 "STALE_ROW: row changed between read and write. Refresh Cure Console."
