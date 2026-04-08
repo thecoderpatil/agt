@@ -1130,5 +1130,53 @@ class TestDeckBadgeSeverityColor(unittest.TestCase):
         self.assertEqual(self._badge_color(None, None), "text-slate-500")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Followup #4 regression: .amount → .net_cash on special dividend
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSpecialDividendBasisAdjustment(unittest.TestCase):
+    """Regression for commit 85b24a6 follow-up: walker.py:544 referenced
+    ev.amount which doesn't exist on TradeEvent. Must use ev.net_cash.
+    A special dividend should reduce per-share cost basis."""
+
+    def test_special_dividend_reduces_basis(self):
+        """100 shares at $50 basis, $2/share special dividend → basis drops to $48/share."""
+        events = [
+            # Step 1: CSP open
+            _make_event(ticker='SDTEST', date_time='20260101;100000', trade_date='20260101',
+                        buy_sell='SELL', open_close='O', right='P', strike=50.0,
+                        expiry='20260110', quantity=1, net_cash=200.0, trade_price=2.00,
+                        transaction_type='ExchTrade', asset_category='OPT'),
+            # Step 2: CSP assignment → acquire 100 shares at $50
+            _make_event(ticker='SDTEST', date_time='20260110;162000', trade_date='20260110',
+                        buy_sell='BUY', open_close='C', right='P', strike=50.0,
+                        expiry='20260110', quantity=1, net_cash=0.0,
+                        transaction_type='BookTrade', notes='A', asset_category='OPT'),
+            _make_event(ticker='SDTEST', date_time='20260110;162000', trade_date='20260110',
+                        buy_sell='BUY', open_close='O', strike=50.0,
+                        quantity=100, net_cash=-5000.0, trade_price=50.0,
+                        transaction_type='BookTrade', notes='A', asset_category='STK'),
+            # Step 3: Special dividend of $200 total ($2/share × 100 shares)
+            _make_event(ticker='SDTEST', source='FLEX_CORP_ACTION',
+                        date_time='20260201;090000', trade_date='20260201',
+                        buy_sell='BUY', open_close='O',
+                        quantity=0, net_cash=200.0, trade_price=0.0,
+                        transaction_type='CorpAction', notes='SD',
+                        asset_category='STK', right=None, strike=None, expiry=None,
+                        raw={'type': 'SD'}),
+        ]
+        cycles = walk_cycles(events)
+        self.assertEqual(len(cycles), 1)
+        cycle = cycles[0]
+        self.assertEqual(cycle.shares_held, 100)
+        # Paper basis: assignment at $50 minus CSP premium $2 = $48/share.
+        # After $2/share SD return of capital: $48 - $2 = $46/share.
+        for acct, (cost, shares) in cycle._paper_basis_by_account.items():
+            if shares > 0:
+                per_share_basis = cost / shares
+                self.assertAlmostEqual(per_share_basis, 46.0, places=2,
+                                       msg="Special dividend should reduce basis by $2/share (CSP premium already factored)")
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -541,8 +541,8 @@ def _apply_event(cycle: Cycle, ev: TradeEvent, et: EventType) -> None:
                 pass
             elif ca_type == 'SD':
                 # Special dividend (return of capital) — reduce basis
-                if ev.amount and cycle.shares_held > 0:
-                    per_share = abs(float(ev.amount)) / cycle.shares_held
+                if ev.net_cash is not None and cycle.shares_held > 0:
+                    per_share = abs(float(ev.net_cash)) / cycle.shares_held
                     for acct, (cost, shares) in list(cycle._paper_basis_by_account.items()):
                         if shares > 0:
                             cycle._paper_basis_by_account[acct] = (cost - per_share * shares, shares)

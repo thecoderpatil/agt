@@ -439,14 +439,14 @@ def evaluate_rule_4(ps: PortfolioState, household: str) -> list[RuleEvaluation]:
     Excludes Rule 10 instruments (SPX boxes, legacy picks SLS/GTLB).
     """
     # Collect tickers with shares in this household, excluding Rule 10
-    tickers = set()
+    ticker_set = set()
     for c in ps.active_cycles:
         if (c.status == 'ACTIVE' and c.shares_held > 0
                 and c.household_id == household
                 and c.ticker not in CORRELATION_EXCLUDED_TICKERS):
-            tickers.add(c.ticker)
+            ticker_set.add(c.ticker)
 
-    tickers = sorted(tickers)
+    tickers = sorted(ticker_set)
     if len(tickers) <= 1:
         return [RuleEvaluation(
             rule_id="rule_4", rule_name="Pairwise Correlation",
@@ -1156,12 +1156,17 @@ def sweep_stale_dynamic_exit_stages(
 
         for row in stale_rows:
             audit_id = row[0] if isinstance(row, tuple) else row["audit_id"]
-            conn.execute(
+            result = conn.execute(
                 "UPDATE bucket3_dynamic_exit_log "
                 "SET final_status = 'ABANDONED', last_updated = datetime('now') "
-                "WHERE audit_id = ?",
+                "WHERE audit_id = ? AND final_status = 'STAGED'",
                 (audit_id,),
             )
+            if result.rowcount == 0:
+                logger.info(
+                    "SWEEP1_RACE_LOST: audit_id=%s no longer STAGED at update time",
+                    audit_id,
+                )
 
         # Sweep 2: stale ATTESTED rows (R7 — 10min TTL)
         attested_cursor = conn.execute(

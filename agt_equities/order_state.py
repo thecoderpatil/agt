@@ -87,6 +87,14 @@ def append_status(
     except ValueError:
         pass  # allow legacy status strings
 
+    # CLEANUP-6: acquire RESERVED lock before SELECT to prevent TOCTOU races
+    # when concurrent thread-pool workers read-modify-write status_history.
+    # Safe to call inside existing transaction (silently ignored).
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except Exception:
+        pass  # Already inside a transaction — lock already held
+
     row = conn.execute(
         "SELECT status, status_history FROM pending_orders WHERE id = ?",
         (order_id,),

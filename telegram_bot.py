@@ -28,7 +28,8 @@ import time
 from collections import defaultdict
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
-from datetime import date as _date, datetime as _datetime, time as _time, timedelta as _timedelta
+from datetime import date as _date, datetime as _datetime, time as _time, timedelta as _timedelta, timezone as _timezone
+from zoneinfo import ZoneInfo as _ZoneInfo
 from pathlib import Path
 
 import nest_asyncio
@@ -159,6 +160,70 @@ except FileNotFoundError:
                    _RULEBOOK_PATH)
 except Exception as _rb_exc:
     logger.warning("Failed to load Rulebook: %s", _rb_exc)
+
+# ---------------------------------------------------------------------------
+# Timezone-aware override expiry helpers (CLEANUP-5)
+# ---------------------------------------------------------------------------
+
+# Legacy override rows were written with naive _datetime.now() which uses
+# the deployment machine's local timezone (US/Eastern). New rows use UTC.
+_LEGACY_OVERRIDE_TZ = _ZoneInfo("America/New_York")
+
+
+def _parse_override_expiry(raw: str) -> _datetime:
+    """Parse an override expiry. Handles legacy naive (assume ET) and
+    new UTC-aware ISO formats. Returns a UTC-aware datetime."""
+    dt = _datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_LEGACY_OVERRIDE_TZ)
+    return dt.astimezone(_timezone.utc)
+
+
+def _new_override_expiry(*, days: int = 0, hours: int = 0) -> str:
+    """Generate a new override expiry as UTC-aware ISO string."""
+    return (_datetime.now(_timezone.utc) + _timedelta(days=days, hours=hours)).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Followup #17: IBKR timestamp normalization (Issue #287 workaround)
+# ---------------------------------------------------------------------------
+
+# MUST match IBKR Gateway timezone setting (verified in PF2).
+# Gateway defaults to OS locale. Deployment machine = US/Eastern.
+_TWS_TZ = _ZoneInfo("America/New_York")
+
+
+def _normalize_ibkr_time(naive_dt):
+    """Workaround for ib_async Issue #287: parseIBDatetime returns naive
+    datetime for timezone-less IBKR strings. Treats naive datetimes as
+    TWS-configured timezone, returns UTC-aware.
+
+    Without this, calling .astimezone(timezone.utc) on a naive datetime
+    in Python uses OS-local timezone, NOT TWS configured timezone,
+    silently corrupting fill timestamps by the OS-vs-TWS delta.
+
+    Verified: IBDefaults.timezone has "no impact on orders or data
+    processing" so it does NOT solve this bug.
+    """
+    if naive_dt is None:
+        return None
+    if naive_dt.tzinfo is not None:
+        return naive_dt.astimezone(_timezone.utc)
+    return naive_dt.replace(tzinfo=_TWS_TZ).astimezone(_timezone.utc)
+
+
+def _parse_sqlite_utc(ts: str) -> _datetime:
+    """Parse SQLite CURRENT_TIMESTAMP variants into UTC-aware datetime.
+
+    Handles:
+      "2026-04-08 13:27:22"       (standard SQLite)
+      "2026-04-08 13:27:22.258"   (fractional seconds)
+      "2026-04-08T13:27:22Z"      (legacy ISO with Z)
+    """
+    s = ts.replace(" ", "T").rstrip("Z")
+    dt = _datetime.fromisoformat(s)
+    return dt.replace(tzinfo=_timezone.utc) if dt.tzinfo is None else dt.astimezone(_timezone.utc)
+
 
 # ---------------------------------------------------------------------------
 # SQLite bridge helpers
@@ -1059,8 +1124,18 @@ async def _auto_reconnect():
     await asyncio.sleep(60)
     for attempt in range(1, 6):
         try:
-            await ensure_ib_connected()
+            ib_conn = await ensure_ib_connected()
             logger.info("Auto-reconnected (attempt %d)", attempt)
+            # Followup #17 Part C.5: orphan scan on autoreconnect
+            try:
+                await ib_conn.reqAllOpenOrdersAsync()
+                from ib_async.objects import ExecutionFilter
+                await ib_conn.reqExecutionsAsync(ExecutionFilter())
+                from telegram import Bot
+                bot = Bot(token=TELEGRAM_BOT_TOKEN)
+                await _scan_orphaned_transmitting_rows(ib_conn, bot)
+            except Exception as scan_exc:
+                logger.exception("Autoreconnect orphan scan failed: %s", scan_exc)
             try:
                 from telegram import Bot
                 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -1891,6 +1966,26 @@ def _r5_on_order_status(trade):
                     (client_id, perm_id, status,
                      f"filled={trade.orderStatus.filled} remaining={remaining}"),
                 )
+                # Followup #17: fallback to bucket3_dynamic_exit_log by orderRef
+                # Column ownership (D4): write ib_perm_id ONLY. Never final_status.
+                order_ref = getattr(order, "orderRef", "") or ""
+                if order_ref and perm_id:
+                    dex_row = conn.execute(
+                        "SELECT audit_id FROM bucket3_dynamic_exit_log "
+                        "WHERE audit_id = ? AND final_status IN ('TRANSMITTING', 'TRANSMITTED')",
+                        (order_ref,),
+                    ).fetchone()
+                    if dex_row:
+                        with conn:
+                            conn.execute(
+                                "UPDATE bucket3_dynamic_exit_log "
+                                "SET ib_perm_id = ? WHERE audit_id = ? AND ib_perm_id IS NULL",
+                                (perm_id, order_ref),
+                            )
+                        logger.info(
+                            "R5_FALLBACK_DEX action=order_status audit_id=%s ib_perm_id=%s",
+                            order_ref[:8], perm_id,
+                        )
                 return
 
             append_status(
@@ -1941,6 +2036,37 @@ def _r5_on_exec_details(trade, fill):
                         (client_id, perm_id, str(new_status),
                          f"exec_id={exec_id_str} price={fill_price} qty={fill_qty}"),
                     )
+                    # Followup #17: fallback to bucket3_dynamic_exit_log by orderRef
+                    # Column ownership (D4): write fill_price, fill_qty, fill_ts ONLY.
+                    order_ref = getattr(order, "orderRef", "") or ""
+                    if order_ref and exec_id_str:
+                        dex_row = conn.execute(
+                            "SELECT audit_id FROM bucket3_dynamic_exit_log "
+                            "WHERE audit_id = ? "
+                            "  AND final_status IN ('TRANSMITTING', 'TRANSMITTED')",
+                            (order_ref,),
+                        ).fetchone()
+                        if dex_row:
+                            exec_obj = getattr(fill, 'execution', None)
+                            normalized_time = _normalize_ibkr_time(
+                                getattr(exec_obj, 'time', None) if exec_obj else None
+                            )
+                            fill_ts_epoch = (
+                                normalized_time.timestamp()
+                                if normalized_time else time.time()
+                            )
+                            conn.execute(
+                                "UPDATE bucket3_dynamic_exit_log "
+                                "SET fill_price = ?, fill_qty = ?, fill_ts = ? "
+                                "WHERE audit_id = ? AND fill_price IS NULL",
+                                (float(fill_price), int(float(fill_qty)),
+                                 fill_ts_epoch, order_ref),
+                            )
+                            logger.info(
+                                "R5_FALLBACK_DEX action=exec_details audit_id=%s "
+                                "price=%.4f qty=%s",
+                                order_ref[:8], float(fill_price), fill_qty,
+                            )
                     return
 
                 order_id = row[0]
@@ -1983,7 +2109,31 @@ def _r5_on_commission_report(trade, fill, report):
                 ).fetchone()
 
             if row is None:
-                return  # orphan commission — less critical than order/fill
+                # Followup #17: fallback to bucket3_dynamic_exit_log by orderRef
+                # Column ownership (D4): write commission ONLY. Never final_status.
+                order_ref = getattr(order, "orderRef", "") or ""
+                if order_ref and commission:
+                    dex_row = conn.execute(
+                        "SELECT audit_id FROM bucket3_dynamic_exit_log "
+                        "WHERE audit_id = ? "
+                        "  AND commission IS NULL "
+                        "  AND final_status IN ('TRANSMITTING', 'TRANSMITTED')",
+                        (order_ref,),
+                    ).fetchone()
+                    if dex_row:
+                        with conn:
+                            conn.execute(
+                                "UPDATE bucket3_dynamic_exit_log "
+                                "SET commission = ? "
+                                "WHERE audit_id = ? AND commission IS NULL",
+                                (float(commission), order_ref),
+                            )
+                        logger.info(
+                            "R5_FALLBACK_DEX action=commission audit_id=%s "
+                            "commission=%.2f",
+                            order_ref[:8], float(commission),
+                        )
+                return
 
             conn.execute(
                 "UPDATE pending_orders SET fill_commission = ? WHERE id = ?",
@@ -2290,6 +2440,7 @@ def _on_shares_sold(trade, fill):
 
         with closing(_get_db_connection()) as conn:
             with conn:
+                conn.execute("BEGIN IMMEDIATE")  # CLEANUP-6: acquire RESERVED lock before SELECT
                 # Atomic dedup inside transaction
                 dup = conn.execute(
                     "SELECT 1 FROM fill_log WHERE exec_id = ?", (exec_id,)
@@ -2385,6 +2536,7 @@ def _on_shares_bought(trade, fill):
 
         with closing(_get_db_connection()) as conn:
             with conn:
+                conn.execute("BEGIN IMMEDIATE")  # CLEANUP-6: acquire RESERVED lock before SELECT
                 # Atomic dedup inside transaction
                 dup = conn.execute(
                     "SELECT 1 FROM fill_log WHERE exec_id = ?", (exec_id,)
@@ -6457,6 +6609,24 @@ async def handle_dex_callback(
     ticker = row["ticker"]
     is_wartime = row["desk_mode"] == "WARTIME"
 
+    # Followup #17: stale-attestation guard (fires BEFORE Step 6 CAS lock)
+    try:
+        attested_age = _datetime.now(_timezone.utc) - _parse_sqlite_utc(row["last_updated"])
+        if attested_age > _timedelta(minutes=10):
+            _dispatched_audits.discard(audit_id)
+            try:
+                await query.edit_message_text(
+                    f"\u274c STALE_ATTESTATION: {ticker} attestation expired "
+                    f"({attested_age.total_seconds()/60:.0f}m old). "
+                    f"Re-stage from Cure Console."
+                )
+            except Exception:
+                pass
+            return
+    except Exception as age_exc:
+        logger.warning("Stale-attestation guard parse error: %s", age_exc)
+        # Fail-open: proceed with TRANSMIT if parse fails
+
     # Step 1: 3-strike row-level check (WARTIME bypasses per ADR-004 §4)
     if not is_wartime and row["re_validation_count"] >= 3:
         # Transition to DRIFT_BLOCKED terminal
@@ -6638,6 +6808,7 @@ async def handle_dex_callback(
         hh_accounts = HOUSEHOLD_MAP.get(row["household"], [])
         account_id = hh_accounts[0] if hh_accounts else ""
         order = _build_adaptive_sell_order(qty, row['limit_price'], account_id)
+        order.orderRef = audit_id  # Followup #17: cryptographic 1:1 link for orphan recovery
 
         trade = ib_conn.placeOrder(contract, order)
         ib_order_id = trade.order.orderId if trade else 0
@@ -6669,16 +6840,51 @@ async def handle_dex_callback(
             pass
         return
 
-    # Step 8: TRANSMITTING → TRANSMITTED
-    with closing(_get_db_connection()) as conn:
-        with conn:
-            conn.execute(
-                "UPDATE bucket3_dynamic_exit_log "
-                "SET final_status = 'TRANSMITTED', transmitted = 1, "
-                "    transmitted_ts = ?, last_updated = CURRENT_TIMESTAMP "
-                "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
-                (now_ts, audit_id),
+    # Step 8: TRANSMITTING → TRANSMITTED (Followup #17: recovery wrapper per D7)
+    try:
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                result = conn.execute(
+                    "UPDATE bucket3_dynamic_exit_log "
+                    "SET final_status = 'TRANSMITTED', transmitted = 1, "
+                    "    transmitted_ts = ?, ib_order_id = ?, "
+                    "    last_updated = CURRENT_TIMESTAMP "
+                    "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+                    (now_ts, ib_order_id, audit_id),
+                )
+                if result.rowcount == 0:
+                    raise RuntimeError(
+                        f"TRANSMIT_STEP8_CAS_LOST audit_id={audit_id}"
+                    )
+    except Exception as exc:
+        logger.exception(
+            "TRANSMIT_STEP8_FAILED: audit_id=%s ib_order_id=%s",
+            audit_id, ib_order_id,
+        )
+        _dispatched_audits.discard(audit_id)
+        try:
+            await context.bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=(
+                    "\U0001f6a8 TRANSMIT RECOVERY REQUIRED\n"
+                    f"{ticker} {audit_id[:8]}... may be live at IBKR, "
+                    f"but local TRANSMITTED write failed.\n"
+                    f"ib_order_id={ib_order_id}\n"
+                    f"error={exc}\n"
+                    "Verify in TWS and use /recover_transmitting."
+                ),
             )
+        except Exception:
+            pass
+        try:
+            await query.edit_message_text(
+                f"\u26a0\ufe0f TRANSMIT RECOVERY REQUIRED: {ticker} may be live at "
+                f"IBKR (ib_order_id={ib_order_id}) but local DB "
+                f"write failed. Check /recover_transmitting."
+            )
+        except Exception:
+            pass
+        return
 
     _dispatched_audits.discard(audit_id)
     logger.info(
@@ -7709,8 +7915,8 @@ def _get_effective_conviction(ticker: str) -> dict:
             if override:
                 # Check expiry
                 try:
-                    expires = _datetime.fromisoformat(override["expires_at"])
-                    if _datetime.now() > expires:
+                    expires = _parse_override_expiry(override["expires_at"])
+                    if _datetime.now(_timezone.utc) > expires:
                         # Expire the override
                         conn.execute(
                             "UPDATE conviction_overrides SET active = 0 WHERE ticker = ? AND active = 1",
@@ -8259,9 +8465,7 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         original_tier = computed["tier"]
 
         # Set expiry
-        expires_at = (
-            _datetime.now() + _timedelta(days=CONVICTION_OVERRIDE_EXPIRY_DAYS)
-        ).isoformat()
+        expires_at = _new_override_expiry(days=CONVICTION_OVERRIDE_EXPIRY_DAYS)
 
         # Deactivate any existing override
         with closing(_get_db_connection()) as conn:
@@ -8358,9 +8562,7 @@ async def cmd_override_earnings(update: Update, context: ContextTypes.DEFAULT_TY
         # Reason (optional free text)
         reason = " ".join(context.args[reason_args_start:]).strip() or None
 
-        expires_at = (
-            _datetime.now() + _timedelta(hours=ttl_hours)
-        ).isoformat()
+        expires_at = _new_override_expiry(hours=ttl_hours)
 
         try:
             with closing(_get_db_connection()) as conn:
@@ -10645,12 +10847,288 @@ async def _scheduled_universe_refresh(context: ContextTypes.DEFAULT_TYPE) -> Non
 # Entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Followup #17: /recover_transmitting operator command (D6, D9, D11)
+# ---------------------------------------------------------------------------
+
+
+async def cmd_recover_transmitting(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Manual recovery for rows stuck in TRANSMITTING state.
+
+    Usage:
+      /recover_transmitting <audit_id> filled [ib_order_id]
+      /recover_transmitting <audit_id> abandoned
+
+    Trusts operator unconditionally (D6). Operator-provided ib_order_id
+    overwrites any existing value.
+    """
+    if not is_authorized(update):
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage:\n"
+            "  /recover_transmitting <audit_id> filled [ib_order_id]\n"
+            "  /recover_transmitting <audit_id> abandoned"
+        )
+        return
+
+    audit_id = args[0]
+    action = args[1].lower()
+    ib_order_id_arg = None
+    if len(args) > 2:
+        try:
+            ib_order_id_arg = int(args[2])
+        except ValueError:
+            await update.message.reply_text("ib_order_id must be an integer.")
+            return
+
+    if action not in ("filled", "abandoned"):
+        await update.message.reply_text("Action must be 'filled' or 'abandoned'.")
+        return
+
+    new_status = "TRANSMITTED" if action == "filled" else "ABANDONED"
+    operator_id = update.effective_user.id
+
+    try:
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")  # D11: lock before SELECT
+
+                row = conn.execute(
+                    "SELECT final_status FROM bucket3_dynamic_exit_log "
+                    "WHERE audit_id = ?",
+                    (audit_id,),
+                ).fetchone()
+
+                if row is None:
+                    # Must reply AFTER conn closes (cross-await rule)
+                    pass
+                elif row["final_status"] != "TRANSMITTING":
+                    pass
+                else:
+                    pre_status = row["final_status"]
+
+                    # Status flip with CAS guard
+                    if action == "filled":
+                        result = conn.execute(
+                            "UPDATE bucket3_dynamic_exit_log "
+                            "SET final_status = ?, ib_order_id = ?, "
+                            "    last_updated = CURRENT_TIMESTAMP "
+                            "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+                            (new_status, ib_order_id_arg, audit_id),
+                        )
+                    else:
+                        result = conn.execute(
+                            "UPDATE bucket3_dynamic_exit_log "
+                            "SET final_status = ?, "
+                            "    last_updated = CURRENT_TIMESTAMP "
+                            "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+                            (new_status, audit_id),
+                        )
+
+                    if result.rowcount != 1:
+                        raise RuntimeError(
+                            f"recover_transmitting CAS failed: audit_id={audit_id}"
+                        )
+
+                    # Audit log INSERT (same transaction — rolls back together)
+                    conn.execute(
+                        "INSERT INTO recovery_audit_log "
+                        "(audit_id, operator_user_id, recovery_action, "
+                        " pre_status, post_status, ib_order_id_provided) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (audit_id, operator_id, action, pre_status,
+                         new_status, ib_order_id_arg),
+                    )
+
+        # Replies after conn is closed (cross-await safe)
+        if row is None:
+            await update.message.reply_text(f"audit_id {audit_id[:12]}... not found.")
+            return
+        if row["final_status"] != "TRANSMITTING":
+            await update.message.reply_text(
+                f"Row not in TRANSMITTING (current: {row['final_status']}). "
+                f"No action taken."
+            )
+            return
+
+        _dispatched_audits.discard(audit_id)
+        await update.message.reply_text(
+            f"\u2705 Recovery applied: {audit_id[:8]}... \u2192 {new_status}"
+            + (f"\nib_order_id: {ib_order_id_arg}" if ib_order_id_arg else "")
+        )
+        logger.info(
+            "RECOVERY: audit_id=%s %s->%s by user %s",
+            audit_id, "TRANSMITTING", new_status, operator_id,
+        )
+    except Exception as exc:
+        logger.exception("cmd_recover_transmitting failed: %s", exc)
+        try:
+            await update.message.reply_text(f"Recovery failed: {exc}")
+        except Exception:
+            pass
+
+
+# Followup #17: orphan scan state sets for resolution policy (D3)
+_OPEN_FILLED_STATES = frozenset({"Filled"})
+_OPEN_DEAD_STATES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
+_OPEN_LIVE_STATES = frozenset({
+    "Submitted", "PreSubmitted", "PendingSubmit", "PendingCancel"
+})
+
+
+async def _scan_orphaned_transmitting_rows(ib_conn, app_bot):
+    """Resolve orphaned TRANSMITTING rows after restart.
+
+    BINDING: Gateway = since-midnight only for executions().
+    Cross-midnight orphans CANNOT be auto-resolved on Gateway.
+    Manual recovery via /recover_transmitting is the only path.
+
+    Column ownership (D4): writes ONLY final_status + last_updated.
+    R5 handlers write fill columns separately.
+    """
+    with closing(_get_db_connection()) as conn:
+        orphans = conn.execute(
+            "SELECT audit_id, ticker, household, action_type, strike, expiry, "
+            "       contracts, shares, limit_price "
+            "FROM bucket3_dynamic_exit_log WHERE final_status = 'TRANSMITTING'"
+        ).fetchall()
+
+    if not orphans:
+        logger.info("orphan_scan: no TRANSMITTING rows — clean startup")
+        return
+
+    logger.warning("orphan_scan: found %d TRANSMITTING row(s)", len(orphans))
+
+    # Use cached openTrades + executions (populated by reqAllOpenOrdersAsync
+    # and reqExecutionsAsync called in post_init before this function)
+    open_trades = ib_conn.openTrades()
+    exec_list = ib_conn.executions()
+
+    auto_resolved = []
+    needs_manual = []
+
+    for orphan in orphans:
+        audit_id = orphan["audit_id"]
+        ticker = orphan["ticker"]
+
+        open_match = next(
+            (t for t in open_trades if t.order.orderRef == audit_id), None
+        )
+        exec_match = next(
+            (e for e in exec_list if e.orderRef == audit_id), None
+        )
+
+        if open_match:
+            status = open_match.orderStatus.status
+            if status in _OPEN_FILLED_STATES:
+                with closing(_get_db_connection()) as conn:
+                    with conn:
+                        r = conn.execute(
+                            "UPDATE bucket3_dynamic_exit_log "
+                            "SET final_status = 'TRANSMITTED', "
+                            "    last_updated = CURRENT_TIMESTAMP "
+                            "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+                            (audit_id,),
+                        )
+                        if r.rowcount > 0:
+                            auto_resolved.append((audit_id, ticker, "filled-via-openTrades"))
+                            logger.info("orphan_scan: %s -> TRANSMITTED (filled)", audit_id)
+            elif status in _OPEN_DEAD_STATES:
+                with closing(_get_db_connection()) as conn:
+                    with conn:
+                        r = conn.execute(
+                            "UPDATE bucket3_dynamic_exit_log "
+                            "SET final_status = 'ABANDONED', "
+                            "    last_updated = CURRENT_TIMESTAMP "
+                            "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+                            (audit_id,),
+                        )
+                        if r.rowcount > 0:
+                            auto_resolved.append((audit_id, ticker, f"dead-at-ibkr ({status})"))
+                            logger.info("orphan_scan: %s -> ABANDONED (%s)", audit_id, status)
+            elif status in _OPEN_LIVE_STATES:
+                filled = getattr(open_match.orderStatus, 'filled', 0)
+                remaining = getattr(open_match.orderStatus, 'remaining', 0)
+                if filled and remaining:
+                    needs_manual.append((audit_id, ticker,
+                                        f"partial-fill (filled={filled}, remaining={remaining})"))
+                else:
+                    needs_manual.append((audit_id, ticker, f"live-unfilled ({status})"))
+                logger.warning("orphan_scan: %s live at IBKR (%s)", audit_id, status)
+            else:
+                needs_manual.append((audit_id, ticker, f"unknown-status ({status})"))
+        elif exec_match:
+            with closing(_get_db_connection()) as conn:
+                with conn:
+                    r = conn.execute(
+                        "UPDATE bucket3_dynamic_exit_log "
+                        "SET final_status = 'TRANSMITTED', "
+                        "    last_updated = CURRENT_TIMESTAMP "
+                        "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+                        (audit_id,),
+                    )
+                    if r.rowcount > 0:
+                        auto_resolved.append((audit_id, ticker, "filled-via-executions"))
+                        logger.info("orphan_scan: %s -> TRANSMITTED (executions)", audit_id)
+        else:
+            # NOT FOUND — DO NOT AUTO-ABANDON. EVER. (D5 binding)
+            needs_manual.append((audit_id, ticker, "not-found-at-ib"))
+            logger.warning(
+                "orphan_scan: %s NOT FOUND at IBKR — manual /recover_transmitting required",
+                audit_id,
+            )
+
+    # Single consolidated alert
+    if auto_resolved or needs_manual:
+        lines = ["\U0001f50d Startup orphan scan complete\n"]
+        if auto_resolved:
+            lines.append(f"Auto-resolved: {len(auto_resolved)}")
+            for aid, tk, reason in auto_resolved:
+                lines.append(f"  {tk} {aid[:8]}... \u2192 {reason}")
+        if needs_manual:
+            lines.append(f"\nNEEDS OPERATOR REVIEW: {len(needs_manual)}")
+            for aid, tk, reason in needs_manual:
+                lines.append(f"  {tk} {aid[:8]}... ({reason})")
+            lines.append("\nUse: /recover_transmitting <audit_id> filled|abandoned")
+            lines.append(
+                "\nCross-midnight Gateway limitation: orders from prior days "
+                "require manual verification."
+            )
+        try:
+            await app_bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text="\n".join(lines),
+            )
+        except Exception as tg_exc:
+            logger.error("orphan_scan: Telegram alert failed: %s", tg_exc)
+
+
 async def post_init(app) -> None:
     try:
-        await ensure_ib_connected()
+        ib_conn = await ensure_ib_connected()
     except Exception as exc:
         logger.error("Could not connect on startup: %s", exc)
         logger.error("Use /reconnect once Gateway/TWS is ready.")
+        return
+
+    # Followup #17: populate open order + execution caches for orphan scan
+    try:
+        await ib_conn.reqAllOpenOrdersAsync()
+        from ib_async.objects import ExecutionFilter
+        await ib_conn.reqExecutionsAsync(ExecutionFilter())
+    except Exception as exc:
+        logger.warning("post_init: reqAllOpenOrders/reqExecutions failed: %s", exc)
+
+    # Followup #17: scan for orphaned TRANSMITTING rows
+    try:
+        await _scan_orphaned_transmitting_rows(ib_conn, app.bot)
+    except Exception as exc:
+        logger.error("Orphan scan failed: %s — bot continues without scan", exc)
 # ---------------------------------------------------------------------------
 # Beta Impl 3: ATTESTED row poller (R6 — 10s interval, idempotent delivery)
 # ---------------------------------------------------------------------------
@@ -10803,6 +11281,7 @@ def main() -> None:
     app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("cure", cmd_cure))
     app.add_handler(CommandHandler("clear_quarantine", cmd_clear_quarantine))
+    app.add_handler(CommandHandler("recover_transmitting", cmd_recover_transmitting))
     app.add_handler(CallbackQueryHandler(handle_cc_ladder_callback, pattern=r"^cc:"))
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve:"))

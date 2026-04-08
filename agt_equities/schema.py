@@ -624,6 +624,33 @@ def register_master_log_tables(conn) -> None:
     except Exception:
         pass  # Column already exists
 
+    # Followup #17: columns for orderRef linking, fill tracking, operator recovery
+    for _f17_stmt in [
+        "ALTER TABLE bucket3_dynamic_exit_log ADD COLUMN ib_order_id INTEGER",
+        "ALTER TABLE bucket3_dynamic_exit_log ADD COLUMN ib_perm_id INTEGER",
+        "ALTER TABLE bucket3_dynamic_exit_log ADD COLUMN fill_qty INTEGER",
+        "ALTER TABLE bucket3_dynamic_exit_log ADD COLUMN commission REAL",
+    ]:
+        try:
+            conn.execute(_f17_stmt)
+        except Exception:
+            pass  # Column already exists
+
+    # Followup #17: operator recovery audit trail (append-only)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recovery_audit_log (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            audit_id            TEXT NOT NULL,
+            operator_user_id    INTEGER NOT NULL,
+            recovery_action     TEXT NOT NULL CHECK (recovery_action IN ('filled', 'abandoned')),
+            pre_status          TEXT NOT NULL,
+            post_status         TEXT NOT NULL,
+            ib_order_id_provided INTEGER,
+            operator_note       TEXT,
+            recovery_ts         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Phase 3A.5b: Red Alert state (R9 hysteresis)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS red_alert_state (
