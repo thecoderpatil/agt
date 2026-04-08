@@ -574,6 +574,41 @@ async def cure_console_partial(request: Request):
         conn.close()
 
 
+@app.get("/api/cure/empty", response_class=HTMLResponse)
+async def cure_empty(request: Request):
+    """Return empty HTML — used by modal close button to clear #modal-root."""
+    return HTMLResponse("")
+
+
+@app.get("/api/cure/dynamic_exit/{audit_id}/attest", response_class=HTMLResponse)
+async def smart_friction_modal(request: Request, audit_id: str):
+    """Render the Smart Friction attestation modal for a STAGED dynamic exit row."""
+    token = request.query_params.get("t", "")
+    conn = get_ro_conn()
+    try:
+        row = queries.get_staged_exit_by_audit_id(conn, audit_id)
+    except Exception as e:
+        logger.warning("smart_friction_modal: query failed for %s: %s", audit_id, e)
+        row = None
+    finally:
+        conn.close()
+
+    if not row:
+        return HTMLResponse(
+            '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+            "Staging row not found or no longer STAGED. Refresh Cure Console."
+            "</div>",
+            status_code=404,
+        )
+
+    loss_whole = round(row.get("gate1_realized_loss") or 0)
+    return _render("cure_smart_friction.html", {
+        "row": row,
+        "loss_whole": loss_whole,
+        "token": token,
+    })
+
+
 # ── Entry point ───────────────────────────────────────────────────
 
 def main():

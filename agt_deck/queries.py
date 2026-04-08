@@ -233,3 +233,22 @@ def get_staged_dynamic_exits(conn: sqlite3.Connection) -> list[dict]:
         })
 
     return list(grouped.values())
+
+
+def get_staged_exit_by_audit_id(conn: sqlite3.Connection, audit_id: str) -> dict | None:
+    """Fetch a single STAGED row by audit_id for Smart Friction modal render.
+
+    Returns dict with all columns, or None if not found / not STAGED.
+    """
+    try:
+        row = conn.execute(
+            "SELECT * FROM bucket3_dynamic_exit_log "
+            "WHERE audit_id = ? AND final_status = 'STAGED'",
+            (audit_id,),
+        ).fetchone()
+    except Exception as exc:
+        logger.warning("get_staged_exit_by_audit_id(%s) failed: %s", audit_id, exc)
+        return None
+    if row is None:
+        return None
+    return dict(row)

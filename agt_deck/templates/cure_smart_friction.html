@@ -1,0 +1,103 @@
+{# Smart Friction modal — PEACETIME checkbox flow + WARTIME Integer Lock branch #}
+{# Rendered into #modal-root via hx-get. POST handler ships in β Impl 2b. #}
+<div class="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"
+     onclick="if(event.target===this) htmx.ajax('GET','/api/cure/empty?t={{ token }}',{target:'#modal-root',swap:'innerHTML'})">
+  <div class="bg-slate-900 border border-slate-700 rounded-lg max-w-2xl w-full p-6 max-h-[90vh] overflow-y-auto"
+       onclick="event.stopPropagation()">
+
+    {# ── Header ──────────────────────────────────────────────────── #}
+    <div class="flex items-center justify-between mb-4 pb-3 border-b border-slate-800">
+      <div>
+        <h3 class="text-lg font-semibold text-slate-100">
+          {% if row.desk_mode == 'WARTIME' %}WARTIME RULE 8 STAGING{% else %}Rule 8 Dynamic Exit Attestation{% endif %}
+        </h3>
+        <div class="text-xs text-slate-500 mt-1">{{ row.ticker }} · {{ row.household }} · {{ row.desk_mode }}</div>
+      </div>
+      <button type="button" class="text-slate-500 hover:text-slate-300 text-lg leading-none"
+              hx-get="/api/cure/empty?t={{ token }}" hx-target="#modal-root" hx-swap="innerHTML">&#x2715;</button>
+    </div>
+
+    {# ── Frozen gate math display ────────────────────────────────── #}
+    <div class="bg-slate-950 rounded-lg p-3 mb-4 text-xs space-y-1">
+      <div class="flex justify-between">
+        <span class="text-slate-500">Action</span>
+        <span class="text-slate-200">Sell {{ row.contracts }}x {{ row.ticker }} {{ "%.2f"|format(row.strike) }}C {{ row.expiry }}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-500">Conviction</span>
+        <span class="text-slate-300">{{ row.gate1_conviction_tier }}{% if row.gate1_conviction_modifier is not none %} ({{ row.gate1_conviction_modifier }}){% endif %}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-500">Gate 1 ratio</span>
+        <span class="{% if row.gate1_ratio >= 1.5 %}text-emerald-400{% elif row.gate1_ratio >= 1.0 %}text-amber-400{% else %}text-rose-400{% endif %}">{{ "%.2f"|format(row.gate1_ratio) }}x</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-500">Freed margin</span>
+        <span class="text-slate-300">{{ money(row.gate1_freed_margin) }}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-500">Realized loss</span>
+        <span class="text-rose-400">-{{ money(loss_whole) }}</span>
+      </div>
+    </div>
+
+    {# ── Attestation form (POST handler is β Impl 2b) ────────────── #}
+    <form id="smart-friction-form">
+      <input type="hidden" name="audit_id" value="{{ row.audit_id }}">
+      <input type="hidden" name="render_ts" value="{{ row.render_ts }}">
+
+      {% if row.desk_mode == 'WARTIME' %}
+      {# ── WARTIME Integer Lock — no thesis, no checkboxes ────── #}
+      <div class="mb-4">
+        <label class="block text-xs text-slate-400 mb-2">
+          Type the exact integer <span class="font-mono text-amber-400">{{ loss_whole }}</span> to authorize Gate 3 bypass:
+        </label>
+        <input type="text" name="attestation_value_typed" id="integer-lock-input"
+               class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-slate-100 font-mono"
+               autocomplete="off"
+               oninput="document.getElementById('sf-stage-btn').disabled = (this.value !== '{{ loss_whole }}')">
+      </div>
+      <button type="button" id="sf-stage-btn" disabled
+              class="w-full bg-rose-700 hover:bg-rose-600 disabled:bg-slate-800 disabled:text-slate-600 text-white py-2 rounded font-semibold cursor-not-allowed disabled:cursor-not-allowed">
+        STAGE EMERGENCY EXIT
+      </button>
+      <p class="text-xs text-slate-600 mt-2 text-center">POST handler pending &beta; Impl 2b</p>
+
+      {% else %}
+      {# ── PEACETIME — checkboxes + thesis ────────────────────── #}
+      <div class="space-y-3 mb-4">
+        <label class="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
+          <input type="checkbox" name="ack_loss" id="sf-ack-loss" class="mt-0.5"
+                 onchange="sfUpdateButton()">
+          <span>I acknowledge this trade locks in a <span class="text-rose-400">-{{ money(loss_whole) }}</span> unrecoverable loss.</span>
+        </label>
+        <label class="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
+          <input type="checkbox" name="ack_cure" id="sf-ack-cure" class="mt-0.5"
+                 onchange="sfUpdateButton()">
+          <span>I confirm the cure target for {{ row.ticker }} in {{ row.household }}.</span>
+        </label>
+      </div>
+      <div class="mb-4">
+        <label class="block text-xs text-slate-400 mb-1">Strategic rationale (min 30 chars)</label>
+        <textarea name="operator_thesis" id="sf-thesis-input" rows="4"
+                  class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-xs text-slate-100"
+                  oninput="sfUpdateButton()"
+                  placeholder="{{ row.ticker }} is currently above the 20% R1 ceiling. Explain the strategic thesis..."></textarea>
+      </div>
+      <button type="button" id="sf-stage-btn" disabled
+              class="w-full bg-emerald-700 hover:bg-emerald-600 disabled:bg-slate-800 disabled:text-slate-600 text-white py-2 rounded font-semibold cursor-not-allowed disabled:cursor-not-allowed">
+        STAGE
+      </button>
+      <p class="text-xs text-slate-600 mt-2 text-center">POST handler pending &beta; Impl 2b</p>
+      <script>
+        function sfUpdateButton() {
+          var ack1 = document.getElementById('sf-ack-loss').checked;
+          var ack2 = document.getElementById('sf-ack-cure').checked;
+          var thesis = document.getElementById('sf-thesis-input').value.trim();
+          document.getElementById('sf-stage-btn').disabled = !(ack1 && ack2 && thesis.length >= 30);
+        }
+      </script>
+      {% endif %}
+    </form>
+  </div>
+</div>

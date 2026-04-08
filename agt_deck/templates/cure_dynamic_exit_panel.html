@@ -52,7 +52,11 @@
               {{ money(c.gate1_freed_margin) }}
             </td>
             <td class="py-1.5 text-right">
-              <span class="text-slate-600 italic">[modal pending β2]</span>
+              <button class="text-xs px-2 py-0.5 rounded bg-emerald-900/40 text-emerald-400 hover:bg-emerald-800/60"
+                      hx-get="/api/cure/dynamic_exit/{{ c.audit_id }}/attest?t={{ token }}"
+                      hx-target="#modal-root" hx-swap="innerHTML">
+                Begin Attestation
+              </button>
             </td>
           </tr>
           {% endfor %}
