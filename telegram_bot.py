@@ -6141,7 +6141,14 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def handle_approve_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle approve/reject button taps for staged orders."""
+    """Handle approve/reject button taps for staged orders.
+
+    ARCHITECTURE (Followup #13): read/await/write phase separation.
+    No DB connection is held across any await call. All UPDATEs use
+    a CAS guard (WHERE status='staged') to prevent lost-update races
+    from concurrent operator clicks. No asyncio.Lock needed — the
+    CAS guard survives bot restarts.
+    """
     query = update.callback_query
     if not query or not query.data:
         return
@@ -6162,43 +6169,50 @@ async def handle_approve_callback(
         action = parts[1]
 
         if action == "reject_all":
-            # Reject all staged orders
-            with _get_db_connection() as conn:
-                result = conn.execute(
-                    "UPDATE pending_orders SET status = 'rejected' WHERE status = 'staged'"
-                )
-                count = result.rowcount
+            # ── WRITE phase (no await inside) ──
+            with closing(_get_db_connection()) as conn:
+                with conn:
+                    result = conn.execute(
+                        "UPDATE pending_orders SET status = 'rejected' WHERE status = 'staged'"
+                    )
+                    count = result.rowcount
+            # ── AWAIT phase (conn released) ──
             await query.edit_message_text(
                 f"\u274c Rejected {count} staged orders."
             )
             return
 
         if action == "all":
-            with _get_db_connection() as conn:
-                # Step 1: Get IDs of currently staged orders
+            # ── READ phase: get staged IDs ──
+            with closing(_get_db_connection()) as conn:
                 staged_ids = [
                     r["id"] for r in conn.execute(
                         "SELECT id FROM pending_orders WHERE status = 'staged' ORDER BY id"
                     ).fetchall()
                 ]
 
-                if not staged_ids:
-                    await query.edit_message_text("No staged orders remaining.")
-                    return
+            # ── AWAIT phase (conn released) ──
+            if not staged_ids:
+                await query.edit_message_text("No staged orders remaining.")
+                return
 
-                # Step 2: Atomically claim ONLY those specific IDs
-                placeholders = ",".join("?" * len(staged_ids))
-                claimed = conn.execute(
-                    f"UPDATE pending_orders SET status = 'processing' "
-                    f"WHERE id IN ({placeholders}) AND status = 'staged'",
-                    staged_ids,
-                ).rowcount
+            # ── WRITE phase: CAS claim staged → processing ──
+            placeholders = ",".join("?" * len(staged_ids))
+            with closing(_get_db_connection()) as conn:
+                with conn:
+                    claimed = conn.execute(
+                        f"UPDATE pending_orders SET status = 'processing' "
+                        f"WHERE id IN ({placeholders}) AND status = 'staged'",
+                        staged_ids,
+                    ).rowcount
 
-                if claimed == 0:
-                    await query.edit_message_text("Orders already being processed.")
-                    return
+            # ── AWAIT phase (conn released) ──
+            if claimed == 0:
+                await query.edit_message_text("Orders already being processed.")
+                return
 
-                # Step 3: Read ONLY the rows we just claimed
+            # ── READ phase: fetch claimed rows ──
+            with closing(_get_db_connection()) as conn:
                 rows = conn.execute(
                     f"SELECT id, payload FROM pending_orders "
                     f"WHERE id IN ({placeholders}) AND status = 'processing' "
@@ -6207,6 +6221,7 @@ async def handle_approve_callback(
                 ).fetchall()
                 claimed_ids = [row["id"] for row in rows]
 
+            # ── AWAIT phase: place orders (no conn held) ──
             placed = 0
             failed = 0
             results_lines = ["\u2501\u2501 Orders Placed \u2501\u2501", ""]
@@ -6266,20 +6281,25 @@ async def handle_approve_callback(
         except ValueError:
             return
 
-        with _get_db_connection() as conn:
-            # Atomic claim: update status before reading
-            result = conn.execute(
-                "UPDATE pending_orders SET status = 'processing' "
-                "WHERE id = ? AND status = 'staged'",
-                (db_id,),
-            )
-            if result.rowcount == 0:
-                await query.edit_message_text(
-                    f"Order #{db_id} already processed or not found."
+        # ── WRITE phase: CAS claim single row ──
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                result = conn.execute(
+                    "UPDATE pending_orders SET status = 'processing' "
+                    "WHERE id = ? AND status = 'staged'",
+                    (db_id,),
                 )
-                return
-            claimed_ids = [db_id]
 
+        # ── AWAIT phase (conn released) ──
+        if result.rowcount == 0:
+            await query.edit_message_text(
+                f"Order #{db_id} already processed or not found."
+            )
+            return
+        claimed_ids = [db_id]
+
+        # ── READ phase: fetch claimed row ──
+        with closing(_get_db_connection()) as conn:
             row = conn.execute(
                 "SELECT id, payload FROM pending_orders WHERE id = ?",
                 (db_id,),
@@ -6292,6 +6312,7 @@ async def handle_approve_callback(
             )
             return
 
+        # ── AWAIT phase: place order (no conn held) ──
         payload = json.loads(row["payload"])
         success, msg = await _place_single_order(payload, db_id)
 
