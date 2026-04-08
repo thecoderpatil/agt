@@ -160,13 +160,13 @@ Per ADR-004 §4 + Patch 5:
 
 Architect drafts thesis templates pre-β. Coder consumes via template variables. Templates should not be hardcoded strings in Python — pull from a config file or templates dir for revision without code changes.
 
-### 4.4 Walk-Away P&L Single Source of Truth
+### 4.4 Walk-Away P&L Single Source of Truth — RESOLVED
 
-**Surprise from discovery §16:** ADR-004 references `walker.compute_walk_away_pnl()` as canonical, but this function does not exist. Walk-away P&L lives inline in `telegram_bot.py` at lines 2967 and 7590.
+**Discovery §16 was stale.** `walker.compute_walk_away_pnl()` was shipped in α at `walker.py:759` with `WalkAwayResult` dataclass and 4 unit tests. ADR-004's reference to this function is correct.
 
-**Architect decision pending:** Create in `walker.py` (purity concern — walker is pure function only) or create shared utility module. β consumers (Cure Console panel, Smart Friction modal, JIT handler) all need to call this function.
+**β prep 1 (`16cd244`):** 3 inline reimplementations refactored to delegate to canonical function. Math agreement verified across all sites (all use adjusted basis). Validation: walk-away 4/4, Gate 1 8/8, dry_run 88/88.
 
-**Lean:** Shared utility module `agt_equities/walk_away.py`. Pure function. Walker stays untouched.
+β consumers import `compute_walk_away_pnl` from `agt_equities.walker` directly. No new utility module needed. Implementation order item #1 is complete.
 
 ### 4.5 Process Pattern Watch Carryover
 
