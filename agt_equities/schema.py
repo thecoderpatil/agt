@@ -636,6 +636,16 @@ def register_master_log_tables(conn) -> None:
         except Exception:
             pass  # Column already exists
 
+    # Followup #20: originating account for sub-account routing
+    try:
+        conn.execute(
+            "ALTER TABLE bucket3_dynamic_exit_log "
+            "ADD COLUMN originating_account_id TEXT"
+        )
+        _log.info("schema: added originating_account_id column")
+    except Exception:
+        pass  # Column already exists
+
     # Followup #17: operator recovery audit trail (append-only)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS recovery_audit_log (
@@ -747,6 +757,7 @@ def register_master_log_tables(conn) -> None:
                     'rule_6_forced_liquidation', 'emergency_risk_event')),
             fill_ts REAL,
             fill_price REAL,
+            originating_account_id TEXT,
             last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (campaign_id) REFERENCES bucket3_dynamic_exit_campaigns(campaign_id)
         ) WITHOUT ROWID
@@ -1056,6 +1067,7 @@ def _migrate_dyn_exit_add_transmitting(conn) -> None:
                         'rule_6_forced_liquidation', 'emergency_risk_event')),
                 fill_ts REAL,
                 fill_price REAL,
+                originating_account_id TEXT,
                 last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (campaign_id) REFERENCES bucket3_dynamic_exit_campaigns(campaign_id)
             ) WITHOUT ROWID

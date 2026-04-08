@@ -69,6 +69,7 @@ CREATE TABLE bucket3_dynamic_exit_log (
                           'cc_overweight', 'manual_stage')),
     fill_ts REAL,
     fill_price REAL,
+    originating_account_id TEXT,
     last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) WITHOUT ROWID
 """
@@ -577,6 +578,7 @@ class TestF2MigrationExplicitColumns(unittest.TestCase):
                 final_status TEXT NOT NULL DEFAULT 'PENDING',
                 fill_ts REAL,
                 fill_price REAL,
+                originating_account_id TEXT,
                 last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             ) WITHOUT ROWID
         """)
@@ -642,6 +644,7 @@ class TestF2MigrationExplicitColumns(unittest.TestCase):
                 source TEXT NOT NULL DEFAULT 'scheduled_watchdog',
                 fill_ts REAL,
                 fill_price REAL,
+                originating_account_id TEXT,
                 last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             ) WITHOUT ROWID
         """)

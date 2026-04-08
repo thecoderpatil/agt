@@ -70,6 +70,7 @@ CREATE TABLE bucket3_dynamic_exit_log (
             'rule_6_forced_liquidation', 'emergency_risk_event')),
     fill_ts REAL,
     fill_price REAL,
+    originating_account_id TEXT,
     last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) WITHOUT ROWID
 """
@@ -100,7 +101,8 @@ class TestMigrationAddsExceptionType(unittest.TestCase):
             CREATE TABLE bucket3_dynamic_exit_log (
                 audit_id TEXT PRIMARY KEY, ticker TEXT, household TEXT,
                 desk_mode TEXT, action_type TEXT, household_nlv REAL,
-                underlying_spot_at_render REAL, final_status TEXT
+                underlying_spot_at_render REAL, final_status TEXT,
+                originating_account_id TEXT
             )
         """)
         # ALTER to add

@@ -69,6 +69,7 @@ CREATE TABLE bucket3_dynamic_exit_log (
     exception_type TEXT,
     fill_ts REAL,
     fill_price REAL,
+    originating_account_id TEXT,
     last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     ib_order_id INTEGER,
     ib_perm_id INTEGER,

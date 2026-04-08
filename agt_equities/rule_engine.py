@@ -712,8 +712,11 @@ def stage_stock_sale_via_smart_friction(
             "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
             " household_nlv, underlying_spot_at_render, "
             " gate1_realized_loss, walk_away_pnl_per_share, "
-            " shares, limit_price, exception_type, final_status) "
-            "VALUES (?, date('now'), ?, ?, ?, 'STK_SELL', ?, ?, ?, ?, ?, ?, ?, 'STAGED')",
+            " shares, limit_price, exception_type, final_status, "
+            " originating_account_id) "
+            "VALUES (?, date('now'), ?, ?, ?, 'STK_SELL', ?, ?, ?, ?, ?, ?, ?, 'STAGED',"
+            " NULL)",
+            # TODO Followup #20b: capture originating account from Cure Console form (post-paper)
             (audit_id, ticker, household, desk_mode,
              household_nlv, spot,
              round(loss_total, 2),

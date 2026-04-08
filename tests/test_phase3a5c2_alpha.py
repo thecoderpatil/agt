@@ -204,6 +204,7 @@ class TestSweeper(unittest.TestCase):
                 audit_id TEXT PRIMARY KEY, final_status TEXT NOT NULL,
                 staged_ts REAL, ticker TEXT, household TEXT,
                 contracts INTEGER, shares INTEGER, action_type TEXT,
+                originating_account_id TEXT,
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 trade_date TEXT, desk_mode TEXT, household_nlv REAL,
                 underlying_spot_at_render REAL, transmitted INTEGER DEFAULT 0,
@@ -315,6 +316,7 @@ class TestSchemaMigrations(unittest.TestCase):
                 contracts INTEGER, shares INTEGER, limit_price REAL,
                 final_status TEXT DEFAULT 'STAGED', transmitted INTEGER DEFAULT 0,
                 re_validation_count INTEGER DEFAULT 0,
+                originating_account_id TEXT,
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -342,6 +344,7 @@ class TestSchemaMigrations(unittest.TestCase):
                 underlying_spot_at_render REAL, strike REAL, expiry TEXT,
                 contracts INTEGER, shares INTEGER, final_status TEXT DEFAULT 'STAGED',
                 transmitted INTEGER DEFAULT 0, re_validation_count INTEGER DEFAULT 0,
+                originating_account_id TEXT,
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -377,6 +380,7 @@ class TestStageStockSale(unittest.TestCase):
                 final_status TEXT DEFAULT 'STAGED', transmitted INTEGER DEFAULT 0,
                 re_validation_count INTEGER DEFAULT 0,
                 exception_type TEXT,
+                originating_account_id TEXT,
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)

@@ -81,6 +81,7 @@ CREATE TABLE bucket3_dynamic_exit_log (
             'rule_6_forced_liquidation', 'emergency_risk_event')),
     fill_ts REAL,
     fill_price REAL,
+    originating_account_id TEXT,
     last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) WITHOUT ROWID
 """

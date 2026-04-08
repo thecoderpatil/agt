@@ -1,8 +1,8 @@
 # AGT Equities — Disaster Recovery Runbook v1
 
-**Generated:** 2026-04-08
-**Anchor:** `5dc87e4` (Sprint W)
-**Tests:** 407/407
+**Generated:** 2026-04-08 (DR-02/DR-04 filled: F23)
+**Anchor:** `5dc87e4` (Sprint W), updated F23
+**Tests:** 451/451
 
 ---
 
@@ -11,9 +11,9 @@
 | ID | Scenario | Severity | Detect target | Recover target | Last drilled |
 |----|----------|----------|---------------|----------------|-------------|
 | DR-01 | SQLite corruption / WAL checkpoint failure | CRITICAL | 5 min | 10 min | NEVER |
-| DR-02 | Bot crash with ATTESTED row mid-transmit | CRITICAL | PENDING #17 | PENDING #17 | NEVER |
+| DR-02 | Bot crash with ATTESTED row mid-transmit | CRITICAL | 60 sec | 5 min | NEVER |
 | DR-03 | IBKR disconnect mid-stage (pre-transmit) | HIGH | 60 sec | 5 min | NEVER |
-| DR-04 | IBKR disconnect post-transmit, pre-ack | CRITICAL | PENDING #17 | PENDING #17 | NEVER |
+| DR-04 | IBKR disconnect post-transmit, pre-ack | CRITICAL | 60 sec | 5 min | NEVER |
 | DR-05 | Telegram API outage | MEDIUM | 10 min | 15 min | NEVER |
 | DR-06 | CC leg partial fill | HIGH | 60 sec | 30 min | NEVER |
 | DR-07 | Duplicate transmit race (CAS catches) | MEDIUM | 0 sec (auto) | 0 min (auto) | NEVER |
@@ -145,9 +145,104 @@ tasklist | findstr litestream
 
 ## DR-02 — Bot Process Crash with ATTESTED Row Mid-Transmit
 
-**STATUS:** PENDING FOLLOWUP #17 IMPLEMENTATION
+**Severity:** CRITICAL
+**Detect window target:** 60 seconds (post-restart)
+**Recover window target:** 5 minutes
 
-Recovery procedure depends on orderRef linking + orphan scan + /recover_transmitting command. This section will be filled in after Followup #17 ships.
+### Symptom
+- Bot process crashed, was force-killed, or X-button closed while a dynamic exit row was in `TRANSMITTING` state.
+- On restart, `bucket3_dynamic_exit_log` has one or more rows with `final_status = 'TRANSMITTING'`.
+- Operator receives startup orphan scan alert: `Startup orphan scan complete`.
+- Possible IBKR-side states: order filled, partially filled, still working, cancelled, never transmitted.
+
+### Detect
+The Followup #17 orphan scan runs automatically in `post_init` (telegram_bot.py `_scan_orphaned_transmitting_rows`) and consolidates findings into a single Telegram alert.
+
+Log patterns:
+```
+grep "orphan_scan: found" logs/*.log
+grep "orphan_scan:.*NOT FOUND at IBKR" logs/*.log
+grep "orphan_scan:.*-> TRANSMITTED" logs/*.log
+grep "orphan_scan:.*-> ABANDONED" logs/*.log
+```
+
+Alert categories:
+- **Auto-resolved -- filled-via-openTrades** -- local row flipped to `TRANSMITTED`, no operator action needed.
+- **Auto-resolved -- filled-via-executions** -- same.
+- **Auto-resolved -- dead-at-ibkr (Cancelled/ApiCancelled/Inactive)** -- local row flipped to `ABANDONED`, no operator action needed.
+- **NEEDS OPERATOR REVIEW -- live-unfilled** -- IBKR still has a working order, operator must decide whether to let it fill or cancel in TWS.
+- **NEEDS OPERATOR REVIEW -- partial-fill** -- operator must decide per-leg.
+- **NEEDS OPERATOR REVIEW -- not-found-at-ib** -- cross-midnight case OR order never reached IBKR. Manual verification in TWS required. **D5 binding: never auto-abandon on not-found.**
+- **NEEDS OPERATOR REVIEW -- unknown-status** -- defensive category, should not occur in practice.
+
+### Contain
+1. Do NOT restart the bot again. Orphan scan already ran.
+2. Do NOT manually edit `bucket3_dynamic_exit_log` rows.
+3. Open TWS (or Gateway web portal) to verify the actual order state for each `NEEDS OPERATOR REVIEW` row.
+
+### Recover
+
+**For `live-unfilled` rows:**
+1. In TWS, locate the working order by `orderRef` (= `audit_id` prefix).
+2. Decide: let it fill at the existing limit, or cancel in TWS.
+3. If you let it fill: wait for fill, then run `/recover_transmitting <audit_id> filled <ib_order_id>` (look up ib_order_id in TWS order history).
+4. If you cancel in TWS: run `/recover_transmitting <audit_id> abandoned`.
+
+**For `partial-fill` rows:**
+1. In TWS, verify total filled quantity vs row's intended quantity.
+2. If the remaining quantity is now filled or cancelled, run `/recover_transmitting <audit_id> filled <ib_order_id>`.
+3. If still partially working, decide whether to cancel the remainder in TWS first, then recover.
+4. **Known gap:** `/recover_transmitting` does not currently record partial-fill quantities separately; the row is marked TRANSMITTED at the audit-trail level regardless. Post-paper enhancement (track in followup queue if this occurs in practice).
+
+**For `not-found-at-ib` rows (cross-midnight case):**
+1. This is the **Gateway since-midnight limitation** -- `executions()` on Gateway only returns same-day fills. A row transmitted yesterday that crashed cannot be auto-resolved by the scan.
+2. In TWS, open the **order history** (not just working orders) for the relevant account.
+3. Filter by date range covering when the row was transmitted.
+4. Search for the `orderRef` field matching the `audit_id`.
+5. If found and filled: `/recover_transmitting <audit_id> filled <ib_order_id>`.
+6. If found and cancelled/expired: `/recover_transmitting <audit_id> abandoned`.
+7. If not found in TWS order history: the order never reached IBKR (crash happened before or during `placeOrder`). Safe to run `/recover_transmitting <audit_id> abandoned`.
+
+**For `not-found-at-ib` rows (same-day case):**
+- Same procedure as cross-midnight, but you can also check TWS working orders directly since the order is guaranteed to be either same-day filled, same-day cancelled, or never-transmitted.
+
+### Verify
+```sql
+-- Confirm no TRANSMITTING rows remain after recovery
+SELECT COUNT(*) FROM bucket3_dynamic_exit_log WHERE final_status = 'TRANSMITTING';
+-- Expected: 0
+
+-- Confirm recovery_audit_log entry exists for each manually recovered row
+SELECT audit_id, operator_user_id, recovery_action, pre_status, post_status, created_at
+FROM recovery_audit_log
+ORDER BY created_at DESC LIMIT 10;
+```
+
+In Telegram: `/orders` to confirm no stale working orders remain that shouldn't be there.
+
+### Post-mortem fields
+- Crash cause (X-button, OOM, power loss, segfault, kill -9)
+- Number of TRANSMITTING rows found at startup
+- Auto-resolved count
+- Manual-review count (broken down by category)
+- For each manually recovered row: audit_id, final disposition, ib_order_id if applicable, time from crash to recovery
+- Whether Windows Defender / Search Indexer exclusions were active at time of crash (PRE_PAPER_CHECKLIST items)
+
+### Repro Steps (drill)
+1. Stage a dynamic exit row via Cure Console, attest it, transmit it.
+2. While the row is still `TRANSMITTING` (before Step 8 completes), kill the bot process with Task Manager -- End Task on `python.exe`.
+3. Do NOT let post_shutdown fire. This simulates an uncontrolled crash.
+4. Restart via `boot_desk.bat`.
+5. Expected: Telegram alert `Startup orphan scan complete` fires within 30s of boot.
+6. Verify the row was either auto-resolved (if IBKR filled it) or listed as `NEEDS OPERATOR REVIEW`.
+7. If manual review: run `/recover_transmitting` with the correct disposition.
+8. Verify `bucket3_dynamic_exit_log` has no `TRANSMITTING` rows and `recovery_audit_log` has the recovery entry.
+9. **Cross-midnight variant:** repeat steps 1-2, wait until past midnight ET, restart, verify the row shows as `not-found-at-ib` (because Gateway executions since-midnight returns empty for the prior day), and manually recover via TWS order history lookup.
+
+### Known gaps
+- Partial-fill quantity tracking is not granular in `/recover_transmitting`; the row flips to TRANSMITTED regardless of fill completeness. Post-paper followup if observed.
+- No automated cross-check between `/recover_transmitting` input and actual TWS state -- trusts operator per D6.
+- Cross-midnight Gateway limitation is locked Option B (manual verification required). Defense in depth via Flex Web Services reconciliation is Followup #19, post-paper.
 
 ---
 
@@ -232,9 +327,148 @@ The bot auto-detects via `disconnectedEvent` handler (telegram_bot.py:1129) whic
 
 ## DR-04 — IBKR Disconnect Post-Transmit, Pre-Ack
 
-**STATUS:** PENDING FOLLOWUP #17 IMPLEMENTATION
+**Severity:** CRITICAL
+**Detect window target:** 60 seconds
+**Recover window target:** 5 minutes
 
-Recovery procedure depends on orderRef linking + orphan scan + /recover_transmitting command. This section will be filled in after Followup #17 ships.
+### Symptom
+One of three scenarios:
+
+**Scenario A -- Step 8 DB write failed:**
+- `placeOrder` succeeded (IBKR has the order).
+- Local `UPDATE bucket3_dynamic_exit_log SET final_status='TRANSMITTED'` failed (DB error, lock timeout, etc.).
+- Operator receives: `TRANSMIT RECOVERY REQUIRED\n<ticker> <audit_id>... may be live at IBKR, but local TRANSMITTED write failed.`
+- Row remains in `TRANSMITTING` state with possible live order at IBKR.
+
+**Scenario B -- IBKR disconnect during or immediately after placeOrder:**
+- Network or Gateway failure between transmit and order acknowledgment.
+- `disconnectedEvent` fires -- `_schedule_reconnect` -- `_auto_reconnect`.
+- Followup #17 Part C.5: on successful reconnect, orphan scan runs automatically and reconciles `TRANSMITTING` rows.
+- Followup #23: if the reconnect event carries IBKR error 1101 (data lost), `_handle_1101_data_lost` also triggers the orphan scan path.
+
+**Scenario C -- bot process crash during transmit (not disconnect):**
+- Same as DR-02. Restart -- orphan scan in post_init.
+
+### Detect
+Log patterns:
+```
+grep "TRANSMIT_STEP8_FAILED" logs/*.log
+grep "TRANSMIT_STEP8_CAS_LOST" logs/*.log
+grep "TRANSMIT RECOVERY REQUIRED" logs/*.log
+grep "IBKR 1101: data lost" logs/*.log
+grep "_handle_1101" logs/*.log
+grep "orphan_scan" logs/*.log
+```
+
+Telegram alerts to watch for:
+- `TRANSMIT RECOVERY REQUIRED` (Scenario A)
+- `IBKR 1101: data lost. Reconciliation in progress.` (Scenario B with 1101)
+- `IB Gateway reconnected (attempt N/5).` followed by `Startup orphan scan complete` (Scenario B with auto-reconnect)
+- `1101 recovery complete.` (Scenario B with 1101 edge-case branch where reconciliation ran inline)
+- `1101 recovery FAILED: ... MANUAL REVIEW REQUIRED.` (worst case -- fail-closed alert fired but automatic recovery did not complete)
+
+### Contain
+1. Do NOT manually transmit the same row again -- the order may already be live at IBKR.
+2. Do NOT force-restart the bot unless Scenario A requires it (see Recover step 1 below).
+3. Open TWS and check the relevant account's working orders + recent order history.
+
+### Recover
+
+**Scenario A (Step 8 DB write failed):**
+1. In TWS, search working orders and recent order history by `orderRef = <audit_id>`.
+2. If found and filled: `/recover_transmitting <audit_id> filled <ib_order_id>`.
+3. If found and still working: decide whether to let it fill or cancel in TWS, then recover accordingly.
+4. If found and cancelled: `/recover_transmitting <audit_id> abandoned`.
+5. If not found in TWS: the placeOrder likely succeeded at the API level but the order was never acknowledged. Contact IBKR support with timestamps before abandoning. Do NOT recover until TWS confirms state.
+6. Verify `recovery_audit_log` has the entry.
+
+**Scenario B -- auto-reconnect succeeded + orphan scan ran:**
+1. Read the orphan scan Telegram alert -- it lists what was auto-resolved and what needs manual review.
+2. For auto-resolved rows: no action needed, verify in TWS if paranoid.
+3. For `NEEDS OPERATOR REVIEW` rows: follow the DR-02 recovery procedure above (per category).
+
+**Scenario B -- 1101 recovery FAILED alert fired:**
+1. This means `_handle_1101_data_lost` was triggered without a preceding disconnect event (edge case), tried to re-fetch open orders + executions, and one of those steps failed.
+2. The bot is still running and connected, but reconciliation did not complete.
+3. Manually run `/reconnect` in Telegram. This cycles the IBKR connection and triggers `_auto_reconnect` -- full orphan scan path.
+4. Read the resulting orphan scan alert and follow DR-02 procedure.
+5. If `/reconnect` itself fails: restart the bot via Ctrl+C + `boot_desk.bat`. Startup orphan scan in post_init will run.
+
+**Scenario B -- all 5 reconnect attempts failed:**
+1. Operator receives: `CRITICAL: IB Gateway disconnected. 5 reconnect attempts failed.`
+2. Check Gateway/TWS process on the host; restart the IB desktop application if needed.
+3. In Telegram: `/reconnect`.
+4. On successful reconnect, `_auto_reconnect` orphan scan will fire automatically.
+5. If still failing: restart the bot (Ctrl+C + `boot_desk.bat`). post_init orphan scan handles reconciliation on the fresh connection.
+
+**Scenario C (crash):** See DR-02.
+
+### Verify
+```sql
+-- Confirm no stale TRANSMITTING rows
+SELECT audit_id, ticker, final_status, last_updated
+FROM bucket3_dynamic_exit_log
+WHERE final_status = 'TRANSMITTING';
+-- Expected: 0 rows
+
+-- Confirm recovery audit trail for any manually recovered rows
+SELECT audit_id, operator_user_id, recovery_action, pre_status, post_status,
+       ib_order_id_provided, created_at
+FROM recovery_audit_log
+WHERE created_at > datetime('now', '-1 day')
+ORDER BY created_at DESC;
+```
+
+In Telegram:
+```
+/orders
+# Verify no unexpected working orders remain at IBKR
+
+/health
+# Verify connection is healthy and accounts list is complete
+```
+
+### Post-mortem fields
+- Scenario (A / B with auto-recover / B with 1101 / B with failed recover / C)
+- Time of disconnect or Step 8 failure
+- Time of first recovery alert
+- Time of final row disposition
+- Number of rows affected
+- Whether manual `/recover_transmitting` was needed
+- Whether TWS order history lookup was needed
+- Gateway/TWS process state during the incident
+- IBKR error codes observed (1100/1101/1102)
+
+### Repro Steps (drill)
+
+**Scenario A drill (Step 8 DB failure):**
+1. Stage, attest, and begin transmitting a dynamic exit row.
+2. In a separate shell, hold an exclusive lock on `agt_desk.db` during Step 8 (use `sqlite3 agt_desk.db 'BEGIN IMMEDIATE'` and hold).
+3. Expected: placeOrder succeeds at IBKR, Step 8 UPDATE fails with lock timeout, `TRANSMIT RECOVERY REQUIRED` alert fires.
+4. Release the lock.
+5. Follow Scenario A recovery procedure above.
+6. Verify final state.
+
+**Scenario B drill (disconnect + 1102):**
+1. Stage, attest, transmit a row.
+2. After confirming TRANSMITTED, disconnect the network interface briefly (< 30s).
+3. Expected: `disconnectedEvent` fires, reconnect succeeds on first attempt, no orphan scan findings (row already TRANSMITTED).
+4. Verify no false positives in logs.
+
+**Scenario B drill (disconnect + 1101):**
+1. Same as above but disconnect for > 60s to force IBKR to drop session state.
+2. Expected: on reconnect, IBKR emits error 1101.
+3. `_handle_1101_data_lost` should alert, defer to `_auto_reconnect` path (since `disconnectedEvent` already fired), and the orphan scan should run.
+4. Verify Telegram receives both the 1101 critical alert AND the orphan scan completion alert.
+
+**Scenario B drill (1101 without disconnect -- edge case):**
+1. This is hard to simulate without a custom mock harness. Defer to unit test coverage (F23-3 tests 9 and 10) for this branch.
+
+### Known gaps
+- Scenario A cannot distinguish "placeOrder reached IBKR" from "placeOrder failed at network layer" without checking TWS. No automated differentiation.
+- 1101 without a preceding disconnect event is an edge case covered by unit tests only, not by an end-to-end drill.
+- Cross-midnight disconnect-during-transmit inherits the Gateway since-midnight limitation from DR-02.
+- Flex Web Services reconciliation (Followup #19) would close the cross-midnight gap but is post-paper.
 
 ---
 
@@ -646,7 +880,7 @@ grep "attested_sweeper" logs/*.log | tail -3
 | G9 | No structured race audit trail | DR-07 | LOW | recovery_audit_log (Followup #17) |
 | G10 | No NTP sync check on startup | DR-08 | LOW | Pre-paper checklist item |
 | G11 | Mixed naive/aware datetimes | DR-08 | LOW | Post-paper cleanup |
-| G12 | DR-02 and DR-04 depend on Followup #17 | DR-02, DR-04 | CRITICAL | Ship Followup #17 |
+| G12 | ~~DR-02 and DR-04 depend on Followup #17~~ | DR-02, DR-04 | ~~CRITICAL~~ CLOSED | Followup #17 shipped, DR-02/DR-04 filled (F23) |
 | G13 | Automated DR drill scripts | All | MEDIUM | Followup #16 (proposed) |
 
 ---

@@ -85,4 +85,18 @@
 
 ---
 
+## Windows Hardening — Signed off 2026-04-08
+
+- [x] Windows Defender exclusion: C:\AGT_Telegram_Bridge
+- [x] Windows Search indexing: disabled system-wide (no action needed)
+- [x] PRAGMA busy_timeout=5000
+- [x] PRAGMA synchronous=FULL (2) — stricter than NORMAL target, accepted
+- [x] PRAGMA journal_mode=wal
+- [x] Ctrl+C positive test: 3 clean post_shutdown lines (18:49:34)
+- [x] X-button negative test: zero post_shutdown lines after 18:50:02 (bypass confirmed)
+
+Operator signature: Yash | Date: 2026-04-08
+
+---
+
 *End of checklist.*

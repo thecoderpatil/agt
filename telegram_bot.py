@@ -1117,6 +1117,191 @@ OUTPUT RULES:
 ib: ib_async.IB | None = None
 _ib_connect_lock = asyncio.Lock()
 _reconnect_task: asyncio.Task | None = None
+_shutdown_started = False
+
+
+async def _alert_telegram(text: str) -> None:
+    """Send a one-shot Telegram alert to the operator.
+
+    Used by infrastructure handlers (_auto_reconnect, errorEvent, shutdown)
+    that run outside PTB's Application context and therefore cannot use
+    context.bot.  Callers must wrap in try/except if alert failure should
+    not abort the caller.
+    """
+    from telegram import Bot
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    await bot.send_message(chat_id=AUTHORIZED_USER_ID, text=text)
+
+
+async def _graceful_shutdown(application) -> None:
+    """PTB post_shutdown callback. Fires after Application.stop() completes.
+
+    Releases IBKR connection and cancels any pending reconnect task.
+
+    NOTE: This does NOT fire on Windows X-button close. Operator must use
+    Ctrl+C only. See PRE_PAPER_CHECKLIST.md.
+
+    Guarded against reentry (F23-patch-1): PTB can invoke post_shutdown
+    multiple times during cascading teardown. The flag prevents 7x runs.
+    """
+    global ib, _reconnect_task, _shutdown_started
+
+    if _shutdown_started:
+        logger.debug("post_shutdown: already running, skipping reentry")
+        return
+    _shutdown_started = True
+
+    logger.info("post_shutdown: graceful shutdown initiated")
+
+    # 0. Detach BOTH event handlers BEFORE disconnect to prevent cascade.
+    #    ib.disconnect() tears down the socket → ib_async surfaces 1100/1101/1102
+    #    → our handlers fire → asyncio.create_task against dying loop. (F23-patch-1)
+    if ib is not None:
+        try:
+            ib.disconnectedEvent -= _schedule_reconnect
+        except Exception:
+            pass
+        try:
+            ib.errorEvent -= _on_ib_error
+        except Exception:
+            pass
+
+    # 1. Cancel auto-reconnect task if pending
+    if _reconnect_task is not None and not _reconnect_task.done():
+        try:
+            _reconnect_task.cancel()
+            try:
+                await asyncio.wait_for(_reconnect_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            logger.info("post_shutdown: _reconnect_task cancelled")
+        except Exception as exc:
+            logger.warning("post_shutdown: _reconnect_task cancel failed: %s", exc)
+    _reconnect_task = None
+
+    # 2. Disconnect IBKR cleanly
+    if ib is not None:
+        try:
+            if ib.isConnected():
+                ib.disconnect()  # synchronous socket close (ib_async 2.1.0 has no disconnectAsync)
+                logger.info("post_shutdown: IBKR disconnected cleanly")
+            else:
+                logger.info("post_shutdown: IBKR already disconnected")
+        except Exception as exc:
+            logger.error("post_shutdown: IBKR disconnect failed: %s", exc)
+    ib = None
+
+    # 3. SQLite — all connections are per-call via _get_db_connection() with
+    #    closing() context manager. No persistent connection to close.
+
+    logger.info("post_shutdown: complete — all resources released")
+
+
+# ---------------------------------------------------------------------------
+# IBKR errorEvent handler — 1100/1101/1102 connectivity differentiation
+# ---------------------------------------------------------------------------
+
+
+def _on_ib_error(reqId: int, errorCode: int, errorString: str, contract) -> None:
+    """IBKR error event handler. Differentiates 1100/1101/1102 connectivity events.
+
+    1100 = Connectivity lost (handled by disconnectedEvent -> _schedule_reconnect)
+    1101 = Connectivity restored, DATA LOST -> re-fetch open orders + executions,
+           re-run orphan scan to reconcile bucket3_dynamic_exit_log
+    1102 = Connectivity restored, DATA MAINTAINED -> log + alert only, no action
+
+    Other error codes are logged at DEBUG and ignored here (other handlers
+    elsewhere in the codebase deal with order-specific errors).
+
+    Threading: errorEvent dispatches on the asyncio main loop via Connection
+    (asyncio.Protocol). Verified against ib_async 2.1.0 source — see
+    reports/f23_shutdown_survey_addendum_20260408.md
+    """
+    if errorCode == 1100:
+        logger.warning("IBKR 1100: connectivity lost — disconnect handler will fire")
+        return
+
+    if errorCode == 1102:
+        logger.info("IBKR 1102: connectivity restored, data maintained")
+        # Safe: errorEvent dispatches on the asyncio main loop via Connection
+        # (asyncio.Protocol). Verified against ib_async 2.1.0 source — see
+        # reports/f23_shutdown_survey_addendum_20260408.md
+        asyncio.create_task(_alert_1102())
+        return
+
+    if errorCode == 1101:
+        logger.critical("IBKR 1101: connectivity restored, DATA LOST — triggering reconciliation")
+        # Safe: errorEvent dispatches on the asyncio main loop via Connection
+        # (asyncio.Protocol). Verified against ib_async 2.1.0 source — see
+        # reports/f23_shutdown_survey_addendum_20260408.md
+        asyncio.create_task(_handle_1101_data_lost())
+        return
+
+    # Non-connectivity errors fall through to existing handling elsewhere
+    logger.debug("IBKR error %d (reqId=%s): %s", errorCode, reqId, errorString)
+
+
+async def _alert_1102() -> None:
+    """Send 1102 info alert. Separated to keep _on_ib_error synchronous."""
+    try:
+        await _alert_telegram(
+            "\U0001f7e2 IBKR reconnected (1102) — data maintained, no action needed."
+        )
+    except Exception as exc:
+        logger.warning("1102 Telegram alert failed: %s", exc)
+
+
+async def _handle_1101_data_lost() -> None:
+    """Handle IBKR 1101 (data lost). In most cases the disconnect event
+    fires alongside 1101 and _auto_reconnect handles reconciliation.
+    This handler covers the edge case where 1101 fires without a
+    preceding disconnect (ib_async has been observed to do this).
+    """
+    try:
+        await _alert_telegram(
+            "\U0001f534 IBKR 1101: data lost. Reconciliation in progress."
+        )
+    except Exception:
+        pass  # Alert failure must not block reconciliation
+
+    global ib
+    try:
+        still_connected = ib is not None and ib.isConnected()
+    except Exception as exc:
+        logger.exception("_handle_1101: isConnected() check failed")
+        try:
+            await _alert_telegram(
+                f"\U0001f534 1101 recovery: connection state check failed ({exc}). "
+                "MANUAL REVIEW REQUIRED."
+            )
+        except Exception:
+            pass
+        return
+
+    if not still_connected:
+        # Disconnect path will handle it via _auto_reconnect
+        logger.info("_handle_1101: disconnect path active, deferring to _auto_reconnect")
+        return
+
+    # Edge case: 1101 fired without disconnect. Force reconciliation here.
+    try:
+        from ib_async.objects import ExecutionFilter
+        await ib.reqAllOpenOrdersAsync()
+        await ib.reqExecutionsAsync(ExecutionFilter())
+        from telegram import Bot
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        await _scan_orphaned_transmitting_rows(ib, bot)
+        await _alert_telegram(
+            "\u2705 1101 recovery complete. Orphan scan finished."
+        )
+    except Exception as exc:
+        logger.exception("_handle_1101_data_lost reconciliation failed")
+        try:
+            await _alert_telegram(
+                f"\U0001f534 1101 recovery FAILED: {exc}. MANUAL REVIEW REQUIRED."
+            )
+        except Exception:
+            pass
 
 
 async def _auto_reconnect():
@@ -1137,11 +1322,8 @@ async def _auto_reconnect():
             except Exception as scan_exc:
                 logger.exception("Autoreconnect orphan scan failed: %s", scan_exc)
             try:
-                from telegram import Bot
-                bot = Bot(token=TELEGRAM_BOT_TOKEN)
-                await bot.send_message(
-                    chat_id=AUTHORIZED_USER_ID,
-                    text=f"\u2705 IB Gateway reconnected (attempt {attempt}/5).",
+                await _alert_telegram(
+                    f"\u2705 IB Gateway reconnected (attempt {attempt}/5)."
                 )
             except Exception:
                 pass
@@ -1153,19 +1335,14 @@ async def _auto_reconnect():
 
     # Alert the user via Telegram
     try:
-        from telegram import Bot
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        await bot.send_message(
-            chat_id=AUTHORIZED_USER_ID,
-            text=(
-                "\U0001f534 CRITICAL: IB Gateway disconnected.\n"
-                "5 reconnect attempts failed.\n\n"
-                "The trading desk is OFFLINE.\n"
-                "- Scheduled CC staging will NOT fire\n"
-                "- Fill events will NOT be processed\n"
-                "- Watchdog alerts will NOT trigger\n\n"
-                "Action: Check IB Gateway/TWS, then /reconnect"
-            ),
+        await _alert_telegram(
+            "\U0001f534 CRITICAL: IB Gateway disconnected.\n"
+            "5 reconnect attempts failed.\n\n"
+            "The trading desk is OFFLINE.\n"
+            "- Scheduled CC staging will NOT fire\n"
+            "- Fill events will NOT be processed\n"
+            "- Watchdog alerts will NOT trigger\n\n"
+            "Action: Check IB Gateway/TWS, then /reconnect"
         )
     except Exception as notify_exc:
         logger.error("Failed to send disconnect alert: %s", notify_exc)
@@ -1227,6 +1404,13 @@ async def ensure_ib_connected() -> ib_async.IB:
                     logger.info("Fill + R5 order state event listeners registered (8 handlers)")
                 except Exception as evt_exc:
                     logger.warning("Failed to register fill events: %s", evt_exc)
+
+                # F23: IBKR error event listener for 1100/1101/1102 differentiation
+                try:
+                    candidate.errorEvent += _on_ib_error
+                    logger.info("IBKR errorEvent listener registered")
+                except Exception as evt_exc:
+                    logger.warning("Failed to register errorEvent: %s", evt_exc)
 
                 ib = candidate
                 logger.info("Connected via %s — accounts: %s", label, ib.managedAccounts())
@@ -6804,9 +6988,42 @@ async def handle_dex_callback(
             )
             qty = row["shares"]
 
-        # Resolve account: first margin account in household
-        hh_accounts = HOUSEHOLD_MAP.get(row["household"], [])
-        account_id = hh_accounts[0] if hh_accounts else ""
+        # Followup #20: route to originating account (fail-closed on NULL)
+        account_id = row["originating_account_id"]
+        if not account_id:
+            logger.error(
+                "TRANSMIT_BLOCKED_NULL_ACCOUNT: audit_id=%s household=%s",
+                audit_id, row["household"],
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=AUTHORIZED_USER_ID,
+                    text=(
+                        f"\U0001f6a8 TRANSMIT BLOCKED\n"
+                        f"Row {audit_id[:8]}... has NULL originating_account_id.\n"
+                        f"Ticker: {ticker} | Household: {row['household']}\n\n"
+                        f"This row was staged before Followup #20 or via a path "
+                        f"that does not capture account. Use /recover_transmitting."
+                    ),
+                )
+            except Exception:
+                pass
+            with closing(_get_db_connection()) as cancel_conn:
+                with cancel_conn:
+                    cancel_conn.execute(
+                        "UPDATE bucket3_dynamic_exit_log "
+                        "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
+                        "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+                        (audit_id,),
+                    )
+            try:
+                await query.edit_message_text(
+                    f"\U0001f6a8 TRANSMIT BLOCKED: {ticker} {audit_id[:8]}... "
+                    f"has no originating account. Cancelled."
+                )
+            except Exception:
+                pass
+            return
         order = _build_adaptive_sell_order(qty, row['limit_price'], account_id)
         order.orderRef = audit_id  # Followup #17: cryptographic 1:1 link for orphan recovery
 
@@ -7989,6 +8206,47 @@ def _compute_escalation_tier(position_pct: float) -> dict:
         return {"tier": "STANDARD", "frequency": "3 consecutive low-yield", "cycles": 3}
 
 
+def allocate_excess_proportional(
+    excess_contracts: int,
+    accounts_with_shares: dict,
+) -> dict:
+    """Allocate excess contracts across accounts proportional to shares held.
+
+    Followup #20: sub-account routing. Each returned entry becomes a
+    separate staged row with its own originating_account_id.
+
+    Rules:
+    - Integer contracts only (each contract = 100 shares)
+    - Accounts with < 100 shares are skipped (can't write 1 contract)
+    - Fractional remainders go to the largest holder (stable sort by
+      shares desc, then account_id asc for determinism)
+    - Returns {account_id: contracts} with zero-values omitted
+    """
+    eligible = {
+        a: info["shares"] if isinstance(info, dict) else info
+        for a, info in accounts_with_shares.items()
+        if (info["shares"] if isinstance(info, dict) else info) >= 100
+    }
+    if not eligible or excess_contracts <= 0:
+        return {}
+
+    total = sum(eligible.values())
+    if total <= 0:
+        return {}
+
+    raw = {a: excess_contracts * s / total for a, s in eligible.items()}
+    floored = {a: int(v) for a, v in raw.items()}
+    remainder = excess_contracts - sum(floored.values())
+
+    if remainder > 0:
+        order = sorted(eligible.items(), key=lambda kv: (-kv[1], kv[0]))
+        for i in range(remainder):
+            acct = order[i % len(order)][0]
+            floored[acct] += 1
+
+    return {a: c for a, c in floored.items() if c > 0}
+
+
 def _compute_overweight_scope(
     current_shares: int,
     current_price: float,
@@ -8278,47 +8536,80 @@ async def _stage_dynamic_exit_candidate(
                 ),
             }
 
-        # ── Write STAGED row — atomic transaction ──
-        audit_id = str(uuid.uuid4())
+        # ── Followup #20: per-account allocation ──
+        acct_shares = position.get("accounts_with_shares", {})
+        allocation = allocate_excess_proportional(excess_contracts, acct_shares)
+        if not allocation:
+            # Fallback: single account from household primary (legacy path)
+            hh_accounts = HOUSEHOLD_MAP.get(hh_name, [])
+            fallback_acct = hh_accounts[0] if hh_accounts else None
+            if fallback_acct:
+                allocation = {fallback_acct: excess_contracts}
+            else:
+                return {
+                    "staged": False, "audit_id": None,
+                    "excess_contracts": excess_contracts,
+                    "summary": f"{ticker} ({hh_short}): no eligible account for staging",
+                }
+
+        # ── Write STAGED rows — atomic transaction, one row per account ──
         now_ts = time.time()
         desk_mode = _get_current_desk_mode()
+        total_realized = (
+            round(abs(best_walk_away_per_share) * 100 * excess_contracts, 2)
+            if best_walk_away_per_share < 0 else 0.0
+        )
 
+        staged_audit_ids = []
         try:
             with closing(_get_db_connection()) as conn:
                 with conn:
-                    conn.execute(
-                        "INSERT INTO bucket3_dynamic_exit_log "
-                        "(audit_id, trade_date, ticker, household, desk_mode, "
-                        " action_type, household_nlv, underlying_spot_at_render, "
-                        " gate1_freed_margin, gate1_realized_loss, "
-                        " gate1_conviction_tier, gate1_conviction_modifier, "
-                        " gate1_ratio, gate2_target_contracts, "
-                        " walk_away_pnl_per_share, strike, expiry, "
-                        " contracts, shares, limit_price, "
-                        " render_ts, staged_ts, final_status, source) "
-                        "VALUES (?, date('now'), ?, ?, ?, "
-                        " 'CC', ?, ?, "
-                        " ?, ?, "
-                        " ?, ?, "
-                        " ?, ?, "
-                        " ?, ?, ?, "
-                        " ?, ?, ?, "
-                        " ?, ?, 'STAGED', ?)",
-                        (
-                            audit_id, ticker, hh_name, desk_mode,
-                            round(hh_nlv, 2), round(spot, 4),
-                            round(best_freed, 2),
-                            round(abs(best_walk_away_per_share) * 100 * excess_contracts, 2)
-                            if best_walk_away_per_share < 0 else 0.0,
-                            conviction["tier"], round(modifier, 4),
-                            round(best_ratio, 4), excess_contracts,
-                            round(best_walk_away_per_share, 4),
-                            round(best_strike, 2), best_exp,
-                            excess_contracts, excess_contracts * 100,
-                            round(best_bid, 4),
-                            now_ts, now_ts, source,
-                        ),
-                    )
+                    for account_id, acct_contracts in allocation.items():
+                        row_audit_id = str(uuid.uuid4())
+                        scale = acct_contracts / excess_contracts
+                        row_freed = round(best_freed * scale, 2)
+                        row_realized = round(total_realized * scale, 2)
+                        row_shares = acct_contracts * 100
+
+                        conn.execute(
+                            "INSERT INTO bucket3_dynamic_exit_log "
+                            "(audit_id, trade_date, ticker, household, desk_mode, "
+                            " action_type, household_nlv, underlying_spot_at_render, "
+                            " gate1_freed_margin, gate1_realized_loss, "
+                            " gate1_conviction_tier, gate1_conviction_modifier, "
+                            " gate1_ratio, gate2_target_contracts, "
+                            " walk_away_pnl_per_share, strike, expiry, "
+                            " contracts, shares, limit_price, "
+                            " render_ts, staged_ts, final_status, source, "
+                            " originating_account_id) "
+                            "VALUES (?, date('now'), ?, ?, ?, "
+                            " 'CC', ?, ?, "
+                            " ?, ?, "
+                            " ?, ?, "
+                            " ?, ?, "
+                            " ?, ?, ?, "
+                            " ?, ?, ?, "
+                            " ?, ?, 'STAGED', ?, ?)",
+                            (
+                                row_audit_id, ticker, hh_name, desk_mode,
+                                round(hh_nlv, 2), round(spot, 4),
+                                row_freed, row_realized,
+                                conviction["tier"], round(modifier, 4),
+                                round(best_ratio, 4), acct_contracts,
+                                round(best_walk_away_per_share, 4),
+                                round(best_strike, 2), best_exp,
+                                acct_contracts, row_shares,
+                                round(best_bid, 4),
+                                now_ts, now_ts, source,
+                                account_id,
+                            ),
+                        )
+                        staged_audit_ids.append(row_audit_id)
+                        logger.info(
+                            "STAGED: %s %s %dc -> %s (%s)",
+                            ticker, hh_short, acct_contracts, account_id,
+                            ACCOUNT_LABELS.get(account_id, account_id),
+                        )
         except Exception as db_exc:
             logger.error("Failed to stage dynamic exit for %s: %s", ticker, db_exc)
             return {
@@ -8327,15 +8618,20 @@ async def _stage_dynamic_exit_candidate(
                 "summary": f"{ticker} ({hh_short}): DB write failed — {db_exc}",
             }
 
+        acct_detail = ", ".join(
+            f"{c}c->{ACCOUNT_LABELS.get(a, a)}"
+            for a, c in allocation.items()
+        )
         summary = (
             f"\U0001f6a8 STAGED: {ticker} ({hh_short}) "
             f"-{excess_contracts}c ${best_strike:.0f}C {best_exp} "
             f"@ ${best_bid:.2f} | Gate 1 PASS ({best_ratio:.1f}x) "
             f"| {position_pct:.1f}% conc"
+            f"\n  Routed: {acct_detail}"
         )
         return {
             "staged": True,
-            "audit_id": audit_id,
+            "audit_id": staged_audit_ids[0] if len(staged_audit_ids) == 1 else staged_audit_ids,
             "excess_contracts": excess_contracts,
             "summary": summary,
         }
@@ -10990,6 +11286,7 @@ async def _scan_orphaned_transmitting_rows(ib_conn, app_bot):
 
     Column ownership (D4): writes ONLY final_status + last_updated.
     R5 handlers write fill columns separately.
+    originating_account_id: write-once at staging, never modified after (F20).
     """
     with closing(_get_db_connection()) as conn:
         orphans = conn.execute(
@@ -11245,6 +11542,7 @@ def main() -> None:
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(_graceful_shutdown)
         .build()
     )
 

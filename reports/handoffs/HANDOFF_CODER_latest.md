@@ -1,8 +1,8 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
 **Last updated:** 2026-04-08
-**Status:** Phase 3A.5c2-β COMPLETE. Followup #17 (orderRef linking + orphan recovery) COMPLETE. Pre-paper cleanup sprint COMPLETE.
-**Tests:** 441/441 passing. Runtime: ~30s.
+**Status:** Phase 3A.5c2-β COMPLETE. F17+F23+F20 COMPLETE. Pre-paper cleanup + Windows hardening COMPLETE.
+**Tests:** 466/466 passing. Runtime: ~30s.
 **Next:** Paper run. Then Phase 3B.
 
 ---
@@ -51,6 +51,8 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 - `agt_deck/templates/cure_dynamic_exit_panel.html` — Dynamic Exit & R5 panel
 - `agt_deck/templates/cure_smart_friction.html` — Smart Friction modal (polymorphic: R8 CC + R5 STK_SELL)
 - `agt_deck/templates/command_deck.html` — main deck with Mode Badge
+- `tests/test_shutdown_handlers.py` — 11 F23 tests (5 shutdown + 3 error routing + 3 handle_1101)
+- `tests/test_originating_account.py` — 14 F20 tests (6 allocation + 2 staging + 3 routing + 1 STK_SELL + 1 schema + 1 math)
 - `tests/test_followup_17.py` — 23 Followup #17 tests (orphan scan, recovery, CAS, column ownership, timezone)
 - `tests/test_cleanup6_toctou.py` — 3 concurrency regression tests (BEGIN IMMEDIATE)
 - `tests/test_cleanup5_datetime.py` — 7 timezone-aware expiry tests
@@ -153,7 +155,7 @@ _stage_dynamic_exit_candidate(ticker, hh_name, hh_data, position, source)
 
 ## Current State
 
-- **Tests:** 441/441 (92 walker + 23 property + 65 phase3a + 63 phase3a5a + 20 rule_9 + 10 dto + 18 providers + 36 alpha + 23 impl3 + 17 impl5 + 4 impl6 + 4 impl8 + 8 impl9 + 5 f9pr1 + 7 f9pr2 + 5 f9pr3 + 5 f13 + 1 r9_day1 + 23 followup17 + 3 cleanup6_toctou + 7 cleanup5_datetime + 2 yf_tkr_regression)
+- **Tests:** 466/466 (92 walker + 23 property + 65 phase3a + 63 phase3a5a + 20 rule_9 + 10 dto + 18 providers + 36 alpha + 23 impl3 + 17 impl5 + 4 impl6 + 4 impl8 + 8 impl9 + 5 f9pr1 + 7 f9pr2 + 5 f9pr3 + 5 f13 + 1 r9_day1 + 23 followup17 + 3 cleanup6_toctou + 7 cleanup5_datetime + 2 yf_tkr_regression + 11 shutdown_handlers + 14 originating_account)
 - **Mode:** PEACETIME
 - **Production DB:** CLEAN — zero ATTESTED, zero TRANSMITTING, zero STAGED. Smoke test row cleaned up. 49 pre-live pending_orders bulk-cancelled.
 - **Walker:** fully closed through W3.8 + special dividend fix (.net_cash)
@@ -161,7 +163,10 @@ _stage_dynamic_exit_candidate(ticker, hh_name, hh_data, position, source)
 - **Smart Friction:** Polymorphic (R8 CC + R5 STK_SELL). 10-branch validator. TOCTOU desk_mode guard.
 - **Telegram TRANSMIT/CANCEL:** 9-step JIT chain + stale-attestation guard + Step 8 recovery wrapper. order.orderRef = audit_id. ib_order_id written at Step 8.
 - **Sweeper:** STAGED 15min (CAS-guarded with `AND final_status='STAGED'`) + ATTESTED 10min.
-- **Orphan scan:** Runs at startup (post_init) AND on autoreconnect. Resolves TRANSMITTING rows against openTrades()/executions(). Non-fatal on failure.
+- **Orphan scan:** Runs at startup (post_init) AND on autoreconnect AND on 1101 (data lost). Resolves TRANSMITTING rows against openTrades()/executions(). Non-fatal on failure.
+- **Graceful shutdown:** `post_shutdown` callback wired. Detaches disconnectedEvent + errorEvent, cancels `_reconnect_task`, disconnects IBKR. Reentry-guarded (`_shutdown_started`). Does NOT fire on Windows X-button (documented, tested).
+- **IBKR errorEvent:** `_on_ib_error` registered. 1100=log only (disconnect handler owns it), 1101=CRITICAL alert + orphan scan (defers to `_auto_reconnect` if disconnected, inline reconciliation if still connected), 1102=info alert only.
+- **Sub-account routing:** `originating_account_id` column on `bucket3_dynamic_exit_log`. CC staging writes per-account rows via `allocate_excess_proportional()`. TRANSMIT reads `row["originating_account_id"]` — fail-closed NULL guard blocks + cancels. STK_SELL writes NULL (blocked at TRANSMIT until F20b).
 - **Connection management:** All write sites use canonical `closing() + with conn:`. Fill handlers use `BEGIN IMMEDIATE` (CLEANUP-6). CAS guards on all state transitions.
 - **/recover_transmitting:** Operator command for manual TRANSMITTING recovery. BEGIN IMMEDIATE + CAS + recovery_audit_log in one transaction.
 - **R5 fill handlers:** Fallback to bucket3_dynamic_exit_log by orderRef. Column ownership enforced (fill columns only, never final_status).
@@ -191,6 +196,29 @@ _stage_dynamic_exit_candidate(ticker, hh_name, hh_data, position, source)
 | #17 Part H: Timezone workaround | 430 | _normalize_ibkr_time, _parse_sqlite_utc |
 | #17 Part G: Tests | 441 | 23 tests covering all parts |
 
+## Completed Work — F23 Graceful Shutdown + 1101/1102
+
+| Task | Tests | Notes |
+|------|-------|-------|
+| F23-0: `_alert_telegram` helper | 441 | Extracted from 2 ad-hoc `Bot(token=...)` sites in `_auto_reconnect` |
+| F23-1: `post_shutdown` callback | 441 | Wired in `main()`. Cancels reconnect task, disconnects IBKR, no SQLite action needed |
+| F23-2: `errorEvent` + 1101/1102 | 441 | `_on_ib_error` registered. 1101 defers to `_auto_reconnect` or inline reconciliation |
+| F23-3: Tests | 451 | 10 tests (4 shutdown + 3 error routing + 3 handle_1101) |
+| F23-patch-1: Reentry guard + dual detach | 466 | `_shutdown_started` flag, detach both disconnectedEvent + errorEvent before disconnect |
+| DR-02/DR-04 runbook | 466 | Full DR procedures replacing PENDING #17 stubs |
+
+## Completed Work — F20 Sub-account Routing
+
+| Task | Tests | Notes |
+|------|-------|-------|
+| F20-1: Schema migration | 451 | `originating_account_id TEXT` column, idempotent ALTER |
+| F20-2: Allocation helper | 451 | `allocate_excess_proportional()` — proportional, floor, remainder to largest |
+| F20-3: Multi-row CC staging | 451 | Per-account rows via allocation. Atomic transaction. Gate 1 math scaled |
+| F20-4: TRANSMIT fail-closed guard | 451 | `row["originating_account_id"]` replaces `HOUSEHOLD_MAP[hh][0]`. NULL → block + cancel |
+| F20-5: STK_SELL hardening | 451 | Writes NULL. TRANSMIT guard blocks. Full fix = F20b post-paper |
+| F20-6: Column ownership | 451 | `originating_account_id`: write-once at staging |
+| F20-7: Tests | 465 | 14 tests (6 allocation + 2 staging + 3 routing + 1 STK_SELL + 1 schema + 1 math) |
+
 ## Completed Work — Sprint W + Sprint X (audit/documentation)
 
 - Sprint W: 13/13 tasks, 12 reports + DR_RUNBOOK.md + PRE_PAPER_CHECKLIST.md
@@ -201,7 +229,7 @@ _stage_dynamic_exit_candidate(ticker, hh_name, hh_data, position, source)
 
 ## In Flight
 
-**Nothing in flight.** All followups through #17 are complete. System is paper-run ready.
+**Nothing in flight.** All followups through #23 are complete. F20 sub-account routing shipped. System is paper-run ready. Windows hardening signed off (PRE_PAPER_CHECKLIST.md).
 
 ---
 
@@ -216,6 +244,7 @@ _stage_dynamic_exit_candidate(ticker, hh_name, hh_data, position, source)
 | 11 | `/sell_shares` Telegram command | β Impl 5 | Post-paper |
 | 14 | ~6 low-risk reply_text cross-await sites | Followup #13 / Sprint W | Post-paper |
 | 19 | Flex statement reconciliation for cross-midnight orphans | #17 | Post-paper |
+| 20b | STK_SELL form/handler for originating_account_id | F20 | Post-paper |
 | 25 | TOCTOU deferred sites (beyond share ledger) | CLEANUP-6 survey | Post-paper |
 
 **Closed followups:**
@@ -223,6 +252,8 @@ _stage_dynamic_exit_candidate(ticker, hh_name, hh_data, position, source)
 - ~~#9~~ Connection leak sweep — COMPLETE
 - ~~#13 Phase 1~~ Cross-await refactor — COMPLETE
 - ~~#17~~ orderRef linking + orphan recovery + R5 fill patch — COMPLETE
+- ~~#20~~ Sub-account routing (CC path + TRANSMIT guard) — COMPLETE
+- ~~#23~~ Graceful shutdown + 1101/1102 differentiation — COMPLETE
 
 ---
 
@@ -268,6 +299,13 @@ _stage_dynamic_exit_candidate(ticker, hh_name, hh_data, position, source)
 29. **Gateway since-midnight limitation** — executions() returns current calendar day only. Cross-midnight orphans require manual /recover_transmitting.
 30. **BEGIN IMMEDIATE in RMW handlers** — _on_shares_sold, _on_shares_bought, append_status. Prevents concurrent partial fill lost updates.
 31. **Sweep 1 CAS guard** — `AND final_status='STAGED'` prevents overwriting concurrent attestations.
+32. **`_shutdown_started` reentry guard** — module-level bool. `_graceful_shutdown` runs exactly once even if PTB calls post_shutdown 7 times during cascade.
+33. **Detach before disconnect** — `_graceful_shutdown` removes both `disconnectedEvent` and `errorEvent` handlers BEFORE calling `ib.disconnect()`. Prevents 1100/1101/1102 cascade during teardown.
+34. **`_on_ib_error` is synchronous (`def`)** — matches errorEvent dispatch contract (asyncio main loop). Async work via `asyncio.create_task()`. Threading model verified against ib_async 2.1.0 source (see `reports/f23_shutdown_survey_addendum_20260408.md`).
+35. **`_handle_1101_data_lost` defers to `_auto_reconnect`** — if `ib is None or not ib.isConnected()`, disconnect path handles reconciliation. Inline reconciliation only for edge case where 1101 fires without preceding disconnect.
+36. **`originating_account_id` column** — write-once at staging. NULL for STK_SELL (Followup #20b). TRANSMIT fail-closed: NULL → block + cancel + alert. Never touched by orphan scan, R5 handlers, `/recover_transmitting`.
+37. **`allocate_excess_proportional()`** — proportional allocation, floor then remainder to largest holder. Sub-lot accounts (<100sh) skipped. Deterministic sort by (-shares, account_id).
+38. **Multi-row CC staging** — `_stage_dynamic_exit_candidate` may INSERT multiple rows (one per account) in a single atomic transaction. Each row has its own `uuid.uuid4()` audit_id and `originating_account_id`. Gate 1 math scaled proportionally per row.
 
 ---
 
