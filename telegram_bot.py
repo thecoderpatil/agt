@@ -39,6 +39,7 @@ import finnhub
 import ib_async
 import pandas as pd
 import yfinance as yf
+from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -7575,7 +7576,7 @@ async def _stage_dynamic_exit_candidate(
                     continue
 
                 freed = strike * 100 * excess_contracts
-                wa_per_share = strike + bid - adj_basis
+                wa_per_share = _compute_walk_away_pnl(adj_basis, strike, bid, quantity=1, multiplier=1).walk_away_pnl_per_share
                 if wa_per_share >= 0:
                     g1_pass = True
                     walk_away = 0.0
@@ -8899,7 +8900,7 @@ async def _walk_harvest_chain(
                 continue
 
             # Walk-away P&L per share = strike + premium - adjusted_basis
-            walk_away_pnl = strike + bid - adjusted_basis
+            walk_away_pnl = _compute_walk_away_pnl(adjusted_basis, strike, bid, quantity=1, multiplier=1).walk_away_pnl_per_share
 
             return {
                 "ticker": ticker,

@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Optional
 
+from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
+
 logger = logging.getLogger(__name__)
 
 
@@ -1187,7 +1189,7 @@ def evaluate_gate_1(
     """
     modifier = CONVICTION_MODIFIERS[conviction_tier]
     freed_margin = candidate_strike * 100 * contracts
-    wa_per_share = candidate_strike + candidate_premium - adjusted_cost_basis
+    wa_per_share = _compute_walk_away_pnl(adjusted_cost_basis, candidate_strike, candidate_premium, quantity=1, multiplier=1).walk_away_pnl_per_share
     nominal_loss = abs(wa_per_share) * 100 * contracts if wa_per_share < 0 else 0.0
     adjusted_loss = nominal_loss + tax_liability_override
 
