@@ -179,7 +179,7 @@ def _get_current_desk_mode() -> str:
     """Read current desk mode from mode_history. Returns 'PEACETIME' on any error."""
     try:
         from agt_equities.mode_engine import get_current_mode
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             return get_current_mode(conn)
     except Exception:
         return "PEACETIME"
@@ -224,478 +224,479 @@ async def _push_mode_transition(app, old_mode: str, new_mode: str,
 
 
 def init_db() -> None:
-    with _get_db_connection() as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_orders (
-                id INTEGER PRIMARY KEY,
-                payload JSON NOT NULL,
-                status TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS live_blotter (
-                order_id INTEGER PRIMARY KEY,
-                account_id TEXT,
-                ticker TEXT,
-                sec_type TEXT,
-                action TEXT,
-                right TEXT,
-                quantity INTEGER,
-                limit_price REAL,
-                live_mid REAL,
-                natural_mid REAL,
-                market_mid REAL,
-                status TEXT,
-                error TEXT,
-                updated_at TIMESTAMP NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS executed_orders (
-                id INTEGER PRIMARY KEY,
-                payload JSON NOT NULL,
-                executed_at TIMESTAMP NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS premium_ledger (
-                household_id TEXT NOT NULL,
-                ticker TEXT NOT NULL,
-                initial_basis REAL,
-                total_premium_collected REAL,
-                shares_owned INTEGER,
-                PRIMARY KEY (household_id, ticker)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS csp_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                household_id TEXT NOT NULL,
-                ticker TEXT NOT NULL,
-                sector TEXT,
-                spot_price REAL,
-                strike REAL,
-                expiry TEXT,
-                dte INTEGER,
-                bid REAL,
-                annualized_yield REAL,
-                iv_rank REAL,
-                fundamental_score REAL,
-                technical_score REAL,
-                portfolio_fit_score REAL,
-                composite_score REAL,
-                decision TEXT NOT NULL,
-                modified_ticker TEXT,
-                modified_strike REAL,
-                notes TEXT,
-                vix_at_entry REAL,
-                el_pct_at_entry REAL,
-                portfolio_weight_after REAL,
-                outcome TEXT,
-                outcome_pnl REAL,
-                outcome_date TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ticker_universe (
-                ticker TEXT PRIMARY KEY,
-                company_name TEXT,
-                gics_sector TEXT,
-                gics_industry_group TEXT,
-                index_membership TEXT,
-                has_weekly_options INTEGER DEFAULT 0,
-                avg_volume_30d REAL,
-                market_cap REAL,
-                last_updated TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_ticker_universe_industry_group
-            ON ticker_universe(gics_industry_group)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_pending_orders_status_created_at
-            ON pending_orders(status, created_at, id)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_executed_orders_executed_at
-            ON executed_orders(executed_at, id)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_live_blotter_account_ticker
-            ON live_blotter(account_id, ticker, sec_type, action, right, status, order_id)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_csp_decisions_household_ticker
-            ON csp_decisions(household_id, ticker, timestamp)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_csp_decisions_decision
-            ON csp_decisions(decision, composite_score)
-            """
-        )
-
-        # ── Tracker tables (cc_cycle_log, roll_watchlist, mode_transitions) ──
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS cc_cycle_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker      TEXT    NOT NULL,
-                household   TEXT,
-                mode        TEXT    NOT NULL,
-                strike      REAL,
-                expiry      TEXT,
-                bid         REAL,
-                annualized  REAL,
-                otm_pct     REAL,
-                dte         INTEGER,
-                walk_away_pnl REAL,
-                spot        REAL,
-                adjusted_basis REAL,
-                created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS roll_watchlist (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id    INTEGER NOT NULL,
-                ticker      TEXT    NOT NULL,
-                account_id  TEXT,
-                strike      REAL,
-                expiry      TEXT,
-                quantity    INTEGER,
-                mode        TEXT,
-                status      TEXT    NOT NULL DEFAULT 'active',
-                created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-                resolved_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mode_transitions (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker      TEXT    NOT NULL,
-                household   TEXT,
-                from_mode   TEXT    NOT NULL,
-                to_mode     TEXT    NOT NULL,
-                spot        REAL,
-                adjusted_basis REAL,
-                created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_cc_cycle_ticker ON cc_cycle_log(ticker, created_at)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_roll_watchlist_status ON roll_watchlist(status, expiry)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mode_transitions_ticker ON mode_transitions(ticker, created_at)"
-        )
-
-        # ── Sprint 3 Fix 12: overweight_since column on mode_transitions ──
-        mt_cols = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(mode_transitions)").fetchall()
-        }
-        if "overweight_since" not in mt_cols:
+    with closing(_get_db_connection()) as conn:
+        with conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute(
-                "ALTER TABLE mode_transitions ADD COLUMN overweight_since TEXT"
+                """
+                CREATE TABLE IF NOT EXISTS pending_orders (
+                    id INTEGER PRIMARY KEY,
+                    payload JSON NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_blotter (
+                    order_id INTEGER PRIMARY KEY,
+                    account_id TEXT,
+                    ticker TEXT,
+                    sec_type TEXT,
+                    action TEXT,
+                    right TEXT,
+                    quantity INTEGER,
+                    limit_price REAL,
+                    live_mid REAL,
+                    natural_mid REAL,
+                    market_mid REAL,
+                    status TEXT,
+                    error TEXT,
+                    updated_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executed_orders (
+                    id INTEGER PRIMARY KEY,
+                    payload JSON NOT NULL,
+                    executed_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS premium_ledger (
+                    household_id TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    initial_basis REAL,
+                    total_premium_collected REAL,
+                    shares_owned INTEGER,
+                    PRIMARY KEY (household_id, ticker)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS csp_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    household_id TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    sector TEXT,
+                    spot_price REAL,
+                    strike REAL,
+                    expiry TEXT,
+                    dte INTEGER,
+                    bid REAL,
+                    annualized_yield REAL,
+                    iv_rank REAL,
+                    fundamental_score REAL,
+                    technical_score REAL,
+                    portfolio_fit_score REAL,
+                    composite_score REAL,
+                    decision TEXT NOT NULL,
+                    modified_ticker TEXT,
+                    modified_strike REAL,
+                    notes TEXT,
+                    vix_at_entry REAL,
+                    el_pct_at_entry REAL,
+                    portfolio_weight_after REAL,
+                    outcome TEXT,
+                    outcome_pnl REAL,
+                    outcome_date TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ticker_universe (
+                    ticker TEXT PRIMARY KEY,
+                    company_name TEXT,
+                    gics_sector TEXT,
+                    gics_industry_group TEXT,
+                    index_membership TEXT,
+                    has_weekly_options INTEGER DEFAULT 0,
+                    avg_volume_30d REAL,
+                    market_cap REAL,
+                    last_updated TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ticker_universe_industry_group
+                ON ticker_universe(gics_industry_group)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pending_orders_status_created_at
+                ON pending_orders(status, created_at, id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_executed_orders_executed_at
+                ON executed_orders(executed_at, id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_live_blotter_account_ticker
+                ON live_blotter(account_id, ticker, sec_type, action, right, status, order_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_csp_decisions_household_ticker
+                ON csp_decisions(household_id, ticker, timestamp)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_csp_decisions_decision
+                ON csp_decisions(decision, composite_score)
+                """
             )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS fill_log (
-                exec_id TEXT PRIMARY KEY,
-                ticker TEXT NOT NULL,
-                action TEXT NOT NULL,
-                quantity REAL,
-                price REAL,
-                premium_delta REAL,
-                account_id TEXT,
-                household_id TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            # ── Tracker tables (cc_cycle_log, roll_watchlist, mode_transitions) ──
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cc_cycle_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker      TEXT    NOT NULL,
+                    household   TEXT,
+                    mode        TEXT    NOT NULL,
+                    strike      REAL,
+                    expiry      TEXT,
+                    bid         REAL,
+                    annualized  REAL,
+                    otm_pct     REAL,
+                    dte         INTEGER,
+                    walk_away_pnl REAL,
+                    spot        REAL,
+                    adjusted_basis REAL,
+                    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+                )
+                """
             )
-            """
-        )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS roll_watchlist (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id    INTEGER NOT NULL,
+                    ticker      TEXT    NOT NULL,
+                    account_id  TEXT,
+                    strike      REAL,
+                    expiry      TEXT,
+                    quantity    INTEGER,
+                    mode        TEXT,
+                    status      TEXT    NOT NULL DEFAULT 'active',
+                    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+                    resolved_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mode_transitions (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker      TEXT    NOT NULL,
+                    household   TEXT,
+                    from_mode   TEXT    NOT NULL,
+                    to_mode     TEXT    NOT NULL,
+                    spot        REAL,
+                    adjusted_basis REAL,
+                    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cc_cycle_ticker ON cc_cycle_log(ticker, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_roll_watchlist_status ON roll_watchlist(status, expiry)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mode_transitions_ticker ON mode_transitions(ticker, created_at)"
+            )
 
-        # Add flag column to cc_cycle_log if missing (added in hardening sprint)
-        cc_cols = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(cc_cycle_log)").fetchall()
-        }
-        if "flag" not in cc_cols:
-            conn.execute("ALTER TABLE cc_cycle_log ADD COLUMN flag TEXT DEFAULT 'NORMAL'")
-
-        # ── V7: Conviction columns on ticker_universe ──
-        tu_cols = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(ticker_universe)").fetchall()
-        }
-        for col_name, col_type in (
-            ("conviction_tier", "TEXT DEFAULT 'NEUTRAL'"),
-            ("eps_revision_trend", "TEXT"),
-            ("revenue_growth_vs_sector", "TEXT"),
-            ("analyst_consensus_shift", "TEXT"),
-            ("margin_trend", "TEXT"),
-            ("conviction_updated_at", "TEXT"),
-        ):
-            if col_name not in tu_cols:
+            # ── Sprint 3 Fix 12: overweight_since column on mode_transitions ──
+            mt_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(mode_transitions)").fetchall()
+            }
+            if "overweight_since" not in mt_cols:
                 conn.execute(
-                    f"ALTER TABLE ticker_universe ADD COLUMN {col_name} {col_type}"
+                    "ALTER TABLE mode_transitions ADD COLUMN overweight_since TEXT"
                 )
 
-        # ── V7: conviction_overrides table ──
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS conviction_overrides (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                original_tier TEXT NOT NULL,
-                overridden_tier TEXT NOT NULL,
-                justification TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-            """
-        )
-
-        # ── Sprint 2 Fix 5: premium_ledger_history for archiving exited positions ──
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS premium_ledger_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                household_id TEXT NOT NULL,
-                ticker TEXT NOT NULL,
-                initial_basis REAL,
-                total_premium_collected REAL,
-                shares_owned INTEGER,
-                archived_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-            """
-        )
-
-        live_blotter_columns = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(live_blotter)").fetchall()
-        }
-        for column_name, ddl in (
-            ("account_id", "TEXT"),
-            ("sec_type", "TEXT"),
-            ("action", "TEXT"),
-            ("right", "TEXT"),
-            ("quantity", "INTEGER"),
-            ("live_mid", "REAL"),
-            ("natural_mid", "REAL"),
-            ("market_mid", "REAL"),
-            ("status", "TEXT"),
-            ("error", "TEXT"),
-        ):
-            if column_name not in live_blotter_columns:
-                conn.execute(
-                    f"ALTER TABLE live_blotter ADD COLUMN {column_name} {ddl}"
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fill_log (
+                    exec_id TEXT PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    quantity REAL,
+                    price REAL,
+                    premium_delta REAL,
+                    account_id TEXT,
+                    household_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS api_usage (
-                date TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                api_calls INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date)
+                """
             )
-            """
-        )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS api_usage_by_model (
-                date TEXT NOT NULL,
-                model TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                api_calls INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date, model)
-            )
-            """
-        )
+            # Add flag column to cc_cycle_log if missing (added in hardening sprint)
+            cc_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(cc_cycle_log)").fetchall()
+            }
+            if "flag" not in cc_cols:
+                conn.execute("ALTER TABLE cc_cycle_log ADD COLUMN flag TEXT DEFAULT 'NORMAL'")
 
-        # ── Dashboard tables ────────────────────────────────────────────
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS trade_ledger (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id TEXT NOT NULL,
-                household_id TEXT NOT NULL,
-                trade_date TEXT NOT NULL,
-                trade_datetime TEXT,
-                symbol TEXT NOT NULL,
-                underlying TEXT,
-                asset_category TEXT NOT NULL,
-                trade_type TEXT NOT NULL,
-                quantity REAL NOT NULL,
-                price REAL NOT NULL,
-                proceeds REAL NOT NULL,
-                realized_pnl REAL DEFAULT 0,
-                commission REAL DEFAULT 0,
-                return_category TEXT NOT NULL,
-                source TEXT DEFAULT 'CSV',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(account_id, symbol, trade_datetime, quantity, price)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dividend_ledger (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id TEXT NOT NULL,
-                household_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                amount REAL NOT NULL,
-                div_date TEXT NOT NULL,
-                description TEXT,
-                source TEXT DEFAULT 'CSV',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(account_id, symbol, div_date, amount)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS nav_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id TEXT NOT NULL,
-                household_id TEXT NOT NULL,
-                snapshot_date TEXT NOT NULL,
-                nav_total REAL,
-                nav_cash REAL,
-                nav_stock REAL,
-                nav_options REAL,
-                net_deposits REAL DEFAULT 0,
-                mwr_pct REAL,
-                twr_pct REAL,
-                source TEXT DEFAULT 'CSV',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(account_id, snapshot_date)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS deposit_ledger (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id TEXT NOT NULL,
-                household_id TEXT NOT NULL,
-                dep_date TEXT NOT NULL,
-                amount REAL NOT NULL,
-                dep_type TEXT,
-                description TEXT,
-                source TEXT DEFAULT 'CSV',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(account_id, dep_date, amount, description)
-            )
-            """
-        )
+            # ── V7: Conviction columns on ticker_universe ──
+            tu_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(ticker_universe)").fetchall()
+            }
+            for col_name, col_type in (
+                ("conviction_tier", "TEXT DEFAULT 'NEUTRAL'"),
+                ("eps_revision_trend", "TEXT"),
+                ("revenue_growth_vs_sector", "TEXT"),
+                ("analyst_consensus_shift", "TEXT"),
+                ("margin_trend", "TEXT"),
+                ("conviction_updated_at", "TEXT"),
+            ):
+                if col_name not in tu_cols:
+                    conn.execute(
+                        f"ALTER TABLE ticker_universe ADD COLUMN {col_name} {col_type}"
+                    )
 
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_date ON trade_ledger(trade_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_account ON trade_ledger(account_id, trade_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_category ON trade_ledger(return_category, trade_date)")
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS historical_offsets (
-                account_id TEXT NOT NULL,
-                household_id TEXT NOT NULL,
-                period TEXT NOT NULL,
-                premium_offset REAL DEFAULT 0,
-                capgains_offset REAL DEFAULT 0,
-                dividend_offset REAL DEFAULT 0,
-                total_offset REAL DEFAULT 0,
-                note TEXT,
-                PRIMARY KEY (account_id, period)
+            # ── V7: conviction_overrides table ──
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conviction_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    original_tier TEXT NOT NULL,
+                    overridden_tier TEXT NOT NULL,
+                    justification TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
             )
-            """
-        )
 
-        # Fidelity Jan-Sep 2025 returns (pre-IBKR transfer)
-        conn.execute("""
-            INSERT OR IGNORE INTO historical_offsets
-                (account_id, household_id, period, total_offset, note)
-            VALUES ('U21971297', 'Yash_Household', '2025', 12509.0,
-                    'Fidelity Z30-836527 ($4,924) + Z32-346647 ($7,585) Jan-Sep 2025')
-        """)
-        conn.execute("""
-            INSERT OR IGNORE INTO historical_offsets
-                (account_id, household_id, period, total_offset, note)
-            VALUES ('U22076329', 'Yash_Household', '2025', 25605.37,
-                    'Fidelity 231-598209 Roth IRA Jan-Sep 2025')
-        """)
-        # U22076184 inception_carry_in: dormant account historical baseline, required by Walker for cycle reconstruction
-        conn.execute("""
-            INSERT OR IGNORE INTO historical_offsets
-                (account_id, household_id, period, total_offset, note)
-            VALUES ('U22076184', 'Yash_Household', '2025', 12888.54,
-                    'Fidelity 263-000581 Rollover IRA Jan-Sep 2025')
-        """)
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS inception_config (
-                key TEXT PRIMARY KEY,
-                value REAL NOT NULL,
-                note TEXT
+            # ── Sprint 2 Fix 5: premium_ledger_history for archiving exited positions ──
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS premium_ledger_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    household_id TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    initial_basis REAL,
+                    total_premium_collected REAL,
+                    shares_owned INTEGER,
+                    archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
             )
-            """
-        )
-        conn.execute("""
-            INSERT OR IGNORE INTO inception_config (key, value, note) VALUES
-                ('starting_capital', 146959.04, 'Fidelity total portfolio Jan 1 2025')
-        """)
-        conn.execute("""
-            INSERT OR IGNORE INTO inception_config (key, value, note) VALUES
-                ('fidelity_remaining', 7412.00, 'Fidelity HSA + Cash Mgmt still held Dec 31 2025')
-        """)
-        conn.execute("""
-            INSERT OR IGNORE INTO inception_config (key, value, note) VALUES
-                ('fidelity_net_external', 48591.29, 'Fidelity net external deposits Jan-Sep 2025: $76,544 in - $27,953 out')
-        """)
 
-        # ── Master Log Refactor v3: Bucket 2 + Bucket 3 new tables ──
-        from agt_equities.schema import register_master_log_tables
-        register_master_log_tables(conn)
+            live_blotter_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(live_blotter)").fetchall()
+            }
+            for column_name, ddl in (
+                ("account_id", "TEXT"),
+                ("sec_type", "TEXT"),
+                ("action", "TEXT"),
+                ("right", "TEXT"),
+                ("quantity", "INTEGER"),
+                ("live_mid", "REAL"),
+                ("natural_mid", "REAL"),
+                ("market_mid", "REAL"),
+                ("status", "TEXT"),
+                ("error", "TEXT"),
+            ):
+                if column_name not in live_blotter_columns:
+                    conn.execute(
+                        f"ALTER TABLE live_blotter ADD COLUMN {column_name} {ddl}"
+                    )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_usage (
+                    date TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    api_calls INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (date)
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_usage_by_model (
+                    date TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    api_calls INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (date, model)
+                )
+                """
+            )
+
+            # ── Dashboard tables ────────────────────────────────────────────
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    household_id TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    trade_datetime TEXT,
+                    symbol TEXT NOT NULL,
+                    underlying TEXT,
+                    asset_category TEXT NOT NULL,
+                    trade_type TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    price REAL NOT NULL,
+                    proceeds REAL NOT NULL,
+                    realized_pnl REAL DEFAULT 0,
+                    commission REAL DEFAULT 0,
+                    return_category TEXT NOT NULL,
+                    source TEXT DEFAULT 'CSV',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(account_id, symbol, trade_datetime, quantity, price)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dividend_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    household_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    div_date TEXT NOT NULL,
+                    description TEXT,
+                    source TEXT DEFAULT 'CSV',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(account_id, symbol, div_date, amount)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS nav_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    household_id TEXT NOT NULL,
+                    snapshot_date TEXT NOT NULL,
+                    nav_total REAL,
+                    nav_cash REAL,
+                    nav_stock REAL,
+                    nav_options REAL,
+                    net_deposits REAL DEFAULT 0,
+                    mwr_pct REAL,
+                    twr_pct REAL,
+                    source TEXT DEFAULT 'CSV',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(account_id, snapshot_date)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deposit_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    household_id TEXT NOT NULL,
+                    dep_date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    dep_type TEXT,
+                    description TEXT,
+                    source TEXT DEFAULT 'CSV',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(account_id, dep_date, amount, description)
+                )
+                """
+            )
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_date ON trade_ledger(trade_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_account ON trade_ledger(account_id, trade_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_category ON trade_ledger(return_category, trade_date)")
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS historical_offsets (
+                    account_id TEXT NOT NULL,
+                    household_id TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    premium_offset REAL DEFAULT 0,
+                    capgains_offset REAL DEFAULT 0,
+                    dividend_offset REAL DEFAULT 0,
+                    total_offset REAL DEFAULT 0,
+                    note TEXT,
+                    PRIMARY KEY (account_id, period)
+                )
+                """
+            )
+
+            # Fidelity Jan-Sep 2025 returns (pre-IBKR transfer)
+            conn.execute("""
+                INSERT OR IGNORE INTO historical_offsets
+                    (account_id, household_id, period, total_offset, note)
+                VALUES ('U21971297', 'Yash_Household', '2025', 12509.0,
+                        'Fidelity Z30-836527 ($4,924) + Z32-346647 ($7,585) Jan-Sep 2025')
+            """)
+            conn.execute("""
+                INSERT OR IGNORE INTO historical_offsets
+                    (account_id, household_id, period, total_offset, note)
+                VALUES ('U22076329', 'Yash_Household', '2025', 25605.37,
+                        'Fidelity 231-598209 Roth IRA Jan-Sep 2025')
+            """)
+            # U22076184 inception_carry_in: dormant account historical baseline, required by Walker for cycle reconstruction
+            conn.execute("""
+                INSERT OR IGNORE INTO historical_offsets
+                    (account_id, household_id, period, total_offset, note)
+                VALUES ('U22076184', 'Yash_Household', '2025', 12888.54,
+                        'Fidelity 263-000581 Rollover IRA Jan-Sep 2025')
+            """)
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS inception_config (
+                    key TEXT PRIMARY KEY,
+                    value REAL NOT NULL,
+                    note TEXT
+                )
+                """
+            )
+            conn.execute("""
+                INSERT OR IGNORE INTO inception_config (key, value, note) VALUES
+                    ('starting_capital', 146959.04, 'Fidelity total portfolio Jan 1 2025')
+            """)
+            conn.execute("""
+                INSERT OR IGNORE INTO inception_config (key, value, note) VALUES
+                    ('fidelity_remaining', 7412.00, 'Fidelity HSA + Cash Mgmt still held Dec 31 2025')
+            """)
+            conn.execute("""
+                INSERT OR IGNORE INTO inception_config (key, value, note) VALUES
+                    ('fidelity_net_external', 48591.29, 'Fidelity net external deposits Jan-Sep 2025: $76,544 in - $27,953 out')
+            """)
+
+            # ── Master Log Refactor v3: Bucket 2 + Bucket 3 new tables ──
+            from agt_equities.schema import register_master_log_tables
+            register_master_log_tables(conn)
 
     _cleanup_test_orders()
     _load_todays_usage()
@@ -704,16 +705,17 @@ def init_db() -> None:
 def _cleanup_test_orders():
     """Mark all stale staged orders as superseded on boot."""
     try:
-        with _get_db_connection() as conn:
-            result = conn.execute(
-                """
-                UPDATE pending_orders
-                SET status = 'superseded'
-                WHERE status = 'staged'
-                """
-            )
-            if result.rowcount > 0:
-                logger.info("Cleaned %d stale staged orders", result.rowcount)
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                result = conn.execute(
+                    """
+                    UPDATE pending_orders
+                    SET status = 'superseded'
+                    WHERE status = 'staged'
+                    """
+                )
+                if result.rowcount > 0:
+                    logger.info("Cleaned %d stale staged orders", result.rowcount)
     except Exception as exc:
         logger.warning("_cleanup_test_orders failed: %s", exc)
 
@@ -723,7 +725,7 @@ def _load_todays_usage():
     global _budget_date, _tokens_used_today
     try:
         today = str(_date.today())
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             row = conn.execute(
                 "SELECT input_tokens + output_tokens as total "
                 "FROM api_usage WHERE date = ?",
@@ -752,14 +754,15 @@ def append_pending_tickets(tickets: list[dict]) -> None:
             created_at,
         ))
 
-    with _get_db_connection() as conn:
-        conn.executemany(
-            """
-            INSERT INTO pending_orders (payload, status, created_at)
-            VALUES (?, ?, ?)
-            """,
-            rows,
-        )
+    with closing(_get_db_connection()) as conn:
+        with conn:
+            conn.executemany(
+                """
+                INSERT INTO pending_orders (payload, status, created_at)
+                VALUES (?, ?, ?)
+                """,
+                rows,
+            )
 
 
 def _revert_pending_order_claims(order_ids: list[int]) -> int:
@@ -768,16 +771,17 @@ def _revert_pending_order_claims(order_ids: list[int]) -> int:
         return 0
 
     placeholders = ",".join("?" for _ in order_ids)
-    with _get_db_connection() as conn:
-        result = conn.execute(
-            f"""
-            UPDATE pending_orders
-            SET status = 'staged'
-            WHERE id IN ({placeholders}) AND status = 'processing'
-            """,
-            order_ids,
-        )
-        return result.rowcount
+    with closing(_get_db_connection()) as conn:
+        with conn:
+            result = conn.execute(
+                f"""
+                UPDATE pending_orders
+                SET status = 'staged'
+                WHERE id IN ({placeholders}) AND status = 'processing'
+                """,
+                order_ids,
+            )
+            return result.rowcount
 
 
 def _log_cc_cycle(entries: list[dict]) -> None:
@@ -802,17 +806,18 @@ def _log_cc_cycle(entries: list[dict]) -> None:
                 e.get("adjusted_basis"),
                 e.get("flag", "NORMAL"),
             ))
-        with _get_db_connection() as conn:
-            conn.executemany(
-                """
-                INSERT INTO cc_cycle_log
-                    (ticker, household, mode, strike, expiry, bid,
-                     annualized, otm_pct, dte, walk_away_pnl,
-                     spot, adjusted_basis, flag)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                conn.executemany(
+                    """
+                    INSERT INTO cc_cycle_log
+                        (ticker, household, mode, strike, expiry, bid,
+                         annualized, otm_pct, dte, walk_away_pnl,
+                         spot, adjusted_basis, flag)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
     except Exception as exc:
         logger.warning("_log_cc_cycle failed: %s", exc)
 
@@ -855,30 +860,31 @@ def _check_and_track_tokens(input_tokens: int, output_tokens: int, model: str = 
     _tokens_used_today += total
 
     try:
-        with _get_db_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO api_usage (date, input_tokens, output_tokens, api_calls)
-                VALUES (?, ?, ?, 1)
-                ON CONFLICT(date) DO UPDATE SET
-                    input_tokens = input_tokens + excluded.input_tokens,
-                    output_tokens = output_tokens + excluded.output_tokens,
-                    api_calls = api_calls + 1
-                """,
-                (today, input_tokens, output_tokens),
-            )
-            if model and total > 0:
+        with closing(_get_db_connection()) as conn:
+            with conn:
                 conn.execute(
                     """
-                    INSERT INTO api_usage_by_model (date, model, input_tokens, output_tokens, api_calls)
-                    VALUES (?, ?, ?, ?, 1)
-                    ON CONFLICT(date, model) DO UPDATE SET
+                    INSERT INTO api_usage (date, input_tokens, output_tokens, api_calls)
+                    VALUES (?, ?, ?, 1)
+                    ON CONFLICT(date) DO UPDATE SET
                         input_tokens = input_tokens + excluded.input_tokens,
                         output_tokens = output_tokens + excluded.output_tokens,
                         api_calls = api_calls + 1
                     """,
-                    (today, model, input_tokens, output_tokens),
+                    (today, input_tokens, output_tokens),
                 )
+                if model and total > 0:
+                    conn.execute(
+                        """
+                        INSERT INTO api_usage_by_model (date, model, input_tokens, output_tokens, api_calls)
+                        VALUES (?, ?, ?, ?, 1)
+                        ON CONFLICT(date, model) DO UPDATE SET
+                            input_tokens = input_tokens + excluded.input_tokens,
+                            output_tokens = output_tokens + excluded.output_tokens,
+                            api_calls = api_calls + 1
+                        """,
+                        (today, model, input_tokens, output_tokens),
+                    )
     except Exception as exc:
         logger.warning("Failed to persist api_usage: %s", exc)
 
@@ -1197,17 +1203,14 @@ async def _check_rule_11_leverage(household: str) -> tuple[bool, str]:
             pass
 
         # Compute household NLV
-        import sqlite3 as _sql
-        conn = _sql.connect(DB_PATH)
-        conn.row_factory = _sql.Row
-        nav = {}
-        for r in conn.execute(
-            "SELECT account_id, CAST(total AS REAL) as nav "
-            "FROM master_log_nav WHERE report_date = "
-            "(SELECT MAX(report_date) FROM master_log_nav)"
-        ).fetchall():
-            nav[r['account_id']] = r['nav']
-        conn.close()
+        with closing(_get_db_connection()) as conn:
+            nav = {}
+            for r in conn.execute(
+                "SELECT account_id, CAST(total AS REAL) as nav "
+                "FROM master_log_nav WHERE report_date = "
+                "(SELECT MAX(report_date) FROM master_log_nav)"
+            ).fetchall():
+                nav[r['account_id']] = r['nav']
 
         hh_nlv = {}
         for acct, hh in ACCOUNT_TO_HOUSEHOLD.items():
@@ -1740,7 +1743,7 @@ def _load_working_call_encumbrance(
     placeholders = ",".join("?" for _ in accounts)
     params = [*accounts, ticker.upper()]
 
-    with _get_db_connection() as conn:
+    with closing(_get_db_connection()) as conn:
         rows = conn.execute(
             f"""
             SELECT account_id, COALESCE(SUM(quantity), 0) AS contracts
@@ -1787,7 +1790,7 @@ def _load_premium_ledger_snapshot(household_id: str, ticker: str) -> dict | None
                            household_id, ticker, exc)
 
     # Legacy fallback
-    with _get_db_connection() as conn:
+    with closing(_get_db_connection()) as conn:
         row = conn.execute(
             """
             SELECT household_id, ticker, initial_basis, total_premium_collected, shares_owned
@@ -1865,7 +1868,7 @@ def _r5_on_order_status(trade):
         if new_status == OrderStatus.FILLED and remaining and float(remaining) > 0:
             new_status = OrderStatus.PARTIALLY_FILLED
 
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             # Match by perm_id first, then client_id
             row = None
             if perm_id:
@@ -1916,42 +1919,43 @@ def _r5_on_exec_details(trade, fill):
         remaining = getattr(trade.orderStatus, 'remaining', 0)
         new_status = OrderStatus.FILLED if (not remaining or float(remaining) == 0) else OrderStatus.PARTIALLY_FILLED
 
-        with _get_db_connection() as conn:
-            row = None
-            if perm_id:
-                row = conn.execute(
-                    "SELECT id FROM pending_orders WHERE ib_perm_id = ? "
-                    "ORDER BY id DESC LIMIT 1", (perm_id,)
-                ).fetchone()
-            if row is None and client_id:
-                row = conn.execute(
-                    "SELECT id FROM pending_orders WHERE ib_order_id = ? "
-                    "ORDER BY id DESC LIMIT 1", (client_id,)
-                ).fetchone()
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                row = None
+                if perm_id:
+                    row = conn.execute(
+                        "SELECT id FROM pending_orders WHERE ib_perm_id = ? "
+                        "ORDER BY id DESC LIMIT 1", (perm_id,)
+                    ).fetchone()
+                if row is None and client_id:
+                    row = conn.execute(
+                        "SELECT id FROM pending_orders WHERE ib_order_id = ? "
+                        "ORDER BY id DESC LIMIT 1", (client_id,)
+                    ).fetchone()
 
-            if row is None:
-                conn.execute(
-                    "INSERT INTO orphan_order_events "
-                    "(event_type, ib_order_id, ib_perm_id, status, payload) "
-                    "VALUES ('execDetails', ?, ?, ?, ?)",
-                    (client_id, perm_id, str(new_status),
-                     f"exec_id={exec_id_str} price={fill_price} qty={fill_qty}"),
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO orphan_order_events "
+                        "(event_type, ib_order_id, ib_perm_id, status, payload) "
+                        "VALUES ('execDetails', ?, ?, ?, ?)",
+                        (client_id, perm_id, str(new_status),
+                         f"exec_id={exec_id_str} price={fill_price} qty={fill_qty}"),
+                    )
+                    return
+
+                order_id = row[0]
+                append_status(
+                    conn, order_id, new_status, 'execDetailsEvent',
+                    {"exec_id": exec_id_str, "price": str(fill_price),
+                     "qty": str(fill_qty), "time": fill_time},
                 )
-                return
 
-            order_id = row[0]
-            append_status(
-                conn, order_id, new_status, 'execDetailsEvent',
-                {"exec_id": exec_id_str, "price": str(fill_price),
-                 "qty": str(fill_qty), "time": fill_time},
-            )
-
-            # Update fill fields
-            conn.execute(
-                "UPDATE pending_orders SET fill_price = ?, fill_qty = ?, fill_time = ? "
-                "WHERE id = ?",
-                (float(fill_price), int(float(fill_qty)), fill_time, order_id),
-            )
+                # Update fill fields
+                conn.execute(
+                    "UPDATE pending_orders SET fill_price = ?, fill_qty = ?, fill_time = ? "
+                    "WHERE id = ?",
+                    (float(fill_price), int(float(fill_qty)), fill_time, order_id),
+                )
 
     except Exception as exc:
         logger.warning("R5 execDetailsEvent handler error: %s", exc)
@@ -1965,7 +1969,7 @@ def _r5_on_commission_report(trade, fill, report):
         client_id = getattr(order, 'orderId', None) or 0
         commission = getattr(report, 'commission', 0) or 0
 
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             row = None
             if perm_id:
                 row = conn.execute(
@@ -1993,7 +1997,7 @@ def _r5_on_commission_report(trade, fill, report):
 def _is_duplicate_fill(exec_id: str) -> bool:
     """Check if this execution ID was already processed."""
     try:
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             row = conn.execute(
                 "SELECT 1 FROM fill_log WHERE exec_id = ?",
                 (exec_id,),
@@ -2008,17 +2012,18 @@ def _record_fill(exec_id: str, ticker: str, action: str,
                  account_id: str, household_id: str) -> None:
     """Log a processed fill for deduplication."""
     try:
-        with _get_db_connection() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO fill_log
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO fill_log
+                        (exec_id, ticker, action, quantity, price,
+                         premium_delta, account_id, household_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     (exec_id, ticker, action, quantity, price,
-                     premium_delta, account_id, household_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (exec_id, ticker, action, quantity, price,
-                 premium_delta, account_id, household_id),
-            )
+                     premium_delta, account_id, household_id),
+                )
     except Exception as exc:
         logger.warning("_record_fill failed: %s", exc)
 
@@ -2035,59 +2040,60 @@ def _apply_fill_atomically(
 ) -> bool:
     """Atomic: dedup via INSERT OR IGNORE + ledger UPSERT. Single transaction."""
     try:
-        with _get_db_connection() as conn:
-            # Step 1: Attempt dedup insert — if exec_id exists, rowcount = 0
-            cur = conn.execute(
-                """
-                INSERT OR IGNORE INTO fill_log
-                    (exec_id, ticker, action, quantity, price,
-                     premium_delta, account_id, household_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (exec_id, ticker, action, quantity, price,
-                 premium_delta, account_id, household_id),
-            )
-            if cur.rowcount == 0:
-                return False  # Duplicate — already processed
-
-            # Step 2: Upsert premium_ledger if there's a delta
-            if premium_delta != 0:
-                conn.execute(
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                # Step 1: Attempt dedup insert — if exec_id exists, rowcount = 0
+                cur = conn.execute(
                     """
-                    INSERT INTO premium_ledger
-                        (household_id, ticker, initial_basis,
-                         total_premium_collected, shares_owned)
-                    VALUES (?, ?, 0.0, ?, 0)
-                    ON CONFLICT(household_id, ticker) DO UPDATE SET
-                        total_premium_collected =
-                            total_premium_collected + excluded.total_premium_collected
+                    INSERT OR IGNORE INTO fill_log
+                        (exec_id, ticker, action, quantity, price,
+                         premium_delta, account_id, household_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (household_id, ticker, premium_delta),
+                    (exec_id, ticker, action, quantity, price,
+                     premium_delta, account_id, household_id),
                 )
+                if cur.rowcount == 0:
+                    return False  # Duplicate — already processed
 
-            # Step 3: Dashboard — record fill to trade_ledger
-            try:
-                conn.execute("""
-                    INSERT OR IGNORE INTO trade_ledger
-                        (account_id, household_id, trade_date, trade_datetime,
-                         symbol, underlying, asset_category, trade_type,
-                         quantity, price, proceeds, realized_pnl,
-                         return_category, source)
-                    VALUES (?, ?, date('now'), datetime('now'),
-                            ?, ?, ?, ?, ?, ?, ?, 0, ?, 'LIVE')
-                """, (
-                    account_id, household_id,
-                    ticker, ticker,
-                    'Equity and Index Options' if action in ('SELL_CALL', 'SELL_PUT', 'BUY_CALL', 'BUY_PUT') else 'Stocks',
-                    action,
-                    quantity, price,
-                    round(premium_delta, 2),
-                    'PREMIUM' if action in ('SELL_CALL', 'SELL_PUT', 'BUY_CALL', 'BUY_PUT') else 'CAPITAL_GAIN',
-                ))
-            except Exception:
-                pass  # Non-critical — don't break the fill handler
+                # Step 2: Upsert premium_ledger if there's a delta
+                if premium_delta != 0:
+                    conn.execute(
+                        """
+                        INSERT INTO premium_ledger
+                            (household_id, ticker, initial_basis,
+                             total_premium_collected, shares_owned)
+                        VALUES (?, ?, 0.0, ?, 0)
+                        ON CONFLICT(household_id, ticker) DO UPDATE SET
+                            total_premium_collected =
+                                total_premium_collected + excluded.total_premium_collected
+                        """,
+                        (household_id, ticker, premium_delta),
+                    )
 
-            return True
+                # Step 3: Dashboard — record fill to trade_ledger
+                try:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO trade_ledger
+                            (account_id, household_id, trade_date, trade_datetime,
+                             symbol, underlying, asset_category, trade_type,
+                             quantity, price, proceeds, realized_pnl,
+                             return_category, source)
+                        VALUES (?, ?, date('now'), datetime('now'),
+                                ?, ?, ?, ?, ?, ?, ?, 0, ?, 'LIVE')
+                    """, (
+                        account_id, household_id,
+                        ticker, ticker,
+                        'Equity and Index Options' if action in ('SELL_CALL', 'SELL_PUT', 'BUY_CALL', 'BUY_PUT') else 'Stocks',
+                        action,
+                        quantity, price,
+                        round(premium_delta, 2),
+                        'PREMIUM' if action in ('SELL_CALL', 'SELL_PUT', 'BUY_CALL', 'BUY_PUT') else 'CAPITAL_GAIN',
+                    ))
+                except Exception:
+                    pass  # Non-critical — don't break the fill handler
+
+                return True
     except Exception as exc:
         logger.warning(
             "_apply_fill_atomically failed: exec_id=%s %s: %s",
@@ -2103,34 +2109,35 @@ def _apply_fill_atomically(
 def _credit_premium(household: str, ticker: str, amount: float) -> bool:
     """Add premium to total_premium_collected. Returns True if updated."""
     try:
-        with _get_db_connection() as conn:
-            existing = conn.execute(
-                "SELECT total_premium_collected FROM premium_ledger "
-                "WHERE household_id = ? AND ticker = ?",
-                (household, ticker),
-            ).fetchone()
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                existing = conn.execute(
+                    "SELECT total_premium_collected FROM premium_ledger "
+                    "WHERE household_id = ? AND ticker = ?",
+                    (household, ticker),
+                ).fetchone()
 
-            if existing:
-                conn.execute(
-                    """
-                    UPDATE premium_ledger
-                    SET total_premium_collected = total_premium_collected + ?
-                    WHERE household_id = ? AND ticker = ?
-                    """,
-                    (amount, household, ticker),
-                )
-                return True
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO premium_ledger
-                        (household_id, ticker, initial_basis,
-                         total_premium_collected, shares_owned)
-                    VALUES (?, ?, 0.0, ?, 0)
-                    """,
-                    (household, ticker, amount),
-                )
-                return True
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE premium_ledger
+                        SET total_premium_collected = total_premium_collected + ?
+                        WHERE household_id = ? AND ticker = ?
+                        """,
+                        (amount, household, ticker),
+                    )
+                    return True
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO premium_ledger
+                            (household_id, ticker, initial_basis,
+                             total_premium_collected, shares_owned)
+                        VALUES (?, ?, 0.0, ?, 0)
+                        """,
+                        (household, ticker, amount),
+                    )
+                    return True
     except Exception as exc:
         logger.warning("_credit_premium failed for %s/%s: %s",
                        household, ticker, exc)
@@ -2281,71 +2288,72 @@ def _on_shares_sold(trade, fill):
 
         shares_sold = abs(int(execution.shares))
 
-        with _get_db_connection() as conn:
-            # Atomic dedup inside transaction
-            dup = conn.execute(
-                "SELECT 1 FROM fill_log WHERE exec_id = ?", (exec_id,)
-            ).fetchone()
-            if dup:
-                return
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                # Atomic dedup inside transaction
+                dup = conn.execute(
+                    "SELECT 1 FROM fill_log WHERE exec_id = ?", (exec_id,)
+                ).fetchone()
+                if dup:
+                    return
 
-            existing = conn.execute(
-                "SELECT shares_owned FROM premium_ledger "
-                "WHERE household_id = ? AND ticker = ?",
-                (household, ticker),
-            ).fetchone()
+                existing = conn.execute(
+                    "SELECT shares_owned FROM premium_ledger "
+                    "WHERE household_id = ? AND ticker = ?",
+                    (household, ticker),
+                ).fetchone()
 
-            if existing and existing["shares_owned"]:
-                new_shares = max(0, int(existing["shares_owned"]) - shares_sold)
-                conn.execute(
-                    """
-                    UPDATE premium_ledger
-                    SET shares_owned = ?
-                    WHERE household_id = ? AND ticker = ?
-                    """,
-                    (new_shares, household, ticker),
-                )
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO fill_log
-                        (exec_id, ticker, action, quantity, price,
-                         premium_delta, account_id, household_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (exec_id, ticker, "STK_SELL", shares_sold,
-                     execution.price, 0, acct_id, household),
-                )
-                logger.info(
-                    "Shares sold: %s %s -%d (remaining: %d)",
-                    household, ticker, shares_sold, new_shares,
-                )
-
-                # Archive and reset ledger when position fully exited
-                if new_shares == 0:
-                    conn.execute(
-                        """
-                        INSERT INTO premium_ledger_history
-                            (household_id, ticker, initial_basis,
-                             total_premium_collected, shares_owned)
-                        SELECT household_id, ticker, initial_basis,
-                               total_premium_collected, ?
-                        FROM premium_ledger
-                        WHERE household_id = ? AND ticker = ?
-                        """,
-                        (shares_sold, household, ticker),
-                    )
+                if existing and existing["shares_owned"]:
+                    new_shares = max(0, int(existing["shares_owned"]) - shares_sold)
                     conn.execute(
                         """
                         UPDATE premium_ledger
-                        SET initial_basis = 0, total_premium_collected = 0
+                        SET shares_owned = ?
                         WHERE household_id = ? AND ticker = ?
                         """,
-                        (household, ticker),
+                        (new_shares, household, ticker),
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO fill_log
+                            (exec_id, ticker, action, quantity, price,
+                             premium_delta, account_id, household_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (exec_id, ticker, "STK_SELL", shares_sold,
+                         execution.price, 0, acct_id, household),
                     )
                     logger.info(
-                        "Position fully exited — archived and reset ledger: %s %s",
-                        household, ticker,
+                        "Shares sold: %s %s -%d (remaining: %d)",
+                        household, ticker, shares_sold, new_shares,
                     )
+
+                    # Archive and reset ledger when position fully exited
+                    if new_shares == 0:
+                        conn.execute(
+                            """
+                            INSERT INTO premium_ledger_history
+                                (household_id, ticker, initial_basis,
+                                 total_premium_collected, shares_owned)
+                            SELECT household_id, ticker, initial_basis,
+                                   total_premium_collected, ?
+                            FROM premium_ledger
+                            WHERE household_id = ? AND ticker = ?
+                            """,
+                            (shares_sold, household, ticker),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE premium_ledger
+                            SET initial_basis = 0, total_premium_collected = 0
+                            WHERE household_id = ? AND ticker = ?
+                            """,
+                            (household, ticker),
+                        )
+                        logger.info(
+                            "Position fully exited — archived and reset ledger: %s %s",
+                            household, ticker,
+                        )
 
     except Exception as exc:
         logger.exception("_on_shares_sold failed: %s", exc)
@@ -2375,82 +2383,83 @@ def _on_shares_bought(trade, fill):
         shares_bought = abs(int(execution.shares))
         cost_per_share = execution.price
 
-        with _get_db_connection() as conn:
-            # Atomic dedup inside transaction
-            dup = conn.execute(
-                "SELECT 1 FROM fill_log WHERE exec_id = ?", (exec_id,)
-            ).fetchone()
-            if dup:
-                return
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                # Atomic dedup inside transaction
+                dup = conn.execute(
+                    "SELECT 1 FROM fill_log WHERE exec_id = ?", (exec_id,)
+                ).fetchone()
+                if dup:
+                    return
 
-            existing = conn.execute(
-                "SELECT shares_owned, initial_basis, total_premium_collected "
-                "FROM premium_ledger WHERE household_id = ? AND ticker = ?",
-                (household, ticker),
-            ).fetchone()
+                existing = conn.execute(
+                    "SELECT shares_owned, initial_basis, total_premium_collected "
+                    "FROM premium_ledger WHERE household_id = ? AND ticker = ?",
+                    (household, ticker),
+                ).fetchone()
 
-            if existing:
-                old_shares = int(existing["shares_owned"] or 0)
-                new_shares = old_shares + shares_bought
+                if existing:
+                    old_shares = int(existing["shares_owned"] or 0)
+                    new_shares = old_shares + shares_bought
 
-                old_basis = float(existing["initial_basis"] or 0)
-                if old_shares > 0 and old_basis > 0:
-                    new_basis = round(
-                        (old_basis * old_shares + cost_per_share * shares_bought)
-                        / new_shares, 4
+                    old_basis = float(existing["initial_basis"] or 0)
+                    if old_shares > 0 and old_basis > 0:
+                        new_basis = round(
+                            (old_basis * old_shares + cost_per_share * shares_bought)
+                            / new_shares, 4
+                        )
+                    else:
+                        new_basis = round(cost_per_share, 4)
+
+                    conn.execute(
+                        """
+                        UPDATE premium_ledger
+                        SET shares_owned = ?, initial_basis = ?
+                        WHERE household_id = ? AND ticker = ?
+                        """,
+                        (new_shares, new_basis, household, ticker),
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO fill_log
+                            (exec_id, ticker, action, quantity, price,
+                             premium_delta, account_id, household_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (exec_id, ticker, "STK_BUY", shares_bought,
+                         cost_per_share, 0, acct_id, household),
+                    )
+                    logger.info(
+                        "Shares bought: %s %s +%d @ $%.2f "
+                        "(total: %d, basis: $%.4f)",
+                        household, ticker, shares_bought, cost_per_share,
+                        new_shares, new_basis,
                     )
                 else:
-                    new_basis = round(cost_per_share, 4)
-
-                conn.execute(
-                    """
-                    UPDATE premium_ledger
-                    SET shares_owned = ?, initial_basis = ?
-                    WHERE household_id = ? AND ticker = ?
-                    """,
-                    (new_shares, new_basis, household, ticker),
-                )
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO fill_log
-                        (exec_id, ticker, action, quantity, price,
-                         premium_delta, account_id, household_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (exec_id, ticker, "STK_BUY", shares_bought,
-                     cost_per_share, 0, acct_id, household),
-                )
-                logger.info(
-                    "Shares bought: %s %s +%d @ $%.2f "
-                    "(total: %d, basis: $%.4f)",
-                    household, ticker, shares_bought, cost_per_share,
-                    new_shares, new_basis,
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO premium_ledger
-                        (household_id, ticker, initial_basis,
-                         total_premium_collected, shares_owned)
-                    VALUES (?, ?, ?, 0.0, ?)
-                    """,
-                    (household, ticker,
-                     round(cost_per_share, 4), shares_bought),
-                )
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO fill_log
-                        (exec_id, ticker, action, quantity, price,
-                         premium_delta, account_id, household_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (exec_id, ticker, "STK_BUY", shares_bought,
-                     cost_per_share, 0, acct_id, household),
-                )
-                logger.info(
-                    "New position: %s %s %d shares @ $%.2f",
-                    household, ticker, shares_bought, cost_per_share,
-                )
+                    conn.execute(
+                        """
+                        INSERT INTO premium_ledger
+                            (household_id, ticker, initial_basis,
+                             total_premium_collected, shares_owned)
+                        VALUES (?, ?, ?, 0.0, ?)
+                        """,
+                        (household, ticker,
+                         round(cost_per_share, 4), shares_bought),
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO fill_log
+                            (exec_id, ticker, action, quantity, price,
+                             premium_delta, account_id, household_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (exec_id, ticker, "STK_BUY", shares_bought,
+                         cost_per_share, 0, acct_id, household),
+                    )
+                    logger.info(
+                        "New position: %s %s %d shares @ $%.2f",
+                        household, ticker, shares_bought, cost_per_share,
+                    )
 
     except Exception as exc:
         logger.exception("_on_shares_bought failed: %s", exc)
@@ -5141,7 +5150,7 @@ async def cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         today = str(_date.today())
         month_start = today[:8] + "01"
 
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             today_row = conn.execute(
                 "SELECT input_tokens, output_tokens, api_calls "
                 "FROM api_usage WHERE date = ?",
@@ -5749,7 +5758,7 @@ def _get_industry_groups_batch(tickers: list[str]) -> dict[str, str]:
         return result
     try:
         placeholders = ",".join("?" for _ in tickers)
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             rows = conn.execute(
                 f"SELECT ticker, gics_industry_group FROM ticker_universe "
                 f"WHERE ticker IN ({placeholders})",
@@ -5847,59 +5856,60 @@ def _refresh_ticker_universe_sync() -> dict:
         added = 0
         updated = 0
 
-        with _get_db_connection() as conn:
-            existing = {
-                row["ticker"]
-                for row in conn.execute("SELECT ticker FROM ticker_universe").fetchall()
-            }
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                existing = {
+                    row["ticker"]
+                    for row in conn.execute("SELECT ticker FROM ticker_universe").fetchall()
+                }
 
-            CHUNK_SIZE = 20
-            now_iso = _datetime.now().isoformat()
+                CHUNK_SIZE = 20
+                now_iso = _datetime.now().isoformat()
 
-            for i in range(0, len(all_syms), CHUNK_SIZE):
-                chunk = all_syms[i:i + CHUNK_SIZE]
-                for sym in chunk:
-                    entry = tickers[sym]
-                    gics_sector = entry.get("gics_sector_wiki", "")
-                    gics_industry_group = ""
+                for i in range(0, len(all_syms), CHUNK_SIZE):
+                    chunk = all_syms[i:i + CHUNK_SIZE]
+                    for sym in chunk:
+                        entry = tickers[sym]
+                        gics_sector = entry.get("gics_sector_wiki", "")
+                        gics_industry_group = ""
 
-                    try:
-                        yf_info = yf.Ticker(sym).info
-                        yf_sector = yf_info.get("sector", "")
-                        yf_industry = yf_info.get("industry", "")
-                        if yf_sector:
-                            gics_sector = yf_sector
-                        if yf_industry:
-                            gics_industry_group = yf_industry
-                    except Exception:
-                        gics_industry_group = entry.get("gics_sub_wiki", "")
+                        try:
+                            yf_info = yf.Ticker(sym).info
+                            yf_sector = yf_info.get("sector", "")
+                            yf_industry = yf_info.get("industry", "")
+                            if yf_sector:
+                                gics_sector = yf_sector
+                            if yf_industry:
+                                gics_industry_group = yf_industry
+                        except Exception:
+                            gics_industry_group = entry.get("gics_sub_wiki", "")
 
-                    index_str = ",".join(entry["indexes"])
+                        index_str = ",".join(entry["indexes"])
 
-                    if sym in existing:
-                        conn.execute(
-                            """UPDATE ticker_universe
-                               SET company_name=?, gics_sector=?,
-                                   gics_industry_group=?, index_membership=?,
-                                   last_updated=?
-                               WHERE ticker=?""",
-                            (entry["company_name"], gics_sector,
-                             gics_industry_group, index_str, now_iso, sym),
-                        )
-                        updated += 1
-                    else:
-                        conn.execute(
-                            """INSERT INTO ticker_universe
-                                   (ticker, company_name, gics_sector,
-                                    gics_industry_group, index_membership,
-                                    last_updated)
-                               VALUES (?, ?, ?, ?, ?, ?)""",
-                            (sym, entry["company_name"], gics_sector,
-                             gics_industry_group, index_str, now_iso),
-                        )
-                        added += 1
+                        if sym in existing:
+                            conn.execute(
+                                """UPDATE ticker_universe
+                                   SET company_name=?, gics_sector=?,
+                                       gics_industry_group=?, index_membership=?,
+                                       last_updated=?
+                                   WHERE ticker=?""",
+                                (entry["company_name"], gics_sector,
+                                 gics_industry_group, index_str, now_iso, sym),
+                            )
+                            updated += 1
+                        else:
+                            conn.execute(
+                                """INSERT INTO ticker_universe
+                                       (ticker, company_name, gics_sector,
+                                        gics_industry_group, index_membership,
+                                        last_updated)
+                                   VALUES (?, ?, ?, ?, ?, ?)""",
+                                (sym, entry["company_name"], gics_sector,
+                                 gics_industry_group, index_str, now_iso),
+                            )
+                            added += 1
 
-                time.sleep(1.0)
+                    time.sleep(1.0)
 
         total = added + updated
         logger.info("ticker_universe refresh: %d added, %d updated, %d total",
@@ -5967,7 +5977,7 @@ async def _cleanup_stale_blotter() -> dict:
             ib_order_ids.add(trade.order.orderId)
 
         removed = 0
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             # Find blotter rows with status suggesting they're "live"
             rows = conn.execute(
                 """
@@ -6037,7 +6047,7 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not is_authorized(update):
         return
     try:
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             rows = conn.execute(
                 """
                 SELECT id, payload, created_at FROM pending_orders
@@ -6727,11 +6737,12 @@ async def _place_single_order(
                         and str(pos.contract.lastTradeDateOrContractMonth).replace("-", "") == expiry_fmt
                         and pos.position < 0):
                     # Already have this exact short call
-                    with _get_db_connection() as conn:
-                        conn.execute(
-                            "UPDATE pending_orders SET status = 'duplicate_skipped' WHERE id = ?",
-                            (db_id,),
-                        )
+                    with closing(_get_db_connection()) as conn:
+                        with conn:
+                            conn.execute(
+                                "UPDATE pending_orders SET status = 'duplicate_skipped' WHERE id = ?",
+                                (db_id,),
+                            )
                     return False, f"#{db_id} {ticker} ${strike:.0f}C {expiry} — duplicate, already held"
         except Exception as dup_exc:
             logger.warning("Duplicate check failed for #%d: %s (proceeding anyway)", db_id, dup_exc)
@@ -6755,11 +6766,12 @@ async def _place_single_order(
 
             acct_uncovered = (acct_long_shares - acct_short_contracts * 100) // 100
             if qty > acct_uncovered:
-                with _get_db_connection() as conn:
-                    conn.execute(
-                        "UPDATE pending_orders SET status = 'rejected_naked' WHERE id = ?",
-                        (db_id,),
-                    )
+                with closing(_get_db_connection()) as conn:
+                    with conn:
+                        conn.execute(
+                            "UPDATE pending_orders SET status = 'rejected_naked' WHERE id = ?",
+                            (db_id,),
+                        )
                 return False, (
                     f"#{db_id} {ticker} ${strike:.0f}C: REJECTED — "
                     f"account {label} has {acct_uncovered}c uncovered capacity "
@@ -6797,16 +6809,17 @@ async def _place_single_order(
         ib_perm_id = trade.order.permId if trade else 0
 
         # R5: Update status to SENT and store IBKR IDs for event matching
-        with _get_db_connection() as conn:
-            from agt_equities.order_state import append_status
-            conn.execute(
-                "UPDATE pending_orders SET ib_order_id = ?, ib_perm_id = ? WHERE id = ?",
-                (ib_order_id, ib_perm_id, db_id),
-            )
-            append_status(conn, db_id, 'sent', 'placeOrder', {
-                'ib_order_id': str(ib_order_id),
-                'ib_perm_id': str(ib_perm_id),
-            })
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                from agt_equities.order_state import append_status
+                conn.execute(
+                    "UPDATE pending_orders SET ib_order_id = ?, ib_perm_id = ? WHERE id = ?",
+                    (ib_order_id, ib_perm_id, db_id),
+                )
+                append_status(conn, db_id, 'sent', 'placeOrder', {
+                    'ib_order_id': str(ib_order_id),
+                    'ib_perm_id': str(ib_perm_id),
+                })
 
         # Add to roll watchlist ONLY for Mode 1 defensive CCs.
         # Mode 2 (welcome assignment, tax-exempt gain) and Dynamic Exit
@@ -6814,15 +6827,16 @@ async def _place_single_order(
         mode = payload.get("mode", "")
         if mode == "MODE_1_DEFENSIVE":
             try:
-                with _get_db_connection() as conn:
-                    conn.execute(
-                        """
-                        INSERT INTO roll_watchlist
-                            (order_id, ticker, account_id, strike, expiry, quantity, mode)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (db_id, ticker, acct_id, strike, expiry, qty, mode),
-                    )
+                with closing(_get_db_connection()) as conn:
+                    with conn:
+                        conn.execute(
+                            """
+                            INSERT INTO roll_watchlist
+                                (order_id, ticker, account_id, strike, expiry, quantity, mode)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (db_id, ticker, acct_id, strike, expiry, qty, mode),
+                        )
             except Exception as rw_exc:
                 logger.warning("roll_watchlist insert failed for #%d: %s", db_id, rw_exc)
         else:
@@ -6843,11 +6857,12 @@ async def _place_single_order(
         logger.exception("_place_single_order failed for #%d", db_id)
         # R5: Mark as failed via state machine
         try:
-            with _get_db_connection() as conn:
-                from agt_equities.order_state import append_status
-                append_status(conn, db_id, 'failed', 'placeOrder_exception', {
-                    'error': str(exc)[:200],
-                })
+            with closing(_get_db_connection()) as conn:
+                with conn:
+                    from agt_equities.order_state import append_status
+                    append_status(conn, db_id, 'failed', 'placeOrder_exception', {
+                        'error': str(exc)[:200],
+                    })
         except Exception:
             pass
         return False, f"#{db_id} {ticker}: {exc}"
@@ -6862,11 +6877,12 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_authorized(update):
         return
     try:
-        with _get_db_connection() as conn:
-            result = conn.execute(
-                "UPDATE pending_orders SET status = 'rejected' WHERE status = 'staged'"
-            )
-            count = result.rowcount
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                result = conn.execute(
+                    "UPDATE pending_orders SET status = 'rejected' WHERE status = 'staged'"
+                )
+                count = result.rowcount
 
         if count > 0:
             await update.message.reply_text(f"\u274c Rejected {count} staged orders.")
@@ -6902,8 +6918,7 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         output_dir.mkdir(exist_ok=True)
 
         # ── Panel 1: Performance Card (always available) ────────────────
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.row_factory = sqlite3.Row
+        conn = _get_db_connection()
 
         perf_path = str(output_dir / "dashboard_performance.png")
         try:
@@ -7076,7 +7091,7 @@ async def cmd_status_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not is_authorized(update):
         return
     try:
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             # Status counts
             count_rows = conn.execute(
                 "SELECT status, COUNT(*) as n FROM pending_orders "
@@ -7177,7 +7192,7 @@ async def cmd_rollcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_authorized(update):
         return
     try:
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             rows = conn.execute(
                 """
                 SELECT id, ticker, account_id, strike, expiry, quantity, mode
@@ -7327,7 +7342,7 @@ async def cmd_cycles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         if not used_master_log:
             # Legacy: cc_cycle_log
-            with _get_db_connection() as conn:
+            with closing(_get_db_connection()) as conn:
                 rows = conn.execute(
                     """
                     SELECT ticker, mode, strike, expiry, bid, annualized,
@@ -7399,7 +7414,7 @@ async def cmd_fills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
     try:
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             rows = conn.execute(
                 """
                 SELECT ticker, action, quantity, price,
@@ -7485,7 +7500,7 @@ async def cmd_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 rows_data = []
 
         if not rows_data:
-            with _get_db_connection() as conn:
+            with closing(_get_db_connection()) as conn:
                 rows = conn.execute(
                     """
                     SELECT household_id, ticker, initial_basis,
@@ -7657,7 +7672,7 @@ def _get_effective_conviction(ticker: str) -> dict:
     Override expires after CONVICTION_OVERRIDE_EXPIRY_DAYS.
     """
     try:
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             # Check for active override
             override = conn.execute(
                 """
@@ -7709,28 +7724,29 @@ def _persist_conviction(ticker: str, conviction: dict) -> None:
     """Save computed conviction to ticker_universe."""
     try:
         inputs = conviction.get("inputs", {})
-        with _get_db_connection() as conn:
-            conn.execute(
-                """
-                UPDATE ticker_universe
-                SET conviction_tier = ?,
-                    eps_revision_trend = ?,
-                    revenue_growth_vs_sector = ?,
-                    analyst_consensus_shift = ?,
-                    margin_trend = ?,
-                    conviction_updated_at = ?
-                WHERE ticker = ?
-                """,
-                (
-                    conviction["tier"],
-                    inputs.get("eps_revision_trend"),
-                    inputs.get("revenue_growth_vs_sector"),
-                    inputs.get("analyst_consensus_shift"),
-                    inputs.get("margin_trend"),
-                    _datetime.now().isoformat(),
-                    ticker,
-                ),
-            )
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE ticker_universe
+                    SET conviction_tier = ?,
+                        eps_revision_trend = ?,
+                        revenue_growth_vs_sector = ?,
+                        analyst_consensus_shift = ?,
+                        margin_trend = ?,
+                        conviction_updated_at = ?
+                    WHERE ticker = ?
+                    """,
+                    (
+                        conviction["tier"],
+                        inputs.get("eps_revision_trend"),
+                        inputs.get("revenue_growth_vs_sector"),
+                        inputs.get("analyst_consensus_shift"),
+                        inputs.get("margin_trend"),
+                        _datetime.now().isoformat(),
+                        ticker,
+                    ),
+                )
     except Exception as exc:
         logger.warning("_persist_conviction failed for %s: %s", ticker, exc)
 
@@ -8040,40 +8056,41 @@ async def _stage_dynamic_exit_candidate(
         desk_mode = _get_current_desk_mode()
 
         try:
-            with _get_db_connection() as conn:
-                conn.execute(
-                    "INSERT INTO bucket3_dynamic_exit_log "
-                    "(audit_id, trade_date, ticker, household, desk_mode, "
-                    " action_type, household_nlv, underlying_spot_at_render, "
-                    " gate1_freed_margin, gate1_realized_loss, "
-                    " gate1_conviction_tier, gate1_conviction_modifier, "
-                    " gate1_ratio, gate2_target_contracts, "
-                    " walk_away_pnl_per_share, strike, expiry, "
-                    " contracts, shares, limit_price, "
-                    " render_ts, staged_ts, final_status, source) "
-                    "VALUES (?, date('now'), ?, ?, ?, "
-                    " 'CC', ?, ?, "
-                    " ?, ?, "
-                    " ?, ?, "
-                    " ?, ?, "
-                    " ?, ?, ?, "
-                    " ?, ?, ?, "
-                    " ?, ?, 'STAGED', ?)",
-                    (
-                        audit_id, ticker, hh_name, desk_mode,
-                        round(hh_nlv, 2), round(spot, 4),
-                        round(best_freed, 2),
-                        round(abs(best_walk_away_per_share) * 100 * excess_contracts, 2)
-                        if best_walk_away_per_share < 0 else 0.0,
-                        conviction["tier"], round(modifier, 4),
-                        round(best_ratio, 4), excess_contracts,
-                        round(best_walk_away_per_share, 4),
-                        round(best_strike, 2), best_exp,
-                        excess_contracts, excess_contracts * 100,
-                        round(best_bid, 4),
-                        now_ts, now_ts, source,
-                    ),
-                )
+            with closing(_get_db_connection()) as conn:
+                with conn:
+                    conn.execute(
+                        "INSERT INTO bucket3_dynamic_exit_log "
+                        "(audit_id, trade_date, ticker, household, desk_mode, "
+                        " action_type, household_nlv, underlying_spot_at_render, "
+                        " gate1_freed_margin, gate1_realized_loss, "
+                        " gate1_conviction_tier, gate1_conviction_modifier, "
+                        " gate1_ratio, gate2_target_contracts, "
+                        " walk_away_pnl_per_share, strike, expiry, "
+                        " contracts, shares, limit_price, "
+                        " render_ts, staged_ts, final_status, source) "
+                        "VALUES (?, date('now'), ?, ?, ?, "
+                        " 'CC', ?, ?, "
+                        " ?, ?, "
+                        " ?, ?, "
+                        " ?, ?, "
+                        " ?, ?, ?, "
+                        " ?, ?, ?, "
+                        " ?, ?, 'STAGED', ?)",
+                        (
+                            audit_id, ticker, hh_name, desk_mode,
+                            round(hh_nlv, 2), round(spot, 4),
+                            round(best_freed, 2),
+                            round(abs(best_walk_away_per_share) * 100 * excess_contracts, 2)
+                            if best_walk_away_per_share < 0 else 0.0,
+                            conviction["tier"], round(modifier, 4),
+                            round(best_ratio, 4), excess_contracts,
+                            round(best_walk_away_per_share, 4),
+                            round(best_strike, 2), best_exp,
+                            excess_contracts, excess_contracts * 100,
+                            round(best_bid, 4),
+                            now_ts, now_ts, source,
+                        ),
+                    )
         except Exception as db_exc:
             logger.error("Failed to stage dynamic exit for %s: %s", ticker, db_exc)
             return {
@@ -8187,11 +8204,12 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         action = context.args[1].upper()
 
         if action == "CLEAR":
-            with _get_db_connection() as conn:
-                result = conn.execute(
-                    "UPDATE conviction_overrides SET active = 0 WHERE ticker = ? AND active = 1",
-                    (ticker,),
-                )
+            with closing(_get_db_connection()) as conn:
+                with conn:
+                    result = conn.execute(
+                        "UPDATE conviction_overrides SET active = 0 WHERE ticker = ? AND active = 1",
+                        (ticker,),
+                    )
             if result.rowcount > 0:
                 await update.message.reply_text(f"Override cleared for {ticker}. Will recompute from fundamentals.")
             else:
@@ -8224,19 +8242,20 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ).isoformat()
 
         # Deactivate any existing override
-        with _get_db_connection() as conn:
-            conn.execute(
-                "UPDATE conviction_overrides SET active = 0 WHERE ticker = ? AND active = 1",
-                (ticker,),
-            )
-            conn.execute(
-                """
-                INSERT INTO conviction_overrides
-                    (ticker, original_tier, overridden_tier, justification, expires_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (ticker, original_tier, action, justification, expires_at),
-            )
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE conviction_overrides SET active = 0 WHERE ticker = ? AND active = 1",
+                    (ticker,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO conviction_overrides
+                        (ticker, original_tier, overridden_tier, justification, expires_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (ticker, original_tier, action, justification, expires_at),
+                )
 
         await update.message.reply_text(
             f"Conviction override set:\n"
@@ -8322,13 +8341,14 @@ async def cmd_override_earnings(update: Update, context: ContextTypes.DEFAULT_TY
         ).isoformat()
 
         try:
-            with _get_db_connection() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO bucket3_earnings_overrides "
-                    "(ticker, override_value, expires_at, created_by, reason) "
-                    "VALUES (?, ?, ?, 'manual_override', ?)",
-                    (ticker, earnings_date.isoformat(), expires_at, reason),
-                )
+            with closing(_get_db_connection()) as conn:
+                with conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO bucket3_earnings_overrides "
+                        "(ticker, override_value, expires_at, created_by, reason) "
+                        "VALUES (?, ?, ?, 'manual_override', ?)",
+                        (ticker, earnings_date.isoformat(), expires_at, reason),
+                    )
         except Exception as db_exc:
             await update.message.reply_text(f"DB write failed: {db_exc}")
             return
@@ -8413,7 +8433,7 @@ async def _discover_positions(
     staged_per_account: dict[str, int] = {}  # "acct|ticker" -> contracts
     if include_staged:
         try:
-            with _get_db_connection() as conn:
+            with closing(_get_db_connection()) as conn:
                 staged_rows = conn.execute(
                     """
                     SELECT payload FROM pending_orders
@@ -8610,7 +8630,7 @@ async def _discover_positions(
 
     if not _ledger_cache:
         try:
-            with _get_db_connection() as conn:
+            with closing(_get_db_connection()) as conn:
                 ledger_rows = conn.execute(
                     "SELECT household_id, ticker, initial_basis, "
                     "total_premium_collected, shares_owned "
@@ -9605,10 +9625,11 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
     all_staged = staged_defensive + staged_harvest
     if all_staged:
         try:
-            with _get_db_connection() as conn:
-                conn.execute(
-                    "UPDATE pending_orders SET status = 'superseded' WHERE status = 'staged'"
-                )
+            with closing(_get_db_connection()) as conn:
+                with conn:
+                    conn.execute(
+                        "UPDATE pending_orders SET status = 'superseded' WHERE status = 'staged'"
+                    )
             await asyncio.to_thread(append_pending_tickets, all_staged)
 
             # Log BOTH staged and skipped to cycle log
@@ -9807,8 +9828,7 @@ async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         from agt_equities.parity import verify_option_eae_parity as _vp
 
         _tr.DB_PATH = DB_PATH
-        conn = _sql.connect(DB_PATH, timeout=30.0)
-        conn.row_factory = _sql.Row
+        conn = _get_db_connection()
 
         # Parity
         violations = _vp(conn)
@@ -9934,13 +9954,11 @@ async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         conn.close()
 
         # Last sync
-        conn2 = _sql.connect(DB_PATH)
-        conn2.row_factory = _sql.Row
-        last_sync = conn2.execute(
-            "SELECT sync_id, finished_at, status, rows_inserted FROM master_log_sync "
-            "ORDER BY sync_id DESC LIMIT 1"
-        ).fetchone()
-        conn2.close()
+        with closing(_get_db_connection()) as conn2:
+            last_sync = conn2.execute(
+                "SELECT sync_id, finished_at, status, rows_inserted FROM master_log_sync "
+                "ORDER BY sync_id DESC LIMIT 1"
+            ).fetchone()
 
         lines = [
             "RECONCILIATION REPORT",
@@ -9962,29 +9980,25 @@ async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         # R5 Phase D: T+2 order reconciliation + stale detection
         try:
-            conn3 = _sql.connect(DB_PATH, timeout=10.0)
-            conn3.row_factory = _sql.Row
+            with closing(_get_db_connection()) as conn3:
+                # T+2 orphans: filled orders with no matching Flex trade
+                t2_orphans = conn3.execute(
+                    "SELECT po.id, po.ib_order_id, po.status, po.created_at, po.payload "
+                    "FROM pending_orders po "
+                    "WHERE po.status IN ('filled', 'partially_filled', 'sent', 'acked', 'working') "
+                    "AND po.created_at < datetime('now', '-2 days') "
+                    "AND po.ib_order_id IS NOT NULL "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM master_log_trades t "
+                    "  WHERE CAST(t.ib_order_id AS INTEGER) = po.ib_order_id"
+                    ")"
+                ).fetchall()
 
-            # T+2 orphans: filled orders with no matching Flex trade
-            t2_orphans = conn3.execute(
-                "SELECT po.id, po.ib_order_id, po.status, po.created_at, po.payload "
-                "FROM pending_orders po "
-                "WHERE po.status IN ('filled', 'partially_filled', 'sent', 'acked', 'working') "
-                "AND po.created_at < datetime('now', '-2 days') "
-                "AND po.ib_order_id IS NOT NULL "
-                "AND NOT EXISTS ("
-                "  SELECT 1 FROM master_log_trades t "
-                "  WHERE CAST(t.ib_order_id AS INTEGER) = po.ib_order_id"
-                ")"
-            ).fetchall()
-
-            # Stale staged orders
-            stale = conn3.execute(
-                "SELECT id, created_at FROM pending_orders "
-                "WHERE status = 'staged' AND created_at < datetime('now', '-1 day')"
-            ).fetchall()
-
-            conn3.close()
+                # Stale staged orders
+                stale = conn3.execute(
+                    "SELECT id, created_at FROM pending_orders "
+                    "WHERE status = 'staged' AND created_at < datetime('now', '-1 day')"
+                ).fetchall()
 
             if t2_orphans or stale:
                 lines.append("")
@@ -10047,13 +10061,14 @@ async def cmd_declare_wartime(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Usage: /declare_wartime <reason for escalation>"
             )
             return
-        with _get_db_connection() as conn:
-            old_mode = get_current_mode(conn)
-            if old_mode == MODE_WARTIME:
-                await update.message.reply_text(f"Already in WARTIME mode.")
-                return
-            log_mode_transition(conn, old_mode, MODE_WARTIME,
-                                trigger_rule="manual", notes=f"/declare_wartime: {reason}")
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                old_mode = get_current_mode(conn)
+                if old_mode == MODE_WARTIME:
+                    await update.message.reply_text(f"Already in WARTIME mode.")
+                    return
+                log_mode_transition(conn, old_mode, MODE_WARTIME,
+                                    trigger_rule="manual", notes=f"/declare_wartime: {reason}")
         await _push_mode_transition(context.application, old_mode, MODE_WARTIME,
                                      trigger=f"Manual: {reason}")
         await update.message.reply_text(
@@ -10075,20 +10090,21 @@ async def cmd_declare_peacetime(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         from agt_equities.mode_engine import get_current_mode, log_mode_transition, MODE_PEACETIME
         memo = " ".join(context.args) if context.args else ""
-        with _get_db_connection() as conn:
-            old_mode = get_current_mode(conn)
-            if old_mode == MODE_PEACETIME:
-                await update.message.reply_text(f"Already in PEACETIME mode.")
-                return
-            if old_mode == "WARTIME" and not memo:
-                await update.message.reply_text(
-                    f"\u26d4 WARTIME \u2192 PEACETIME requires an audit memo.\n"
-                    f"Usage: /declare_peacetime <reason why wartime conditions have cleared>"
-                )
-                return
-            log_mode_transition(conn, old_mode, MODE_PEACETIME,
-                                trigger_rule="manual",
-                                notes=f"/declare_peacetime: {memo}" if memo else "/declare_peacetime")
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                old_mode = get_current_mode(conn)
+                if old_mode == MODE_PEACETIME:
+                    await update.message.reply_text(f"Already in PEACETIME mode.")
+                    return
+                if old_mode == "WARTIME" and not memo:
+                    await update.message.reply_text(
+                        f"\u26d4 WARTIME \u2192 PEACETIME requires an audit memo.\n"
+                        f"Usage: /declare_peacetime <reason why wartime conditions have cleared>"
+                    )
+                    return
+                log_mode_transition(conn, old_mode, MODE_PEACETIME,
+                                    trigger_rule="manual",
+                                    notes=f"/declare_peacetime: {memo}" if memo else "/declare_peacetime")
         await _push_mode_transition(context.application, old_mode, MODE_PEACETIME,
                                      trigger=f"Manual revert" + (f": {memo}" if memo else ""))
         await update.message.reply_text(
@@ -10107,7 +10123,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     try:
         from agt_equities.mode_engine import get_current_mode, get_recent_transitions
-        with _get_db_connection() as conn:
+        with closing(_get_db_connection()) as conn:
             mode = get_current_mode(conn)
             transitions = get_recent_transitions(conn, limit=3)
 
@@ -10158,19 +10174,20 @@ async def cmd_clear_quarantine(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     ticker = context.args[0].upper()
     try:
-        with _get_db_connection() as conn:
-            rows = conn.execute(
-                "SELECT id, action_type FROM corp_action_quarantine "
-                "WHERE ticker = ? AND cleared_at IS NULL", (ticker,)
-            ).fetchall()
-            if not rows:
-                await update.message.reply_text(f"No active quarantine for {ticker}.")
-                return
-            conn.execute(
-                "UPDATE corp_action_quarantine SET cleared_at = datetime('now'), "
-                "cleared_by = '/clear_quarantine' WHERE ticker = ? AND cleared_at IS NULL",
-                (ticker,),
-            )
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                rows = conn.execute(
+                    "SELECT id, action_type FROM corp_action_quarantine "
+                    "WHERE ticker = ? AND cleared_at IS NULL", (ticker,)
+                ).fetchall()
+                if not rows:
+                    await update.message.reply_text(f"No active quarantine for {ticker}.")
+                    return
+                conn.execute(
+                    "UPDATE corp_action_quarantine SET cleared_at = datetime('now'), "
+                    "cleared_by = '/clear_quarantine' WHERE ticker = ? AND cleared_at IS NULL",
+                    (ticker,),
+                )
         await update.message.reply_text(
             f"Quarantine cleared for {ticker} ({len(rows)} action(s)). "
             f"CC/CSP staging re-enabled."
@@ -10256,7 +10273,7 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # ── Roll alerts: active watchlist entries expiring within 5 days ──
         try:
-            with _get_db_connection() as conn:
+            with closing(_get_db_connection()) as conn:
                 rows = conn.execute(
                     """
                     SELECT id, ticker, account_id, strike, expiry, quantity, mode
@@ -10290,18 +10307,19 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                 # Auto-resolve expired entries
                 if dte < 0:
-                    with _get_db_connection() as conn:
-                        conn.execute(
-                            "UPDATE roll_watchlist SET status = 'expired', resolved_at = datetime('now') WHERE id = ?",
-                            (r["id"],),
-                        )
+                    with closing(_get_db_connection()) as conn:
+                        with conn:
+                            conn.execute(
+                                "UPDATE roll_watchlist SET status = 'expired', resolved_at = datetime('now') WHERE id = ?",
+                                (r["id"],),
+                            )
         except Exception as rw_exc:
             logger.warning("Watchdog roll check failed: %s", rw_exc)
 
         # ── Mode transitions: check for positions that changed mode ──
         try:
             disco = await _discover_positions(None)
-            with _get_db_connection() as conn:
+            with closing(_get_db_connection()) as conn:
                 for hh_data in disco.get("households", {}).values():
                     for p in hh_data.get("positions", []):
                         ticker = p["ticker"]
@@ -10361,22 +10379,23 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                         if position_pct <= DYNAMIC_EXIT_RULE1_LIMIT * 100:
                             # Position is no longer overweight — clear marker
-                            with _get_db_connection() as conn:
-                                conn.execute(
-                                    """
-                                    UPDATE mode_transitions
-                                    SET to_mode = 'RECOVERED'
-                                    WHERE ticker = ? AND household = ?
-                                      AND to_mode = 'OVERWEIGHT'
-                                    """,
-                                    (p["ticker"], p["household"]),
-                                )
+                            with closing(_get_db_connection()) as conn:
+                                with conn:
+                                    conn.execute(
+                                        """
+                                        UPDATE mode_transitions
+                                        SET to_mode = 'RECOVERED'
+                                        WHERE ticker = ? AND household = ?
+                                          AND to_mode = 'OVERWEIGHT'
+                                        """,
+                                        (p["ticker"], p["household"]),
+                                    )
         except Exception as rec_exc:
             logger.warning("Overweight recovery check failed: %s", rec_exc)
 
         # ── Rule 8 trigger: 3+ consecutive low-yield cycles ──
         try:
-            with _get_db_connection() as conn:
+            with closing(_get_db_connection()) as conn:
                 tickers_with_cycles = conn.execute(
                     """
                     SELECT DISTINCT ticker FROM cc_cycle_log
@@ -10433,7 +10452,7 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
                         escalation = _compute_escalation_tier(position_pct)
 
                         # Calendar-based trigger: when was position first overweight?
-                        with _get_db_connection() as conn:
+                        with closing(_get_db_connection()) as conn:
                             ow_record = conn.execute(
                                 """
                                 SELECT overweight_since FROM mode_transitions
