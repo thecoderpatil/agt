@@ -178,21 +178,22 @@ def get_recon_summary(conn: sqlite3.Connection) -> dict:
 
 
 def get_staged_dynamic_exits(conn: sqlite3.Connection) -> list[dict]:
-    """Read STAGED Dynamic Exit candidates for Cure Console display.
+    """Read STAGED Dynamic Exit + R5 Sell candidates for Cure Console display.
 
     Only final_status='STAGED' — ATTESTED rows live on the Telegram
     TRANSMIT/CANCEL surface and must NOT appear here (race risk).
 
     Returns list of dicts grouped by ticker, each with a 'candidates' list.
+    Includes both CC (R8) and STK_SELL (R5) action types.
     """
     try:
         rows = conn.execute(
-            "SELECT audit_id, ticker, household, desk_mode, "
-            "  strike, expiry, contracts, "
+            "SELECT audit_id, ticker, household, desk_mode, action_type, "
+            "  strike, expiry, contracts, shares, limit_price, "
             "  gate1_ratio, gate1_freed_margin, gate1_realized_loss, "
             "  gate1_conviction_tier, gate2_max_per_cycle, "
             "  walk_away_pnl_per_share, underlying_spot_at_render, "
-            "  render_ts, staged_ts "
+            "  render_ts, staged_ts, exception_type "
             "FROM bucket3_dynamic_exit_log "
             "WHERE final_status = 'STAGED' "
             "ORDER BY ticker, gate1_ratio DESC"
@@ -214,13 +215,18 @@ def get_staged_dynamic_exits(conn: sqlite3.Connection) -> list[dict]:
                 "ticker": tk,
                 "household": r["household"],
                 "desk_mode": r["desk_mode"],
+                "action_type": r["action_type"],
+                "exception_type": r.get("exception_type"),
                 "candidates": [],
             }
         grouped[tk]["candidates"].append({
             "audit_id": r["audit_id"],
+            "action_type": r["action_type"],
             "strike": r["strike"],
             "expiry": r["expiry"],
             "contracts": r["contracts"],
+            "shares": r["shares"],
+            "limit_price": r["limit_price"],
             "gate1_ratio": r["gate1_ratio"],
             "gate1_freed_margin": r["gate1_freed_margin"],
             "gate1_realized_loss": r["gate1_realized_loss"],
@@ -230,6 +236,7 @@ def get_staged_dynamic_exits(conn: sqlite3.Connection) -> list[dict]:
             "underlying_spot_at_render": r["underlying_spot_at_render"],
             "render_ts": r["render_ts"],
             "staged_ts": r["staged_ts"],
+            "exception_type": r.get("exception_type"),
         })
 
     return list(grouped.values())

@@ -1,4 +1,5 @@
-{# Smart Friction modal — PEACETIME checkbox flow + WARTIME Integer Lock branch #}
+{# Smart Friction modal — polymorphic across R8 CC + R5 STK_SELL exception types #}
+{# PEACETIME: checkboxes + thesis. WARTIME: Integer Lock. R5 branches by exception_type. #}
 {# Rendered into #modal-root via hx-get. POST via hx-post swaps result back. #}
 <div class="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"
      onclick="if(event.target===this) htmx.ajax('GET','/api/cure/empty?t={{ token }}',{target:'#modal-root',swap:'innerHTML'})">
@@ -9,7 +10,21 @@
     <div class="flex items-center justify-between mb-4 pb-3 border-b border-slate-800">
       <div>
         <h3 class="text-lg font-semibold text-slate-100">
-          {% if row.desk_mode == 'WARTIME' %}WARTIME RULE 8 STAGING{% else %}Rule 8 Dynamic Exit Attestation{% endif %}
+          {% if row.action_type == 'STK_SELL' %}
+            {% if row.exception_type == 'rule_6_forced_liquidation' %}
+              WARTIME Forced Liquidation
+            {% elif row.exception_type == 'thesis_deterioration' %}
+              Thesis Deterioration Exit
+            {% elif row.exception_type == 'emergency_risk_event' %}
+              Emergency Risk Exit
+            {% else %}
+              R5 Stock Sale Attestation
+            {% endif %}
+          {% elif row.desk_mode == 'WARTIME' %}
+            WARTIME RULE 8 STAGING
+          {% else %}
+            Rule 8 Dynamic Exit Attestation
+          {% endif %}
         </h3>
         <div class="text-xs text-slate-500 mt-1">{{ row.ticker }} · {{ row.household }} · {{ row.desk_mode }}</div>
       </div>
@@ -17,8 +32,9 @@
               hx-get="/api/cure/empty?t={{ token }}" hx-target="#modal-root" hx-swap="innerHTML">&#x2715;</button>
     </div>
 
-    {# ── Frozen gate math display ────────────────────────────────── #}
+    {# ── Frozen gate math / position display ─────────────────────── #}
     <div class="bg-slate-950 rounded-lg p-3 mb-4 text-xs space-y-1">
+      {% if row.action_type == 'CC' %}
       <div class="flex justify-between">
         <span class="text-slate-500">Action</span>
         <span class="text-slate-200">Sell {{ row.contracts }}x {{ row.ticker }} {{ "%.2f"|format(row.strike) }}C {{ row.expiry }}</span>
@@ -35,6 +51,22 @@
         <span class="text-slate-500">Freed margin</span>
         <span class="text-slate-300">{{ money(row.gate1_freed_margin) }}</span>
       </div>
+      {% else %}
+      <div class="flex justify-between">
+        <span class="text-slate-500">Action</span>
+        <span class="text-slate-200">Sell {{ row.shares }} shares of {{ row.ticker }}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-500">Limit price</span>
+        <span class="text-slate-300">${{ "%.2f"|format(row.limit_price) }}</span>
+      </div>
+      {% if row.exception_type %}
+      <div class="flex justify-between">
+        <span class="text-slate-500">Exception</span>
+        <span class="text-indigo-400">{{ row.exception_type.replace('_', ' ').title() }}</span>
+      </div>
+      {% endif %}
+      {% endif %}
       <div class="flex justify-between">
         <span class="text-slate-500">Realized loss</span>
         <span class="text-rose-400">-{{ money(loss_whole) }}</span>
@@ -48,13 +80,18 @@
       <input type="hidden" name="audit_id" value="{{ row.audit_id }}">
       <input type="hidden" name="render_ts" value="{{ row.render_ts }}">
 
-      {% if row.desk_mode == 'WARTIME' %}
-      {# ── WARTIME Integer Lock — no thesis, no checkboxes ────── #}
-      {# ADR-004 §5: $0/$1 loss falls back to ticker symbol #}
+      {# ── Determine attestation mode ────────────────────────────── #}
+      {# Integer Lock: WARTIME R8, or Forced Liquidation (always WARTIME) #}
+      {# Thesis: PEACETIME R8, Thesis Deterioration, Emergency Risk       #}
+      {% set use_integer_lock = (row.desk_mode == 'WARTIME' and row.action_type == 'CC') or row.exception_type == 'rule_6_forced_liquidation' %}
+
+      {% if use_integer_lock %}
+      {# ── Integer Lock — no thesis, no checkboxes ────────────── #}
       {% if loss_whole <= 1 %}
       <div class="mb-4">
         <label class="block text-xs text-slate-400 mb-2">
-          Type the ticker symbol exactly (<span class="font-mono text-amber-400">{{ row.ticker }}</span>) to authorize Gate 3 bypass:
+          Type the ticker symbol exactly (<span class="font-mono text-amber-400">{{ row.ticker }}</span>) to authorize
+          {% if row.exception_type == 'rule_6_forced_liquidation' %}forced liquidation{% else %}Gate 3 bypass{% endif %}:
         </label>
         <input type="text" name="attestation_value_typed" id="integer-lock-input"
                class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-slate-100 font-mono"
@@ -64,7 +101,8 @@
       {% else %}
       <div class="mb-4">
         <label class="block text-xs text-slate-400 mb-2">
-          Type the exact integer <span class="font-mono text-amber-400">{{ loss_whole }}</span> to authorize Gate 3 bypass:
+          Type the exact integer <span class="font-mono text-amber-400">{{ loss_whole }}</span> to authorize
+          {% if row.exception_type == 'rule_6_forced_liquidation' %}forced liquidation{% else %}Gate 3 bypass{% endif %}:
         </label>
         <input type="text" name="attestation_value_typed" id="integer-lock-input"
                class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-slate-100 font-mono"
@@ -74,11 +112,11 @@
       {% endif %}
       <button type="submit" id="sf-stage-btn" disabled
               class="w-full bg-rose-700 hover:bg-rose-600 disabled:bg-slate-800 disabled:text-slate-600 text-white py-2 rounded font-semibold cursor-not-allowed disabled:cursor-not-allowed">
-        STAGE EMERGENCY EXIT
+        {% if row.exception_type == 'rule_6_forced_liquidation' %}STAGE FORCED LIQUIDATION{% else %}STAGE EMERGENCY EXIT{% endif %}
       </button>
 
       {% else %}
-      {# ── PEACETIME — checkboxes + thesis ────────────────────── #}
+      {# ── PEACETIME / Thesis flow — checkboxes + thesis ─────── #}
       <div class="space-y-3 mb-4">
         <label class="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
           <input type="checkbox" name="ack_loss" id="sf-ack-loss" class="mt-0.5"
@@ -88,15 +126,31 @@
         <label class="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
           <input type="checkbox" name="ack_cure" id="sf-ack-cure" class="mt-0.5"
                  onchange="sfUpdateButton()">
-          <span>I confirm the cure target for {{ row.ticker }} in {{ row.household }}.</span>
+          <span>
+            {% if row.exception_type == 'thesis_deterioration' %}
+              I confirm the thesis on {{ row.ticker }} has deteriorated and this exit is justified.
+            {% elif row.exception_type == 'emergency_risk_event' %}
+              I confirm an emergency risk event affecting {{ row.ticker }} requires immediate exit.
+            {% else %}
+              I confirm the cure target for {{ row.ticker }} in {{ row.household }}.
+            {% endif %}
+          </span>
         </label>
       </div>
       <div class="mb-4">
-        <label class="block text-xs text-slate-400 mb-1">Strategic rationale (min 30 chars)</label>
+        <label class="block text-xs text-slate-400 mb-1">
+          {% if row.exception_type == 'thesis_deterioration' %}
+            Bearish rationale (min 30 chars) — specific thesis deterioration catalyst
+          {% elif row.exception_type == 'emergency_risk_event' %}
+            Risk catalyst (min 30 chars) — delisting, fraud, bankruptcy, or other emergency
+          {% else %}
+            Strategic rationale (min 30 chars)
+          {% endif %}
+        </label>
         <textarea name="operator_thesis" id="sf-thesis-input" rows="4"
                   class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-xs text-slate-100"
                   oninput="sfUpdateButton()"
-                  placeholder="{{ row.ticker }} is currently above the 20% R1 ceiling. Explain the strategic thesis..."></textarea>
+                  placeholder="{% if row.exception_type == 'thesis_deterioration' %}Describe the specific fundamental deterioration: revenue decline, margin compression, competitive threat...{% elif row.exception_type == 'emergency_risk_event' %}Describe the emergency: confirmed fraud, imminent delisting, bankruptcy filing...{% else %}{{ row.ticker }} is currently above the 20% R1 ceiling. Explain the strategic thesis...{% endif %}"></textarea>
       </div>
       <button type="submit" id="sf-stage-btn" disabled
               class="w-full bg-emerald-700 hover:bg-emerald-600 disabled:bg-slate-800 disabled:text-slate-600 text-white py-2 rounded font-semibold cursor-not-allowed disabled:cursor-not-allowed">

@@ -26,6 +26,7 @@ import secrets
 import sqlite3
 import time
 from collections import defaultdict
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
 from datetime import date as _date, datetime as _datetime, time as _time, timedelta as _timedelta
 from pathlib import Path
@@ -95,6 +96,11 @@ _MASTER_LOG_CUTOVER_NOTIFIED = False  # one-time dashboard notification
 CLAUDE_MODEL_HAIKU   = "claude-haiku-4-5-20251001"
 CLAUDE_MODEL_SONNET  = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_MODEL_OPUS    = "claude-opus-4-6"
+
+# Beta Impl 3: Poller dedup set for ATTESTED row keyboard dispatch (R6).
+# Process-local — on restart, all ATTESTED rows re-deliver (idempotent via
+# TRANSMITTING atomic lock in handle_dex_callback).
+_dispatched_audits: set[str] = set()
 MAX_HISTORY          = 50
 MAX_ROUNDS           = 15
 MAX_TOKENS_PER_REPLY = 8192
@@ -1234,6 +1240,59 @@ async def _ibkr_get_spot(ticker: str) -> float:
     except IBKRChainError as exc:
         logger.error("IBKR spot failed for %s: %s [%s]", ticker, exc, exc.error_class)
         raise
+
+
+async def _ibkr_get_option_bid(
+    ticker: str,
+    strike: float,
+    expiry: str,
+    right: str = "C",
+) -> float:
+    """Fetch live bid for a single option contract via IBKR reqMktData.
+
+    Pattern mirrors ib_chains.get_spot() but for options. No caching —
+    each TRANSMIT needs the freshest possible bid.
+
+    Raises RuntimeError if no valid bid available. Guards against IBKR
+    sentinel values (-1, NaN, inf) per Gemini triage item #3.
+    """
+    import math
+    ib_conn = await ensure_ib_connected()
+    expiry_fmt = expiry.replace("-", "")
+    contract = ib_async.Option(
+        symbol=ticker,
+        lastTradeDateOrContractMonth=expiry_fmt,
+        strike=strike,
+        right=right,
+        exchange="SMART",
+    )
+    qualified = await ib_conn.qualifyContractsAsync(contract)
+    if not qualified:
+        raise RuntimeError(f"Could not qualify option {ticker} {strike}{right} {expiry}")
+
+    td = ib_conn.reqMktData(qualified[0], '', False, False)
+    await asyncio.sleep(2.0)
+
+    bid = None
+    for val in [td.bid, getattr(td, 'delayedBid', None)]:
+        if (val is not None
+                and not math.isnan(val)
+                and val > 0
+                and val != float('inf')):
+            bid = float(val)
+            break
+
+    try:
+        ib_conn.cancelMktData(qualified[0])
+    except Exception:
+        pass
+
+    if bid is None:
+        raise RuntimeError(
+            f"No valid bid for {ticker} {strike}{right} {expiry} "
+            f"(raw bid={td.bid}, ask={td.ask})"
+        )
+    return bid
 
 
 async def _ibkr_get_spots_batch(tickers: list[str]) -> dict[str, float]:
@@ -6248,6 +6307,362 @@ async def handle_approve_callback(
             pass
 
 
+# ---------------------------------------------------------------------------
+# Beta Impl 3: Dynamic Exit TRANSMIT / CANCEL handlers
+# ---------------------------------------------------------------------------
+
+
+def _increment_revalidation_count(audit_id: str) -> None:
+    """Increment re_validation_count in an ISOLATED transaction (R8).
+
+    Uses a SEPARATE sqlite3 connection so the counter persists even if
+    the caller's main flow subsequently fails. Per Architect R8 ruling:
+    counter measures failure pressure, not attempt volume. Must survive
+    downstream rollback so the 3-strike budget is accurate.
+    """
+    iso_conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    try:
+        iso_conn.execute(
+            "UPDATE bucket3_dynamic_exit_log "
+            "SET re_validation_count = re_validation_count + 1 "
+            "WHERE audit_id = ?",
+            (audit_id,),
+        )
+        iso_conn.commit()
+    finally:
+        iso_conn.close()
+
+
+async def handle_dex_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle TRANSMIT/CANCEL taps for ATTESTED dynamic exit rows.
+
+    TRANSMIT executes the 9-step JIT re-validation chain (steps 0–8) per
+    HANDOFF_ARCHITECT_v5 Final JIT Precedence Chain, post-Gemini rulings R1–R8.
+
+    CANCEL transitions ATTESTED → CANCELLED atomically (R4: terminal, no revert).
+
+    Counter increment isolation (R8): uses _increment_revalidation_count() which
+    opens a separate DB connection so the counter persists even if the main JIT
+    flow fails after increment. This ensures the 3-strike budget is accurate.
+    """
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    user_id = query.from_user.id if query.from_user else None
+    if user_id != AUTHORIZED_USER_ID:
+        await query.answer("Unauthorized.", show_alert=True)
+        return
+
+    await query.answer()
+
+    # F6: capture keyboard for retryable branches (Q3 defensive — query.message may be None)
+    _original_markup = query.message.reply_markup if query.message else None
+
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        return
+
+    action, audit_id = parts[1], parts[2]
+
+    # ── CANCEL branch ──────────────────────────────────────────────────
+    if action == "cancel":
+        with closing(_get_db_connection()) as conn:
+            result = conn.execute(
+                "UPDATE bucket3_dynamic_exit_log "
+                "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
+                "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+                (audit_id,),
+            )
+        if result.rowcount == 0:
+            logger.warning("CANCEL_RACE_LOST: audit_id=%s", audit_id)
+            try:
+                await query.edit_message_text(
+                    f"\u26a0\ufe0f Cancel race: row no longer ATTESTED.\naudit_id: {audit_id[:8]}..."
+                )
+            except Exception:
+                pass
+        else:
+            logger.info("CANCEL_SUCCESS: audit_id=%s", audit_id)
+            _dispatched_audits.discard(audit_id)
+            try:
+                await query.edit_message_text(
+                    f"\u274c CANCELLED dynamic exit.\naudit_id: {audit_id[:8]}..."
+                )
+            except Exception:
+                pass
+        return
+
+    if action != "transmit":
+        return
+
+    # ── TRANSMIT branch — JIT re-validation chain (steps 0–8) ─────────
+    import time as _time_mod
+    from agt_equities.rule_engine import (
+        evaluate_gate_1, ConvictionTier, is_ticker_locked,
+    )
+
+    # Step 0: Fetch ATTESTED row
+    with closing(_get_db_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM bucket3_dynamic_exit_log "
+            "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+            (audit_id,),
+        ).fetchone()
+
+    if not row:
+        logger.warning("ATTESTED_ROW_NOT_FOUND: audit_id=%s", audit_id)
+        try:
+            await query.edit_message_text(
+                f"\u274c Row not found or no longer ATTESTED.\naudit_id: {audit_id[:8]}..."
+            )
+        except Exception:
+            pass
+        return
+
+    ticker = row["ticker"]
+    is_wartime = row["desk_mode"] == "WARTIME"
+
+    # Step 1: 3-strike row-level check (WARTIME bypasses per ADR-004 §4)
+    if not is_wartime and row["re_validation_count"] >= 3:
+        # Transition to DRIFT_BLOCKED terminal
+        with closing(_get_db_connection()) as conn:
+            conn.execute(
+                "UPDATE bucket3_dynamic_exit_log "
+                "SET final_status = 'DRIFT_BLOCKED', last_updated = CURRENT_TIMESTAMP "
+                "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+                (audit_id,),
+            )
+        logger.warning(
+            "3_STRIKE_LOCKED: audit_id=%s ticker=%s re_validation_count=%d source=row",
+            audit_id, ticker, row["re_validation_count"],
+        )
+        _dispatched_audits.discard(audit_id)
+        try:
+            await query.edit_message_text(
+                f"\u274c DRIFT_BLOCKED: {ticker} locked after 3 JIT failures.\n"
+                f"Re-stage from Cure Console after 5-min cooldown."
+            )
+        except Exception:
+            pass
+        return
+
+    # Step 2: Ticker rolling-window lockout (WARTIME bypasses per ADR-004 §4)
+    with closing(_get_db_connection()) as conn:
+        if not is_wartime and is_ticker_locked(conn, ticker):
+            logger.warning(
+                "3_STRIKE_LOCKED: audit_id=%s ticker=%s source=rolling",
+                audit_id, ticker,
+            )
+            try:
+                await query.edit_message_text(
+                    f"\u274c {ticker} locked (5-min cooldown from recent DRIFT_BLOCKED).\n"
+                    f"Wait for cooldown to expire, then re-stage."
+                )
+            except Exception:
+                pass
+            return
+
+    # Step 3: IBKR connection
+    try:
+        ib_conn = await ensure_ib_connected()
+    except Exception as ib_exc:
+        logger.warning("IBKR_CONNECT_FAIL: audit_id=%s error=%s", audit_id, ib_exc)
+        try:
+            await query.edit_message_text(
+                f"\u274c IBKR connection failed: {ib_exc}\n"
+                f"Check Gateway/TWS, then try again.",
+                reply_markup=_original_markup,
+            )
+        except Exception:
+            pass
+        return
+
+    # Step 4: Live bid fetch (CC → option bid, STK_SELL → stock spot)
+    action_type = row["action_type"]
+    try:
+        if action_type == "CC":
+            live_bid = await _ibkr_get_option_bid(
+                ticker, row["strike"], row["expiry"],
+            )
+        else:
+            live_bid = await _ibkr_get_spot(ticker)
+    except Exception as bid_exc:
+        logger.warning(
+            "LIVE_BID_FETCH_FAIL: audit_id=%s ticker=%s error=%s",
+            audit_id, ticker, bid_exc,
+        )
+        try:
+            await query.edit_message_text(
+                f"\u274c Failed to fetch live {'bid' if action_type == 'CC' else 'price'} "
+                f"for {ticker}: {bid_exc}",
+                reply_markup=_original_markup,
+            )
+        except Exception:
+            pass
+        return
+
+    attested_limit = row["limit_price"]
+
+    # Step 5a: Gate 1 re-eval (CC only — STK_SELL skips per Gemini F8)
+    if action_type == "CC":
+        adjusted_cost_basis = (
+            row["strike"] + row["limit_price"] - row["walk_away_pnl_per_share"]
+        )
+        g1 = evaluate_gate_1(
+            ticker=ticker,
+            household=row["household"],
+            candidate_strike=row["strike"],
+            candidate_premium=live_bid,
+            contracts=row["contracts"],
+            adjusted_cost_basis=adjusted_cost_basis,
+            conviction_tier=ConvictionTier(row["gate1_conviction_tier"]),
+            tax_liability_override=0.0,
+        )
+        if not g1.passed:
+            _increment_revalidation_count(audit_id)
+            logger.warning(
+                "GATE1_JIT_FAIL: audit_id=%s ticker=%s live_bid=%.4f "
+                "ratio=%.4f passed=%s",
+                audit_id, ticker, live_bid, g1.ratio, g1.passed,
+            )
+            try:
+                await query.edit_message_text(
+                    f"\u274c Gate 1 FAILED at live bid ${live_bid:.2f}\n"
+                    f"Ratio: {g1.ratio:.2f}x (need >1.0x)\n"
+                    f"Re-stage from Cure Console if desired.",
+                    reply_markup=_original_markup,
+                )
+            except Exception:
+                pass
+            return
+
+    # Step 5b: Drift check (R1 — $0.10 absolute for CC, 0.5% relative for STK_SELL)
+    drift = abs(live_bid - attested_limit)
+    drift_threshold = 0.10 if action_type == "CC" else attested_limit * 0.005
+    if drift > drift_threshold:
+        _increment_revalidation_count(audit_id)
+        logger.warning(
+            "DRIFT_BLOCK: audit_id=%s ticker=%s live_bid=%.4f "
+            "attested_limit=%.4f delta=%.4f threshold=%.4f",
+            audit_id, ticker, live_bid, attested_limit, drift, drift_threshold,
+        )
+        try:
+            await query.edit_message_text(
+                f"\u274c Price drifted ${drift:.2f} (limit ${drift_threshold:.2f}).\n"
+                f"Attested: ${attested_limit:.2f} \u2192 Live: ${live_bid:.2f}\n"
+                f"Re-stage from Cure Console.",
+                reply_markup=_original_markup,
+            )
+        except Exception:
+            pass
+        return
+
+    # Step 6: Atomic ATTESTED → TRANSMITTING lock
+    now_ts = _time_mod.time()
+    with closing(_get_db_connection()) as conn:
+        lock_result = conn.execute(
+            "UPDATE bucket3_dynamic_exit_log "
+            "SET final_status = 'TRANSMITTING', last_updated = CURRENT_TIMESTAMP "
+            "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+            (audit_id,),
+        )
+        if lock_result.rowcount == 0:
+            logger.warning(
+                "TRANSMIT_RACE_LOST: audit_id=%s expected_status=ATTESTED",
+                audit_id,
+            )
+            try:
+                await query.edit_message_text(
+                    f"\u274c Race: row already claimed by another process.\naudit_id: {audit_id[:8]}..."
+                )
+            except Exception:
+                pass
+            return
+
+    # Step 7: Place order via IBKR
+    try:
+        expiry_fmt = (row["expiry"] or "").replace("-", "")
+        if action_type == "CC":
+            contract = ib_async.Option(
+                symbol=ticker,
+                lastTradeDateOrContractMonth=expiry_fmt,
+                strike=row["strike"],
+                right="C",
+                exchange="SMART",
+            )
+            qty = row["contracts"]
+        else:
+            contract = ib_async.Stock(
+                symbol=ticker, exchange="SMART", currency="USD",
+            )
+            qty = row["shares"]
+
+        # Resolve account: first margin account in household
+        hh_accounts = HOUSEHOLD_MAP.get(row["household"], [])
+        account_id = hh_accounts[0] if hh_accounts else ""
+        order = _build_adaptive_sell_order(qty, row['limit_price'], account_id)
+
+        trade = ib_conn.placeOrder(contract, order)
+        ib_order_id = trade.order.orderId if trade else 0
+    except Exception as ib_err:
+        # TRANSMIT_IB_ERROR: leave in TRANSMITTING, alert operator, NO auto-revert
+        logger.exception(
+            "TRANSMIT_IB_ERROR: audit_id=%s ticker=%s error=%s",
+            audit_id, ticker, ib_err,
+        )
+        try:
+            await query.edit_message_text(
+                f"\u26a0\ufe0f IBKR order FAILED: {ib_err}\n"
+                f"Row left in TRANSMITTING for manual recovery.\n"
+                f"audit_id: {audit_id[:8]}..."
+            )
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=(
+                    f"\U0001f534 TRANSMIT_IB_ERROR: {ticker}\n"
+                    f"audit_id: {audit_id}\n"
+                    f"Row stuck in TRANSMITTING. Manual intervention required.\n"
+                    f"Error: {ib_err}"
+                ),
+            )
+        except Exception:
+            pass
+        return
+
+    # Step 8: TRANSMITTING → TRANSMITTED
+    with closing(_get_db_connection()) as conn:
+        conn.execute(
+            "UPDATE bucket3_dynamic_exit_log "
+            "SET final_status = 'TRANSMITTED', transmitted = 1, "
+            "    transmitted_ts = ?, last_updated = CURRENT_TIMESTAMP "
+            "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+            (now_ts, audit_id),
+        )
+
+    _dispatched_audits.discard(audit_id)
+    logger.info(
+        "TRANSMIT_SUCCESS: audit_id=%s ticker=%s household=%s ib_order_id=%s",
+        audit_id, ticker, row["household"], ib_order_id,
+    )
+
+    strike_label = f"${row['strike']:.0f}C" if action_type == "CC" else ""
+    try:
+        await query.edit_message_text(
+            f"\u2705 TRANSMITTED: {ticker} {strike_label}\n"
+            f"IB Order ID: {ib_order_id}\n"
+            f"Live bid: ${live_bid:.2f} | Drift: ${drift:.2f}\n"
+            f"audit_id: {audit_id[:8]}..."
+        )
+    except Exception:
+        pass
+
+
 def _build_adaptive_sell_order(
     qty: int,
     limit_price: float,
@@ -10189,6 +10604,110 @@ async def post_init(app) -> None:
     except Exception as exc:
         logger.error("Could not connect on startup: %s", exc)
         logger.error("Use /reconnect once Gateway/TWS is ready.")
+# ---------------------------------------------------------------------------
+# Beta Impl 3: ATTESTED row poller (R6 — 10s interval, idempotent delivery)
+# ---------------------------------------------------------------------------
+
+
+async def _sweep_attested_ttl_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Continuous sweeper for stale STAGED + ATTESTED rows (R7 — 10min TTL).
+
+    Runs every 60s. STAGED sweep was previously only at /cc preamble (9:45 AM).
+    Now both STAGED and ATTESTED rows are swept continuously. The /cc preamble
+    sweep becomes a redundant safety net (acceptable per Q4 ruling).
+    """
+    try:
+        with closing(_get_db_connection()) as conn:
+            from agt_equities.rule_engine import sweep_stale_dynamic_exit_stages
+            result = sweep_stale_dynamic_exit_stages(conn)
+            swept = result.get("swept", 0)
+            att_swept = result.get("attested_swept", 0)
+            if swept > 0 or att_swept > 0:
+                logger.info(
+                    "attested_sweeper: staged=%d attested=%d swept",
+                    swept, att_swept,
+                )
+    except Exception as exc:
+        logger.error("attested_sweeper error: %s", exc)
+
+
+async def _poll_attested_rows(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Poll for ATTESTED rows and push TRANSMIT/CANCEL keyboards to operator.
+
+    Runs every 10s via jq.run_repeating per R6 ruling. Uses module-level
+    _dispatched_audits set for dedup — each ATTESTED row gets exactly one
+    keyboard push. On bot restart, set is empty so all ATTESTED rows
+    re-deliver; TRANSMITTING atomic lock prevents double-execution.
+
+    Cleanup: any audit_id in _dispatched_audits whose row is no longer ATTESTED
+    (transmitted, cancelled, abandoned, drift_blocked) is purged each tick to
+    prevent unbounded set growth (triage item #5).
+    """
+    try:
+        with closing(_get_db_connection()) as conn:
+            rows = conn.execute(
+                "SELECT audit_id, ticker, household, action_type, "
+                "       strike, expiry, contracts, shares, limit_price "
+                "FROM bucket3_dynamic_exit_log "
+                "WHERE final_status = 'ATTESTED'"
+            ).fetchall()
+
+        current_attested_ids = {r["audit_id"] for r in rows}
+
+        for row in rows:
+            audit_id = row["audit_id"]
+            if audit_id in _dispatched_audits:
+                continue
+
+            try:
+                ticker = row["ticker"]
+                if row["action_type"] == "CC":
+                    detail = (
+                        f"{row['contracts']}x {ticker} ${row['strike']:.0f}C "
+                        f"{row['expiry']} @ ${row['limit_price']:.2f}"
+                    )
+                else:
+                    detail = f"{row['shares']}sh {ticker} @ ${row['limit_price']:.2f}"
+
+                text = (
+                    f"\u26a0\ufe0f ATTESTED Dynamic Exit\n"
+                    f"Household: {row['household'].replace('_Household', '')}\n"
+                    f"{detail}\n"
+                    f"audit_id: {audit_id[:8]}..."
+                )
+
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "\U0001f4e4 TRANSMIT",
+                        callback_data=f"dex:transmit:{audit_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "\u274c CANCEL",
+                        callback_data=f"dex:cancel:{audit_id}",
+                    ),
+                ]])
+
+                await context.bot.send_message(
+                    chat_id=AUTHORIZED_USER_ID,
+                    text=text,
+                    reply_markup=keyboard,
+                )
+                _dispatched_audits.add(audit_id)
+            except Exception as row_exc:
+                logger.warning(
+                    "attested_poller: failed to dispatch audit_id=%s: %s",
+                    audit_id, row_exc,
+                )
+                # Do NOT add to _dispatched_audits — retry next tick
+
+        # Cleanup: purge dispatched IDs whose rows are no longer ATTESTED
+        stale_dispatched = _dispatched_audits - current_attested_ids
+        _dispatched_audits.difference_update(stale_dispatched)
+
+    except Exception as exc:
+        logger.error("attested_poller error: %s", exc)
+
+
 def main() -> None:
     logger.info(
         "Starting AGT Equities Bridge — Hybrid Architecture "
@@ -10240,6 +10759,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_cc_ladder_callback, pattern=r"^cc:"))
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve:"))
+    app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern=r"^dex:"))
     app.add_handler(CallbackQueryHandler(handle_dashboard_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -10281,6 +10801,20 @@ def main() -> None:
             name="flex_sync_eod",
         )
         logger.info("Scheduled: flex_sync_eod at 5:00 PM ET (Mon-Fri)")
+        jq.run_repeating(
+            callback=_poll_attested_rows,
+            interval=10,
+            first=10,
+            name="attested_poller",
+        )
+        logger.info("Scheduled: attested_poller every 10s")
+        jq.run_repeating(
+            callback=_sweep_attested_ttl_job,
+            interval=60,
+            first=30,
+            name="attested_sweeper",
+        )
+        logger.info("Scheduled: attested_sweeper every 60s")
     else:
         logger.warning("JobQueue not available — scheduled jobs not registered")
 

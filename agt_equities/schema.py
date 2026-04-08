@@ -612,6 +612,18 @@ def register_master_log_tables(conn) -> None:
     # Phase 3A.5a: Add accelerator_clause to glide_paths
     _extend_glide_paths(conn)
 
+    # Beta Impl 3: TRANSMITTING intermediate state for JIT handler
+    _migrate_dyn_exit_add_transmitting(conn)
+
+    # Beta Impl 5: exception_type column for R5 sell gate subclasses
+    try:
+        conn.execute(
+            "ALTER TABLE bucket3_dynamic_exit_log "
+            "ADD COLUMN exception_type TEXT"
+        )
+    except Exception:
+        pass  # Column already exists
+
     # Phase 3A.5b: Red Alert state (R9 hysteresis)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS red_alert_state (
@@ -696,11 +708,16 @@ def register_master_log_tables(conn) -> None:
             re_validation_count INTEGER NOT NULL DEFAULT 0,
             final_status TEXT NOT NULL DEFAULT 'PENDING'
                 CHECK (final_status IN ('PENDING', 'STAGED', 'ATTESTED',
-                                        'TRANSMITTED', 'CANCELLED',
-                                        'DRIFT_BLOCKED', 'ABANDONED')),
+                                        'TRANSMITTING', 'TRANSMITTED',
+                                        'CANCELLED', 'DRIFT_BLOCKED',
+                                        'ABANDONED')),
             source TEXT NOT NULL DEFAULT 'scheduled_watchdog'
                 CHECK (source IN ('scheduled_watchdog', 'manual_inspection',
                                   'cc_overweight', 'manual_stage')),
+            exception_type TEXT
+                CHECK (exception_type IS NULL OR exception_type IN (
+                    'rule_8_dynamic_exit', 'thesis_deterioration',
+                    'rule_6_forced_liquidation', 'emergency_risk_event')),
             fill_ts REAL,
             fill_price REAL,
             last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -908,3 +925,148 @@ def _extend_glide_paths(conn) -> None:
     }
     if "accelerator_clause" not in gp_cols:
         conn.execute("ALTER TABLE glide_paths ADD COLUMN accelerator_clause TEXT")
+
+
+def _migrate_dyn_exit_add_transmitting(conn) -> None:
+    """Beta Impl 3: Add TRANSMITTING to bucket3_dynamic_exit_log CHECK constraint.
+
+    SQLite cannot ALTER CHECK constraints on existing tables. For existing DBs
+    where CREATE TABLE IF NOT EXISTS is a no-op, the old constraint stays frozen.
+
+    Algorithm:
+      1. Probe INSERT with final_status='TRANSMITTING'. If CHECK passes,
+         constraint already allows the value — DELETE probe and return.
+      2. If CHECK fails: table rebuild inside explicit transaction
+         (RENAME → CREATE new → INSERT SELECT → DROP old → recreate indexes).
+
+    The entire rebuild runs in a single BEGIN IMMEDIATE transaction so a failure
+    at any point rolls back to pre-rebuild state (table still has old name).
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if 'bucket3_dynamic_exit_log' not in tables:
+        return  # Table doesn't exist yet; CREATE TABLE IF NOT EXISTS will handle it
+
+    # Step 1: Probe — does the constraint already accept TRANSMITTING?
+    try:
+        conn.execute(
+            "INSERT INTO bucket3_dynamic_exit_log "
+            "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+            " household_nlv, underlying_spot_at_render, final_status) "
+            "VALUES ('__probe_transmitting__', '1970-01-01', '__PROBE__', "
+            "        '__PROBE__', 'PEACETIME', 'CC', 0, 0, 'TRANSMITTING')"
+        )
+        conn.execute(
+            "DELETE FROM bucket3_dynamic_exit_log "
+            "WHERE audit_id = '__probe_transmitting__'"
+        )
+        conn.commit()
+        return  # Constraint already valid
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    # Step 2: Rebuild table with updated CHECK constraint.
+    # Entire rebuild in one explicit transaction for atomicity.
+    _log.warning("Migrating bucket3_dynamic_exit_log: adding TRANSMITTING to CHECK constraint")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        conn.execute(
+            "ALTER TABLE bucket3_dynamic_exit_log "
+            "RENAME TO _dyn_exit_old_transmitting"
+        )
+
+        conn.execute("""
+            CREATE TABLE bucket3_dynamic_exit_log (
+                audit_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                household TEXT NOT NULL,
+                desk_mode TEXT NOT NULL CHECK (desk_mode IN ('PEACETIME', 'AMBER', 'WARTIME')),
+                action_type TEXT NOT NULL CHECK (action_type IN ('CC', 'STK_SELL')),
+                household_nlv REAL NOT NULL,
+                underlying_spot_at_render REAL NOT NULL,
+                gate1_freed_margin REAL,
+                gate1_realized_loss REAL,
+                gate1_conviction_tier TEXT,
+                gate1_conviction_modifier REAL,
+                gate1_ratio REAL,
+                gate2_target_contracts INTEGER,
+                gate2_max_per_cycle INTEGER,
+                walk_away_pnl_per_share REAL,
+                strike REAL,
+                expiry TEXT,
+                contracts INTEGER,
+                shares INTEGER,
+                limit_price REAL,
+                campaign_id TEXT,
+                operator_thesis TEXT,
+                attestation_value_typed TEXT,
+                checkbox_state_json TEXT,
+                render_ts REAL,
+                staged_ts REAL,
+                transmitted INTEGER NOT NULL DEFAULT 0,
+                transmitted_ts REAL,
+                re_validation_count INTEGER NOT NULL DEFAULT 0,
+                final_status TEXT NOT NULL DEFAULT 'PENDING'
+                    CHECK (final_status IN ('PENDING', 'STAGED', 'ATTESTED',
+                                            'TRANSMITTING', 'TRANSMITTED',
+                                            'CANCELLED', 'DRIFT_BLOCKED',
+                                            'ABANDONED')),
+                source TEXT NOT NULL DEFAULT 'scheduled_watchdog'
+                    CHECK (source IN ('scheduled_watchdog', 'manual_inspection',
+                                      'cc_overweight', 'manual_stage')),
+                exception_type TEXT
+                    CHECK (exception_type IS NULL OR exception_type IN (
+                        'rule_8_dynamic_exit', 'thesis_deterioration',
+                        'rule_6_forced_liquidation', 'emergency_risk_event')),
+                fill_ts REAL,
+                fill_price REAL,
+                last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (campaign_id) REFERENCES bucket3_dynamic_exit_campaigns(campaign_id)
+            ) WITHOUT ROWID
+        """)
+
+        # F2 fix: explicit column mapping via PRAGMA to handle ALTER-appended
+        # columns whose physical ordinal differs from the new DDL order.
+        _old_cols = [r[1] for r in conn.execute(
+            "PRAGMA table_info(_dyn_exit_old_transmitting)"
+        ).fetchall()]
+        _col_list = ", ".join(_old_cols)
+        conn.execute(
+            f"INSERT INTO bucket3_dynamic_exit_log ({_col_list}) "
+            f"SELECT {_col_list} FROM _dyn_exit_old_transmitting"
+        )
+
+        conn.execute("DROP TABLE _dyn_exit_old_transmitting")
+
+        # Recreate indexes
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dyn_exit_status
+            ON bucket3_dynamic_exit_log(final_status, household)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dyn_exit_ticker_date
+            ON bucket3_dynamic_exit_log(ticker, trade_date DESC)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dyn_exit_household
+            ON bucket3_dynamic_exit_log(household, trade_date DESC)
+        """)
+
+        conn.commit()
+        _log.info("Migration complete: TRANSMITTING added to CHECK constraint")
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _log.error("Migration FAILED — table left in pre-migration state: %s", exc)
+        raise

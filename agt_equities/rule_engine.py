@@ -670,14 +670,18 @@ def stage_stock_sale_via_smart_friction(
     """Backend entry point for stock sale staging via Smart Friction.
 
     Validates exception flag, runs R5 sell gate, creates a STAGED row
-    in bucket3_dynamic_exit_log with action_type='STK_SELL'.
+    in bucket3_dynamic_exit_log with action_type='STK_SELL' and
+    exception_type persisted for widget rendering.
 
-    In alpha, this function is callable via direct Python (test fixtures)
-    but has no Telegram or Cure Console entry point. Beta adds the
-    /sell_shares command and polymorphic Smart Friction widget.
+    Consumer: Cure Console POST /api/cure/r5_sell/stage. Also callable
+    from tests directly.
+
+    Args:
+        cio_token: Operator completed Smart Friction attestation flow.
+            Vestigial name from CIO Oracle era — under Smart Friction
+            architecture, attestation IS the CIO token (ADR-004).
     """
     import uuid
-    from datetime import timezone
 
     # Run R5 sell gate
     gate_result = evaluate_rule_5_sell_gate(
@@ -708,13 +712,14 @@ def stage_stock_sale_via_smart_friction(
             "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
             " household_nlv, underlying_spot_at_render, "
             " gate1_realized_loss, walk_away_pnl_per_share, "
-            " shares, limit_price, final_status) "
-            "VALUES (?, date('now'), ?, ?, ?, 'STK_SELL', ?, ?, ?, ?, ?, ?, 'STAGED')",
+            " shares, limit_price, exception_type, final_status) "
+            "VALUES (?, date('now'), ?, ?, ?, 'STK_SELL', ?, ?, ?, ?, ?, ?, ?, 'STAGED')",
             (audit_id, ticker, household, desk_mode,
              household_nlv, spot,
              round(loss_total, 2),
              round(limit_price - adjusted_cost_basis, 4),
-             shares, limit_price),
+             shares, limit_price,
+             exception_flag.value if exception_flag else None),
         )
         conn.commit()
     except Exception as exc:
@@ -1126,15 +1131,21 @@ def evaluate_dynamic_exit_candidates(
 def sweep_stale_dynamic_exit_stages(
     conn: sqlite3.Connection,
     max_age_seconds: int = 900,  # 15 minutes
+    attested_ttl_seconds: int = 600,  # 10 minutes (R7)
 ) -> dict:
-    """Releases share reserves on STAGED rows older than max_age_seconds.
+    """Releases share reserves on stale STAGED and ATTESTED rows.
 
     Called as a preamble to the /cc job per Patch 6 / Decision D.
-    Transitions stale STAGED rows to ABANDONED, freeing CC share reserves.
+
+    Two sweeps:
+      1. STAGED rows older than max_age_seconds → ABANDONED
+      2. ATTESTED rows older than attested_ttl_seconds → ABANDONED (R7)
+         Uses last_updated as ATTESTED timestamp (set by queries.attest_staged_exit).
     """
     import time
     cutoff_ts = time.time() - max_age_seconds
     try:
+        # Sweep 1: stale STAGED rows
         cursor = conn.execute(
             "SELECT audit_id, ticker, household, contracts, shares, action_type "
             "FROM bucket3_dynamic_exit_log "
@@ -1151,11 +1162,50 @@ def sweep_stale_dynamic_exit_stages(
                 "WHERE audit_id = ?",
                 (audit_id,),
             )
+
+        # Sweep 2: stale ATTESTED rows (R7 — 10min TTL)
+        attested_cursor = conn.execute(
+            "SELECT audit_id FROM bucket3_dynamic_exit_log "
+            "WHERE final_status = 'ATTESTED' "
+            "AND last_updated < datetime('now', ? || ' minutes')",
+            (f"-{attested_ttl_seconds // 60}",),
+        )
+        attested_stale = attested_cursor.fetchall()
+        for arow in attested_stale:
+            a_id = arow[0] if isinstance(arow, tuple) else arow["audit_id"]
+            conn.execute(
+                "UPDATE bucket3_dynamic_exit_log "
+                "SET final_status = 'ABANDONED', last_updated = datetime('now') "
+                "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+                (a_id,),
+            )
+            logger.info("ATTESTED_TTL_EXPIRED: audit_id=%s", a_id)
+
         conn.commit()
-        return {"swept": len(stale_rows)}
+        return {"swept": len(stale_rows), "attested_swept": len(attested_stale)}
     except Exception as exc:
         logger.error("Sweeper failed: %s", exc)
-        return {"swept": 0, "error": str(exc)}
+        return {"swept": 0, "attested_swept": 0, "error": str(exc)}
+
+
+def is_ticker_locked(
+    conn: sqlite3.Connection,
+    ticker: str,
+    window_minutes: int = 5,
+) -> bool:
+    """Check if ticker is in rolling-window lockout from recent DRIFT_BLOCKED rows.
+
+    Returns True if any DRIFT_BLOCKED row for this ticker was created within
+    the last window_minutes. No new table needed — DRIFT_BLOCKED terminal
+    rows ARE the evidence per R2 ruling.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) FROM bucket3_dynamic_exit_log "
+        "WHERE ticker = ? AND final_status = 'DRIFT_BLOCKED' "
+        "AND last_updated > datetime('now', ? || ' minutes')",
+        (ticker, f"-{window_minutes}"),
+    ).fetchone()
+    return (row[0] if row else 0) > 0
 
 
 # ---------------------------------------------------------------------------

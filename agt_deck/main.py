@@ -787,6 +787,134 @@ async def smart_friction_submit(request: Request, audit_id: str):
         conn.close()
 
 
+# ── Beta Impl 5: R5 Sell Gate staging route ──────────────────────
+
+_VALID_EXCEPTION_TYPES = {
+    "thesis_deterioration",
+    "rule_6_forced_liquidation",
+    "emergency_risk_event",
+}
+
+
+@app.post("/api/cure/r5_sell/stage", response_class=HTMLResponse)
+async def r5_sell_stage(request: Request):
+    """Stage an R5 stock sale via Smart Friction.
+
+    Accepts {ticker, household, shares, limit_price, adjusted_cost_basis,
+    exception_type, desk_mode, household_nlv, spot}. Delegates to
+    rule_engine.stage_stock_sale_via_smart_friction().
+    """
+    try:
+        form = await request.form()
+    except Exception:
+        return _htmx_error(
+            '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+            "Invalid form data.</div>",
+            400,
+        )
+
+    exception_type = form.get("exception_type", "")
+    if exception_type not in _VALID_EXCEPTION_TYPES:
+        return _htmx_error(
+            '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+            f"Invalid exception_type: {exception_type}. "
+            f"Valid: {', '.join(sorted(_VALID_EXCEPTION_TYPES))}</div>",
+            400,
+        )
+
+    ticker = form.get("ticker", "").strip().upper()
+    household = form.get("household", "").strip()
+    if not ticker or not household:
+        return _htmx_error(
+            '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+            "Missing ticker or household.</div>",
+            400,
+        )
+
+    try:
+        shares = int(form.get("shares", 0))
+        limit_price = float(form.get("limit_price", 0))
+        adjusted_cost_basis = float(form.get("adjusted_cost_basis", 0))
+        household_nlv = float(form.get("household_nlv", 0))
+        spot = float(form.get("spot", 0))
+    except (ValueError, TypeError) as e:
+        return _htmx_error(
+            '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+            f"Invalid numeric field: {e}</div>",
+            400,
+        )
+
+    desk_mode = form.get("desk_mode", "PEACETIME")
+    logged_rationale = form.get("logged_rationale", "").strip() or None
+
+    # R6 forced liquidation requires WARTIME
+    if exception_type == "rule_6_forced_liquidation" and desk_mode != "WARTIME":
+        return _htmx_error(
+            '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+            "Forced Liquidation requires WARTIME mode.</div>",
+            400,
+        )
+
+    from agt_equities.rule_engine import (
+        stage_stock_sale_via_smart_friction, SellException,
+    )
+
+    exception_flag = SellException(exception_type)
+
+    conn = get_rw_conn()
+    try:
+        result = stage_stock_sale_via_smart_friction(
+            ticker=ticker,
+            household=household,
+            limit_price=limit_price,
+            shares=shares,
+            adjusted_cost_basis=adjusted_cost_basis,
+            exception_flag=exception_flag,
+            household_nlv=household_nlv,
+            spot=spot,
+            desk_mode=desk_mode,
+            conn=conn,
+            cio_token=True,  # Attestation IS the CIO token (ADR-004)
+            logged_rationale=logged_rationale,
+            vikram_el_below_10=(exception_type == "rule_6_forced_liquidation"),
+        )
+
+        if not result.staged:
+            return _htmx_error(
+                '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+                f"R5 gate blocked: {result.reason}</div>",
+                409,
+            )
+
+        logger.info(
+            "R5_STAGED: audit_id=%s ticker=%s household=%s exception=%s shares=%d",
+            result.audit_id, ticker, household, exception_type, shares,
+        )
+
+        return HTMLResponse(
+            f'<div class="bg-emerald-900/40 border border-emerald-700 text-emerald-200 p-4 rounded-lg">'
+            f'<div class="font-semibold mb-1">R5 Sell Staged</div>'
+            f'<div class="text-xs text-emerald-300">{ticker} · {shares} shares · {exception_type.replace("_", " ").title()}</div>'
+            f'<div class="text-xs text-slate-400 mt-1">audit_id: {result.audit_id[:8]}...</div>'
+            f'<div class="text-xs text-slate-500 mt-2">Telegram TRANSMIT/CANCEL keyboard will appear within 10 seconds.</div>'
+            f"</div>"
+        )
+
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.exception("r5_sell_stage failed: %s", exc)
+        return _htmx_error(
+            '<div class="bg-rose-900/40 border border-rose-700 text-rose-200 p-4 rounded-lg">'
+            "Server error during R5 staging. Check logs.</div>",
+            500,
+        )
+    finally:
+        conn.close()
+
+
 # ── Entry point ───────────────────────────────────────────────────
 
 def main():

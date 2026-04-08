@@ -376,6 +376,7 @@ class TestStageStockSale(unittest.TestCase):
                 walk_away_pnl_per_share REAL, shares INTEGER, limit_price REAL,
                 final_status TEXT DEFAULT 'STAGED', transmitted INTEGER DEFAULT 0,
                 re_validation_count INTEGER DEFAULT 0,
+                exception_type TEXT,
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
