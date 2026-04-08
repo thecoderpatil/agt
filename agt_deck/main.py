@@ -725,9 +725,16 @@ async def smart_friction_submit(request: Request, audit_id: str):
             if len(operator_thesis) < 30:
                 conn.rollback()
                 logger.info("THESIS_TOO_SHORT: audit_id=%s length=%d", audit_id, len(operator_thesis))
+                exc_type = row.get("exception_type") or ""
+                if exc_type == "thesis_deterioration":
+                    thesis_label = "Bearish rationale must be at least 30 characters."
+                elif exc_type == "emergency_risk_event":
+                    thesis_label = "Risk catalyst must be at least 30 characters."
+                else:
+                    thesis_label = "Strategic rationale must be at least 30 characters."
                 return _htmx_error(
                     '<div class="bg-amber-900/40 border border-amber-700 text-amber-200 p-4 rounded-lg">'
-                    "Strategic rationale must be at least 30 characters."
+                    f"{thesis_label}"
                     "</div>",
                     422,
                 )

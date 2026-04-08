@@ -150,7 +150,7 @@
         <textarea name="operator_thesis" id="sf-thesis-input" rows="4"
                   class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-xs text-slate-100"
                   oninput="sfUpdateButton()"
-                  placeholder="{% if row.exception_type == 'thesis_deterioration' %}Describe the specific fundamental deterioration: revenue decline, margin compression, competitive threat...{% elif row.exception_type == 'emergency_risk_event' %}Describe the emergency: confirmed fraud, imminent delisting, bankruptcy filing...{% else %}{{ row.ticker }} is currently above the 20% R1 ceiling. Explain the strategic thesis...{% endif %}"></textarea>
+                  placeholder="{% if row.exception_type == 'thesis_deterioration' %}Describe the specific fundamental deterioration: revenue decline, margin compression, competitive threat...{% elif row.exception_type == 'emergency_risk_event' %}Describe the emergency: confirmed fraud, imminent delisting, bankruptcy filing...{% elif row.action_type == 'STK_SELL' %}{{ row.ticker }} share sale — explain the strategic thesis for reducing this position...{% else %}{{ row.ticker }} is currently above the 20% R1 ceiling. Explain the strategic thesis for this defensive covered call...{% endif %}"></textarea>
       </div>
       <button type="submit" id="sf-stage-btn" disabled
               class="w-full bg-emerald-700 hover:bg-emerald-600 disabled:bg-slate-800 disabled:text-slate-600 text-white py-2 rounded font-semibold cursor-not-allowed disabled:cursor-not-allowed">
