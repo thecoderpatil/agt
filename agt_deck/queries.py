@@ -175,3 +175,61 @@ def get_recon_summary(conn: sqlite3.Connection) -> dict:
         "b_status": "14/14 ✓",
         "c_status": "2/4 (2 accepted)",
     }
+
+
+def get_staged_dynamic_exits(conn: sqlite3.Connection) -> list[dict]:
+    """Read STAGED Dynamic Exit candidates for Cure Console display.
+
+    Only final_status='STAGED' — ATTESTED rows live on the Telegram
+    TRANSMIT/CANCEL surface and must NOT appear here (race risk).
+
+    Returns list of dicts grouped by ticker, each with a 'candidates' list.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT audit_id, ticker, household, desk_mode, "
+            "  strike, expiry, contracts, "
+            "  gate1_ratio, gate1_freed_margin, gate1_realized_loss, "
+            "  gate1_conviction_tier, gate2_max_per_cycle, "
+            "  walk_away_pnl_per_share, underlying_spot_at_render, "
+            "  render_ts, staged_ts "
+            "FROM bucket3_dynamic_exit_log "
+            "WHERE final_status = 'STAGED' "
+            "ORDER BY ticker, gate1_ratio DESC"
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("get_staged_dynamic_exits failed: %s", exc)
+        return []
+
+    if not rows:
+        return []
+
+    # Group by ticker
+    from collections import OrderedDict
+    grouped: OrderedDict[str, dict] = OrderedDict()
+    for r in rows:
+        tk = r["ticker"]
+        if tk not in grouped:
+            grouped[tk] = {
+                "ticker": tk,
+                "household": r["household"],
+                "desk_mode": r["desk_mode"],
+                "candidates": [],
+            }
+        grouped[tk]["candidates"].append({
+            "audit_id": r["audit_id"],
+            "strike": r["strike"],
+            "expiry": r["expiry"],
+            "contracts": r["contracts"],
+            "gate1_ratio": r["gate1_ratio"],
+            "gate1_freed_margin": r["gate1_freed_margin"],
+            "gate1_realized_loss": r["gate1_realized_loss"],
+            "gate1_conviction_tier": r["gate1_conviction_tier"],
+            "gate2_max_per_cycle": r["gate2_max_per_cycle"],
+            "walk_away_pnl_per_share": r["walk_away_pnl_per_share"],
+            "underlying_spot_at_render": r["underlying_spot_at_render"],
+            "render_ts": r["render_ts"],
+            "staged_ts": r["staged_ts"],
+        })
+
+    return list(grouped.values())

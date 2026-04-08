@@ -527,6 +527,12 @@ def _build_cure_data(conn) -> dict:
     mode = get_current_mode(conn)
     transitions = get_recent_transitions(conn)
 
+    try:
+        staged_exits = queries.get_staged_dynamic_exits(conn)
+    except Exception as e:
+        logger.warning("_build_cure_data: get_staged_dynamic_exits failed: %s", e)
+        staged_exits = []
+
     return {
         "mode": mode,
         "households": hh_sections,
@@ -534,6 +540,7 @@ def _build_cure_data(conn) -> dict:
         "all_evals": all_evals,
         "transitions": transitions,
         "top": top,
+        "staged_exits": staged_exits,
     }
 
 

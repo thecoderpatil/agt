@@ -77,6 +77,11 @@
 </section>
 {% endif %}
 
+{# ── DYNAMIC EXIT CANDIDATES ─────────────────────────────────── #}
+{% if staged_exits %}
+{% include "cure_dynamic_exit_panel.html" %}
+{% endif %}
+
 {# ── PER-HOUSEHOLD SECTIONS ───────────────────────────────────── #}
 {% for hh, data in households.items() %}
 <section class="mb-6">
