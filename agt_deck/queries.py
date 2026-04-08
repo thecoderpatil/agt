@@ -242,11 +242,13 @@ def attest_staged_exit(
     attestation_value_typed: str | None,
     checkbox_state_json: str | None,
     attested_limit_price: float | None,
+    expected_desk_mode: str,
 ) -> int:
     """Transition a STAGED row to ATTESTED. Returns cursor.rowcount.
 
     Caller owns conn.commit() / conn.rollback().
-    Returns 0 if audit_id not found or row is no longer STAGED (race/stale).
+    Returns 0 if audit_id not found, row is no longer STAGED, or desk_mode
+    changed between read and write (TOCTOU race gate).
 
     checkbox_state_json shape (PEACETIME):
         {"ack_loss": true, "ack_cure": true, "ack_ts": <epoch float>}
@@ -262,9 +264,9 @@ def attest_staged_exit(
             "    checkbox_state_json = ?, "
             "    limit_price = ?, "
             "    last_updated = CURRENT_TIMESTAMP "
-            "WHERE audit_id = ? AND final_status = 'STAGED'",
+            "WHERE audit_id = ? AND final_status = 'STAGED' AND desk_mode = ?",
             (operator_thesis, attestation_value_typed, checkbox_state_json,
-             attested_limit_price, audit_id),
+             attested_limit_price, audit_id, expected_desk_mode),
         )
         return cursor.rowcount
     except Exception as exc:

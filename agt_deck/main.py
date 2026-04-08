@@ -740,6 +740,7 @@ async def smart_friction_submit(request: Request, audit_id: str):
             attestation_value_typed=attestation_typed,
             checkbox_state_json=checkbox_json,
             attested_limit_price=attested_limit_price,
+            expected_desk_mode=row["desk_mode"],
         )
         if rowcount == 0:
             conn.rollback()
