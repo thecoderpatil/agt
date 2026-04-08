@@ -227,25 +227,25 @@ def _record_fill_to_trade_ledger(
 ):
     """Write a fill event to trade_ledger for dashboard tracking."""
     try:
+        from contextlib import closing
         from datetime import datetime
         now = datetime.now()
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("""
-            INSERT OR IGNORE INTO trade_ledger
-                (account_id, household_id, trade_date, trade_datetime,
-                 symbol, underlying, asset_category, trade_type,
-                 quantity, price, proceeds, realized_pnl,
-                 return_category, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LIVE')
-        """, (
-            account_id, household_id, now.strftime("%Y-%m-%d"),
-            now.strftime("%Y-%m-%d %H:%M:%S"), symbol, ticker,
-            asset_category, trade_type, quantity, price,
-            round(price * abs(quantity) * (100 if "Option" in asset_category else 1), 2),
-            realized_pnl, return_category,
-        ))
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            with conn:
+                conn.execute("""
+                    INSERT OR IGNORE INTO trade_ledger
+                        (account_id, household_id, trade_date, trade_datetime,
+                         symbol, underlying, asset_category, trade_type,
+                         quantity, price, proceeds, realized_pnl,
+                         return_category, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LIVE')
+                """, (
+                    account_id, household_id, now.strftime("%Y-%m-%d"),
+                    now.strftime("%Y-%m-%d %H:%M:%S"), symbol, ticker,
+                    asset_category, trade_type, quantity, price,
+                    round(price * abs(quantity) * (100 if "Option" in asset_category else 1), 2),
+                    realized_pnl, return_category,
+                ))
     except Exception as e:
         logger.warning("trade_ledger insert failed: %s", e)
 

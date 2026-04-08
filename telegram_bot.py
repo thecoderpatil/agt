@@ -6919,130 +6919,131 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         # ── Panel 1: Performance Card (always available) ────────────────
         conn = _get_db_connection()
-
-        perf_path = str(output_dir / "dashboard_performance.png")
         try:
-            dr.render_performance_card(conn, perf_path, use_master_log=READ_FROM_MASTER_LOG)
-        except Exception as e:
-            logger.exception("Performance card render failed: %s", e)
-            await update.message.reply_text(f"\u274c Performance card failed: {e}")
+
+            perf_path = str(output_dir / "dashboard_performance.png")
+            try:
+                dr.render_performance_card(conn, perf_path, use_master_log=READ_FROM_MASTER_LOG)
+            except Exception as e:
+                logger.exception("Performance card render failed: %s", e)
+                await update.message.reply_text(f"\u274c Performance card failed: {e}")
+                return
+
+            # ── Panel 2: Positions Grid (needs live or ledger data) ─────────
+            positions = []
+            ib_connected = False
+            _DASH_EXCLUDE = {"SLS", "GTLB", "IBKR", "TRAW", "TRAW.CVR", "SPX"}
+
+            # Try to get live positions from ib_async
+            try:
+                if ib is not None and ib.isConnected():
+                    ib_connected = True
+                    portfolio_items = ib.portfolio()
+
+                    stock_positions = {}
+                    option_positions = {}
+
+                    for item in portfolio_items:
+                        contract = item.contract
+                        symbol = contract.symbol
+
+                        if symbol in _DASH_EXCLUDE:
+                            continue
+
+                        if contract.secType == "STK":
+                            if item.position != 0:
+                                stock_positions[symbol] = {
+                                    "ticker": symbol,
+                                    "account_id": item.account if hasattr(item, "account") else "U21971297",
+                                    "shares": int(item.position),
+                                    "cost_basis": round(item.averageCost, 2),
+                                    "current_price": round(item.marketPrice, 2),
+                                    "unrealized_pnl": round(item.unrealizedPNL, 2),
+                                    "total_premium": 0,
+                                    "active_option": None,
+                                }
+                        elif contract.secType == "OPT":
+                            if item.position != 0:
+                                underlying = contract.symbol
+                                strike = contract.strike
+                                right = contract.right
+                                expiry = contract.lastTradeDateOrContractMonth
+                                opt_str = f"{right}{strike} {expiry[4:6]}/{expiry[6:]}"
+
+                                if underlying not in option_positions:
+                                    option_positions[underlying] = []
+                                option_positions[underlying].append(opt_str)
+
+                    # Merge options into stock positions
+                    for sym, opts in option_positions.items():
+                        if sym in stock_positions:
+                            stock_positions[sym]["active_option"] = ", ".join(opts[:2])
+
+                    # Enrich with premium from premium_ledger
+                    for sym, pos in stock_positions.items():
+                        try:
+                            row = conn.execute("""
+                                SELECT total_premium_collected
+                                FROM premium_ledger
+                                WHERE ticker = ?
+                                ORDER BY rowid DESC LIMIT 1
+                            """, (sym,)).fetchone()
+                            if row:
+                                pos["total_premium"] = float(row[0] or 0)
+                        except Exception:
+                            pass
+
+                    positions = list(stock_positions.values())
+                    logger.info("Dashboard: %d stock positions, %d option groups from IBKR",
+                                len(stock_positions), len(option_positions))
+
+            except Exception as e:
+                logger.warning("IB live positions unavailable: %s", e)
+
+            # Fallback: build from premium_ledger if IB not connected
+            if not positions:
+                try:
+                    rows = conn.execute("""
+                        SELECT household_id, ticker, initial_basis,
+                               total_premium_collected, shares_owned
+                        FROM premium_ledger
+                        WHERE shares_owned > 0
+                    """).fetchall()
+
+                    for r in rows:
+                        if r[1] in _DASH_EXCLUDE:
+                            continue
+                        household = r[0]
+                        acct_id = "U21971297" if household == "Yash_Household" else "U22388499"
+                        shares = int(r[4])
+                        basis = float(r[2]) if r[2] else 0
+                        premium = float(r[3]) if r[3] else 0
+
+                        positions.append({
+                            "ticker": r[1],
+                            "account_id": acct_id,
+                            "shares": shares,
+                            "cost_basis": round(basis / shares, 2) if shares > 0 else 0,
+                            "total_premium": premium,
+                            "current_price": None,
+                            "unrealized_pnl": None,
+                            "active_option": None,
+                        })
+                except Exception as e:
+                    logger.warning("Premium ledger fallback failed: %s", e)
+
+            pos_path = None
+            if positions:
+                pos_path = str(output_dir / "dashboard_positions.png")
+                try:
+                    dr.render_positions_grid(conn, positions, pos_path,
+                                             use_master_log=READ_FROM_MASTER_LOG)
+                except Exception as e:
+                    logger.exception("Positions grid render failed: %s", e)
+                    pos_path = None
+
+        finally:
             conn.close()
-            return
-
-        # ── Panel 2: Positions Grid (needs live or ledger data) ─────────
-        positions = []
-        ib_connected = False
-        _DASH_EXCLUDE = {"SLS", "GTLB", "IBKR", "TRAW", "TRAW.CVR", "SPX"}
-
-        # Try to get live positions from ib_async
-        try:
-            if ib is not None and ib.isConnected():
-                ib_connected = True
-                portfolio_items = ib.portfolio()
-
-                stock_positions = {}
-                option_positions = {}
-
-                for item in portfolio_items:
-                    contract = item.contract
-                    symbol = contract.symbol
-
-                    if symbol in _DASH_EXCLUDE:
-                        continue
-
-                    if contract.secType == "STK":
-                        if item.position != 0:
-                            stock_positions[symbol] = {
-                                "ticker": symbol,
-                                "account_id": item.account if hasattr(item, "account") else "U21971297",
-                                "shares": int(item.position),
-                                "cost_basis": round(item.averageCost, 2),
-                                "current_price": round(item.marketPrice, 2),
-                                "unrealized_pnl": round(item.unrealizedPNL, 2),
-                                "total_premium": 0,
-                                "active_option": None,
-                            }
-                    elif contract.secType == "OPT":
-                        if item.position != 0:
-                            underlying = contract.symbol
-                            strike = contract.strike
-                            right = contract.right
-                            expiry = contract.lastTradeDateOrContractMonth
-                            opt_str = f"{right}{strike} {expiry[4:6]}/{expiry[6:]}"
-
-                            if underlying not in option_positions:
-                                option_positions[underlying] = []
-                            option_positions[underlying].append(opt_str)
-
-                # Merge options into stock positions
-                for sym, opts in option_positions.items():
-                    if sym in stock_positions:
-                        stock_positions[sym]["active_option"] = ", ".join(opts[:2])
-
-                # Enrich with premium from premium_ledger
-                for sym, pos in stock_positions.items():
-                    try:
-                        row = conn.execute("""
-                            SELECT total_premium_collected
-                            FROM premium_ledger
-                            WHERE ticker = ?
-                            ORDER BY rowid DESC LIMIT 1
-                        """, (sym,)).fetchone()
-                        if row:
-                            pos["total_premium"] = float(row[0] or 0)
-                    except Exception:
-                        pass
-
-                positions = list(stock_positions.values())
-                logger.info("Dashboard: %d stock positions, %d option groups from IBKR",
-                            len(stock_positions), len(option_positions))
-
-        except Exception as e:
-            logger.warning("IB live positions unavailable: %s", e)
-
-        # Fallback: build from premium_ledger if IB not connected
-        if not positions:
-            try:
-                rows = conn.execute("""
-                    SELECT household_id, ticker, initial_basis,
-                           total_premium_collected, shares_owned
-                    FROM premium_ledger
-                    WHERE shares_owned > 0
-                """).fetchall()
-
-                for r in rows:
-                    if r[1] in _DASH_EXCLUDE:
-                        continue
-                    household = r[0]
-                    acct_id = "U21971297" if household == "Yash_Household" else "U22388499"
-                    shares = int(r[4])
-                    basis = float(r[2]) if r[2] else 0
-                    premium = float(r[3]) if r[3] else 0
-
-                    positions.append({
-                        "ticker": r[1],
-                        "account_id": acct_id,
-                        "shares": shares,
-                        "cost_basis": round(basis / shares, 2) if shares > 0 else 0,
-                        "total_premium": premium,
-                        "current_price": None,
-                        "unrealized_pnl": None,
-                        "active_option": None,
-                    })
-            except Exception as e:
-                logger.warning("Premium ledger fallback failed: %s", e)
-
-        pos_path = None
-        if positions:
-            pos_path = str(output_dir / "dashboard_positions.png")
-            try:
-                dr.render_positions_grid(conn, positions, pos_path,
-                                         use_master_log=READ_FROM_MASTER_LOG)
-            except Exception as e:
-                logger.exception("Positions grid render failed: %s", e)
-                pos_path = None
-
-        conn.close()
 
         # ── Send images ─────────────────────────────────────────────────
         source = "\U0001f7e2 Live" if ib_connected else "\U0001f4ca Ledger"
@@ -9829,129 +9830,131 @@ async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         _tr.DB_PATH = DB_PATH
         conn = _get_db_connection()
+        try:
 
-        # Parity
-        violations = _vp(conn)
-        eae_total = conn.execute("SELECT COUNT(*) FROM master_log_option_eae").fetchone()[0]
+            # Parity
+            violations = _vp(conn)
+            eae_total = conn.execute("SELECT COUNT(*) FROM master_log_option_eae").fetchone()[0]
 
-        # Walker
-        all_ev = _tr._load_trade_events(conn)
-        ci_ev = _tr._load_carryin_events(conn)
-        combined = ci_ev + all_ev
-        combined.sort(key=lambda e: (e.household_id, e.ticker))
+            # Walker
+            all_ev = _tr._load_trade_events(conn)
+            ci_ev = _tr._load_carryin_events(conn)
+            combined = ci_ev + all_ev
+            combined.sort(key=lambda e: (e.household_id, e.ticker))
 
-        all_cycles = []
-        all_walker_warnings = []  # W3.6: accumulate across groups (stale-warnings fix)
-        frozen_count = 0
-        for (hh, tk), grp in _gb(combined, key=lambda e: (e.household_id, e.ticker)):
-            try:
-                all_cycles.extend(_wc(list(grp)))
-                all_walker_warnings.extend(_gww())  # capture before next call clears
-            except _UE:
-                frozen_count += 1
+            all_cycles = []
+            all_walker_warnings = []  # W3.6: accumulate across groups (stale-warnings fix)
+            frozen_count = 0
+            for (hh, tk), grp in _gb(combined, key=lambda e: (e.household_id, e.ticker)):
+                try:
+                    all_cycles.extend(_wc(list(grp)))
+                    all_walker_warnings.extend(_gww())  # capture before next call clears
+                except _UE:
+                    frozen_count += 1
 
-        active = sum(1 for c in all_cycles if c.status == 'ACTIVE')
-        wheel = sum(1 for c in all_cycles if c.cycle_type == 'WHEEL')
-        satellite = sum(1 for c in all_cycles if c.cycle_type == 'SATELLITE')
+            active = sum(1 for c in all_cycles if c.status == 'ACTIVE')
+            wheel = sum(1 for c in all_cycles if c.cycle_type == 'WHEEL')
+            satellite = sum(1 for c in all_cycles if c.cycle_type == 'SATELLITE')
 
-        # Cross-check A
-        EXCLUDED = _tr.EXCLUDED_TICKERS
-        walker_r = _dd(float)
-        for c in all_cycles:
-            walker_r[(c.household_id, c.ticker)] += c.realized_pnl
+            # Cross-check A
+            EXCLUDED = _tr.EXCLUDED_TICKERS
+            walker_r = _dd(float)
+            for c in all_cycles:
+                walker_r[(c.household_id, c.ticker)] += c.realized_pnl
 
-        max_rd = conn.execute(
-            "SELECT MAX(report_date) FROM master_log_realized_unrealized_perf"
-        ).fetchone()[0]
-        ibkr_r = _dd(float)
-        if max_rd:
-            for r in conn.execute(
-                "SELECT account_id, COALESCE(underlying_symbol, symbol) as ticker, "
-                "total_realized_pnl FROM master_log_realized_unrealized_perf "
-                "WHERE report_date=?", (max_rd,)
-            ).fetchall():
-                hh = _tr.ACCOUNT_TO_HOUSEHOLD.get(r['account_id'], '?')
-                tk = r['ticker']
-                if tk not in EXCLUDED and r['total_realized_pnl']:
-                    ibkr_r[(hh, tk)] += float(r['total_realized_pnl'])
-
-        a_ok = a_div = 0
-        a_divergent = []
-        for key in set(walker_r.keys()) | set(ibkr_r.keys()):
-            if key[1] in EXCLUDED:
-                continue
-            d = walker_r.get(key, 0) - ibkr_r.get(key, 0)
-            if abs(d) < 0.05:
-                a_ok += 1
-            else:
-                a_div += 1
-                a_divergent.append(f"{key[0]}/{key[1]}: ${d:.2f}")
-
-        # Cross-check B
-        max_op = conn.execute(
-            "SELECT MAX(report_date) FROM master_log_open_positions"
-        ).fetchone()[0]
-        b_ok = b_div = 0
-        for c in all_cycles:
-            if c.status != 'ACTIVE' or c.shares_held <= 0 or c.paper_basis is None or c.cycle_type != 'WHEEL':
-                continue
-            hh_accts = _tr.HOUSEHOLD_MAP.get(c.household_id, [])
-            if not hh_accts:
-                continue
-            ph = ','.join('?' * len(hh_accts))
-            rows = conn.execute(
-                f"SELECT account_id, cost_basis_price FROM master_log_open_positions "
-                f"WHERE asset_category='STK' AND symbol=? AND report_date=? "
-                f"AND account_id IN ({ph})",
-                (c.ticker, max_op, *hh_accts),
-            ).fetchall()
-            if not rows:
-                continue
-            worst = max((abs(c.paper_basis_for_account(r['account_id']) - float(r['cost_basis_price']))
-                         for r in rows if c.paper_basis_for_account(r['account_id']) is not None), default=0)
-            if worst < 0.10:
-                b_ok += 1
-            else:
-                b_div += 1
-
-        # Cross-check C
-        # Iterates all 4 accounts incl. dormant U22076184 — Bucket 2 historical NAV deltas remain in scope for cross-check C
-        c_ok = c_div = 0
-        c_details = []
-        for acct in ['U21971297', 'U22388499', 'U22076329', 'U22076184']:
-            nav = conn.execute(
-                "SELECT * FROM master_log_change_in_nav WHERE account_id=?", (acct,)
-            ).fetchone()
-            if not nav:
-                continue
-            ibkr_delta = float(nav['ending_value'] or 0) - float(nav['starting_value'] or 0)
-            db_real = conn.execute(
-                "SELECT SUM(CAST(fifo_pnl_realized AS REAL)) FROM master_log_trades WHERE account_id=?",
-                (acct,),
-            ).fetchone()[0] or 0
-            unreal = sum(
-                float(r['fifo_pnl_unrealized'] or 0)
+            max_rd = conn.execute(
+                "SELECT MAX(report_date) FROM master_log_realized_unrealized_perf"
+            ).fetchone()[0]
+            ibkr_r = _dd(float)
+            if max_rd:
                 for r in conn.execute(
-                    "SELECT fifo_pnl_unrealized FROM master_log_open_positions WHERE account_id=? AND report_date=?",
-                    (acct, max_op),
-                ).fetchall()
-            ) if max_op else 0
-            f = lambda field: float(nav[field] or 0)
-            w_delta = (db_real + unreal + f('dividends') + f('interest') + f('withholding_tax')
-                       + f('change_in_dividend_accruals') + f('change_in_interest_accruals')
-                       + f('change_in_broker_fee_accruals') + f('broker_fees') + f('other_fees')
-                       + f('other_income') + f('other') + f('deposits_withdrawals')
-                       + f('asset_transfers') + f('internal_cash_transfers')
-                       + f('transferred_pnl_adjustments') + f('cost_adjustments')
-                       + f('corporate_action_proceeds'))
-            recon = ibkr_delta - w_delta
-            if abs(recon) < 1.0:
-                c_ok += 1
-            else:
-                c_div += 1
-            c_details.append(f"{acct}: ${recon:.2f}")
+                    "SELECT account_id, COALESCE(underlying_symbol, symbol) as ticker, "
+                    "total_realized_pnl FROM master_log_realized_unrealized_perf "
+                    "WHERE report_date=?", (max_rd,)
+                ).fetchall():
+                    hh = _tr.ACCOUNT_TO_HOUSEHOLD.get(r['account_id'], '?')
+                    tk = r['ticker']
+                    if tk not in EXCLUDED and r['total_realized_pnl']:
+                        ibkr_r[(hh, tk)] += float(r['total_realized_pnl'])
 
-        conn.close()
+            a_ok = a_div = 0
+            a_divergent = []
+            for key in set(walker_r.keys()) | set(ibkr_r.keys()):
+                if key[1] in EXCLUDED:
+                    continue
+                d = walker_r.get(key, 0) - ibkr_r.get(key, 0)
+                if abs(d) < 0.05:
+                    a_ok += 1
+                else:
+                    a_div += 1
+                    a_divergent.append(f"{key[0]}/{key[1]}: ${d:.2f}")
+
+            # Cross-check B
+            max_op = conn.execute(
+                "SELECT MAX(report_date) FROM master_log_open_positions"
+            ).fetchone()[0]
+            b_ok = b_div = 0
+            for c in all_cycles:
+                if c.status != 'ACTIVE' or c.shares_held <= 0 or c.paper_basis is None or c.cycle_type != 'WHEEL':
+                    continue
+                hh_accts = _tr.HOUSEHOLD_MAP.get(c.household_id, [])
+                if not hh_accts:
+                    continue
+                ph = ','.join('?' * len(hh_accts))
+                rows = conn.execute(
+                    f"SELECT account_id, cost_basis_price FROM master_log_open_positions "
+                    f"WHERE asset_category='STK' AND symbol=? AND report_date=? "
+                    f"AND account_id IN ({ph})",
+                    (c.ticker, max_op, *hh_accts),
+                ).fetchall()
+                if not rows:
+                    continue
+                worst = max((abs(c.paper_basis_for_account(r['account_id']) - float(r['cost_basis_price']))
+                             for r in rows if c.paper_basis_for_account(r['account_id']) is not None), default=0)
+                if worst < 0.10:
+                    b_ok += 1
+                else:
+                    b_div += 1
+
+            # Cross-check C
+            # Iterates all 4 accounts incl. dormant U22076184 — Bucket 2 historical NAV deltas remain in scope for cross-check C
+            c_ok = c_div = 0
+            c_details = []
+            for acct in ['U21971297', 'U22388499', 'U22076329', 'U22076184']:
+                nav = conn.execute(
+                    "SELECT * FROM master_log_change_in_nav WHERE account_id=?", (acct,)
+                ).fetchone()
+                if not nav:
+                    continue
+                ibkr_delta = float(nav['ending_value'] or 0) - float(nav['starting_value'] or 0)
+                db_real = conn.execute(
+                    "SELECT SUM(CAST(fifo_pnl_realized AS REAL)) FROM master_log_trades WHERE account_id=?",
+                    (acct,),
+                ).fetchone()[0] or 0
+                unreal = sum(
+                    float(r['fifo_pnl_unrealized'] or 0)
+                    for r in conn.execute(
+                        "SELECT fifo_pnl_unrealized FROM master_log_open_positions WHERE account_id=? AND report_date=?",
+                        (acct, max_op),
+                    ).fetchall()
+                ) if max_op else 0
+                f = lambda field: float(nav[field] or 0)
+                w_delta = (db_real + unreal + f('dividends') + f('interest') + f('withholding_tax')
+                           + f('change_in_dividend_accruals') + f('change_in_interest_accruals')
+                           + f('change_in_broker_fee_accruals') + f('broker_fees') + f('other_fees')
+                           + f('other_income') + f('other') + f('deposits_withdrawals')
+                           + f('asset_transfers') + f('internal_cash_transfers')
+                           + f('transferred_pnl_adjustments') + f('cost_adjustments')
+                           + f('corporate_action_proceeds'))
+                recon = ibkr_delta - w_delta
+                if abs(recon) < 1.0:
+                    c_ok += 1
+                else:
+                    c_div += 1
+                c_details.append(f"{acct}: ${recon:.2f}")
+
+        finally:
+            conn.close()
 
         # Last sync
         with closing(_get_db_connection()) as conn2:

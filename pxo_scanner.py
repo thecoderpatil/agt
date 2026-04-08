@@ -51,16 +51,16 @@ _FALLBACK_WATCHLIST: list[dict] = [
 def _load_scan_universe() -> list[dict]:
     """Load CSP scan candidates from ticker_universe table."""
     try:
-        conn = sqlite3.connect(_DB_PATH, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """SELECT ticker, gics_industry_group AS sector
-               FROM ticker_universe
-               WHERE gics_industry_group IS NOT NULL
-                 AND gics_industry_group != ''
-               ORDER BY ticker"""
-        ).fetchall()
-        conn.close()
+        from contextlib import closing
+        with closing(sqlite3.connect(_DB_PATH, timeout=10.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT ticker, gics_industry_group AS sector
+                   FROM ticker_universe
+                   WHERE gics_industry_group IS NOT NULL
+                     AND gics_industry_group != ''
+                   ORDER BY ticker"""
+            ).fetchall()
         if rows:
             return [{"ticker": row["ticker"], "sector": row["sector"]} for row in rows]
     except Exception:

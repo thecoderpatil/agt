@@ -8,6 +8,7 @@ Never places orders. Never touches agt_desk.db.
 import asyncio
 import logging
 import math
+from contextlib import closing
 import os
 import sqlite3
 import sys
@@ -71,22 +72,23 @@ logger = logging.getLogger("vrp_veto")
 
 def init_vrp_db() -> None:
     """Create the vrp_daily table if it doesn't exist."""
-    with sqlite3.connect(str(_VRP_DB_PATH)) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS vrp_daily (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_date TEXT NOT NULL,
-                run_timestamp TEXT NOT NULL,
-                run_type TEXT NOT NULL DEFAULT 'scheduled',
-                ticker TEXT NOT NULL,
-                iv REAL,
-                iv_source TEXT,
-                rv_20d REAL,
-                rv_source TEXT,
-                rv_last_close_date TEXT,
-                rv_stale INTEGER DEFAULT 0,
-                vrp REAL,
-                signal TEXT NOT NULL,
+    with closing(sqlite3.connect(str(_VRP_DB_PATH))) as conn:
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS vrp_daily (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_date TEXT NOT NULL,
+                    run_timestamp TEXT NOT NULL,
+                    run_type TEXT NOT NULL DEFAULT 'scheduled',
+                    ticker TEXT NOT NULL,
+                    iv REAL,
+                    iv_source TEXT,
+                    rv_20d REAL,
+                    rv_source TEXT,
+                    rv_last_close_date TEXT,
+                    rv_stale INTEGER DEFAULT 0,
+                    vrp REAL,
+                    signal TEXT NOT NULL,
                 signal_downgraded INTEGER DEFAULT 0,
                 earnings_date TEXT,
                 earnings_source TEXT,
@@ -131,16 +133,17 @@ def write_vrp_results(results: list, run_type: str = "scheduled") -> None:
             earn.get("days_to_earnings"),
         ))
 
-    with sqlite3.connect(str(_VRP_DB_PATH)) as conn:
-        conn.executemany("""
-            INSERT INTO vrp_daily (
-                run_date, run_timestamp, run_type, ticker,
-                iv, iv_source, rv_20d, rv_source,
-                rv_last_close_date, rv_stale, vrp, signal,
-                signal_downgraded, earnings_date, earnings_source,
-                days_to_earnings
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, rows)
+    with closing(sqlite3.connect(str(_VRP_DB_PATH))) as conn:
+        with conn:
+            conn.executemany("""
+                INSERT INTO vrp_daily (
+                    run_date, run_timestamp, run_type, ticker,
+                    iv, iv_source, rv_20d, rv_source,
+                    rv_last_close_date, rv_stale, vrp, signal,
+                    signal_downgraded, earnings_date, earnings_source,
+                    days_to_earnings
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, rows)
 
 
 # ---------------------------------------------------------------------------

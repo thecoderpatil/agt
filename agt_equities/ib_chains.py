@@ -76,16 +76,16 @@ def _log_fetch(ticker: str, source: str, latency_ms: float,
                success: bool, error_class: str = "") -> None:
     """Write to market_data_log table."""
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=5.0)
-        conn.execute(
-            "INSERT INTO market_data_log "
-            "(timestamp, ticker, source, latency_ms, success, error_class) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (datetime.utcnow().isoformat(), ticker, source,
-             round(latency_ms, 1), 1 if success else 0, error_class),
-        )
-        conn.commit()
-        conn.close()
+        from contextlib import closing
+        with closing(sqlite3.connect(DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO market_data_log "
+                    "(timestamp, ticker, source, latency_ms, success, error_class) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (datetime.utcnow().isoformat(), ticker, source,
+                     round(latency_ms, 1), 1 if success else 0, error_class),
+                )
     except Exception:
         pass  # audit logging must never crash the main path
 
