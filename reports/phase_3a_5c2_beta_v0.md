@@ -133,28 +133,37 @@ The Telegram `[TRANSMIT]` callback is the first place this system writes to live
 
 **Architect mandate:** After β implementation lands, before any live verification, the TRANSMIT handler gets a Gemini Deep Think audit. Tier 1 reserve is depleted per v3 handoff — Yash greenlight required to spend.
 
-### 4.2 JIT Re-Validation Precedence (Trickiest β Problem)
+### 4.2 JIT Re-Validation Precedence — RULED
 
-Per discovery §8 + ADR-004 §4:
+Survey 2 (`16cd244` → JIT inventory) resolved the ambiguity. Mode check covers R1/R2/R11 implicitly (mode aggregates them). R7 special-cased due to independent override clock. Drift check folds into Gate 1 re-eval (same `live_bid` from one chain slice fetch).
 
-Three failure modes the operator must distinguish:
-1. **Stale row** — render_ts > 15 min, sweeper missed it (shouldn't happen, but defensive)
-2. **Rule changed since stage** — desk_mode transitioned PEACETIME → AMBER, R7 cache went stale, override expired
-3. **Portfolio moved against you** — live spot drift invalidates Gate 1
+**Final precedence (fail-fast cost order):**
 
-**Question for survey:** Which check fires first? What's the failure message contract? How does the operator distinguish the three?
+| # | Check | Cost | Failure code |
+|---|---|---|---|
+| 0 | Row exists + `final_status='ATTESTED'` | <1ms | `STALE_ROW` |
+| 1 | Mode transition vs `staged.desk_mode` | ~1ms | `MODE_CHANGED` |
+| 2 | R7 override freshness (if applicable) | ~5ms | `R7_STALE` |
+| 3a | Gate 1 re-eval with live bid | ~200ms | `GATE1_FAIL` |
+| 3b | Drift check `abs(live_bid - attested_limit_price) > 0.10` | 0 (piggybacks 3a) | `DRIFT_BLOCK` |
 
-**Architect lean (subject to survey):**
-1. Mode transition check (cheapest, deterministic) → reject with "DESK MODE CHANGED: was PEACETIME at stage, now AMBER. Re-stage."
-2. Rule re-evaluation (R7 override freshness, etc.) → reject with specific rule + reason.
-3. Gate 1 re-eval against live spot (most expensive, requires `IPriceAndVolatility.get_spot()` + `IOptionsChain.get_chain_slice()`) → reject with old/new ratio.
-4. Unmarketable drift check: `abs(live_mid - attested_limit_price) > 0.10` → reject.
+**Failure messages** are codified per code; operator sees the code in Telegram reply. Each code maps to one and only one message string.
 
-Per ADR-004 §4 + Patch 5:
-- 3-strike retry budget (PEACETIME only) → 5-min ticker lock
-- WARTIME 3-strike DISABLED — operator can re-stage indefinitely
+**3-strike rule applies to GATE1_FAIL and DRIFT_BLOCK only (PEACETIME).** Deterministic failures (STALE_ROW, MODE_CHANGED, R7_STALE) don't count strikes — retrying doesn't help. WARTIME bypasses 3-strike entirely per ADR-004 §4.
 
-**This is the most likely candidate for Tier 1 Gemini Deep Think reserve spend.**
+**Reusable infrastructure (per survey 2):**
+- `_get_current_desk_mode()` — telegram_bot.py:172
+- `evaluate_rule_7_earnings()` — rule_engine.py:~820
+- `evaluate_gate_1()` — rule_engine.py:1168 (callable with live premium, strike fixed at stage)
+- `IOptionsChain.get_chain_slice()` — for live bid fetch
+- `handle_approve_callback` skeleton — copy-and-modify template for `handle_dynamic_exit_callback`
+
+**Net-new code:**
+- Drift comparison (no existing pattern)
+- 3-strike state tracking (`re_validation_count` increment + 5-min ticker lock table or in-memory dict)
+- Failure code → message string mapping
+
+**Tier 1 reserve NOT spent.** Survey resolved enough that Gemini Deep Think wasn't needed. Reserve preserved for harder β problems.
 
 ### 4.3 Smart Friction Copy as Writing Task
 
