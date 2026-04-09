@@ -67,7 +67,7 @@
 | 4 | Smoke test cleanup | `SELECT audit_id FROM bucket3_dynamic_exit_log WHERE audit_id LIKE 'smoke-%'` | 0 rows | DELETE smoke test rows | Auto |
 | 5 | Sweeper running | `grep "attested_sweeper" logs/*.log \| tail -1` | Timestamp within last 60s | Restart bot | Auto |
 | 6 | Poller running | `grep "attested_poller" logs/*.log \| tail -1` | Timestamp within last 10s (or no ATTESTED rows) | Restart bot | Auto |
-| 7 | Tests passing | `python -m pytest tests/ -q` | 407/407 (or current count) | Fix failing tests before go-live | Auto |
+| 7 | Tests passing | `python -m pytest tests/ -q` | 608/608 (or current count) | Fix failing tests before go-live | Auto |
 
 ---
 

@@ -1,8 +1,8 @@
 # AGT Equities — Disaster Recovery Runbook v1
 
 **Generated:** 2026-04-08 (DR-02/DR-04 filled: F23)
-**Anchor:** `5dc87e4` (Sprint W), updated F23
-**Tests:** 451/451
+**Anchor:** `339c4a2` (Sprint D), updated doc hygiene sweep
+**Tests:** 608/608
 
 ---
 
