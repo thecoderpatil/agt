@@ -1,3 +1,6 @@
+> **SUPERSEDED** — 2026-04-09. Paper run path deferred indefinitely due to IBKR paper provisioning blocker and the decision to pivot to read-only-live validation. See `P3_2alt_read_only_live_protocol.md`. This file is retained for historical record only.
+>
+
 # P3.2 — Paper Run Protocol
 
 **Purpose:** End-to-end money path validation on IBKR paper account. Manual Dynamic Exit, Yash household, 1 contract SPY covered call.
