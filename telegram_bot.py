@@ -72,16 +72,35 @@ if not ANTHROPIC_API_KEY.strip():
 
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
+# ── Sprint 1C: Paper mode infrastructure ──────────────────────────
+PAPER_MODE: bool = os.environ.get("AGT_PAPER_MODE", "").lower() in ("1", "true", "yes")
+
 IB_HOST         = "127.0.0.1"
-IB_TWS_PORT     = 4001    # IB Gateway (clawdbot69, primary)
-IB_TWS_FALLBACK = 7496    # TWS direct (fallback if Gateway is down)
+IB_TWS_PORT     = 4002 if PAPER_MODE else 4001    # Paper sim / IB Gateway
+IB_TWS_FALLBACK = 7497 if PAPER_MODE else 7496    # Paper sim / TWS direct
 IB_CLIENT_ID    = 1
 
-HOUSEHOLD_MAP = {
-    # U22076184 (Trad IRA) dormant — retained in HOUSEHOLD_MAP for Walker historical reconstruction; not in active routing (see ACCOUNT_LABELS, ACCOUNT_ALIAS)
+_LIVE_HOUSEHOLD_MAP = {
+    # U22076184 (Trad IRA) dormant — retained for Walker historical reconstruction
     "Yash_Household": ["U21971297", "U22076329", "U22076184"],
     "Vikram_Household": ["U22388499"],
 }
+
+# Paper account IDs from env: AGT_PAPER_ACCOUNTS="DU123:Yash_Household,DU456:Vikram_Household"
+_PAPER_HOUSEHOLD_MAP: dict[str, list[str]] = {}
+if PAPER_MODE:
+    _raw_paper = os.environ.get("AGT_PAPER_ACCOUNTS", "")
+    for _pair in _raw_paper.split(","):
+        if ":" in _pair:
+            _acct, _hh = _pair.strip().split(":", 1)
+            _PAPER_HOUSEHOLD_MAP.setdefault(_hh.strip(), []).append(_acct.strip())
+    if not _PAPER_HOUSEHOLD_MAP:
+        logging.getLogger(__name__).error(
+            "PAPER_MODE active but AGT_PAPER_ACCOUNTS empty or malformed — "
+            "desk cannot route orders"
+        )
+
+HOUSEHOLD_MAP = _PAPER_HOUSEHOLD_MAP if (PAPER_MODE and _PAPER_HOUSEHOLD_MAP) else _LIVE_HOUSEHOLD_MAP
 ACCOUNT_TO_HOUSEHOLD = {
     account_id: household_id
     for household_id, account_ids in HOUSEHOLD_MAP.items()
@@ -894,6 +913,14 @@ def _log_cc_cycle(entries: list[dict]) -> None:
 
 init_db()
 
+# Sprint 1C: loud paper mode startup log
+if PAPER_MODE:
+    logger.warning("=" * 60)
+    logger.warning("PAPER MODE ACTIVE — port %d — all orders simulated", IB_TWS_PORT)
+    logger.warning("=" * 60)
+else:
+    logger.info("LIVE MODE — primary port %d, fallback %d", IB_TWS_PORT, IB_TWS_FALLBACK)
+
 
 # ---------------------------------------------------------------------------
 # Conversation history & rate-limiting
@@ -1124,6 +1151,33 @@ _reconnect_task: asyncio.Task | None = None
 _shutdown_started = False
 
 
+def _paper_prefix(text: str) -> str:
+    """Prepend [PAPER] to outbound Telegram text when PAPER_MODE active."""
+    if PAPER_MODE and not text.startswith("[PAPER]"):
+        return f"[PAPER] {text}"
+    return text
+
+
+def _mode_prefix(text: str) -> str:
+    """Prepend mode badge to outbound Telegram text when WARTIME/AMBER."""
+    try:
+        with closing(_get_db_connection()) as conn:
+            from agt_equities.mode_engine import get_current_mode
+            mode = get_current_mode(conn)
+    except Exception:
+        return text
+    if mode == "WARTIME" and "[WARTIME]" not in text:
+        return f"[\U0001f6a8 WARTIME] {text}"
+    if mode == "AMBER" and "[AMBER]" not in text:
+        return f"[\u26a0\ufe0f AMBER] {text}"
+    return text
+
+
+def _format_outbound(text: str) -> str:
+    """Apply all outbound Telegram text formatting: paper prefix + mode prefix."""
+    return _paper_prefix(_mode_prefix(text))
+
+
 async def _alert_telegram(text: str) -> None:
     """Send a one-shot Telegram alert to the operator.
 
@@ -1132,6 +1186,7 @@ async def _alert_telegram(text: str) -> None:
     context.bot.  Callers must wrap in try/except if alert failure should
     not abort the caller.
     """
+    text = _format_outbound(text)
     from telegram import Bot
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     await bot.send_message(chat_id=AUTHORIZED_USER_ID, text=text)
@@ -1796,22 +1851,34 @@ async def parse_and_stage_order(text: str) -> str:
 
 # ── Tool implementations ────────────────────────────────────────────────────
 
-ACCOUNT_LABELS = {
+_LIVE_ACCOUNT_LABELS = {
     "U21971297": "Individual",
     "U22076329": "Roth IRA",
     "U22388499": "Vikram",
 }
+if PAPER_MODE:
+    ACCOUNT_LABELS = {acct: f"Paper-{hh.replace('_Household', '')}"
+                      for acct, hh in ACCOUNT_TO_HOUSEHOLD.items()}
+else:
+    ACCOUNT_LABELS = _LIVE_ACCOUNT_LABELS
 
 # ---------------------------------------------------------------------------
 # Margin-eligible accounts for Rule 2 EL% calculation
 # Roth IRA and Traditional IRA are EXCLUDED — they cannot deploy margin
 # or sell naked CSPs. See Rulebook v5, Rule 2.
 # ---------------------------------------------------------------------------
-MARGIN_ACCOUNTS = {"U21971297", "U22388499"}
-ACCOUNT_NAMES = {
+_LIVE_MARGIN_ACCOUNTS = {"U21971297", "U22388499"}
+_LIVE_ACCOUNT_NAMES = {
     "U21971297": "Personal Brokerage",
     "U22388499": "Brother Brokerage",
 }
+if PAPER_MODE:
+    MARGIN_ACCOUNTS = set(ACCOUNT_TO_HOUSEHOLD.keys())
+    ACCOUNT_NAMES = {acct: f"Paper-{hh.replace('_Household', '')}"
+                     for acct, hh in ACCOUNT_TO_HOUSEHOLD.items()}
+else:
+    MARGIN_ACCOUNTS = _LIVE_MARGIN_ACCOUNTS
+    ACCOUNT_NAMES = _LIVE_ACCOUNT_NAMES
 
 # ---------------------------------------------------------------------------
 # Phase 3 constants — Rulebook v6, Rule 7, Rule 1, Rule 3
@@ -4692,7 +4759,7 @@ async def handle_orders_callback(
                             break
 
                 if target_trade:
-                    target_trade.order.lmtPrice = round(nat_val, 2)
+                    target_trade.order.lmtPrice = _round_to_nickel(round(nat_val, 2))
                     # Sprint 1A: unified pre-trade gate
                     gate_ok, gate_reason = await _pre_trade_gates(
                         target_trade.order, target_trade.contract,
@@ -7038,7 +7105,8 @@ async def handle_dex_callback(
             except Exception:
                 pass
             return
-        order = _build_adaptive_sell_order(qty, row['limit_price'], account_id)
+        limit_for_order = _round_to_nickel(row['limit_price']) if action_type == "CC" else row['limit_price']
+        order = _build_adaptive_sell_order(qty, limit_for_order, account_id)
         order.orderRef = audit_id  # Followup #17: cryptographic 1:1 link for orphan recovery
 
         # Sprint 1A: unified pre-trade gate (defense-in-depth)
@@ -7238,6 +7306,20 @@ async def _pre_trade_gates(
         return (False, f"gate error: {exc}")
 
 
+def _round_to_nickel(price: float) -> float:
+    """Round OPT limit price for IBKR paper compatibility.
+
+    Nickel ($0.05) for premiums <= $3.00, dime ($0.10) for > $3.00.
+    Live mode: no-op. Stock prices should NOT use this helper.
+    """
+    if not PAPER_MODE:
+        return price
+    if price is None or price <= 0:
+        return price
+    increment = 0.10 if price > 3.00 else 0.05
+    return round(round(price / increment) * increment, 2)
+
+
 def _build_adaptive_sell_order(
     qty: int,
     limit_price: float,
@@ -7351,7 +7433,7 @@ async def _place_single_order(
             right="C",
             exchange="SMART",
         )
-        order = _build_adaptive_sell_order(qty, bid, acct_id)
+        order = _build_adaptive_sell_order(qty, _round_to_nickel(bid), acct_id)
 
         # Sprint 1A: unified pre-trade gate
         gate_ok, gate_reason = await _pre_trade_gates(
@@ -11883,6 +11965,30 @@ def main() -> None:
         logger.info("Scheduled: el_snapshot_writer every 30s")
     else:
         logger.warning("JobQueue not available — scheduled jobs not registered")
+
+    # Sprint 1C+1D: install outbound formatting hooks (paper prefix + mode prefix)
+    _orig_send = app.bot.send_message
+    _orig_edit = app.bot.edit_message_text
+
+    async def _send_wrapped(*args, **kwargs):
+        if "text" in kwargs:
+            kwargs["text"] = _format_outbound(kwargs["text"])
+        elif len(args) >= 2:
+            args = list(args)
+            args[1] = _format_outbound(args[1])
+        return await _orig_send(*args, **kwargs)
+
+    async def _edit_wrapped(*args, **kwargs):
+        if "text" in kwargs:
+            kwargs["text"] = _format_outbound(kwargs["text"])
+        return await _orig_edit(*args, **kwargs)
+
+    app.bot.send_message = _send_wrapped
+    app.bot.edit_message_text = _edit_wrapped
+    logger.info("Outbound formatting hooks installed (paper=%s, mode prefix=active)", PAPER_MODE)
+    # TODO Sprint 2: add PTB middleware to also cover reply_text calls.
+    # Current coverage: _alert_telegram, bot.send_message, bot.edit_message_text.
+    # Gap: ~125 reply_text sites in command handlers.
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
