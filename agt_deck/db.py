@@ -16,6 +16,7 @@ def get_ro_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(uri, uri=True, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
 
@@ -24,4 +25,5 @@ def get_rw_conn() -> sqlite3.Connection:
     uri = f"file:{DB_PATH}"
     conn = sqlite3.connect(uri, uri=True, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000;")
     return conn

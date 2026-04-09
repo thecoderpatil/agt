@@ -329,6 +329,9 @@ def init_db() -> None:
     with closing(_get_db_connection()) as conn:
         with conn:
             conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=FULL;")
+            conn.execute("PRAGMA wal_autocheckpoint=4000;")
+            conn.execute("PRAGMA busy_timeout=5000;")
 
             # Cleanup Sprint A Purge 5: operational DDL moved to schema.py
             from agt_equities.schema import register_operational_tables
