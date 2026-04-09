@@ -1,9 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
 **Last updated:** 2026-04-09
-**Status:** Sprint 1 (A-F) + Cleanup A + Sprint B COMPLETE. Pre-paper hardening done.
-**Tests:** 589/589 passing. Runtime: ~30s.
-**Next:** Sprint C (state_builder SSOT), then P3.2 paper run.
+**Status:** Sprint 1 (A-F) + Cleanup A + Sprint B + Sprint C + Sprint D + Cure Polish COMPLETE. Paper-ready.
+**Tests:** 608/608 passing. Runtime: ~30s.
+**Next:** P3.2 paper run (pending paper account provisioning).
 
 ---
 
@@ -41,7 +41,8 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 - `agt_equities/schema.py` — all SQLite migrations, idempotent DDL (incl. operational tables migrated from init_db in Cleanup A)
 - `agt_equities/beta_cache.py` — cached yfinance trailing betas (Sprint 1F), daily 04:00 refresh
 - `agt_equities/risk.py` — leverage, EL, concentration, sector helpers (relocated from agt_deck/ in Sprint B)
-- `agt_equities/state_builder.py` — correlation matrix + account EL snapshot builder (Sprint C will add build_state() SSOT)
+- `agt_equities/config.py` — canonical HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, MARGIN_ELIGIBLE_ACCOUNTS, MARGIN_ACCOUNTS, PAPER_MODE (Sprint C pre-step + Sprint D)
+- `agt_equities/state_builder.py` — correlation matrix + account EL snapshot builder + DeskSnapshot + build_state() SSOT (Sprint C1)
 - `agt_equities/order_state.py` — R5 order state machine (with BEGIN IMMEDIATE TOCTOU fix)
 - `agt_equities/providers/` — ibkr_price_volatility.py, ibkr_options_chain.py, yfinance_corporate_intelligence.py
 - `agt_deck/main.py` — FastAPI Command Deck + Cure Console routes + Smart Friction POST + Lifecycle Queue + Health Strip
@@ -52,8 +53,11 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 - `agt_deck/templates/cure_lifecycle.html` — Action Queue HTMX fragment (10s self-poll)
 - `agt_deck/templates/cure_health_strip.html` — Health Strip HTMX fragment (10s self-poll)
 - `agt_deck/templates/cure_smart_friction.html` — Smart Friction modal (polymorphic: R8 CC + R5 STK_SELL)
-- `agt_deck/templates/command_deck.html` — main deck with Underwater Positions panel (CC indicator, household badge)
+- `agt_deck/templates/command_deck.html` — main deck with Underwater Positions panel (grouped by household, CC column, breathe animation)
+- `agt_deck/templates/cure_partial.html` — Cure Console HTMX body (Underwater Positions, Glide Paths, Rule Evaluations)
 - `agt_deck/templates/base.html` — base template with paper mode banner
+- `agt_deck/static/app.css` — breathe animation keyframes + reduced-motion support
+- `protocols/P3_2_paper_run_protocol.md` — end-to-end paper run protocol
 - `launcher/` — one-click Windows desktop launcher (start_cure.bat, stop_cure.bat, AGT_Cure.vbs, install_shortcut.ps1)
 
 ---
@@ -105,12 +109,12 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 
 ## Current State
 
-- **Tests:** 589/589 (466 baseline + 19 Sprint1A + 28 Sprint1B + 18 Sprint1C + 30 Sprint1D + 4 Sprint1E + 10 Sprint1F + 4 SprintB_R9 + 4 SprintB_DEX + 3 SprintB_Gate1 + 3 underwater)
+- **Tests:** 608/608 (589 baseline through Sprint B + 8 Sprint C1 build_state + 2 Sprint C2 build_top_strip + 3 G2 underwater + 1 G7 breathe + 5 Sprint D margin/rule6)
 - **Mode:** PEACETIME
 - **Production DB:** CLEAN
 - **Walker:** fully closed through W3.8 + special dividend fix (.net_cash)
-- **telegram_bot.py:** 9,500 lines (down from 12,180 after Cleanup A purge)
-- **Cure Console:** live at `/cure`, Health Strip (10s EL refresh), Lifecycle Queue (10s), Underwater Positions (CC indicator)
+- **telegram_bot.py:** ~9,500 lines (down from 12,180 after Cleanup A purge)
+- **Cure Console:** live at `/cure`, Health Strip (10s EL refresh), Lifecycle Queue (10s), Underwater Positions (grouped by household, CC column), linear-breathing top strip
 - **Smart Friction:** Polymorphic. TOCTOU desk_mode guard.
 - **Telegram commands (pruned Sprint 1D):** /start, /status, /orders, /budget, /clear, /reconnect, /vrp, /think, /deep, /approve, /reject, /declare_peacetime, /mode, /cure, /recover_transmitting, /halt
 - **Killed commands:** /health, /cycles, /ledger, /fills, /dashboard, /cc, /mode1, /scan, /rollcheck, /declare_wartime, /sync_universe, /cleanup_blotter, /status_orders, /stop, /dynamic_exit, /override, /override_earnings, /reconcile, /clear_quarantine
@@ -121,6 +125,9 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 - **EL snapshots:** 30s writer job. Top strip and PortfolioState read from el_snapshots table.
 - **R7 corporate intel:** Daily 05:00 refresh job. evaluate_rule_7 reads cache.
 - **PRAGMA tuning:** WAL + synchronous=FULL + wal_autocheckpoint=4000 + busy_timeout=5000.
+- **DeskSnapshot SSOT (Sprint C):** `build_state()` returns frozen DeskSnapshot (NAV, cycles, betas, DEX encumbrance). `build_top_strip` consumes it.
+- **Config centralized (Sprint C + D):** HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, MARGIN_ELIGIBLE_ACCOUNTS, MARGIN_ACCOUNTS, PAPER_MODE all in `agt_equities/config.py`. Paper-aware. Rule engine imports from config (no hardcoded account IDs).
+- **P3.2 protocol:** `protocols/P3_2_paper_run_protocol.md` — ready to execute on paper account arrival.
 - **GitLab:** `git@gitlab.com:agt-group2/agt-equities-desk.git` (SSH `@yashpatil1`)
 - **GitHub mirror:** push mirror from GitLab (verified)
 - **Litestream:** continuous DB replication to Cloudflare R2
@@ -163,13 +170,40 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 
 ---
 
+## Completed Work — Sprint C (state_builder SSOT)
+
+| Unit | What | Commit |
+|------|------|--------|
+| Pre-step | HOUSEHOLD_MAP → `agt_equities/config.py` (7 definition sites collapsed) | `017e9b1` |
+| C1 | Additive `build_state()` + `DeskSnapshot` dataclass in state_builder.py | `5c58083` |
+| C2 | `build_top_strip` consumes DeskSnapshot (NAV, cycles, betas deduped) | `6772d18` |
+
+**C2 pivot:** Original plan targeted `_build_cure_data` then `_discover_positions`. Survey found both are orchestrators/IB-aggregators with minimal DeskSnapshot overlap. `build_top_strip` was the actual DB-read dedup target. `_discover_positions` deferred to Followup #35. `_build_cure_data` deferred to Followup #33.
+
+## Completed Work — Cure Console Polish
+
+| Group | What | Commit |
+|-------|------|--------|
+| G6 | `agt_deck/main.py` PAPER_MODE import from config (pre-step residual) | `25faa5e` |
+| G1+G2 | Underwater Positions ported to cure_console, both decks relayouted (household grouping, CC column, sort indicator) | `816a5cd` |
+| G7 | Linear-breathing animation on top strip .num values (4s linear, hover-pause, reduced-motion) | `402d187` |
+
+## Completed Work — Sprint D (Rule Engine Hardcode Purge)
+
+| Unit | What | Commit |
+|------|------|--------|
+| D1 | MARGIN_ELIGIBLE_ACCOUNTS + MARGIN_ACCOUNTS → config.py (paper-aware) | `ad8dc6f` |
+| D2 | Rule 6 derives Vikram account from config (was hardcoded U22388499) | `ad8dc6f` |
+| D3 | telegram_bot.py imports MARGIN_ACCOUNTS from config | `ad8dc6f` |
+| D4 | AST guard test: no U-prefixed 8-digit strings in rule_engine.py | `ad8dc6f` |
+
+**Resolved DEX pre-flight Blockers 1-3.** Paper run unblocked.
+
+---
+
 ## In Flight
 
-**Sprint C (state_builder SSOT)** — scoped, not started:
-- C1: Add `build_state()` to `agt_equities/state_builder.py`
-- C2: Swap `_build_cure_data` to consume `build_state()`
-- C3: Swap `_discover_positions` to consume `build_state()`
-- **Pre-C1 prep:** relocate HOUSEHOLD_MAP to `agt_equities/config.py` (breaks circular import)
+**P3.2 Paper Run** — protocol written (`protocols/P3_2_paper_run_protocol.md`), blocked on IBKR paper account provisioning.
 
 ---
 
@@ -185,6 +219,11 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 | 20b | STK_SELL form/handler for originating_account_id | F20 | Post-paper |
 | 25 | TOCTOU deferred sites (beyond share ledger) | CLEANUP-6 survey | Post-paper |
 | 26 | fill_qty should be cumulative not last-write-wins | Sprint B Unit 9 | Post-paper |
+| 33 | `_build_cure_data` SSOT consolidation (gated on PortfolioState reconciliation) | Sprint C2 survey | Post-paper |
+| 34 | DeskSnapshot extensions (MarketSnapshot/ModeSnapshot decision) | Sprint C2 survey | Post-paper |
+| 35 | `_discover_positions` swap (gated on #34) | Sprint C2 survey | Post-paper |
+| 36 | Dead helper sweep post-Sprint C (get_portfolio_nav, load_active_cycles, get_betas) | Sprint C2 | Post-paper |
+| 39 | Dedupe Underwater Positions rendering into shared Jinja macro | G2 | Post-paper |
 | — | R4 pair mapping (glide_paths needs ticker_a/ticker_b ALTER) | Sprint 1F | Post-paper |
 | — | run_polling() → manual PTB init (if event loop starvation observed) | Sprint B Unit 5 | Post-paper |
 | — | Remaining query cursor hygiene migration | Sprint B Unit 7 | Post-paper |
@@ -220,6 +259,11 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 22. **DEX encumbrance** (Sprint B) — `_discover_positions` reads STAGED/ATTESTED/TRANSMITTING from bucket3_dynamic_exit_log.
 23. **Cursor hygiene** (Sprint B) — `_fetchall()`/`_fetchone()` helpers in queries.py for explicit cursor.close().
 24. **Reconnect verify** (Sprint B) — accountSummaryAsync() called after auto-reconnect, logged.
+25. **DeskSnapshot** (Sprint C1) — `build_state()` returns frozen `DeskSnapshot` (NAV, cycles, betas, DEX encumbrance, optional live_positions). IB-free, pure DB read path. `build_top_strip` is the first consumer (Sprint C2).
+26. **config.py centralized** (Sprint C pre-step + D) — HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, MARGIN_ELIGIBLE_ACCOUNTS, MARGIN_ACCOUNTS, PAPER_MODE all canonical in `agt_equities/config.py`. Paper-aware. All consumers import from config.
+27. **Rule 6 dynamic** (Sprint D) — Vikram account derived from `MARGIN_ELIGIBLE_ACCOUNTS["Vikram_Household"][0]`, not hardcoded. Returns GREEN if config empty.
+28. **Underwater Positions** (G2) — present on BOTH command_deck and cure_console. Grouped by household, dedicated CC column, ▼ sort indicator. Shared `_build_underwater_rows()` helper.
+29. **Breathe animation** (G7) — `.breathe` class on `<header>`, cascades to `.num` children. `:not(.animate-pulse)` excludes WARTIME badges. Hover pauses, reduced-motion disables.
 
 ---
 
