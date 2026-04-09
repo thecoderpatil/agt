@@ -6915,17 +6915,22 @@ async def _stage_dynamic_exit_candidate(
                 if bid <= 0:
                     continue
 
-                freed = strike * 100 * excess_contracts
-                wa_per_share = _compute_walk_away_pnl(adj_basis, strike, bid, quantity=1, multiplier=1).walk_away_pnl_per_share
-                if wa_per_share >= 0:
-                    g1_pass = True
-                    walk_away = 0.0
-                    ratio = 999.0
-                else:
-                    walk_away = abs(wa_per_share) * 100 * excess_contracts
-                    velocity = freed * modifier
-                    g1_pass = velocity > walk_away
-                    ratio = (velocity / walk_away) if walk_away > 0 else 999.0
+                # Sprint B Unit 3: dedup Gate 1 — call canonical evaluate_gate_1
+                from agt_equities.rule_engine import evaluate_gate_1, ConvictionTier
+                g1 = evaluate_gate_1(
+                    ticker=ticker,
+                    household=hh_name,
+                    candidate_strike=strike,
+                    candidate_premium=bid,
+                    contracts=excess_contracts,
+                    adjusted_cost_basis=adj_basis,
+                    conviction_tier=ConvictionTier(conviction["tier"]),
+                )
+                ratio = g1.ratio
+                g1_pass = g1.passed
+                best_walk_away_per_share_candidate = _compute_walk_away_pnl(
+                    adj_basis, strike, bid, quantity=1, multiplier=1
+                ).walk_away_pnl_per_share
 
                 if g1_pass and ratio > best_ratio:
                     best_ratio = ratio
@@ -6933,8 +6938,8 @@ async def _stage_dynamic_exit_candidate(
                     best_bid = bid
                     best_exp = candidate_exp
                     best_dte = candidate_dte
-                    best_freed = freed
-                    best_walk_away_per_share = wa_per_share
+                    best_freed = g1.freed_margin
+                    best_walk_away_per_share = best_walk_away_per_share_candidate
                     gate1_pass = True
 
         except Exception as chain_exc:
