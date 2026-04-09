@@ -221,5 +221,289 @@ class TestModeTransitionIdempotency(unittest.TestCase):
         self.assertEqual(count, 1)
 
 
+# ── Sprint C1: build_state() + DeskSnapshot tests ────────────────────
+
+class _BuildStateDBMixin:
+    """Shared in-memory DB setup for build_state tests."""
+
+    def _make_db(self) -> str:
+        """Create a temp DB file with required tables, return path."""
+        import tempfile
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        db_path = self._tmp.name
+        self._tmp.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("""
+            CREATE TABLE master_log_nav (
+                account_id TEXT, report_date TEXT, total TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE bucket3_dynamic_exit_log (
+                audit_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                household TEXT NOT NULL,
+                desk_mode TEXT NOT NULL DEFAULT 'PEACETIME',
+                action_type TEXT NOT NULL DEFAULT 'CC',
+                household_nlv REAL NOT NULL DEFAULT 0,
+                underlying_spot_at_render REAL NOT NULL DEFAULT 0,
+                final_status TEXT NOT NULL DEFAULT 'STAGED',
+                last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE beta_cache (
+                ticker TEXT PRIMARY KEY,
+                beta REAL NOT NULL DEFAULT 1.0,
+                fetched_ts TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def _cleanup_db(self):
+        import os
+        try:
+            os.unlink(self._tmp.name)
+        except Exception:
+            pass
+
+
+class TestBuildStateHappyPath(_BuildStateDBMixin, unittest.TestCase):
+    """C1 test #1: build_state returns DeskSnapshot with all fields populated."""
+
+    def setUp(self):
+        self.db_path = self._make_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('U12345', '2026-04-09', '100000')"
+        )
+        conn.execute(
+            "INSERT INTO bucket3_dynamic_exit_log "
+            "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+            "household_nlv, underlying_spot_at_render, final_status) "
+            "VALUES ('dex-001', '2026-04-09', 'AAPL', 'Yash_Household', "
+            "'PEACETIME', 'CC', 100000, 170.0, 'STAGED')"
+        )
+        conn.execute(
+            "INSERT INTO beta_cache (ticker, beta) VALUES ('AAPL', 1.2)"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._cleanup_db()
+
+    def test_build_state_returns_desk_snapshot(self):
+        from agt_equities.state_builder import build_state, DeskSnapshot
+        snapshot = build_state(
+            db_path=self.db_path,
+            live_positions=[{"symbol": "AAPL", "qty": 100}],
+        )
+        self.assertIsInstance(snapshot, DeskSnapshot)
+        self.assertAlmostEqual(snapshot.nav_total, 100000.0)
+        self.assertEqual(
+            snapshot.dex_encumbered_keys,
+            frozenset({("Yash_Household", "AAPL")}),
+        )
+        self.assertAlmostEqual(snapshot.beta_by_symbol["AAPL"], 1.2)
+        self.assertEqual(len(snapshot.live_positions), 1)
+        # No warnings expected (live_positions provided, beta not empty, NAV present)
+        # active_cycles may warn if trade_repo can't read from our temp DB
+        non_cycle_warnings = [
+            w for w in snapshot.warnings if "active_cycles" not in w
+        ]
+        self.assertEqual(non_cycle_warnings, [])
+
+
+class TestBuildStateRaisesOnEmptyNav(_BuildStateDBMixin, unittest.TestCase):
+    """C1 test #2: build_state raises ValueError on empty master_log_nav."""
+
+    def setUp(self):
+        self.db_path = self._make_db()
+
+    def tearDown(self):
+        self._cleanup_db()
+
+    def test_raises_on_empty_nav(self):
+        from agt_equities.state_builder import build_state
+        with self.assertRaises(ValueError) as ctx:
+            build_state(db_path=self.db_path, live_positions=[])
+        self.assertIn("zero rows", str(ctx.exception))
+
+
+class TestBuildStateDexFilters(_BuildStateDBMixin, unittest.TestCase):
+    """C1 test #3: DEX encumbrance filters out inactive statuses."""
+
+    def setUp(self):
+        self.db_path = self._make_db()
+        conn = sqlite3.connect(self.db_path)
+        # Need NAV to avoid ValueError
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('U12345', '2026-04-09', '100000')"
+        )
+        # 3 DEX rows: STAGED, ATTESTED, CANCELLED
+        for audit_id, ticker, status in [
+            ("dex-1", "AAPL", "STAGED"),
+            ("dex-2", "MSFT", "ATTESTED"),
+            ("dex-3", "GOOG", "CANCELLED"),
+        ]:
+            conn.execute(
+                "INSERT INTO bucket3_dynamic_exit_log "
+                "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+                "household_nlv, underlying_spot_at_render, final_status) "
+                "VALUES (?, '2026-04-09', ?, 'Yash_Household', "
+                "'PEACETIME', 'CC', 100000, 170.0, ?)",
+                (audit_id, ticker, status),
+            )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._cleanup_db()
+
+    def test_dex_filters_inactive_statuses(self):
+        from agt_equities.state_builder import build_state
+        snapshot = build_state(db_path=self.db_path, live_positions=[])
+        self.assertEqual(
+            snapshot.dex_encumbered_keys,
+            frozenset({
+                ("Yash_Household", "AAPL"),
+                ("Yash_Household", "MSFT"),
+            }),
+        )
+        self.assertEqual(len(snapshot.dex_encumbered_keys), 2)
+
+
+class TestBuildStateBetaCacheEmpty(_BuildStateDBMixin, unittest.TestCase):
+    """C1 test #4: empty beta_cache warns, does not raise."""
+
+    def setUp(self):
+        self.db_path = self._make_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('U12345', '2026-04-09', '50000')"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._cleanup_db()
+
+    def test_beta_cache_empty_warns(self):
+        from agt_equities.state_builder import build_state
+        snapshot = build_state(db_path=self.db_path, live_positions=[])
+        self.assertEqual(snapshot.beta_by_symbol, {})
+        beta_warnings = [w for w in snapshot.warnings if "beta_cache empty" in w]
+        self.assertTrue(len(beta_warnings) >= 1, f"Expected beta warning, got: {snapshot.warnings}")
+
+
+class TestBuildStatePerAccountNavMaxDate(_BuildStateDBMixin, unittest.TestCase):
+    """C1 test #5: per-account MAX(report_date) NAV, not global MAX.
+
+    References: v12 Sprint 1F Fix 1 decision. The pre-Fix-1 bug used
+    a global MAX(report_date) which excluded dormant accounts whose
+    last report_date was older than the most recent active account.
+    """
+
+    def setUp(self):
+        self.db_path = self._make_db()
+        conn = sqlite3.connect(self.db_path)
+        # Account A: two dates, only newest should be used
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('A1', '20260407', '90000')"
+        )
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('A1', '20260409', '100000')"
+        )
+        # Account B: older date (dormant-style) — must still appear
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('B1', '20260401', '25000')"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._cleanup_db()
+
+    def test_per_account_nav_max_report_date(self):
+        from agt_equities.state_builder import build_state
+        snapshot = build_state(db_path=self.db_path, live_positions=[])
+        # A1 should use 100000 (2026-04-09), not 90000 (2026-04-07)
+        self.assertAlmostEqual(snapshot.nav_by_account["A1"], 100000.0)
+        # B1 should still appear with its only value, even though its
+        # report_date is older than A1's latest
+        self.assertAlmostEqual(snapshot.nav_by_account["B1"], 25000.0)
+        self.assertAlmostEqual(snapshot.nav_total, 125000.0)
+
+
+class TestDeskSnapshotDistinctFromPortfolioState(unittest.TestCase):
+    """C1 test #6: DeskSnapshot and PortfolioState are distinct classes."""
+
+    def test_desk_snapshot_distinct_from_portfoliostate(self):
+        from agt_equities.state_builder import DeskSnapshot
+        from agt_equities.rule_engine import PortfolioState
+        self.assertIsNot(DeskSnapshot, PortfolioState)
+        self.assertNotEqual(DeskSnapshot.__name__, PortfolioState.__name__)
+
+
+class TestBuildStateWithoutLivePositions(_BuildStateDBMixin, unittest.TestCase):
+    """C1 test #7: live_positions=None produces empty list + warning."""
+
+    def setUp(self):
+        self.db_path = self._make_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('U12345', '2026-04-09', '50000')"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._cleanup_db()
+
+    def test_without_live_positions_warns(self):
+        from agt_equities.state_builder import build_state
+        snapshot = build_state(db_path=self.db_path)  # no live_positions arg
+        self.assertEqual(snapshot.live_positions, [])
+        lp_warnings = [w for w in snapshot.warnings if "live_positions not provided" in w]
+        self.assertTrue(len(lp_warnings) >= 1, f"Expected warning, got: {snapshot.warnings}")
+
+
+class TestBuildStateNoForbiddenImports(unittest.TestCase):
+    """C1 test #8: state_builder.py has no forbidden imports (AST check)."""
+
+    def test_no_forbidden_imports(self):
+        import ast
+        sb_path = os.path.join(
+            os.path.dirname(__file__), "..", "agt_equities", "state_builder.py"
+        )
+        with open(sb_path) as f:
+            tree = ast.parse(f.read())
+
+        forbidden = {"telegram_bot", "agt_deck", "ib_async"}
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                top = node.module.split(".")[0]
+                if top in forbidden:
+                    found.append(node.module)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top in forbidden:
+                        found.append(alias.name)
+
+        self.assertEqual(
+            found, [],
+            f"Forbidden imports in state_builder.py: {found}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
