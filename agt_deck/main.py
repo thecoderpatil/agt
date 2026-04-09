@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("agt_deck")
 
 DECK_TOKEN = os.environ.get("AGT_DECK_TOKEN", "")
-PAPER_MODE = os.environ.get("AGT_PAPER_MODE", "").lower() in ("1", "true", "yes")
+from agt_equities.config import PAPER_MODE  # Sprint C pre-step: single source for AGT_PAPER_MODE
 BASE_DIR = Path(__file__).resolve().parent
 
 app = FastAPI(title="AGT Command Deck", docs_url=None, redoc_url=None)
