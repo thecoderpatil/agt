@@ -23,6 +23,7 @@ import math
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import time
 from collections import defaultdict
@@ -8301,21 +8302,55 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Failed: {exc}")
 
 
+def _detect_deck_host() -> str:
+    """Return the host to use in deck URLs sent to the operator.
+
+    Priority:
+      1. AGT_DECK_HOST env var (explicit override — set to Tailscale IP,
+         hostname, or any reachable address the operator wants).
+      2. Primary outbound LAN IP via UDP-socket trick (no packet sent,
+         just selects the interface the OS would use for internet traffic).
+      3. 127.0.0.1 fallback (last resort — only works on the deck machine).
+
+    Note: fallback to 127.0.0.1 is logged at WARNING level so we notice
+    if auto-detect is silently broken on a given host.
+    """
+    override = os.environ.get("AGT_DECK_HOST", "").strip()
+    if override:
+        return override
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # Does NOT actually send a packet — connect() on UDP just
+            # selects the outbound interface.
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception as exc:
+        logger.warning(
+            "_detect_deck_host: LAN auto-detect failed (%s), falling back to 127.0.0.1",
+            exc,
+        )
+        return "127.0.0.1"
+
+
 async def cmd_cure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/cure — returns link to the Deck Cure Console."""
     if not is_authorized(update):
         return
     try:
         deck_token = os.environ.get("AGT_DECK_TOKEN", "")
+        deck_host = _detect_deck_host()
+        deck_port = os.environ.get("AGT_DECK_PORT", "8787")
         mode = _get_current_desk_mode()
         emoji = {"PEACETIME": "\u2705", "AMBER": "\u26a0\ufe0f", "WARTIME": "\U0001f6a8"}.get(mode, "\u2753")
-        url = f"http://127.0.0.1:8787/cure"
+        url = f"http://{deck_host}:{deck_port}/cure"
         if deck_token:
             url += f"?t={deck_token}"
         await update.message.reply_text(
             f"{emoji} Mode: {mode}\n\n"
-            f"Cure Console: {url}\n\n"
-            f"(Tailscale: replace 127.0.0.1 with your Tailscale IP)"
+            f"Cure Console: {url}"
         )
     except Exception as exc:
         logger.exception("/cure failed: %s", exc)
