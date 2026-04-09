@@ -33,16 +33,10 @@ class WalkerWarning:
     context: dict = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
-# Household mapping (account → household)
+# Household mapping (account → household) — canonical source: agt_equities.config
 # ---------------------------------------------------------------------------
 
-HOUSEHOLD_MAP: dict[str, str] = {
-    "U21971297": "Yash_Household",      # Yash Individual
-    "U22076329": "Yash_Household",      # Yash Roth IRA
-    # U22076184 (Trad IRA) dormant — retained for Walker historical reconstruction of pre-dormancy trades in master_log_trades
-    "U22076184": "Yash_Household",      # Yash Trad IRA
-    "U22388499": "Vikram_Household",    # Vikram Individual
-}
+from agt_equities.config import ACCOUNT_TO_HOUSEHOLD as HOUSEHOLD_MAP  # acct→hh (inverted)
 
 
 def household_for(account_id: str) -> str:

@@ -13,11 +13,7 @@ from agt_equities.mode_engine import (
 )
 from agt_equities.data_provider import IBKRProvider, DataProviderError
 
-HOUSEHOLD_MAP = {
-    'U21971297': 'Yash_Household',
-    'U22076329': 'Yash_Household',
-    'U22388499': 'Vikram_Household',
-}
+from agt_equities.config import ACCOUNT_TO_HOUSEHOLD as HOUSEHOLD_MAP  # acct→hh
 
 def main():
     # 1. Load glide paths

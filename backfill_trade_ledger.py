@@ -28,12 +28,8 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Account → Household mapping ──────────────────────────────────
-HOUSEHOLD_MAP = {
-    "U21971297": "Yash_Household",   # Individual
-    "U22076329": "Yash_Household",   # Roth IRA
-    "U22388499": "Vikram_Household", # Vikram IND
-}
+# ── Account → Household mapping (canonical source: agt_equities.config) ──
+from agt_equities.config import ACCOUNT_TO_HOUSEHOLD as HOUSEHOLD_MAP
 
 ACCOUNT_ALIAS = {
     "U21971297": "Individual",

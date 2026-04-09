@@ -73,40 +73,15 @@ if not ANTHROPIC_API_KEY.strip():
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
 # ── Sprint 1C: Paper mode infrastructure ──────────────────────────
-PAPER_MODE: bool = os.environ.get("AGT_PAPER_MODE", "").lower() in ("1", "true", "yes")
+# Sprint C pre-step: canonical home is now agt_equities/config.py
+from agt_equities.config import (  # noqa: E402
+    PAPER_MODE, HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, ACTIVE_ACCOUNTS,
+)
 
 IB_HOST         = "127.0.0.1"
 IB_TWS_PORT     = 4002 if PAPER_MODE else 4001    # Paper sim / IB Gateway
 IB_TWS_FALLBACK = 7497 if PAPER_MODE else 7496    # Paper sim / TWS direct
 IB_CLIENT_ID    = 1
-
-_LIVE_HOUSEHOLD_MAP = {
-    # U22076184 (Trad IRA) dormant — retained for Walker historical reconstruction
-    "Yash_Household": ["U21971297", "U22076329", "U22076184"],
-    "Vikram_Household": ["U22388499"],
-}
-
-# Paper account IDs from env: AGT_PAPER_ACCOUNTS="DU123:Yash_Household,DU456:Vikram_Household"
-_PAPER_HOUSEHOLD_MAP: dict[str, list[str]] = {}
-if PAPER_MODE:
-    _raw_paper = os.environ.get("AGT_PAPER_ACCOUNTS", "")
-    for _pair in _raw_paper.split(","):
-        if ":" in _pair:
-            _acct, _hh = _pair.strip().split(":", 1)
-            _PAPER_HOUSEHOLD_MAP.setdefault(_hh.strip(), []).append(_acct.strip())
-    if not _PAPER_HOUSEHOLD_MAP:
-        logging.getLogger(__name__).error(
-            "PAPER_MODE active but AGT_PAPER_ACCOUNTS empty or malformed — "
-            "desk cannot route orders"
-        )
-
-HOUSEHOLD_MAP = _PAPER_HOUSEHOLD_MAP if (PAPER_MODE and _PAPER_HOUSEHOLD_MAP) else _LIVE_HOUSEHOLD_MAP
-ACCOUNT_TO_HOUSEHOLD = {
-    account_id: household_id
-    for household_id, account_ids in HOUSEHOLD_MAP.items()
-    for account_id in account_ids
-}
-ACTIVE_ACCOUNTS = list(ACCOUNT_TO_HOUSEHOLD)
 
 # ── Master Log Refactor v3: reader cutover flag ──
 # Set False to rollback all reads to legacy tables.

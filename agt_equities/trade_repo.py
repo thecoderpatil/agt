@@ -14,20 +14,12 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+from .config import HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD
 from .walker import Cycle, TradeEvent, walk_cycles, UnknownEventError
 
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
-
-HOUSEHOLD_MAP = {
-    # U22076184 (Trad IRA) dormant — retained for historical trade lookup; no new activity routed here
-    "Yash_Household": ["U21971297", "U22076329", "U22076184"],
-    "Vikram_Household": ["U22388499"],
-}
-ACCOUNT_TO_HOUSEHOLD = {
-    acct: hh for hh, accts in HOUSEHOLD_MAP.items() for acct in accts
-}
 
 # Tickers excluded from Walker (index options, not wheel candidates)
 EXCLUDED_TICKERS = frozenset({'SPX', 'VIX', 'NDX', 'RUT', 'XSP'})

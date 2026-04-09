@@ -42,11 +42,7 @@ ACCOUNT_ALIAS = {
     "U22388499": "Vikram IND",
 }
 
-HOUSEHOLD_MAP = {
-    "U21971297": "Yash_Household",
-    "U22076329": "Yash_Household",
-    "U22388499": "Vikram_Household",
-}
+from agt_equities.config import ACCOUNT_TO_HOUSEHOLD as HOUSEHOLD_MAP  # acct→hh
 
 # Accounts to show on dashboard (skip Trad — negligible)
 DISPLAY_ACCOUNTS = ["U21971297", "U22076329", "U22388499"]

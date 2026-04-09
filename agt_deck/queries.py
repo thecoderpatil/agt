@@ -38,12 +38,7 @@ ACCOUNT_ALIAS = {
     "U22388499": "Vikram",
 }
 
-HOUSEHOLD_MAP = {
-    "U21971297": "Yash_Household",
-    "U22076329": "Yash_Household",
-    "U22076184": "Yash_Household",
-    "U22388499": "Vikram_Household",
-}
+from agt_equities.config import ACCOUNT_TO_HOUSEHOLD as HOUSEHOLD_MAP  # acct→hh
 
 
 def _safe(fn):
