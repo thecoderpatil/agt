@@ -26,8 +26,9 @@ from agt_equities import risk
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("agt_deck")
 
-DECK_TOKEN = os.environ.get("AGT_DECK_TOKEN", "")
 from agt_equities.config import PAPER_MODE  # Sprint C pre-step: single source for AGT_PAPER_MODE
+# load_dotenv runs inside config.py — must import config BEFORE reading .env vars
+DECK_TOKEN = os.environ.get("AGT_DECK_TOKEN", "")
 BASE_DIR = Path(__file__).resolve().parent
 
 app = FastAPI(title="AGT Command Deck", docs_url=None, redoc_url=None)
