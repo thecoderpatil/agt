@@ -1,9 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
 **Last updated:** 2026-04-09
-**Status:** Sprint 1 (A-F) + Cleanup A + Sprint B + Sprint C + Sprint D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix COMPLETE. P3.2-alt pre-flight Day 0 done.
-**Tests:** 620/620 passing. Runtime: ~30s.
-**Next:** P3.2-alt Day 1 cold boot + smoke (read-only live against IBKR).
+**Status:** Sprint 1 (A-F) + Cleanup A + Sprint B + Sprint C + Sprint D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix COMPLETE. P3.2-alt Day 1 in progress. Day 2 findings (#10, #12, #4, #43) shipped.
+**Tests:** 634/634 passing. Runtime: ~30s.
+**Next:** P3.2-alt Day 2 continued — kill-switch live test (watchdog seeded), R9 banner investigation, caller wiring for live_nlv.
 
 ---
 
@@ -109,9 +109,9 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 
 ## Current State
 
-- **Tests:** 620/620 (608 through Sprint D + 1 hotfix cure_data + 3 PTB AGTFormattedBot + 1 dump_rules smoke + 5 execution_gate + 2 placeOrder AST guard)
+- **Tests:** 634/634 (620 baseline + 3 dex_revert + 3 cure_command + 3 r7_earnings + 3 nav_freshness + 2 nav_live_nlv)
 - **Mode:** PEACETIME
-- **Production DB:** CLEAN, backed up as `agt_desk.db.p3.2alt.bak`
+- **Production DB:** CLEAN, backed up as `agt_desk.db.p3.2alt.bak`. mode_transitions seeded with 3 OVERWEIGHT rows (2026-04-01 backdate) for watchdog live test.
 - **Walker:** fully closed through W3.8 + special dividend fix (.net_cash). 14 active cycles (8 Yash + 6 Vikram).
 - **telegram_bot.py:** ~9,500 lines (down from 12,180 after Cleanup A purge)
 - **Cure Console:** live at `/cure`, Health Strip (10s EL refresh), Lifecycle Queue (10s), Underwater Positions (grouped by household, CC column), linear-breathing top strip
@@ -123,11 +123,11 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 - **DEX overlay:** FIXED (Sprint B Unit 2). _discover_positions reads STAGED/ATTESTED/TRANSMITTING encumbrance.
 - **Beta cache:** Daily 04:00 refresh job. Both top strip and rule engine use same cached betas.
 - **EL snapshots:** 30s writer job. Top strip and PortfolioState read from el_snapshots table.
-- **R7 corporate intel:** Daily 05:00 refresh job. evaluate_rule_7 reads cache.
+- **R7 corporate intel:** Daily 05:00 refresh job. evaluate_rule_7 reads cache. Bug fixed: evaluate_all now forwards conn= to R7 (enables operator overrides). Provider handles yfinance 1.2.0 datetime.date return type.
 - **PRAGMA tuning:** WAL + synchronous=FULL + wal_autocheckpoint=4000 + busy_timeout=5000.
-- **DeskSnapshot SSOT (Sprint C):** `build_state()` returns frozen DeskSnapshot (NAV, cycles, betas, DEX encumbrance). `build_top_strip` consumes it.
+- **DeskSnapshot SSOT (Sprint C + #43):** `build_state()` returns frozen DeskSnapshot (NAV, cycles, betas, DEX encumbrance). 3-tier NAV: live_nlv param > el_snapshots (<120s) > Flex EOD. `nav_source_by_account` tracks provenance. `build_top_strip` consumes it.
 - **Config centralized (Sprint C + D):** HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, MARGIN_ELIGIBLE_ACCOUNTS, MARGIN_ACCOUNTS, PAPER_MODE all in `agt_equities/config.py`. Paper-aware. Rule engine imports from config (no hardcoded account IDs).
-- **Execution kill-switch:** `AGT_EXECUTION_ENABLED` env var (default OFF) + `_HALTED` in-process + `execution_state` DB row. Triple-gate OR logic. All 3 placeOrder sites wrapped. AST guard test enforces. `/halt` persists to DB, `/resume CONFIRM` clears.
+- **Execution kill-switch:** `AGT_EXECUTION_ENABLED` env var (default OFF) + `_HALTED` in-process + `execution_state` DB row. Triple-gate OR logic. All 3 placeOrder sites wrapped. AST guard test enforces. `/halt` persists to DB, `/resume CONFIRM` clears. DEX TRANSMIT handler reverts TRANSMITTING→CANCELLED on gate/kill-switch failure (Finding #10).
 - **AGTFormattedBot:** ExtBot subclass replaces monkey-patch for PTB 22.7 compat. Applies `_format_outbound` (paper + mode prefix) to send_message + edit_message_text.
 - **P3.2-alt protocol:** `protocols/P3_2alt_read_only_live_protocol.md`. P3.2 paper superseded.
 - **dump_rules.py:** `scripts/dump_rules.py` — one-shot rule evaluator for Day 1.4 smoke test. Verified against live DB: 14 cycles, R11 Yash 2.16x / Vikram 2.85x, R9 Red Alert active both households.
@@ -215,15 +215,27 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 | Doc hygiene | Stale test counts + anchors refreshed | `7c45a6f` |
 | dump_rules | `scripts/dump_rules.py` one-shot rule evaluator for Day 1.4 | `177ad25` |
 
+## Completed Work — P3.2-alt Day 2 Findings
+
+| Finding | What | Commit |
+|---------|------|--------|
+| #10 | DEX TRANSMIT: revert TRANSMITTING→CANCELLED on gate/kill-switch failure. `_revert_transmitting_to_cancelled` helper. Deleted redundant NULL-account block (wrong WHERE clause). Preserved TRANSMIT_IB_ERROR sticky path. | `40bfdae` |
+| #12 | `/cure` auto-detect LAN host via UDP socket trick + `AGT_DECK_HOST` env override + `AGT_DECK_PORT`. Removed manual Tailscale hint. | `41e3e02` |
+| #4 | R7 dual fix: (A) yfinance 1.2.0 returns `datetime.date`, not `datetime.datetime` — isinstance dispatch. (B) `evaluate_all` was not forwarding `conn=` to `evaluate_rule_7` — operator overrides were dead code. | `ad275b3` |
+| #43 | NAV freshness: `build_state()` overlays live NLV from el_snapshots (<120s) over Flex EOD. `nav_source_by_account` field on DeskSnapshot for observability. | `bdeb4af` |
+| #43 v2 | `live_nlv` injection param on `build_state()` for 0-second freshness. 3-tier priority: injected > db_live > flex_eod. No caller wiring yet. | `019d118` |
+
 ---
 
 ## In Flight
 
-**P3.2-alt Read-Only Live** — Day 0 pre-flight complete. Day 1 cold boot pending operator availability.
+**P3.2-alt Read-Only Live** — Day 1 complete, Day 2 findings shipped. Kill-switch live test pending (watchdog seeded).
 - Protocol: `protocols/P3_2alt_read_only_live_protocol.md`
 - Git tag: `p3.2alt-start` at `04c1d20`
 - DB backup: `agt_desk.db.p3.2alt.bak`
 - Kill-switch: triple-gate verified (env OFF + DB disabled=1 + _HALTED=False)
+- mode_transitions: seeded 3 OVERWEIGHT rows (ADBE×2, PYPL×1) backdated to 2026-04-01 for watchdog staging test
+- R9 runtime harness (`scripts/debug_r9.py`, throwaway): confirmed R9 fires RED both households, red_alert_state ON with conditions A+B
 
 ---
 
@@ -288,6 +300,13 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 31. **AGTFormattedBot** (PTB 22.7) — `ExtBot` subclass overrides `send_message` + `edit_message_text` to apply `_format_outbound`. Replaces monkey-patch broken by `TelegramObject._frozen` lockdown. Wired via `ApplicationBuilder().bot(AGTFormattedBot(...))`.
 32. **`_build_cure_data` get_betas** (hotfix) — deferred import restored inside `_build_cure_data` after Sprint C2 removed it from `build_top_strip`. Followup #33 will plumb DeskSnapshot betas properly.
 33. **dump_rules.py** — `scripts/dump_rules.py` standalone rule evaluator. Read-only, no IB, no telegram_bot. Consumes rule_engine + Walker + yfinance + DB. For P3.2-alt Day 1.4 smoke test.
+34. **DEX revert helper** (Finding #10) — `_revert_transmitting_to_cancelled(audit_id, reason)` reverts TRANSMITTING→CANCELLED after Step 7 early-exit (gate failure or kill-switch). Idempotent (WHERE final_status='TRANSMITTING'). NOT used for TRANSMIT_IB_ERROR (intentionally sticky). `_dispatched_audits.discard` cleanup wired in both branches.
+35. **`/cure` auto-detect** (Finding #12) — `_detect_deck_host()` priority: AGT_DECK_HOST env > UDP socket LAN auto-detect > 127.0.0.1 fallback. `AGT_DECK_PORT` env (default 8787).
+36. **R7 conn forwarding** (Finding #4) — `evaluate_all` now passes `conn=conn` to `evaluate_rule_7`. Operator overrides in `bucket3_earnings_overrides` are now reachable. 10 overrides currently active (expires 2026-04-14).
+37. **yfinance 1.2.0 compat** (Finding #4) — Provider extraction uses `isinstance(raw, datetime)` / `isinstance(raw, date)` dispatch. Silent `except Exception: pass` replaced with `logger.warning`.
+38. **NAV 3-tier priority** (#43 + #43v2) — `build_state()` NAV: (1) `live_nlv` param → "live_injected", (2) el_snapshots <120s → "live_db", (3) master_log_nav → "flex_eod". `nav_source_by_account` on DeskSnapshot tracks provenance. No callers wire `live_nlv` yet.
+39. **mode_transitions seed** (Day 2 live test) — 3 OVERWEIGHT rows (ADBE Yash, ADBE Vikram, PYPL Vikram) backdated to 2026-04-01 for watchdog calendar gate bypass. `days_overweight=8 >= 7` (EVERY_CYCLE tier).
+40. **R9 runtime confirmed** (#5b survey) — R9 fires RED both households (Condition A: 2+ simultaneous R1 RED). `red_alert_state` table shows ON with conditions A+B. Cure Console banner rendering is separate display-layer issue, not rule engine bug.
 
 ---
 
