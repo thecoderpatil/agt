@@ -367,13 +367,40 @@ def get_lifecycle_rows(conn: sqlite3.Connection) -> list[dict]:
         result = []
         for r in rows:
             d = dict(r)
-            ts = d.get("transmitted_ts") or d.get("staged_ts") or 0
+
+            # Robust timestamp parsing helper
+            def _parse_ts(val):
+                if not val:
+                    return 0
+                if isinstance(val, (int, float)):
+                    return val
+                try:
+                    from datetime import datetime, timezone
+                    # Handle typical SQLite ISO strings, fallback to 0
+                    s = str(val).replace("Z", "+00:00")
+                    if " " in s and "T" not in s:
+                        s = s.replace(" ", "T")
+                    return datetime.fromisoformat(s).replace(
+                        tzinfo=timezone.utc
+                    ).timestamp()
+                except Exception:
+                    return 0
+
+            tx_ts = _parse_ts(d.get("transmitted_ts"))
+            st_ts = _parse_ts(d.get("staged_ts"))
+            ts = tx_ts or st_ts or 0
+
             d["is_orphan"] = (
                 d["final_status"] == "TRANSMITTING"
-                and d.get("transmitted_ts") is not None
-                and d["transmitted_ts"] < orphan_cutoff
+                and tx_ts > 0
+                and tx_ts < orphan_cutoff
             )
             d["age_seconds"] = int(now - ts) if ts else 0
+
+            # Re-assign parsed floats so downstream templates don't break
+            d["transmitted_ts"] = tx_ts if tx_ts > 0 else None
+            d["staged_ts"] = st_ts if st_ts > 0 else None
+
             result.append(d)
         return result
     except Exception as exc:

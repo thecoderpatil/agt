@@ -1,16 +1,17 @@
-"""Sprint 1A: Tests for cold-start mode bootstrap pin."""
+"""Priority 4: Tests for cold-start wartime leverage pin."""
 import os
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _create_mode_history(conn):
-    """Create mode_history table matching agt_equities/schema.py:886-895."""
+    """Create mode_history table matching agt_equities/schema.py."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS mode_history (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,8 +27,8 @@ def _create_mode_history(conn):
     conn.commit()
 
 
-class TestColdStartPin(unittest.TestCase):
-    """_pin_mode_on_startup() should reset WARTIME → PEACETIME on boot."""
+class TestColdStartPin(unittest.IsolatedAsyncioTestCase):
+    """_pin_mode_on_startup() should pin to WARTIME on high leverage."""
 
     def setUp(self):
         self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
@@ -68,58 +69,104 @@ class TestColdStartPin(unittest.TestCase):
         conn.close()
         return result
 
+    @patch("agt_equities.state_builder.build_state")
+    @patch("telegram_bot._ibkr_get_spots_batch", new_callable=AsyncMock)
     @patch("telegram_bot._get_db_connection")
-    def test_wartime_pinned_to_peacetime(self, mock_db):
+    async def test_high_leverage_pins_to_wartime(self, mock_db, mock_spots, mock_build_state):
         mock_db.side_effect = lambda: self._get_conn()
-        self._seed("PEACETIME", "WARTIME")
+        self._seed("AMBER", "PEACETIME")
+
+        mock_build_state.return_value = SimpleNamespace(
+            active_cycles=[
+                SimpleNamespace(
+                    status="ACTIVE",
+                    shares_held=100,
+                    household_id="Yash_Household",
+                    ticker="AAPL",
+                )
+            ],
+            household_nav={"Yash_Household": 10000.0},
+            beta_by_symbol={"AAPL": 1.6},
+        )
+        mock_spots.return_value = {"AAPL": 100.0}
+
+        mock_ib = AsyncMock()
+        mock_ib.accountSummaryAsync = AsyncMock(return_value=[
+            SimpleNamespace(account="U21971297", tag="NetLiquidation", value="10000"),
+        ])
 
         from telegram_bot import _pin_mode_on_startup
-        alert = _pin_mode_on_startup()
+        alert = await _pin_mode_on_startup(mock_ib)
 
         self.assertIsNotNone(alert)
-        self.assertIn("PEACETIME", alert)
-        self.assertIn("COLD-START", alert)
+        self.assertIn("WARTIME", alert)
+        self.assertIn("1.50x", alert)
+
+        build_kwargs = mock_build_state.call_args.kwargs
+        self.assertEqual(build_kwargs["live_nlv"], {"U21971297": 10000.0})
 
         row = self._last_row()
-        self.assertEqual(row["new_mode"], "PEACETIME")
+        self.assertEqual(row["new_mode"], "WARTIME")
         self.assertEqual(row["trigger_rule"], "cold_start_pin")
+        self.assertEqual(row["trigger_household"], "Yash_Household")
+        self.assertAlmostEqual(row["trigger_value"], 1.6, places=4)
+        self.assertEqual(row["notes"], "Cold-start pin: leverage >= 1.50x")
 
+    @patch("agt_equities.state_builder.build_state")
+    @patch("telegram_bot._ibkr_get_spots_batch", new_callable=AsyncMock)
     @patch("telegram_bot._get_db_connection")
-    def test_peacetime_noop(self, mock_db):
+    async def test_below_threshold_noop(self, mock_db, mock_spots, mock_build_state):
         mock_db.side_effect = lambda: self._get_conn()
-        self._seed("WARTIME", "PEACETIME")
+        self._seed("AMBER", "PEACETIME")
+
+        mock_build_state.return_value = SimpleNamespace(
+            active_cycles=[
+                SimpleNamespace(
+                    status="ACTIVE",
+                    shares_held=100,
+                    household_id="Yash_Household",
+                    ticker="AAPL",
+                )
+            ],
+            household_nav={"Yash_Household": 10000.0},
+            beta_by_symbol={"AAPL": 1.49},
+        )
+        mock_spots.return_value = {"AAPL": 100.0}
+
+        mock_ib = AsyncMock()
+        mock_ib.accountSummaryAsync = AsyncMock(return_value=[
+            SimpleNamespace(account="U21971297", tag="NetLiquidation", value="10000"),
+        ])
 
         from telegram_bot import _pin_mode_on_startup
-        alert = _pin_mode_on_startup()
+        alert = await _pin_mode_on_startup(mock_ib)
 
         self.assertIsNone(alert)
         self.assertEqual(self._count_rows(), 1)
 
+    @patch("agt_equities.state_builder.build_state")
+    @patch("telegram_bot._ibkr_get_spots_batch", new_callable=AsyncMock)
     @patch("telegram_bot._get_db_connection")
-    def test_amber_noop(self, mock_db):
+    async def test_already_wartime_noop(self, mock_db, mock_spots, mock_build_state):
         mock_db.side_effect = lambda: self._get_conn()
-        self._seed("PEACETIME", "AMBER", trigger="rule_11")
+        self._seed("PEACETIME", "WARTIME", trigger="rule_11")
+
+        mock_ib = AsyncMock()
+        mock_ib.accountSummaryAsync = AsyncMock()
 
         from telegram_bot import _pin_mode_on_startup
-        alert = _pin_mode_on_startup()
+        alert = await _pin_mode_on_startup(mock_ib)
 
         self.assertIsNone(alert)
         self.assertEqual(self._count_rows(), 1)
-
-    @patch("telegram_bot._get_db_connection")
-    def test_empty_history_noop(self, mock_db):
-        mock_db.side_effect = lambda: self._get_conn()
-
-        from telegram_bot import _pin_mode_on_startup
-        alert = _pin_mode_on_startup()
-
-        self.assertIsNone(alert)
-        self.assertEqual(self._count_rows(), 0)
+        mock_ib.accountSummaryAsync.assert_not_awaited()
+        mock_build_state.assert_not_called()
+        mock_spots.assert_not_awaited()
 
     @patch("telegram_bot._get_db_connection", side_effect=RuntimeError("DB locked"))
-    def test_db_error_does_not_raise(self, mock_db):
+    async def test_db_error_does_not_raise(self, mock_db):
         from telegram_bot import _pin_mode_on_startup
-        alert = _pin_mode_on_startup()
+        alert = await _pin_mode_on_startup(AsyncMock())
         self.assertIsNone(alert)
 
 

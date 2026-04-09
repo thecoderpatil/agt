@@ -9172,38 +9172,95 @@ async def _scan_orphaned_transmitting_rows(ib_conn, app_bot):
             logger.error("orphan_scan: Telegram alert failed: %s", tg_exc)
 
 
-def _pin_mode_on_startup() -> str | None:
-    """Cold-start mode pin: reset WARTIME → PEACETIME on bot restart.
-
-    If the last mode_history row is WARTIME, insert a PEACETIME transition
-    with trigger_rule='cold_start_pin'. Operator must explicitly re-declare
-    WARTIME if still warranted.
-
-    Returns alert text if pin fired, None otherwise.
-    """
+async def _pin_mode_on_startup(ib_conn=None) -> str | None:
+    """Cold-start mode pin: enter WARTIME on boot if leverage is elevated."""
     try:
-        from agt_equities.mode_engine import get_current_mode, log_mode_transition
+        from agt_equities import trade_repo
+        from agt_equities.mode_engine import MODE_WARTIME, get_current_mode, log_mode_transition
+        from agt_equities.rule_engine import LEVERAGE_LIMIT, compute_leverage_pure
+        from agt_equities.state_builder import build_state
+
         with closing(_get_db_connection()) as conn:
-            last_mode = get_current_mode(conn)
-            if last_mode != "WARTIME":
-                logger.info("Cold-start mode pin: last mode was %s, no action", last_mode)
+            current_mode = get_current_mode(conn)
+        if current_mode == MODE_WARTIME:
+            logger.info("Cold-start wartime pin: already in WARTIME, no action")
+            return None
+
+        if ib_conn is None:
+            ib_conn = await ensure_ib_connected()
+
+        live_nlv: dict[str, float] = {}
+        try:
+            summary = await ib_conn.accountSummaryAsync()
+            for item in summary or []:
+                if item.account not in ACTIVE_ACCOUNTS or item.tag != "NetLiquidation":
+                    continue
+                try:
+                    live_nlv[item.account] = float(item.value)
+                except (TypeError, ValueError):
+                    continue
+        except Exception as exc:
+            logger.warning("Cold-start wartime pin: accountSummary failed: %s", exc)
+
+        trade_repo.DB_PATH = DB_PATH
+        snapshot = build_state(
+            db_path=str(DB_PATH),
+            live_nlv=live_nlv or None,
+        )
+
+        tickers = sorted({
+            c.ticker for c in snapshot.active_cycles
+            if c.status == "ACTIVE" and c.shares_held > 0
+        })
+        spots = await _ibkr_get_spots_batch(tickers) if tickers else {}
+
+        breaches: list[tuple[str, float]] = []
+        for household in snapshot.household_nav:
+            leverage = compute_leverage_pure(
+                snapshot.active_cycles,
+                spots,
+                snapshot.beta_by_symbol,
+                snapshot.household_nav,
+                household,
+            )
+            if leverage >= LEVERAGE_LIMIT:
+                breaches.append((household, leverage))
+
+        if not breaches:
+            logger.info("Cold-start wartime pin: no household at or above %.2fx", LEVERAGE_LIMIT)
+            return None
+
+        breach_household, breach_leverage = max(breaches, key=lambda item: item[1])
+        reason = "Cold-start pin: leverage >= 1.50x"
+
+        with closing(_get_db_connection()) as conn:
+            current_mode = get_current_mode(conn)
+            if current_mode == MODE_WARTIME:
+                logger.info("Cold-start wartime pin: already in WARTIME, no action")
                 return None
             log_mode_transition(
-                conn, "WARTIME", "PEACETIME",
+                conn,
+                current_mode,
+                MODE_WARTIME,
                 trigger_rule="cold_start_pin",
-                notes=(
-                    "Bot restarted while in WARTIME. Auto-pinned to PEACETIME. "
-                    "Operator must explicitly re-declare WARTIME if still warranted."
-                ),
+                trigger_household=breach_household,
+                trigger_value=round(breach_leverage, 4),
+                notes=reason,
             )
-            logger.warning("Cold-start mode pin: last mode was WARTIME, pinned to PEACETIME")
-            return (
-                "\U0001f6a8 COLD-START MODE PIN\n"
-                "Last session was WARTIME. Auto-pinned to PEACETIME on restart.\n"
-                "If WARTIME is still warranted, use /declare_wartime."
-            )
+
+        logger.warning(
+            "Cold-start wartime pin: %s leverage %.2fx >= %.2fx",
+            breach_household,
+            breach_leverage,
+            LEVERAGE_LIMIT,
+        )
+        return (
+            "\U0001f6a8 COLD-START WARTIME PIN\n"
+            f"{breach_household} leverage {breach_leverage:.2f}x >= {LEVERAGE_LIMIT:.2f}x.\n"
+            f"{reason}"
+        )
     except Exception as exc:
-        logger.exception("Cold-start mode pin failed: %s", exc)
+        logger.exception("Cold-start wartime pin failed: %s", exc)
         return None
 
 
@@ -9229,13 +9286,13 @@ async def post_init(app) -> None:
     except Exception as exc:
         logger.error("Orphan scan failed: %s — bot continues without scan", exc)
 
-    # Sprint 1A: cold-start mode pin (WARTIME → PEACETIME on restart)
+    # Priority 4: cold-start wartime pin before polling/watchdog loops
     try:
-        alert = _pin_mode_on_startup()
+        alert = await _pin_mode_on_startup(ib_conn)
         if alert:
             await _alert_telegram(alert)
     except Exception as exc:
-        logger.error("Cold-start mode pin alert failed: %s — continuing", exc)
+        logger.error("Cold-start wartime pin alert failed: %s — continuing", exc)
 # ---------------------------------------------------------------------------
 # Beta Impl 3: ATTESTED row poller (R6 — 10s interval, idempotent delivery)
 # ---------------------------------------------------------------------------
