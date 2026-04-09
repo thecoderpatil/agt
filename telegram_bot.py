@@ -11700,6 +11700,71 @@ async def _poll_attested_rows(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("attested_poller error: %s", exc)
 
 
+# ---------------------------------------------------------------------------
+# Sprint 1B: EL snapshots writer (30s polling job)
+# ---------------------------------------------------------------------------
+
+_el_last_write: dict[str, float] = {}  # {account_id: last_write_epoch}
+_EL_WRITE_DEBOUNCE_SECONDS = 30
+
+
+async def _el_snapshot_writer_job(context) -> None:
+    """Poll accountSummary and write EL snapshots to DB for Cure Console.
+
+    Runs every 30s. Writes one row per account to el_snapshots.
+    Debounces per-account writes to prevent duplicate rows.
+    """
+    if _HALTED:
+        return
+    try:
+        ib_conn = await ensure_ib_connected()
+        summary = await ib_conn.accountSummaryAsync()
+        if not summary:
+            return
+
+        now = time.time()
+        _WANTED = {"NetLiquidation", "ExcessLiquidity", "BuyingPower"}
+        acct_data: dict[str, dict] = {}
+
+        for item in summary:
+            if item.account not in ACTIVE_ACCOUNTS:
+                continue
+            if item.tag not in _WANTED:
+                continue
+            acct_data.setdefault(item.account, {})
+            acct_data[item.account][item.tag] = float(item.value)
+
+        for acct_id, data in acct_data.items():
+            # Debounce: skip if last write <30s ago
+            last = _el_last_write.get(acct_id, 0)
+            if now - last < _EL_WRITE_DEBOUNCE_SECONDS:
+                continue
+
+            hh = ACCOUNT_TO_HOUSEHOLD.get(acct_id, "Unknown")
+            try:
+                with closing(_get_db_connection()) as conn:
+                    with conn:
+                        conn.execute(
+                            "INSERT INTO el_snapshots "
+                            "(account_id, household, excess_liquidity, nlv, buying_power, source) "
+                            "VALUES (?, ?, ?, ?, ?, 'ibkr_live')",
+                            (
+                                acct_id,
+                                hh,
+                                data.get("ExcessLiquidity"),
+                                data.get("NetLiquidation"),
+                                data.get("BuyingPower"),
+                            ),
+                        )
+                _el_last_write[acct_id] = now
+            except Exception as db_exc:
+                logger.warning("el_snapshot write failed for %s: %s", acct_id, db_exc)
+
+    except Exception as exc:
+        # Non-fatal: IB may be disconnected, just skip this tick
+        logger.debug("el_snapshot_writer: %s", exc)
+
+
 def main() -> None:
     logger.info(
         "Starting AGT Equities Bridge — Hybrid Architecture "
@@ -11809,6 +11874,13 @@ def main() -> None:
             name="attested_sweeper",
         )
         logger.info("Scheduled: attested_sweeper every 60s")
+        jq.run_repeating(
+            callback=_el_snapshot_writer_job,
+            interval=30,
+            first=15,
+            name="el_snapshot_writer",
+        )
+        logger.info("Scheduled: el_snapshot_writer every 30s")
     else:
         logger.warning("JobQueue not available — scheduled jobs not registered")
 
