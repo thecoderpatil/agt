@@ -596,6 +596,279 @@ _BUCKET_3_INDEXES = [
 # Public API
 # ---------------------------------------------------------------------------
 
+def register_operational_tables(conn) -> None:
+    """Create operational tables (pending_orders, live_blotter, etc.).
+
+    Migrated from telegram_bot.py init_db() in Cleanup Sprint A Purge 5.
+    All statements use IF NOT EXISTS — safe to call on every startup.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_orders (
+            id INTEGER PRIMARY KEY,
+            payload JSON NOT NULL,
+            status TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS live_blotter (
+            order_id INTEGER PRIMARY KEY,
+            account_id TEXT,
+            ticker TEXT,
+            sec_type TEXT,
+            action TEXT,
+            right TEXT,
+            quantity INTEGER,
+            limit_price REAL,
+            live_mid REAL,
+            natural_mid REAL,
+            market_mid REAL,
+            status TEXT,
+            error TEXT,
+            updated_at TIMESTAMP NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS executed_orders (
+            id INTEGER PRIMARY KEY,
+            payload JSON NOT NULL,
+            executed_at TIMESTAMP NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS premium_ledger (
+            household_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            initial_basis REAL,
+            total_premium_collected REAL,
+            shares_owned INTEGER,
+            PRIMARY KEY (household_id, ticker)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS csp_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            household_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            sector TEXT,
+            spot_price REAL,
+            strike REAL,
+            expiry TEXT,
+            dte INTEGER,
+            bid REAL,
+            annualized_yield REAL,
+            iv_rank REAL,
+            fundamental_score REAL,
+            technical_score REAL,
+            portfolio_fit_score REAL,
+            composite_score REAL,
+            decision TEXT NOT NULL,
+            modified_ticker TEXT,
+            modified_strike REAL,
+            notes TEXT,
+            vix_at_entry REAL,
+            el_pct_at_entry REAL,
+            portfolio_weight_after REAL,
+            outcome TEXT,
+            outcome_pnl REAL,
+            outcome_date TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ticker_universe (
+            ticker TEXT PRIMARY KEY,
+            company_name TEXT,
+            gics_sector TEXT,
+            gics_industry_group TEXT,
+            index_membership TEXT,
+            has_weekly_options INTEGER DEFAULT 0,
+            avg_volume_30d REAL,
+            market_cap REAL,
+            last_updated TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ticker_universe_industry_group ON ticker_universe(gics_industry_group)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_orders_status_created_at ON pending_orders(status, created_at, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_executed_orders_executed_at ON executed_orders(executed_at, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_live_blotter_account_ticker ON live_blotter(account_id, ticker, sec_type, action, right, status, order_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_csp_decisions_household_ticker ON csp_decisions(household_id, ticker, timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_csp_decisions_decision ON csp_decisions(decision, composite_score)")
+
+    # Tracker tables
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cc_cycle_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL,
+            household TEXT, mode TEXT NOT NULL, strike REAL, expiry TEXT,
+            bid REAL, annualized REAL, otm_pct REAL, dte INTEGER,
+            walk_away_pnl REAL, spot REAL, adjusted_basis REAL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS roll_watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
+            ticker TEXT NOT NULL, account_id TEXT, strike REAL, expiry TEXT,
+            quantity INTEGER, mode TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')), resolved_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mode_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL,
+            household TEXT, from_mode TEXT NOT NULL, to_mode TEXT NOT NULL,
+            spot REAL, adjusted_basis REAL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cc_cycle_ticker ON cc_cycle_log(ticker, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_roll_watchlist_status ON roll_watchlist(status, expiry)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mode_transitions_ticker ON mode_transitions(ticker, created_at)")
+
+    # ALTER migrations
+    mt_cols = {row["name"] for row in conn.execute("PRAGMA table_info(mode_transitions)").fetchall()}
+    if "overweight_since" not in mt_cols:
+        conn.execute("ALTER TABLE mode_transitions ADD COLUMN overweight_since TEXT")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fill_log (
+            exec_id TEXT PRIMARY KEY, ticker TEXT NOT NULL, action TEXT NOT NULL,
+            quantity REAL, price REAL, premium_delta REAL, account_id TEXT,
+            household_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
+    cc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(cc_cycle_log)").fetchall()}
+    if "flag" not in cc_cols:
+        conn.execute("ALTER TABLE cc_cycle_log ADD COLUMN flag TEXT DEFAULT 'NORMAL'")
+
+    tu_cols = {row["name"] for row in conn.execute("PRAGMA table_info(ticker_universe)").fetchall()}
+    for col_name, col_type in (
+        ("conviction_tier", "TEXT DEFAULT 'NEUTRAL'"), ("eps_revision_trend", "TEXT"),
+        ("revenue_growth_vs_sector", "TEXT"), ("analyst_consensus_shift", "TEXT"),
+        ("margin_trend", "TEXT"), ("conviction_updated_at", "TEXT"),
+    ):
+        if col_name not in tu_cols:
+            conn.execute(f"ALTER TABLE ticker_universe ADD COLUMN {col_name} {col_type}")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conviction_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL,
+            original_tier TEXT NOT NULL, overridden_tier TEXT NOT NULL,
+            justification TEXT NOT NULL, expires_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS premium_ledger_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, household_id TEXT NOT NULL,
+            ticker TEXT NOT NULL, initial_basis REAL, total_premium_collected REAL,
+            shares_owned INTEGER, archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
+    live_blotter_columns = {row["name"] for row in conn.execute("PRAGMA table_info(live_blotter)").fetchall()}
+    for column_name, ddl in (
+        ("account_id", "TEXT"), ("sec_type", "TEXT"), ("action", "TEXT"),
+        ("right", "TEXT"), ("quantity", "INTEGER"), ("live_mid", "REAL"),
+        ("natural_mid", "REAL"), ("market_mid", "REAL"), ("status", "TEXT"), ("error", "TEXT"),
+    ):
+        if column_name not in live_blotter_columns:
+            conn.execute(f"ALTER TABLE live_blotter ADD COLUMN {column_name} {ddl}")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_usage (
+            date TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0, api_calls INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (date)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_usage_by_model (
+            date TEXT NOT NULL, model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+            api_calls INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (date, model)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+            household_id TEXT NOT NULL, trade_date TEXT NOT NULL, trade_datetime TEXT,
+            symbol TEXT NOT NULL, underlying TEXT, asset_category TEXT NOT NULL,
+            trade_type TEXT NOT NULL, quantity REAL NOT NULL, price REAL NOT NULL,
+            proceeds REAL NOT NULL, realized_pnl REAL DEFAULT 0, commission REAL DEFAULT 0,
+            return_category TEXT NOT NULL, source TEXT DEFAULT 'CSV',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(account_id, symbol, trade_datetime, quantity, price)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dividend_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+            household_id TEXT NOT NULL, symbol TEXT NOT NULL, amount REAL NOT NULL,
+            div_date TEXT NOT NULL, description TEXT, source TEXT DEFAULT 'CSV',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(account_id, symbol, div_date, amount)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nav_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+            household_id TEXT NOT NULL, snapshot_date TEXT NOT NULL,
+            nav_total REAL, nav_cash REAL, nav_stock REAL, nav_options REAL,
+            net_deposits REAL DEFAULT 0, mwr_pct REAL, twr_pct REAL,
+            source TEXT DEFAULT 'CSV', created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(account_id, snapshot_date)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deposit_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+            household_id TEXT NOT NULL, dep_date TEXT NOT NULL, amount REAL NOT NULL,
+            dep_type TEXT, description TEXT, source TEXT DEFAULT 'CSV',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(account_id, dep_date, amount, description)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_date ON trade_ledger(trade_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_account ON trade_ledger(account_id, trade_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_category ON trade_ledger(return_category, trade_date)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS historical_offsets (
+            account_id TEXT NOT NULL, household_id TEXT NOT NULL,
+            period TEXT NOT NULL, premium_offset REAL DEFAULT 0,
+            capgains_offset REAL DEFAULT 0, dividend_offset REAL DEFAULT 0,
+            total_offset REAL DEFAULT 0, note TEXT,
+            PRIMARY KEY (account_id, period)
+        )
+    """)
+    conn.execute("""INSERT OR IGNORE INTO historical_offsets (account_id, household_id, period, total_offset, note) VALUES ('U21971297', 'Yash_Household', '2025', 12509.0, 'Fidelity Z30-836527 ($4,924) + Z32-346647 ($7,585) Jan-Sep 2025')""")
+    conn.execute("""INSERT OR IGNORE INTO historical_offsets (account_id, household_id, period, total_offset, note) VALUES ('U22076329', 'Yash_Household', '2025', 25605.37, 'Fidelity 231-598209 Roth IRA Jan-Sep 2025')""")
+    conn.execute("""INSERT OR IGNORE INTO historical_offsets (account_id, household_id, period, total_offset, note) VALUES ('U22076184', 'Yash_Household', '2025', 12888.54, 'Fidelity 263-000581 Rollover IRA Jan-Sep 2025')""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS inception_config (
+            key TEXT PRIMARY KEY, value REAL NOT NULL, note TEXT
+        )
+    """)
+    conn.execute("""INSERT OR IGNORE INTO inception_config (key, value, note) VALUES ('starting_capital', 146959.04, 'Fidelity total portfolio Jan 1 2025')""")
+    conn.execute("""INSERT OR IGNORE INTO inception_config (key, value, note) VALUES ('fidelity_remaining', 7412.00, 'Fidelity HSA + Cash Mgmt still held Dec 31 2025')""")
+    conn.execute("""INSERT OR IGNORE INTO inception_config (key, value, note) VALUES ('fidelity_net_external', 48591.29, 'Fidelity net external deposits Jan-Sep 2025: $76,544 in - $27,953 out')""")
+
+
 def register_master_log_tables(conn) -> None:
     """Execute all DDL for Master Log Refactor v3. Safe to call on every startup.
 
