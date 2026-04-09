@@ -868,6 +868,21 @@ def register_operational_tables(conn) -> None:
     conn.execute("""INSERT OR IGNORE INTO inception_config (key, value, note) VALUES ('fidelity_remaining', 7412.00, 'Fidelity HSA + Cash Mgmt still held Dec 31 2025')""")
     conn.execute("""INSERT OR IGNORE INTO inception_config (key, value, note) VALUES ('fidelity_net_external', 48591.29, 'Fidelity net external deposits Jan-Sep 2025: $76,544 in - $27,953 out')""")
 
+    # ── Execution kill-switch state (Sprint D safety) ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS execution_state (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            disabled INTEGER NOT NULL DEFAULT 1,
+            set_by TEXT,
+            set_at TEXT,
+            reason TEXT
+        )
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO execution_state (id, disabled, set_by, set_at, reason)
+        VALUES (1, 1, 'schema_init', datetime('now'), 'default disabled')
+    """)
+
 
 def register_master_log_tables(conn) -> None:
     """Execute all DDL for Master Log Refactor v3. Safe to call on every startup.

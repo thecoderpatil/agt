@@ -41,6 +41,7 @@ import finnhub
 import ib_async
 import pandas as pd
 import yfinance as yf
+from agt_equities.execution_gate import assert_execution_enabled, ExecutionDisabledError
 from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -4161,10 +4162,14 @@ async def handle_orders_callback(
                         logger.warning("Match Mid blocked by gate: %s", gate_reason)
                         failed_count += 1
                         continue
+                    assert_execution_enabled(in_process_halted=_HALTED)
                     ib_conn.placeOrder(target_trade.contract, target_trade.order)
                     matched_count += 1
                 else:
                     failed_count += 1
+            except ExecutionDisabledError as exd:
+                logger.error("EXECUTION BLOCKED at placeOrder (match_mid): %s", exd)
+                failed_count += 1
             except Exception as exc:
                 logger.warning("Match mid failed for %s: %s", o.get("ticker"), exc)
                 failed_count += 1
@@ -5966,8 +5971,17 @@ async def handle_dex_callback(
                 pass
             return
 
+        assert_execution_enabled(in_process_halted=_HALTED)
         trade = ib_conn.placeOrder(contract, order)
         ib_order_id = trade.order.orderId if trade else 0
+    except ExecutionDisabledError as exd:
+        logger.error("EXECUTION BLOCKED at placeOrder (dex): %s", exd)
+        try:
+            await query.edit_message_text(f"\U0001f6d1 EXECUTION BLOCKED: {exd}")
+        except Exception:
+            pass
+        await _alert_telegram(f"\U0001f6d1 Execution blocked (dex {ticker}): {exd}")
+        return
     except Exception as ib_err:
         # TRANSMIT_IB_ERROR: leave in TRANSMITTING, alert operator, NO auto-revert
         logger.exception(
@@ -6299,6 +6313,7 @@ async def _place_single_order(
                 db_id,
             )
 
+        assert_execution_enabled(in_process_halted=_HALTED)
         trade = ib_conn.placeOrder(contract, order)
         ib_order_id = trade.order.orderId if trade else 0
         ib_perm_id = trade.order.permId if trade else 0
@@ -8857,7 +8872,10 @@ async def cmd_recover_transmitting(
 # ---------------------------------------------------------------------------
 
 async def cmd_halt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/halt — emergency killswitch. Stops all scheduled jobs and blocks trades."""
+    """/halt — emergency killswitch. Stops all scheduled jobs and blocks trades.
+
+    Sets in-process _HALTED flag + persists disabled state to execution_state DB.
+    """
     global _HALTED
     if not is_authorized(update):
         return
@@ -8874,11 +8892,68 @@ async def cmd_halt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         logger.warning("/halt job cancellation error: %s", exc)
 
+    # Persist to DB (survives restart)
+    try:
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO execution_state "
+                    "(id, disabled, set_by, set_at, reason) "
+                    "VALUES (1, 1, ?, datetime('now'), ?)",
+                    (str(update.effective_user.id), "/halt command"),
+                )
+    except Exception as exc:
+        logger.warning("/halt DB persist failed: %s", exc)
+
     await update.message.reply_text(
         f"\U0001f6d1 DESK HALTED\n"
         f"Cancelled {cancelled} scheduled jobs.\n"
         f"All trade gates blocked. IB connection preserved.\n"
-        f"Restart bot to resume."
+        f"Execution disabled in DB (persists across restarts).\n"
+        f"Use /resume CONFIRM to re-enable."
+    )
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/resume CONFIRM — re-enable execution after /halt. Requires explicit CONFIRM token."""
+    global _HALTED
+    if not is_authorized(update):
+        return
+
+    args = (update.message.text or "").split()
+    if len(args) < 2 or args[1] != "CONFIRM":
+        # Show current state and require confirmation
+        env_ok = os.getenv("AGT_EXECUTION_ENABLED", "false").strip().lower() == "true"
+        await update.message.reply_text(
+            f"\u26a0\ufe0f Resume requires explicit confirmation.\n\n"
+            f"Current state:\n"
+            f"  In-process _HALTED: {_HALTED}\n"
+            f"  Env AGT_EXECUTION_ENABLED: {env_ok}\n"
+            f"  DB execution_state: check /halt history\n\n"
+            f"To re-enable: /resume CONFIRM"
+        )
+        return
+
+    _HALTED = False
+    logger.warning("DESK RESUMED by operator via /resume CONFIRM")
+
+    # Clear DB disable
+    try:
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO execution_state "
+                    "(id, disabled, set_by, set_at, reason) "
+                    "VALUES (1, 0, ?, datetime('now'), ?)",
+                    (str(update.effective_user.id), "/resume CONFIRM"),
+                )
+    except Exception as exc:
+        logger.warning("/resume DB update failed: %s", exc)
+
+    await update.message.reply_text(
+        f"\u2705 DESK RESUMED\n"
+        f"In-process halt cleared. DB execution enabled.\n"
+        f"Scheduled jobs NOT restored (restart bot to restore jobs)."
     )
 
 
@@ -9325,6 +9400,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cure",      cmd_cure))
     app.add_handler(CommandHandler("recover_transmitting", cmd_recover_transmitting))
     app.add_handler(CommandHandler("halt",      cmd_halt))
+    app.add_handler(CommandHandler("resume",    cmd_resume))
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve:"))
     app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern=r"^dex:"))
