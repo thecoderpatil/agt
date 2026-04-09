@@ -464,3 +464,29 @@ def get_health_strip_data(conn: sqlite3.Connection) -> dict:
         "ib_connected": any_fresh,
         "accounts": accounts,
     }
+
+
+def get_live_nav_by_account(
+    conn: sqlite3.Connection, max_age_seconds: int = 120,
+) -> dict[str, float]:
+    """Latest per-account NLV from el_snapshots, only if fresh.
+
+    Returns {account_id: nlv} for accounts with a snapshot newer than
+    max_age_seconds. Accounts with stale or missing snapshots are omitted
+    from the result — caller falls back to master_log_nav for those.
+    """
+    try:
+        rows = _fetchall(conn, """
+            SELECT e1.account_id, e1.nlv, e1.timestamp
+            FROM el_snapshots e1
+            WHERE e1.id = (
+                SELECT MAX(e2.id) FROM el_snapshots e2
+                WHERE e2.account_id = e1.account_id
+            )
+            AND e1.nlv IS NOT NULL
+            AND (julianday('now') - julianday(e1.timestamp)) * 86400 <= ?
+        """, (max_age_seconds,))
+        return {r["account_id"]: r["nlv"] for r in rows}
+    except Exception as exc:
+        logger.warning("get_live_nav_by_account: %s", exc)
+        return {}

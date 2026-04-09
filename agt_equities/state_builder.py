@@ -212,6 +212,9 @@ class DeskSnapshot:
     # Beta (from beta_cache table, per Sprint 1F Fix 2)
     beta_by_symbol: Dict[str, float]
 
+    # NAV source tracking (observability — not consumed by rule engine)
+    nav_source_by_account: Dict[str, str] = field(default_factory=dict)
+
     # Meta
     warnings: List[str] = field(default_factory=list)
 
@@ -275,6 +278,33 @@ def build_state(
         raise ValueError(
             "NAV query returned zero rows — master_log_nav is empty or DB path is wrong"
         )
+
+    # Overlay live NLV from el_snapshots for accounts with fresh readings
+    nav_source_by_account: Dict[str, str] = {}
+    try:
+        with _open_readonly(db_path) as snap_conn:
+            _snap_rows = snap_conn.execute("""
+                SELECT e1.account_id, e1.nlv
+                FROM el_snapshots e1
+                WHERE e1.id = (
+                    SELECT MAX(e2.id) FROM el_snapshots e2
+                    WHERE e2.account_id = e1.account_id
+                )
+                AND e1.nlv IS NOT NULL
+                AND (julianday('now') - julianday(e1.timestamp)) * 86400 <= ?
+            """, (120,)).fetchall()
+            live_nav = {r["account_id"]: r["nlv"] for r in _snap_rows}
+    except Exception:
+        # el_snapshots may not exist in test DBs or pre-Sprint-1B schemas.
+        # Silently fall back to Flex-only NAV — not an operational warning.
+        live_nav = {}
+
+    for acct_id in nav_by_account:
+        if acct_id in live_nav:
+            nav_by_account[acct_id] = live_nav[acct_id]
+            nav_source_by_account[acct_id] = "live_ibkr"
+        else:
+            nav_source_by_account[acct_id] = "flex_eod"
 
     nav_total = sum(nav_by_account.values())
 
@@ -341,5 +371,6 @@ def build_state(
         live_positions=live_positions,
         dex_encumbered_keys=dex_encumbered_keys,
         beta_by_symbol=beta_by_symbol,
+        nav_source_by_account=nav_source_by_account,
         warnings=warnings,
     )
