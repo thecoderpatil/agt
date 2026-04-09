@@ -151,14 +151,29 @@ def load_active_cycles() -> list:
 # ── Build top strip data ─────────────────────────────────────────
 
 def build_top_strip(conn) -> dict:
+    # ── Sprint C2: SSOT reads from DeskSnapshot (NAV, cycles, betas) ──
+    from agt_equities.state_builder import build_state
+    from agt_equities import trade_repo
+
+    snapshot = build_state(db_path=str(trade_repo.DB_PATH))
+
+    # Filter "live_positions not provided" — expected noise at this layer
+    # because build_top_strip has no IB context.
+    _snap_warnings = [w for w in snapshot.warnings if "live_positions not provided" not in w]
+    if _snap_warnings:
+        for w in _snap_warnings:
+            logger.info("build_top_strip: DeskSnapshot warning: %s", w)
+
+    nav_by_acct = snapshot.nav_by_account
+    total_nav = snapshot.nav_total
+    hh_nlv = dict(snapshot.household_nav)  # mutable copy for downstream
+    cycles = snapshot.active_cycles
+
+    # ── Local reads stay on passed-in conn ──
     vix = get_vix()
-    nav_by_acct = queries.get_portfolio_nav(conn)
     change_nav = queries.get_change_in_nav(conn)
     last_sync = queries.get_last_sync(conn)
     industries = queries.get_ticker_industries(conn)
-    cycles = load_active_cycles()
-
-    total_nav = sum(nav_by_acct.values())
 
     # Inception P&L = current NAV − net inflows (deposits + asset transfers)
     net_deposits = 0
@@ -192,11 +207,6 @@ def build_top_strip(conn) -> dict:
         vikram_el_pct = round(_vikram_el / _vikram_nlv * 100, 1)
 
     # Concentration — use spot prices, per-household
-    hh_nlv = {}
-    for acct, hh in queries.HOUSEHOLD_MAP.items():
-        hh_nlv.setdefault(hh, 0)
-        hh_nlv[hh] += nav_by_acct.get(acct, 0)
-    # Fetch spots for concentration calc
     wheel_tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE' and c.cycle_type == 'WHEEL'})
     conc_spots = get_spots(wheel_tickers) if wheel_tickers else {}
     conc_ticker, conc_pct, conc_hh = risk.concentration_check(cycles, hh_nlv, conc_spots)
@@ -204,9 +214,8 @@ def build_top_strip(conn) -> dict:
     # Sector violations
     sector_v = risk.sector_violations(cycles, industries)
 
-    # Rule 11: Beta-weighted leverage (Sprint 1F: cached betas, no sync fetch)
-    from agt_equities.beta_cache import get_betas
-    _betas = get_betas(wheel_tickers) if wheel_tickers else {}
+    # Rule 11: Beta-weighted leverage (Sprint C2: betas from DeskSnapshot, 1.0 fallback)
+    _betas = {t: snapshot.beta_by_symbol.get(t, 1.0) for t in wheel_tickers}
     leverage = risk.gross_beta_leverage(cycles, conc_spots, _betas, hh_nlv)
 
     # W3.6: Walker warnings from latest sync

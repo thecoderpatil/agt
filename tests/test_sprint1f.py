@@ -505,5 +505,172 @@ class TestBuildStateNoForbiddenImports(unittest.TestCase):
         )
 
 
+# ── Sprint C2: build_top_strip consumes DeskSnapshot ─────────────────
+
+class _TopStripDBMixin:
+    """Shared temp DB for build_top_strip tests."""
+
+    def _make_top_strip_db(self) -> str:
+        import tempfile
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        db_path = self._tmp.name
+        self._tmp.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("""
+            CREATE TABLE master_log_nav (
+                account_id TEXT, report_date TEXT, total TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE beta_cache (
+                ticker TEXT PRIMARY KEY,
+                beta REAL NOT NULL DEFAULT 1.0,
+                fetched_ts TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE bucket3_dynamic_exit_log (
+                audit_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                household TEXT NOT NULL,
+                desk_mode TEXT NOT NULL DEFAULT 'PEACETIME',
+                action_type TEXT NOT NULL DEFAULT 'CC',
+                household_nlv REAL NOT NULL DEFAULT 0,
+                underlying_spot_at_render REAL NOT NULL DEFAULT 0,
+                final_status TEXT NOT NULL DEFAULT 'STAGED',
+                last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Tables queried by build_top_strip via conn (graceful fallback on missing)
+        conn.execute("""
+            CREATE TABLE master_log_change_in_nav (
+                account_id TEXT, starting_value TEXT, ending_value TEXT,
+                twr TEXT, deposits_withdrawals TEXT, asset_transfers TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def _cleanup_top_strip_db(self):
+        import os
+        try:
+            os.unlink(self._tmp.name)
+        except Exception:
+            pass
+
+
+class TestBuildTopStripConsumesDeskSnapshot(_TopStripDBMixin, unittest.TestCase):
+    """C2 test #1: build_top_strip reads NAV/cycles/betas from DeskSnapshot."""
+
+    def setUp(self):
+        self.db_path = self._make_top_strip_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('U21971297', '20260409', '200000')"
+        )
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('U22388499', '20260409', '100000')"
+        )
+        conn.execute(
+            "INSERT INTO beta_cache (ticker, beta) VALUES ('AAPL', 1.15)"
+        )
+        conn.execute(
+            "INSERT INTO master_log_change_in_nav VALUES "
+            "('U21971297', '190000', '200000', '0.05', '50000', '0')"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._cleanup_top_strip_db()
+
+    def test_build_top_strip_has_expected_keys(self):
+        from unittest.mock import patch
+        from agt_equities import trade_repo
+        from pathlib import Path
+
+        # Monkeypatch trade_repo.DB_PATH for build_state() internal connection
+        orig_db_path = trade_repo.DB_PATH
+        trade_repo.DB_PATH = Path(self.db_path)
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+
+            with patch("agt_deck.main.get_vix", return_value=18.5), \
+                 patch("agt_deck.main.get_spots", return_value={}):
+                from agt_deck.main import build_top_strip
+                result = build_top_strip(conn)
+
+            conn.close()
+
+            expected_keys = {
+                "vix", "el_retain_pct", "total_nav", "inception_pnl",
+                "inception_pnl_pct", "net_inflows", "el_current", "el_required",
+                "vikram_el_pct", "conc_ticker", "conc_pct", "conc_hh",
+                "sector_violations", "leverage", "last_sync", "nav_by_acct",
+                "change_nav", "walker_warning_count", "walker_worst_severity",
+                "desk_mode",
+            }
+            self.assertEqual(set(result.keys()), expected_keys)
+            self.assertAlmostEqual(result["total_nav"], 300000.0)
+            self.assertIn("U21971297", result["nav_by_acct"])
+        finally:
+            trade_repo.DB_PATH = orig_db_path
+
+
+class TestBuildTopStripNavMatchesBuildState(_TopStripDBMixin, unittest.TestCase):
+    """C2 test #2: build_top_strip total_nav equals build_state().nav_total."""
+
+    def setUp(self):
+        self.db_path = self._make_top_strip_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('U21971297', '20260409', '175000')"
+        )
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('U22076329', '20260409', '45000')"
+        )
+        conn.execute(
+            "INSERT INTO master_log_nav VALUES ('U22388499', '20260408', '80000')"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._cleanup_top_strip_db()
+
+    def test_nav_matches_build_state(self):
+        from unittest.mock import patch
+        from agt_equities import trade_repo
+        from agt_equities.state_builder import build_state
+        from pathlib import Path
+
+        orig_db_path = trade_repo.DB_PATH
+        trade_repo.DB_PATH = Path(self.db_path)
+        try:
+            snapshot = build_state(db_path=self.db_path, live_positions=[])
+
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+
+            with patch("agt_deck.main.get_vix", return_value=None), \
+                 patch("agt_deck.main.get_spots", return_value={}):
+                from agt_deck.main import build_top_strip
+                result = build_top_strip(conn)
+
+            conn.close()
+
+            self.assertAlmostEqual(
+                result["total_nav"], snapshot.nav_total,
+                msg="build_top_strip total_nav must equal build_state().nav_total",
+            )
+        finally:
+            trade_repo.DB_PATH = orig_db_path
+
+
 if __name__ == "__main__":
     unittest.main()
