@@ -924,6 +924,15 @@ async def _auto_reconnect():
         try:
             ib_conn = await ensure_ib_connected()
             logger.info("Auto-reconnected (attempt %d)", attempt)
+            # Sprint B Unit 8: verify account summary available post-reconnect
+            try:
+                summary = await ib_conn.accountSummaryAsync()
+                if summary:
+                    logger.info("Post-reconnect: accountSummary OK (%d items)", len(summary))
+                else:
+                    logger.warning("Post-reconnect: accountSummary returned empty — EL snapshots may be stale")
+            except Exception as as_exc:
+                logger.warning("Post-reconnect: accountSummary check failed: %s", as_exc)
             # Followup #17 Part C.5: orphan scan on autoreconnect
             try:
                 await ib_conn.reqAllOpenOrdersAsync()
