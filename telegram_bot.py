@@ -125,6 +125,20 @@ _dispatched_audits: set[str] = set()
 # Sprint 1A/1D: /halt killswitch
 _HALTED: bool = False
 
+# Sprint 1D: Trust tier for DEX cooldown (T0=10s, T1=5s, T2=0s)
+TRUST_TIER = os.environ.get("AGT_TRUST_TIER", "T0")
+
+def _get_cooldown_seconds() -> int:
+    return {"T0": 10, "T1": 5, "T2": 0}.get(TRUST_TIER, 10)
+
+# Sprint 1D: cooldown active tracking (audit_id → asyncio.Task)
+_cooldown_tasks: dict[str, "asyncio.Task"] = {}
+
+# Sprint 1D: STAGED alert coalescing buffer
+_staged_alert_buffer: list[dict] = []
+_staged_alert_last_flush: float = 0.0
+STAGED_COALESCE_WINDOW = 60  # seconds
+
 MAX_HISTORY          = 50
 MAX_ROUNDS           = 15
 MAX_TOKENS_PER_REPLY = 8192
@@ -5474,22 +5488,19 @@ _GREETINGS = {
 
 
 async def _send_command_menu(update: Update) -> None:
+    # Sprint 1D: pruned command menu
     menu = (
         "<b>AGT Equities</b>\n"
         "\n"
         "<b>Trade</b>\n"
-        "  /cc \u2014 stage covered calls\n"
-        "  /scan \u2014 CSP candidate pipeline\n"
-        "  /dynamic_exit \u2014 evaluate exit\n"
-        "  /approve \u00b7 /reject \u2014 manage staged\n"
-        "  /override_earnings \u2014 attest earnings date\n"
+        "  /approve \u00b7 /reject \u2014 manage staged orders\n"
+        "  /orders \u2014 live working orders\n"
+        "  /cure \u2014 open Cure Console\n"
         "\n"
         "<b>Monitor</b>\n"
-        "  /health \u2014 portfolio diagnostic\n"
+        "  /status \u2014 connection + account metrics\n"
+        "  /mode \u2014 desk mode + transitions\n"
         "  /vrp \u2014 volatility risk premium\n"
-        "  /dashboard \u2014 visual performance cards\n"
-        "  /orders \u2014 live working orders\n"
-        "  /rollcheck \u00b7 /fills \u00b7 /ledger\n"
         "  /budget \u2014 API cost tracking\n"
         "\n"
         "<b>LLM</b>\n"
@@ -5498,8 +5509,10 @@ async def _send_command_menu(update: Update) -> None:
         "  /deep \u2014 Opus 4.6\n"
         "\n"
         "<b>System</b>\n"
-        "  /reconnect \u00b7 /status \u00b7 /clear\n"
-        "  /sync_universe \u00b7 /override\n"
+        "  /reconnect \u00b7 /clear\n"
+        "  /recover_transmitting \u2014 manual orphan recovery\n"
+        "  /declare_peacetime \u2014 revert from WARTIME/AMBER\n"
+        "  /halt \u2014 \U0001f6d1 emergency killswitch\n"
     )
     await update.message.reply_text(menu, parse_mode="HTML")
 
@@ -6928,6 +6941,49 @@ async def handle_dex_callback(
                 await query.edit_message_text(
                     f"\u274c {ticker} locked (5-min cooldown from recent DRIFT_BLOCKED).\n"
                     f"Wait for cooldown to expire, then re-stage."
+                )
+            except Exception:
+                pass
+            return
+
+    # Sprint 1D: Trust-tier cooldown (T0=10s, T1=5s, T2=0s)
+    cooldown = _get_cooldown_seconds()
+    if cooldown > 0:
+        if audit_id in _cooldown_tasks:
+            try:
+                await query.answer(f"Cooldown active: {cooldown}s", show_alert=False)
+            except Exception:
+                pass
+            return
+
+        current_task = asyncio.current_task()
+        _cooldown_tasks[audit_id] = current_task
+        try:
+            await query.edit_message_text(
+                f"\u23f3 Arming {ticker} in {cooldown}s\u2026\n"
+                f"audit_id: {audit_id[:8]}\u2026",
+            )
+            await asyncio.sleep(cooldown)
+        except asyncio.CancelledError:
+            _cooldown_tasks.pop(audit_id, None)
+            try:
+                await query.edit_message_text("\u274c Aborted during cooldown")
+            except Exception:
+                pass  # Edit may fail if message already modified
+            return  # Row stays ATTESTED, operator can retap TRANSMIT
+        finally:
+            _cooldown_tasks.pop(audit_id, None)
+
+        with closing(_get_db_connection()) as conn:
+            recheck = conn.execute(
+                "SELECT final_status FROM bucket3_dynamic_exit_log WHERE audit_id = ?",
+                (audit_id,),
+            ).fetchone()
+        if not recheck or recheck["final_status"] != "ATTESTED":
+            try:
+                await query.edit_message_text(
+                    f"\u274c Aborted during cooldown — row no longer ATTESTED.\n"
+                    f"audit_id: {audit_id[:8]}\u2026"
                 )
             except Exception:
                 pass
@@ -11478,6 +11534,72 @@ async def cmd_recover_transmitting(
             pass
 
 
+# ---------------------------------------------------------------------------
+# Sprint 1D: /halt killswitch
+# ---------------------------------------------------------------------------
+
+async def cmd_halt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/halt — emergency killswitch. Stops all scheduled jobs and blocks trades."""
+    global _HALTED
+    if not is_authorized(update):
+        return
+    _HALTED = True
+    logger.warning("DESK HALTED by operator via /halt")
+
+    cancelled = 0
+    try:
+        jq = context.application.job_queue
+        if jq:
+            for job in jq.jobs():
+                job.schedule_removal()
+                cancelled += 1
+    except Exception as exc:
+        logger.warning("/halt job cancellation error: %s", exc)
+
+    await update.message.reply_text(
+        f"\U0001f6d1 DESK HALTED\n"
+        f"Cancelled {cancelled} scheduled jobs.\n"
+        f"All trade gates blocked. IB connection preserved.\n"
+        f"Restart bot to resume."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sprint 1D: STAGED alert coalescing flush job
+# ---------------------------------------------------------------------------
+
+async def _flush_staged_alerts_job(context) -> None:
+    """Flush buffered STAGED alerts as a single digest message."""
+    if _HALTED:
+        return
+    global _staged_alert_last_flush
+    now = time.time()
+    if not _staged_alert_buffer:
+        return
+    if now - _staged_alert_last_flush < STAGED_COALESCE_WINDOW:
+        return
+
+    lines = [f"\u26a0\ufe0f {len(_staged_alert_buffer)} STAGED"]
+    for row in _staged_alert_buffer:
+        tk = row.get("ticker", "?")
+        act = row.get("action_type", "?")
+        qty = row.get("contracts") or row.get("shares") or "?"
+        unit = "c" if act == "CC" else "sh"
+        strike = f"${row['strike']:.0f}C" if row.get("strike") else ""
+        limit_p = f"@ ${row['limit_price']:.2f}" if row.get("limit_price") else ""
+        hh = (row.get("household") or "").replace("_Household", "")
+        lines.append(f"\u00b7 {tk} Sell {qty}{unit} {strike} {limit_p} | {hh}")
+
+    text = "\n".join(lines)
+    try:
+        await context.bot.send_message(chat_id=AUTHORIZED_USER_ID, text=text)
+    except Exception as exc:
+        logger.warning("staged_alert_flush: send failed: %s", exc)
+
+    _staged_alert_buffer.clear()
+    _staged_alert_last_flush = now
+
+
 # Followup #17: orphan scan state sets for resolution policy (D3)
 _OPEN_FILLED_STATES = frozenset({"Filled"})
 _OPEN_DEAD_STATES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
@@ -11690,6 +11812,8 @@ async def _sweep_attested_ttl_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     Now both STAGED and ATTESTED rows are swept continuously. The /cc preamble
     sweep becomes a redundant safety net (acceptable per Q4 ruling).
     """
+    if _HALTED:
+        return
     try:
         with closing(_get_db_connection()) as conn:
             from agt_equities.rule_engine import sweep_stale_dynamic_exit_stages
@@ -11717,6 +11841,8 @@ async def _poll_attested_rows(context: ContextTypes.DEFAULT_TYPE) -> None:
     (transmitted, cancelled, abandoned, drift_blocked) is purged each tick to
     prevent unbounded set growth (triage item #5).
     """
+    if _HALTED:
+        return
     try:
         with closing(_get_db_connection()) as conn:
             rows = conn.execute(
@@ -11863,45 +11989,26 @@ def main() -> None:
         .build()
     )
 
+    # Sprint 1D: pruned command registry (20 handlers + 2 callbacks killed)
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("orders",    cmd_orders))
     app.add_handler(CommandHandler("budget",    cmd_budget))
     app.add_handler(CommandHandler("clear",     cmd_clear))
-    app.add_handler(CommandHandler("stop",      cmd_stop))
     app.add_handler(CommandHandler("reconnect", cmd_reconnect))
-    app.add_handler(CommandHandler("scan",      cmd_scan))
     app.add_handler(CommandHandler("vrp",       cmd_vrp))
-    app.add_handler(CommandHandler("dashboard", cmd_dashboard))
     app.add_handler(CommandHandler("think",     cmd_think))
     app.add_handler(CommandHandler("deep",      cmd_deep))
-    app.add_handler(CommandHandler("health",    cmd_health))
-    app.add_handler(CommandHandler("cc",        cmd_cc))
-    app.add_handler(CommandHandler("mode1",     cmd_mode1))
-    app.add_handler(CommandHandler("rollcheck", cmd_rollcheck))
-    app.add_handler(CommandHandler("cycles",    cmd_cycles))
-    app.add_handler(CommandHandler("sync_universe", cmd_sync_universe))
-    app.add_handler(CommandHandler("cleanup_blotter", cmd_cleanup_blotter))
-    app.add_handler(CommandHandler("approve", cmd_approve))
-    app.add_handler(CommandHandler("reject", cmd_reject))
-    app.add_handler(CommandHandler("status_orders", cmd_status_orders))
-    app.add_handler(CommandHandler("fills", cmd_fills))
-    app.add_handler(CommandHandler("ledger", cmd_ledger))
-    app.add_handler(CommandHandler("dynamic_exit", cmd_dynamic_exit))
-    app.add_handler(CommandHandler("override", cmd_override))
-    app.add_handler(CommandHandler("override_earnings", cmd_override_earnings))
-    app.add_handler(CommandHandler("reconcile", cmd_reconcile))
-    app.add_handler(CommandHandler("declare_wartime", cmd_declare_wartime))
+    app.add_handler(CommandHandler("approve",   cmd_approve))
+    app.add_handler(CommandHandler("reject",    cmd_reject))
     app.add_handler(CommandHandler("declare_peacetime", cmd_declare_peacetime))
-    app.add_handler(CommandHandler("mode", cmd_mode))
-    app.add_handler(CommandHandler("cure", cmd_cure))
-    app.add_handler(CommandHandler("clear_quarantine", cmd_clear_quarantine))
+    app.add_handler(CommandHandler("mode",      cmd_mode))
+    app.add_handler(CommandHandler("cure",      cmd_cure))
     app.add_handler(CommandHandler("recover_transmitting", cmd_recover_transmitting))
-    app.add_handler(CallbackQueryHandler(handle_cc_ladder_callback, pattern=r"^cc:"))
+    app.add_handler(CommandHandler("halt",      cmd_halt))
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve:"))
     app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern=r"^dex:"))
-    app.add_handler(CallbackQueryHandler(handle_dashboard_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # ── Scheduled jobs ──
@@ -11963,6 +12070,13 @@ def main() -> None:
             name="el_snapshot_writer",
         )
         logger.info("Scheduled: el_snapshot_writer every 30s")
+        jq.run_repeating(
+            callback=_flush_staged_alerts_job,
+            interval=15,
+            first=20,
+            name="staged_alert_flush",
+        )
+        logger.info("Scheduled: staged_alert_flush every 15s")
     else:
         logger.warning("JobQueue not available — scheduled jobs not registered")
 
