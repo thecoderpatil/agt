@@ -202,6 +202,9 @@ def log_mode_transition(
     notes: str | None = None,
 ) -> None:
     """Write a mode transition to mode_history table. Idempotent."""
+    # Sprint 1F Fix 10: no-op if mode unchanged (prevents duplicate rows)
+    if old_mode == new_mode:
+        return
     try:
         conn.execute(
             "INSERT INTO mode_history "

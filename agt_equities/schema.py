@@ -912,6 +912,44 @@ def register_master_log_tables(conn) -> None:
         ON el_snapshots(household, timestamp)
     """)
 
+    # Sprint 1B: add account_id to el_snapshots for per-account EL tracking
+    try:
+        conn.execute(
+            "ALTER TABLE el_snapshots ADD COLUMN account_id TEXT"
+        )
+        _log.info("schema: added account_id column to el_snapshots")
+    except Exception:
+        pass  # Column already exists
+
+    # Sprint 1E: Multi-tenant schema prep — add client_id to operational tables
+    # No code reads client_id yet. DEFAULT 'AGT' backfills existing rows.
+    import logging as _s1e_log
+    _s1e_tables = [
+        "bucket3_dynamic_exit_log",
+        "pending_orders",
+        "el_snapshots",
+        "mode_history",
+        "premium_ledger",
+        "live_blotter",
+        "executed_orders",
+    ]
+    _existing_tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    for _tbl in _s1e_tables:
+        if _tbl not in _existing_tables:
+            _s1e_log.getLogger(__name__).info("schema: skipping client_id for %s (table not found)", _tbl)
+            continue
+        try:
+            conn.execute(
+                f"ALTER TABLE {_tbl} ADD COLUMN client_id TEXT DEFAULT 'AGT'"
+            )
+            _s1e_log.getLogger(__name__).info("schema: added client_id column to %s", _tbl)
+        except Exception:
+            pass  # Column already exists
+
     # Phase 3A: Sector overrides — manual industry classification corrections
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sector_overrides (

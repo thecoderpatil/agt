@@ -175,7 +175,7 @@ class TestTransmitPath(unittest.TestCase):
             src = f.read()
         # orderRef assignment must come before placeOrder in handle_dex_callback
         func_start = src.find('async def handle_dex_callback')
-        func_body = src[func_start:func_start + 15000]
+        func_body = src[func_start:func_start + 20000]  # Sprint 1D: cooldown insertion widened function
         ref_pos = func_body.find('order.orderRef = audit_id')
         place_pos = func_body.find('ib_conn.placeOrder(contract, order)')
         self.assertNotEqual(ref_pos, -1, "order.orderRef = audit_id not found")

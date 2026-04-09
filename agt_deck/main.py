@@ -26,6 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("agt_deck")
 
 DECK_TOKEN = os.environ.get("AGT_DECK_TOKEN", "")
+PAPER_MODE = os.environ.get("AGT_PAPER_MODE", "").lower() in ("1", "true", "yes")
 BASE_DIR = Path(__file__).resolve().parent
 
 app = FastAPI(title="AGT Command Deck", docs_url=None, redoc_url=None)
@@ -43,6 +44,10 @@ _FMT_CONTEXT = {
     "color_class": formatters.color_class,
     "concentration_color": formatters.concentration_color,
     "time_ago": formatters.time_ago,
+    "format_age": formatters.format_age,
+    "el_pct_color": formatters.el_pct_color,
+    "lifecycle_state_classes": formatters.lifecycle_state_classes,
+    "paper_mode": PAPER_MODE,
 }
 
 
@@ -164,13 +169,26 @@ def build_top_strip(conn) -> dict:
     inception_pnl = total_nav - net_inflows
     inception_pnl_pct = (inception_pnl / net_inflows * 100) if net_inflows > 0 else None
 
-    # EL: not persisted yet, show placeholder
-    el_current = None
-    el_required = None
+    # Sprint 1F Fix 3B: read EL from el_snapshots (written by bot's el_snapshot_writer)
     el_retain_pct = risk.vix_required_el_pct(vix) if vix else None
-
-    # Vikram EL
+    _el_data = queries.get_health_strip_data(conn)
+    _yash_el = sum(
+        a["excess_liquidity"] or 0 for a in _el_data.get("accounts", [])
+        if a.get("household") == "Yash_Household" and a.get("excess_liquidity") is not None
+    )
+    _vikram_el = sum(
+        a["excess_liquidity"] or 0 for a in _el_data.get("accounts", [])
+        if a.get("household") == "Vikram_Household" and a.get("excess_liquidity") is not None
+    )
+    el_current = _yash_el if _yash_el > 0 else None
+    el_required = None  # EL required from VIX table, needs total margin NLV — deferred
     vikram_el_pct = None
+    _vikram_nlv = sum(
+        a["nlv"] or 0 for a in _el_data.get("accounts", [])
+        if a.get("household") == "Vikram_Household" and a.get("nlv") is not None
+    )
+    if _vikram_nlv > 0 and _vikram_el > 0:
+        vikram_el_pct = round(_vikram_el / _vikram_nlv * 100, 1)
 
     # Concentration — use spot prices, per-household
     hh_nlv = {}
@@ -185,17 +203,9 @@ def build_top_strip(conn) -> dict:
     # Sector violations
     sector_v = risk.sector_violations(cycles, industries)
 
-    # Rule 11: Beta-weighted leverage
-    _betas = {}
-    try:
-        import yfinance as yf
-        for tk in wheel_tickers:
-            try:
-                _betas[tk] = float(yf.Ticker(tk).info.get('beta', 1.0) or 1.0)
-            except Exception:
-                _betas[tk] = 1.0
-    except Exception:
-        pass
+    # Rule 11: Beta-weighted leverage (Sprint 1F: cached betas, no sync fetch)
+    from agt_equities.beta_cache import get_betas
+    _betas = get_betas(wheel_tickers) if wheel_tickers else {}
     leverage = risk.gross_beta_leverage(cycles, conc_spots, _betas, hh_nlv)
 
     # W3.6: Walker warnings from latest sync
@@ -330,7 +340,7 @@ async def command_deck(request: Request):
         recon = queries.get_recon_summary(conn)
         recent_orders = queries.get_recent_orders(conn)
 
-        # Attention items — filter noise: DTE ≤ 5 OR (loss > 15% AND > $1500)
+        # Underwater positions — DTE ≤ 5 OR (loss > 15% AND > $1500)
         ATTENTION_MIN_LOSS_DOLLAR = 1500
         attention = [
             r for r in cycles
@@ -338,11 +348,19 @@ async def command_deck(request: Request):
             or (r["unreal_pct"] is not None and r["unreal_pct"] < -15
                 and r["unreal_dollar"] is not None and abs(r["unreal_dollar"]) >= ATTENTION_MIN_LOSS_DOLLAR)
         ]
+        # CC-aware indicator: check if position has active covered calls
+        for a in attention:
+            a["has_cc"] = a.get("open_short_calls", 0) > 0
+        # Sort: biggest loss first, household alphabetical as tiebreak
+        attention.sort(key=lambda r: (
+            r["unreal_pct"] if r["unreal_pct"] is not None else 0,
+            r.get("household", ""),
+        ))
 
         # Account pills
         nav_by_acct = top["nav_by_acct"]
         pills = []
-        for acct in ["U21971297", "U22076329", "U22388499"]:
+        for acct in queries.ACCOUNT_ALIAS:  # Sprint 1E: derive from shared map
             pills.append({
                 "account_id": acct,
                 "alias": queries.ACCOUNT_ALIAS.get(acct, acct),
@@ -405,9 +423,25 @@ async def sse(request: Request):
 
 # ── Cure Console ─────────────────────────────────────────────────
 
+def _build_household_el(top: dict, hh_nlv: dict) -> dict:
+    """Sprint 1F Fix 3C: build per-household EL dict from top strip EL data."""
+    result = {}
+    for hh in hh_nlv:
+        if "Yash" in hh:
+            result[hh] = top.get("el_current")
+        elif "Vikram" in hh:
+            # Compute Vikram EL from vikram_el_pct + NLV
+            pct = top.get("vikram_el_pct")
+            nlv = hh_nlv.get(hh, 0)
+            result[hh] = round(pct / 100 * nlv, 2) if pct and nlv else None
+        else:
+            result[hh] = None
+    return result
+
+
 def _build_cure_data(conn) -> dict:
     """Assemble Cure Console data from rule engine + glide paths."""
-    from agt_equities.rule_engine import PortfolioState, evaluate_all, compute_leverage_pure
+    from agt_equities.rule_engine import PortfolioState, evaluate_all, compute_leverage_pure, evaluate_rule_9_composite
     from agt_equities.mode_engine import (
         get_current_mode, load_glide_paths, evaluate_glide_path,
         get_recent_transitions,
@@ -438,15 +472,27 @@ def _build_cure_data(conn) -> dict:
 
     ps = PortfolioState(
         household_nlv=hh_nlv,
-        household_el={hh: None for hh in hh_nlv},  # EL pending IBKR live feed
+        household_el=_build_household_el(top, hh_nlv),  # Sprint 1F Fix 3C
         active_cycles=cycles_raw,
         spots=spots,
-        betas={tk: 1.0 for tk in spots},  # beta=1.0 per decision
+        betas=get_betas(list(spots.keys())) if spots else {},  # Sprint 1F: cached yfinance betas
         industries=industries,
         sector_overrides=sector_overrides,
         vix=top.get("vix"),
         report_date=_date.today().strftime("%Y%m%d"),
     )
+
+    # Sprint 1F Fix 4: load glide paths early for eval softening
+    glide_paths_raw = load_glide_paths(conn)
+    _paused_rules: dict[tuple[str, str, str | None], str] = {}
+    for gp in glide_paths_raw:
+        if gp.pause_conditions:
+            try:
+                pc = json.loads(gp.pause_conditions)
+                if pc.get("paused"):
+                    _paused_rules[(gp.household_id, gp.rule_id, gp.ticker)] = pc.get("reason", "paused")
+            except Exception:
+                pass
 
     # Evaluate all rules per household
     households = sorted(hh_nlv.keys())
@@ -454,6 +500,23 @@ def _build_cure_data(conn) -> dict:
     hh_sections = {}
     for hh in households:
         evals = evaluate_all(ps, hh)
+
+        # Sprint 1F Fix 4: soften paused evals → GREEN before rendering + R9
+        for ev in evals:
+            pause_key = (hh, ev.rule_id, ev.ticker)
+            pause_reason = _paused_rules.get(pause_key)
+            if pause_reason and ev.status in ("RED", "AMBER"):
+                ev.status = "GREEN"
+                ev.message = f"{ev.message} [paused: {pause_reason}]"
+
+        # Sprint 1F Fix 4: wire real R9 compositor (replaces stub)
+        try:
+            r9_real = evaluate_rule_9_composite(evals, hh, conn)
+            # Replace the stub R9 eval in the list
+            evals = [ev if ev.rule_id != "rule_9" else r9_real for ev in evals]
+        except Exception as r9_exc:
+            logger.warning("R9 compositor failed for %s: %s — keeping stub", hh, r9_exc)
+
         all_evals.extend(evals)
 
         lev = compute_leverage_pure(cycles_raw, spots, ps.betas, hh_nlv, hh)
@@ -477,11 +540,10 @@ def _build_cure_data(conn) -> dict:
                                  if c.status == 'ACTIVE' and c.household_id == hh),
         }
 
-    # Glide paths with progress
-    glide_paths = load_glide_paths(conn)
+    # Glide paths with progress (uses glide_paths_raw loaded above for Fix 4 softening)
     today_str = _date.today().isoformat()
     glide_rows = []
-    for gp in glide_paths:
+    for gp in glide_paths_raw:
         # Find matching actual value from evaluations
         actual = gp.baseline_value  # fallback
         for ev in all_evals:
@@ -922,6 +984,40 @@ async def r5_sell_stage(request: Request):
         conn.close()
 
 
+# ── Sprint 1B: Lifecycle Queue + Health Strip fragments ──────────
+
+@app.get("/cure/lifecycle", response_class=HTMLResponse)
+async def cure_lifecycle(request: Request):
+    """HTMX fragment: Action Queue with STAGED/ATTESTED/TRANSMITTING/TRANSMITTED rows."""
+    conn = get_ro_conn()
+    try:
+        rows = queries.get_lifecycle_rows(conn)
+        orphans = [r for r in rows if r.get("is_orphan")]
+        return _render("cure_lifecycle.html", {
+            "request": request,
+            "token": request.query_params.get("t", ""),
+            "rows": rows,
+            "orphans": orphans,
+        })
+    finally:
+        conn.close()
+
+
+@app.get("/cure/health_strip", response_class=HTMLResponse)
+async def cure_health_strip(request: Request):
+    """HTMX fragment: Health Strip with per-account EL and mode badge."""
+    conn = get_ro_conn()
+    try:
+        data = queries.get_health_strip_data(conn)
+        return _render("cure_health_strip.html", {
+            "request": request,
+            "token": request.query_params.get("t", ""),
+            **data,
+        })
+    finally:
+        conn.close()
+
+
 # ── Entry point ───────────────────────────────────────────────────
 
 def main():
@@ -936,6 +1032,18 @@ def main():
         print(f"  Access: http://127.0.0.1:8787/?t={token}\n")
     else:
         print(f"\n  Access: http://127.0.0.1:8787/?t={DECK_TOKEN}\n")
+
+    # Write active token to .deck_token for launcher discovery (atomic)
+    import tempfile
+    _token_path = Path(__file__).resolve().parent.parent / ".deck_token"
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(_token_path.parent), prefix=".deck_token_")
+        with os.fdopen(fd, "w") as f:
+            f.write(DECK_TOKEN)
+        os.replace(tmp, str(_token_path))
+        logger.info(".deck_token written for launcher discovery")
+    except Exception as exc:
+        logger.warning("Failed to write .deck_token: %s", exc)
 
     # Bind 0.0.0.0 for Tailscale mobile access (token auth protects all routes)
     uvicorn.run(app, host="0.0.0.0", port=8787, log_level="info")

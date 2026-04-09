@@ -10,12 +10,14 @@ logger = logging.getLogger(__name__)
 ACCOUNT_ALIAS = {
     "U21971297": "Yash Ind",
     "U22076329": "Yash Roth",
+    "U22076184": "Yash Trad IRA",
     "U22388499": "Vikram",
 }
 
 HOUSEHOLD_MAP = {
     "U21971297": "Yash_Household",
     "U22076329": "Yash_Household",
+    "U22076184": "Yash_Household",
     "U22388499": "Vikram_Household",
 }
 
@@ -34,12 +36,21 @@ def _safe(fn):
 # ── NAV / Top strip ──────────────────────────────────────────────
 
 def get_portfolio_nav(conn: sqlite3.Connection) -> dict:
-    """Latest NAV per account from master_log_nav."""
+    """Latest NAV per account from master_log_nav.
+
+    Uses per-account MAX(report_date) so dormant accounts (e.g. U22076184
+    Trad IRA) whose Flex rows stop appearing still contribute their last
+    known NAV. Fix 1 / Sprint 1F.
+    """
     try:
         rows = conn.execute("""
-            SELECT account_id, CAST(total AS REAL) as nav
-            FROM master_log_nav
-            WHERE report_date = (SELECT MAX(report_date) FROM master_log_nav)
+            SELECT m1.account_id, CAST(m1.total AS REAL) as nav
+            FROM master_log_nav m1
+            WHERE m1.report_date = (
+                SELECT MAX(m2.report_date)
+                FROM master_log_nav m2
+                WHERE m2.account_id = m1.account_id
+            )
         """).fetchall()
         result = {}
         for r in rows:
@@ -298,3 +309,139 @@ def get_staged_exit_by_audit_id(conn: sqlite3.Connection, audit_id: str) -> dict
     if row is None:
         return None
     return dict(row)
+
+
+# ── Sprint 1B: Lifecycle Queue ───────────────────────────────────
+
+def get_lifecycle_rows(conn: sqlite3.Connection) -> list[dict]:
+    """All active lifecycle rows for Cure Console Action Queue.
+
+    Returns STAGED + ATTESTED + TRANSMITTING + recently TRANSMITTED (within 5m).
+    Orphans (TRANSMITTING for >10min) sorted first.
+    """
+    import time
+    now = time.time()
+    transmitted_cutoff = now - 300   # 5 minutes
+    orphan_cutoff = now - 600        # 10 minutes
+    try:
+        rows = conn.execute(
+            "SELECT audit_id, ticker, household, action_type, contracts, shares, "
+            "  strike, expiry, limit_price, final_status, desk_mode, "
+            "  staged_ts, last_updated, transmitted_ts, "
+            "  fill_price, fill_qty, fill_ts, "
+            "  originating_account_id, re_validation_count, exception_type "
+            "FROM bucket3_dynamic_exit_log "
+            "WHERE final_status IN ('STAGED', 'ATTESTED', 'TRANSMITTING') "
+            "   OR (final_status = 'TRANSMITTED' AND transmitted_ts > ?) "
+            "ORDER BY "
+            "  CASE WHEN final_status = 'TRANSMITTING' AND transmitted_ts < ? THEN 0 ELSE 1 END, "
+            "  CASE final_status "
+            "    WHEN 'STAGED' THEN 1 "
+            "    WHEN 'ATTESTED' THEN 2 "
+            "    WHEN 'TRANSMITTING' THEN 3 "
+            "    WHEN 'TRANSMITTED' THEN 4 "
+            "  END, "
+            "  staged_ts DESC",
+            (transmitted_cutoff, orphan_cutoff),
+        ).fetchall()
+
+        result = []
+        for r in rows:
+            d = dict(r)
+            ts = d.get("transmitted_ts") or d.get("staged_ts") or 0
+            d["is_orphan"] = (
+                d["final_status"] == "TRANSMITTING"
+                and d.get("transmitted_ts") is not None
+                and d["transmitted_ts"] < orphan_cutoff
+            )
+            d["age_seconds"] = int(now - ts) if ts else 0
+            result.append(d)
+        return result
+    except Exception as exc:
+        logger.warning("get_lifecycle_rows failed: %s", exc)
+        return []
+
+
+# ── Sprint 1B: Health Strip ──────────────────────────────────────
+
+def get_health_strip_data(conn: sqlite3.Connection) -> dict:
+    """Health Strip data for Cure Console header.
+
+    Reads per-account EL from el_snapshots (written by telegram_bot's
+    el_snapshot_writer_job every 30s). Computes staleness.
+
+    # TODO Sprint 1D: add explicit ib_connection_heartbeat row that
+    # telegram_bot writes on every poll regardless of IB state, so deck
+    # can distinguish 'IB down' from 'bot down'. Current staleness
+    # inference conflates IB disconnected vs writer job crashed vs bot down.
+    """
+    import time
+    from agt_equities.mode_engine import get_current_mode
+
+    now = time.time()
+    mode = get_current_mode(conn)
+
+    # Sprint 1E: derive from shared maps instead of third hardcoded list
+    account_configs = [
+        (acct, ACCOUNT_ALIAS.get(acct, acct), hh)
+        for acct, hh in HOUSEHOLD_MAP.items()
+    ]
+
+    accounts = []
+    any_fresh = False
+    for acct_id, alias, household in account_configs:
+        try:
+            row = conn.execute(
+                "SELECT excess_liquidity, nlv, buying_power, timestamp "
+                "FROM el_snapshots "
+                "WHERE account_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (acct_id,),
+            ).fetchone()
+        except Exception:
+            row = None
+
+        if row and row["nlv"]:
+            from datetime import datetime, timezone
+            try:
+                ts = datetime.fromisoformat(
+                    row["timestamp"].replace("Z", "+00:00")
+                )
+                staleness = int((datetime.now(timezone.utc) - ts).total_seconds())
+            except Exception:
+                staleness = 9999
+            el = row["excess_liquidity"] or 0
+            nlv = row["nlv"] or 0
+            el_pct = round(el / nlv * 100, 1) if nlv > 0 else 0.0
+            is_stale = staleness > 120
+            if not is_stale:
+                any_fresh = True
+            accounts.append({
+                "account_id": acct_id,
+                "alias": alias,
+                "household": household,
+                "nlv": nlv,
+                "excess_liquidity": el,
+                "buying_power": row["buying_power"] or 0,
+                "el_pct": el_pct,
+                "staleness_seconds": staleness,
+                "is_stale": is_stale,
+            })
+        else:
+            accounts.append({
+                "account_id": acct_id,
+                "alias": alias,
+                "household": household,
+                "nlv": None,
+                "excess_liquidity": None,
+                "buying_power": None,
+                "el_pct": None,
+                "staleness_seconds": None,
+                "is_stale": True,
+            })
+
+    return {
+        "mode": mode,
+        "ib_connected": any_fresh,
+        "accounts": accounts,
+    }

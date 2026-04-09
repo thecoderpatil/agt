@@ -1,0 +1,43 @@
+{# Sprint 1B: Health Strip — HTMX self-polling sticky header (10s) #}
+<header id="health-strip"
+        hx-get="/cure/health_strip?t={{ token }}"
+        hx-trigger="every 10s"
+        hx-swap="outerHTML"
+        class="sticky top-0 z-10 bg-slate-900 border-b border-slate-700 px-4 py-2 mb-4">
+  <div class="flex flex-wrap items-center gap-4 font-mono text-xs">
+
+    {# ── Mode badge ───────────────────────────────────────────── #}
+    {% if mode == 'WARTIME' %}
+    <span class="bg-rose-900 text-rose-100 px-2 py-0.5 rounded font-bold animate-pulse">WAR</span>
+    {% elif mode == 'AMBER' %}
+    <span class="bg-amber-900 text-amber-200 px-2 py-0.5 rounded">AMBER</span>
+    {% else %}
+    <span class="bg-emerald-900 text-emerald-200 px-2 py-0.5 rounded">PEACE</span>
+    {% endif %}
+
+    {# ── IB / DB status dots ──────────────────────────────────── #}
+    <span class="flex items-center gap-1">
+      <span class="w-2 h-2 rounded-full {{ 'bg-emerald-500' if ib_connected else 'bg-rose-500' }}"></span>
+      <span class="text-slate-400">IB</span>
+    </span>
+
+    {# ── Per-account EL bars ──────────────────────────────────── #}
+    {% for acct in accounts %}
+    <div class="flex flex-col min-w-0">
+      <span class="text-slate-500 truncate">{{ acct.alias }}</span>
+      {% if acct.nlv is not none %}
+      <span class="{{ el_pct_color(acct.el_pct) }}">
+        EL ${{ "{:,.0f}".format(acct.excess_liquidity) }}
+        ({{ "%.1f"|format(acct.el_pct) }}%)
+        {% if acct.is_stale and acct.staleness_seconds is not none %}
+        <span class="text-amber-500">⚠ {{ acct.staleness_seconds }}s</span>
+        {% endif %}
+      </span>
+      {% else %}
+      <span class="text-slate-600">—</span>
+      {% endif %}
+    </div>
+    {% endfor %}
+
+  </div>
+</header>

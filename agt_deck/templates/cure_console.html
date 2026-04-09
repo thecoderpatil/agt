@@ -45,6 +45,9 @@
   </div>
 </header>
 
+{# ── HEALTH STRIP (Sprint 1B — self-polls every 10s) ─────────── #}
+<div hx-get="/cure/health_strip?t={{ token }}" hx-trigger="load" hx-swap="outerHTML"></div>
+
 {# ── CURE BODY (HTMX refreshable) ─────────────────────────────── #}
 <main id="cure-body" class="flex-1 p-4 max-w-[1920px] mx-auto w-full"
       hx-get="/api/cure?t={{ token }}" hx-trigger="every 60s" hx-swap="innerHTML">

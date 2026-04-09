@@ -76,3 +76,45 @@ def time_ago(iso_str: str | None) -> str:
             return f"{delta.days}d ago"
     except Exception:
         return iso_str[:16] if iso_str else "—"
+
+
+def format_age(seconds) -> str:
+    """Human-readable relative age from seconds."""
+    if seconds is None or seconds < 0:
+        return "—"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s ago"
+    elif seconds < 3600:
+        return f"{seconds // 60}m ago"
+    elif seconds < 86400:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}h {m}m ago"
+    else:
+        return f"{seconds // 86400}d ago"
+
+
+def el_pct_color(pct_val) -> str:
+    """EL percentage → Tailwind color class for Health Strip."""
+    if pct_val is None:
+        return "text-slate-500"
+    if pct_val >= 40:
+        return "text-emerald-400"
+    if pct_val >= 25:
+        return "text-amber-400"
+    if pct_val >= 15:
+        return "text-orange-400"
+    return "text-rose-500 font-bold animate-pulse"
+
+
+def lifecycle_state_classes(status: str, is_orphan: bool = False) -> str:
+    """Lifecycle row → Tailwind classes for Action Queue."""
+    if is_orphan:
+        return "border-l-4 border-rose-600 bg-rose-900/40 font-bold"
+    return {
+        "STAGED": "border-l-4 border-amber-500 bg-amber-950/20",
+        "ATTESTED": "border-l-4 border-blue-500 bg-blue-950/20",
+        "TRANSMITTING": "border-l-4 border-purple-500 bg-purple-950/30 animate-pulse",
+        "TRANSMITTED": "border-l-4 border-emerald-600 bg-emerald-950/20 opacity-60",
+    }.get(status, "")

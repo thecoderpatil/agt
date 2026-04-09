@@ -2,6 +2,7 @@
 .env
 .env.*
 *.env
+.deck_token
 litestream.yml
 litestream.exe
 

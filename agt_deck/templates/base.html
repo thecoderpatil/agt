@@ -31,7 +31,12 @@
     </style>
     <link rel="stylesheet" href="/static/app.css?t={{ token }}">
 </head>
-<body class="bg-slate-950 text-slate-100 font-sans min-h-screen flex flex-col">
+<body class="bg-slate-950 text-slate-100 font-sans min-h-screen flex flex-col {% if paper_mode %}border-4 border-blue-500{% endif %}">
+    {% if paper_mode %}
+    <div class="sticky top-0 z-50 w-full bg-blue-600 text-white text-center py-1 font-mono text-sm font-bold border-b-2 border-blue-400">
+      ⚠ PAPER TRADING — simulated orders only ⚠
+    </div>
+    {% endif %}
     {% block content %}{% endblock %}
     <script src="/static/app.js?t={{ token }}"></script>
 </body>

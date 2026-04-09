@@ -93,6 +93,13 @@ def seed_glide_paths(conn: sqlite3.Connection) -> int:
             accel = None
         else:
             hh, rule, ticker, baseline, target, start, target_dt, pause, notes, accel = row
+        # Sprint 1F Fix 9: SQLite UNIQUE doesn't match NULL=NULL.
+        # For NULL-ticker rows, explicitly DELETE before INSERT to prevent duplicates.
+        if ticker is None:
+            conn.execute(
+                "DELETE FROM glide_paths WHERE household_id = ? AND rule_id = ? AND ticker IS NULL",
+                (hh, rule),
+            )
         conn.execute(
             "INSERT OR REPLACE INTO glide_paths "
             "(household_id, rule_id, ticker, baseline_value, target_value, "
