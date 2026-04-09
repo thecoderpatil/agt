@@ -895,5 +895,63 @@ class TestNoHardcodedAccountIdsInRuleEngine(unittest.TestCase):
         )
 
 
+# ── Hotfix: _build_cure_data get_betas coverage gap ──────────────────
+
+class TestBuildCureDataWithNonEmptyCycles(unittest.TestCase):
+    """Hotfix: _build_cure_data must not NameError when cycles have spots."""
+
+    def test_get_betas_called_when_spots_exist(self):
+        from unittest.mock import patch, MagicMock
+        from agt_equities import trade_repo
+        from pathlib import Path
+        import tempfile
+
+        # Minimal DB for build_state + _build_cure_data
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        db_path = tmp.name
+        tmp.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE master_log_nav (account_id TEXT, report_date TEXT, total TEXT)")
+        conn.execute("INSERT INTO master_log_nav VALUES ('U21971297', '20260409', '200000')")
+        conn.execute("CREATE TABLE beta_cache (ticker TEXT PRIMARY KEY, beta REAL DEFAULT 1.0, fetched_ts TEXT DEFAULT (datetime('now')))")
+        conn.execute("CREATE TABLE bucket3_dynamic_exit_log (audit_id TEXT PRIMARY KEY, trade_date TEXT, ticker TEXT, household TEXT, desk_mode TEXT DEFAULT 'PEACETIME', action_type TEXT DEFAULT 'CC', household_nlv REAL DEFAULT 0, underlying_spot_at_render REAL DEFAULT 0, final_status TEXT DEFAULT 'STAGED', last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("CREATE TABLE master_log_change_in_nav (account_id TEXT, starting_value TEXT, ending_value TEXT, twr TEXT, deposits_withdrawals TEXT, asset_transfers TEXT)")
+        conn.execute("CREATE TABLE glide_paths (id INTEGER PRIMARY KEY, household_id TEXT, rule_id TEXT, ticker TEXT, baseline_value REAL, target_value REAL, start_date TEXT, target_date TEXT, pause_conditions TEXT, notes TEXT, accelerator_clause TEXT, UNIQUE(household_id, rule_id, ticker))")
+        conn.execute("CREATE TABLE mode_history (id INTEGER PRIMARY KEY, timestamp TEXT, old_mode TEXT, new_mode TEXT, trigger_rule TEXT, trigger_household TEXT, trigger_value REAL, notes TEXT)")
+        conn.commit()
+
+        # Mock cycle with a real ticker so spots is non-empty
+        mock_cycle = MagicMock()
+        mock_cycle.status = "ACTIVE"
+        mock_cycle.ticker = "SPY"
+        mock_cycle.cycle_type = "WHEEL"
+        mock_cycle.household_id = "Yash_Household"
+        mock_cycle.shares_held = 100
+        mock_cycle.open_short_calls = 1
+        mock_cycle.open_short_puts = 0
+
+        orig_db_path = trade_repo.DB_PATH
+        trade_repo.DB_PATH = Path(db_path)
+        try:
+            with patch("agt_deck.main.get_vix", return_value=18.0), \
+                 patch("agt_deck.main.get_spots", return_value={"SPY": 520.0}), \
+                 patch("agt_deck.main.load_active_cycles", return_value=[mock_cycle]), \
+                 patch("agt_deck.main.build_cycles_table", return_value=[]):
+                from agt_deck.main import _build_cure_data
+                # This call triggers get_betas(["SPY"]) at line 513
+                result = _build_cure_data(conn)
+
+            self.assertIn("households", result)
+        finally:
+            trade_repo.DB_PATH = orig_db_path
+            conn.close()
+            try:
+                os.unlink(db_path)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -505,6 +505,11 @@ def _build_cure_data(conn) -> dict:
 
     industries = queries.get_ticker_industries(conn)
 
+    # Hotfix: deferred import restored — Sprint C2 removed build_top_strip's
+    # deferred import which _build_cure_data depended on via module namespace.
+    # Followup #33 will plumb DeskSnapshot betas here instead.
+    from agt_equities.beta_cache import get_betas
+
     ps = PortfolioState(
         household_nlv=hh_nlv,
         household_el=_build_household_el(top, hh_nlv),  # Sprint 1F Fix 3C
