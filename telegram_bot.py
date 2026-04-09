@@ -5585,6 +5585,44 @@ def _increment_revalidation_count(audit_id: str) -> None:
         iso_conn.close()
 
 
+def _revert_transmitting_to_cancelled(audit_id: str, reason: str) -> int:
+    """Revert a TRANSMITTING row to CANCELLED after a Step 7 early-exit.
+
+    Used when gate check fails or kill-switch fires AFTER the Step 6 CAS
+    lock (ATTESTED → TRANSMITTING) has already been acquired. Idempotent:
+    if the row is no longer TRANSMITTING, the UPDATE is a no-op.
+
+    NOT used for TRANSMIT_IB_ERROR (the `except Exception as ib_err:` branch
+    in handle_dex_callback) — that path is intentionally sticky because
+    we don't know if the IBKR order reached the wire mid-flight.
+
+    Returns cursor.rowcount (0 if idempotent no-op, 1 on successful revert).
+    All exceptions swallowed with logger.exception — this helper must never
+    raise into the caller's error handling path.
+    """
+    try:
+        with closing(_get_db_connection()) as conn:
+            with conn:
+                result = conn.execute(
+                    "UPDATE bucket3_dynamic_exit_log "
+                    "SET final_status = 'CANCELLED', "
+                    "    last_updated = CURRENT_TIMESTAMP "
+                    "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+                    (audit_id,),
+                )
+        logger.info(
+            "DEX_REVERT: audit_id=%s rowcount=%d reason=%s",
+            audit_id, result.rowcount, reason,
+        )
+        return result.rowcount
+    except Exception as exc:
+        logger.exception(
+            "DEX_REVERT_FAILED: audit_id=%s reason=%s error=%s",
+            audit_id, reason, exc,
+        )
+        return 0
+
+
 async def handle_dex_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
@@ -5918,40 +5956,6 @@ async def handle_dex_callback(
 
         # Followup #20: route to originating account (fail-closed on NULL)
         account_id = row["originating_account_id"]
-        if not account_id:
-            logger.error(
-                "TRANSMIT_BLOCKED_NULL_ACCOUNT: audit_id=%s household=%s",
-                audit_id, row["household"],
-            )
-            try:
-                await context.bot.send_message(
-                    chat_id=AUTHORIZED_USER_ID,
-                    text=(
-                        f"\U0001f6a8 TRANSMIT BLOCKED\n"
-                        f"Row {audit_id[:8]}... has NULL originating_account_id.\n"
-                        f"Ticker: {ticker} | Household: {row['household']}\n\n"
-                        f"This row was staged before Followup #20 or via a path "
-                        f"that does not capture account. Use /recover_transmitting."
-                    ),
-                )
-            except Exception:
-                pass
-            with closing(_get_db_connection()) as cancel_conn:
-                with cancel_conn:
-                    cancel_conn.execute(
-                        "UPDATE bucket3_dynamic_exit_log "
-                        "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
-                        "WHERE audit_id = ? AND final_status = 'ATTESTED'",
-                        (audit_id,),
-                    )
-            try:
-                await query.edit_message_text(
-                    f"\U0001f6a8 TRANSMIT BLOCKED: {ticker} {audit_id[:8]}... "
-                    f"has no originating account. Cancelled."
-                )
-            except Exception:
-                pass
-            return
         limit_for_order = _round_to_nickel(row['limit_price']) if action_type == "CC" else row['limit_price']
         order = _build_adaptive_sell_order(qty, limit_for_order, account_id)
         order.orderRef = audit_id  # Followup #17: cryptographic 1:1 link for orphan recovery
@@ -5963,12 +5967,14 @@ async def handle_dex_callback(
         )
         if not gate_ok:
             logger.error("DEX TRANSMIT blocked: audit_id=%s reason=%s", audit_id, gate_reason)
+            _revert_transmitting_to_cancelled(audit_id, f"gate_blocked: {gate_reason}")
             try:
                 await query.edit_message_text(
                     f"\U0001f6ab GATE BLOCKED: {ticker} {audit_id[:8]}...\n{gate_reason}",
                 )
             except Exception:
                 pass
+            _dispatched_audits.discard(audit_id)
             return
 
         assert_execution_enabled(in_process_halted=_HALTED)
@@ -5976,11 +5982,13 @@ async def handle_dex_callback(
         ib_order_id = trade.order.orderId if trade else 0
     except ExecutionDisabledError as exd:
         logger.error("EXECUTION BLOCKED at placeOrder (dex): %s", exd)
+        _revert_transmitting_to_cancelled(audit_id, f"execution_disabled: {exd}")
         try:
             await query.edit_message_text(f"\U0001f6d1 EXECUTION BLOCKED: {exd}")
         except Exception:
             pass
         await _alert_telegram(f"\U0001f6d1 Execution blocked (dex {ticker}): {exd}")
+        _dispatched_audits.discard(audit_id)
         return
     except Exception as ib_err:
         # TRANSMIT_IB_ERROR: leave in TRANSMITTING, alert operator, NO auto-revert
