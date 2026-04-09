@@ -12077,6 +12077,75 @@ def main() -> None:
             name="staged_alert_flush",
         )
         logger.info("Scheduled: staged_alert_flush every 15s")
+
+        # Sprint 1F Fix 2: daily beta cache refresh (04:00 local, pre-market)
+        async def _beta_cache_refresh_job(context):
+            if _HALTED:
+                return
+            try:
+                from agt_equities.beta_cache import refresh_beta_cache
+                tickers = []
+                try:
+                    from agt_equities import trade_repo
+                    from pathlib import Path
+                    trade_repo.DB_PATH = str(Path(__file__).resolve().parent / "agt_desk.db")
+                    cycles = trade_repo.get_active_cycles()
+                    tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE'})
+                except Exception:
+                    pass
+                if tickers:
+                    await asyncio.to_thread(refresh_beta_cache, tickers)
+            except Exception as exc:
+                logger.warning("beta_cache_refresh_job failed: %s", exc)
+
+        from datetime import time as _dt_time
+        jq.run_daily(
+            callback=_beta_cache_refresh_job,
+            time=_dt_time(4, 0),
+            name="beta_cache_refresh",
+        )
+        logger.info("Scheduled: beta_cache_refresh daily at 04:00")
+        async def _beta_startup_check(context):
+            await _beta_cache_refresh_job(context)
+        jq.run_once(_beta_startup_check, when=10, name="beta_startup")
+
+        # Sprint 1F Fix 6: daily R7 corporate intel refresh (05:00 local)
+        async def _corporate_intel_refresh_job(context):
+            if _HALTED:
+                return
+            try:
+                from agt_equities.providers.yfinance_corporate_intelligence import (
+                    YFinanceCorporateIntelligenceProvider,
+                )
+                tickers = []
+                try:
+                    from agt_equities import trade_repo
+                    from pathlib import Path as _P
+                    trade_repo.DB_PATH = str(_P(__file__).resolve().parent / "agt_desk.db")
+                    cycles = trade_repo.get_active_cycles()
+                    tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE'})
+                except Exception:
+                    pass
+                if tickers:
+                    provider = YFinanceCorporateIntelligenceProvider()
+                    for tk in tickers:
+                        try:
+                            await asyncio.to_thread(provider.get_corporate_calendar, tk)
+                        except Exception as tk_exc:
+                            logger.warning("corporate_intel refresh failed for %s: %s", tk, tk_exc)
+                    logger.info("corporate_intel: refreshed %d tickers", len(tickers))
+            except Exception as exc:
+                logger.warning("corporate_intel_refresh_job failed: %s", exc)
+
+        jq.run_daily(
+            callback=_corporate_intel_refresh_job,
+            time=_dt_time(5, 0),
+            name="corporate_intel_refresh",
+        )
+        logger.info("Scheduled: corporate_intel_refresh daily at 05:00")
+        async def _corporate_intel_startup(context):
+            await _corporate_intel_refresh_job(context)
+        jq.run_once(_corporate_intel_startup, when=15, name="corporate_intel_startup")
     else:
         logger.warning("JobQueue not available — scheduled jobs not registered")
 
