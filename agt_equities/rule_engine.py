@@ -1529,7 +1529,7 @@ def evaluate_all(
     results.extend(evaluate_rule_4(ps, household))   # returns list (pairs)
     results.append(evaluate_rule_5(ps, household))
     results.append(evaluate_rule_6(ps, household))
-    results.extend(evaluate_rule_7(ps, household))
+    results.extend(evaluate_rule_7(ps, household, conn=conn))
     results.append(evaluate_rule_8(ps, household))
     # R9 reads R1-R8 results; pass them so compositor can evaluate breaches
     results.append(evaluate_rule_9(ps, household, prior_evals=results, conn=conn))

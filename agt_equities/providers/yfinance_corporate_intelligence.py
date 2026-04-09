@@ -65,9 +65,17 @@ class YFinanceCorporateIntelligenceProvider:
                 if cal is not None and isinstance(cal, dict):
                     earn = cal.get("Earnings Date")
                     if earn and len(earn) > 0:
-                        next_earnings = earn[0].date() if hasattr(earn[0], "date") else None
-            except Exception:
-                pass
+                        # yfinance 1.2.0 returns datetime.date;
+                        # earlier versions returned datetime.datetime.
+                        _raw = earn[0]
+                        if isinstance(_raw, datetime):
+                            next_earnings = _raw.date()
+                        elif isinstance(_raw, date):
+                            next_earnings = _raw
+                        else:
+                            next_earnings = None
+            except Exception as cal_exc:
+                logger.warning("yfinance calendar extraction failed for %s: %s", ticker, cal_exc)
 
             ex_div = None
             div_amount = 0.0
