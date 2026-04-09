@@ -1046,7 +1046,7 @@ async def _check_rule_11_leverage(household: str) -> tuple[bool, str]:
     """Check Rule 11 leverage cap. Returns (ok, message).
     ok=True means CSP staging is allowed. ok=False means blocked."""
     try:
-        from agt_deck.risk import gross_beta_leverage, LEVERAGE_LIMIT
+        from agt_equities.risk import gross_beta_leverage, LEVERAGE_LIMIT
         from agt_equities import trade_repo
         trade_repo.DB_PATH = DB_PATH
         cycles = trade_repo.get_active_cycles()

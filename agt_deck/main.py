@@ -20,7 +20,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agt_deck.db import get_ro_conn, get_rw_conn
-from agt_deck import queries, risk, formatters
+from agt_deck import queries, formatters
+from agt_equities import risk
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("agt_deck")

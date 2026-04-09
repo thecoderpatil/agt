@@ -2,8 +2,8 @@
 import sys, os, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from agt_deck import risk
-from agt_deck.risk import vix_required_el_pct
+from agt_equities import risk
+from agt_equities.risk import vix_required_el_pct
 
 
 class TestVixElTableV8(unittest.TestCase):
