@@ -953,5 +953,61 @@ class TestBuildCureDataWithNonEmptyCycles(unittest.TestCase):
                 pass
 
 
+# ── AGTFormattedBot subclass tests (PTB 22.7 compat) ────────────────
+
+class TestAGTFormattedBotIsExtBot(unittest.TestCase):
+    """Bot subclass must inherit from ExtBot."""
+
+    def test_isinstance(self):
+        from telegram.ext import ExtBot
+        from telegram_bot import AGTFormattedBot
+        bot = AGTFormattedBot(token="test:fake_token_for_unit_test")
+        self.assertIsInstance(bot, ExtBot)
+
+
+class TestAGTFormattedBotSendMessage(unittest.TestCase):
+    """send_message must apply _format_outbound to text."""
+
+    def test_send_message_formats_text(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from telegram_bot import AGTFormattedBot, _format_outbound
+
+        bot = AGTFormattedBot(token="test:fake_token_for_unit_test")
+        with patch.object(
+            bot.__class__.__bases__[0], "send_message", new_callable=AsyncMock
+        ) as mock_super:
+            mock_super.return_value = None
+            asyncio.get_event_loop().run_until_complete(
+                bot.send_message(chat_id=123, text="hello")
+            )
+            mock_super.assert_called_once()
+            call_args = mock_super.call_args
+            sent_text = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("text")
+            self.assertEqual(sent_text, _format_outbound("hello"))
+
+
+class TestAGTFormattedBotEditMessageText(unittest.TestCase):
+    """edit_message_text must apply _format_outbound to text."""
+
+    def test_edit_message_text_formats_text(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from telegram_bot import AGTFormattedBot, _format_outbound
+
+        bot = AGTFormattedBot(token="test:fake_token_for_unit_test")
+        with patch.object(
+            bot.__class__.__bases__[0], "edit_message_text", new_callable=AsyncMock
+        ) as mock_super:
+            mock_super.return_value = None
+            asyncio.get_event_loop().run_until_complete(
+                bot.edit_message_text(text="world", chat_id=123, message_id=456)
+            )
+            mock_super.assert_called_once()
+            call_args = mock_super.call_args
+            sent_text = call_args[0][0] if call_args[0] else call_args[1].get("text")
+            self.assertEqual(sent_text, _format_outbound("world"))
+
+
 if __name__ == "__main__":
     unittest.main()

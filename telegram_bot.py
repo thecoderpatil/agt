@@ -48,6 +48,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
+    ExtBot,
     MessageHandler,
     ContextTypes,
     filters,
@@ -706,6 +707,24 @@ def _mode_prefix(text: str) -> str:
 def _format_outbound(text: str) -> str:
     """Apply all outbound Telegram text formatting: paper prefix + mode prefix."""
     return _paper_prefix(_mode_prefix(text))
+
+
+class AGTFormattedBot(ExtBot):
+    """ExtBot subclass that applies _format_outbound to all outbound text.
+
+    Replaces the monkey-patch approach (Sprint 1C/1D) which broke on
+    PTB 22.7 due to TelegramObject._frozen attribute lockdown.
+    Coverage: send_message + edit_message_text. reply_text gap remains
+    (Followup #14).
+    """
+
+    async def send_message(self, chat_id, text, *args, **kwargs):
+        text = _format_outbound(text)
+        return await super().send_message(chat_id, text, *args, **kwargs)
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        text = _format_outbound(text)
+        return await super().edit_message_text(text, *args, **kwargs)
 
 
 async def _alert_telegram(text: str) -> None:
@@ -9280,9 +9299,10 @@ def main() -> None:
         "loaded" if _RULEBOOK_TEXT else "NOT FOUND",
     )
 
+    bot = AGTFormattedBot(token=TELEGRAM_BOT_TOKEN)
     app = (
         ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
+        .bot(bot)
         .post_init(post_init)
         .post_shutdown(_graceful_shutdown)
         .build()
@@ -9448,29 +9468,10 @@ def main() -> None:
     else:
         logger.warning("JobQueue not available — scheduled jobs not registered")
 
-    # Sprint 1C+1D: install outbound formatting hooks (paper prefix + mode prefix)
-    _orig_send = app.bot.send_message
-    _orig_edit = app.bot.edit_message_text
-
-    async def _send_wrapped(*args, **kwargs):
-        if "text" in kwargs:
-            kwargs["text"] = _format_outbound(kwargs["text"])
-        elif len(args) >= 2:
-            args = list(args)
-            args[1] = _format_outbound(args[1])
-        return await _orig_send(*args, **kwargs)
-
-    async def _edit_wrapped(*args, **kwargs):
-        if "text" in kwargs:
-            kwargs["text"] = _format_outbound(kwargs["text"])
-        return await _orig_edit(*args, **kwargs)
-
-    app.bot.send_message = _send_wrapped
-    app.bot.edit_message_text = _edit_wrapped
-    logger.info("Outbound formatting hooks installed (paper=%s, mode prefix=active)", PAPER_MODE)
-    # TODO Sprint 2: add PTB middleware to also cover reply_text calls.
-    # Current coverage: _alert_telegram, bot.send_message, bot.edit_message_text.
-    # Gap: ~125 reply_text sites in command handlers.
+    # Sprint 1C+1D outbound formatting now handled by AGTFormattedBot subclass
+    # (replaces monkey-patch that broke on PTB 22.7 TelegramObject._frozen lockdown).
+    # Followup #14 still open: ~53 reply_text sites bypass _format_outbound.
+    logger.info("Outbound formatting via AGTFormattedBot (paper=%s, mode prefix=active)", PAPER_MODE)
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
