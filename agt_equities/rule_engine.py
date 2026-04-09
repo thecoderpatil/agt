@@ -1489,8 +1489,8 @@ def evaluate_rule_9_composite(
         rule_id="rule_9", rule_name="Red Alert",
         household=household, ticker=None,
         raw_value=conditions_count, status=status,
-        message=f"Red Alert {'ACTIVE' if new_state == 'ON' else 'OFF'} "
-                f"({conditions_count}/3 conditions: {','.join(conditions_met) or 'none'})",
+       message=f"Red Alert {'ACTIVE' if new_state == 'ON' else 'OFF'} "
+                f"({conditions_count}/4 conditions: {','.join(conditions_met) or 'none'})",
         detail={
             "red_alert_active": new_state == "ON",
             "conditions_met": conditions_met,

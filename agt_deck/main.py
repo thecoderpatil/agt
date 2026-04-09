@@ -156,7 +156,19 @@ def build_top_strip(conn) -> dict:
     from agt_equities.state_builder import build_state
     from agt_equities import trade_repo
 
-    snapshot = build_state(db_path=str(trade_repo.DB_PATH))
+    _el_data = queries.get_health_strip_data(conn)
+    live_nlv_dict = {
+        account["account_id"]: float(account["nlv"])
+        for account in _el_data.get("accounts", [])
+        if account.get("account_id")
+        and account.get("nlv") is not None
+        and not account.get("is_stale")
+    }
+
+    snapshot = build_state(
+        db_path=str(trade_repo.DB_PATH),
+        live_nlv=live_nlv_dict or None,
+    )
 
     # Filter "live_positions not provided" — expected noise at this layer
     # because build_top_strip has no IB context.
@@ -188,7 +200,6 @@ def build_top_strip(conn) -> dict:
 
     # Sprint 1F Fix 3B: read EL from el_snapshots (written by bot's el_snapshot_writer)
     el_retain_pct = risk.vix_required_el_pct(vix) if vix else None
-    _el_data = queries.get_health_strip_data(conn)
     _yash_el = sum(
         a["excess_liquidity"] or 0 for a in _el_data.get("accounts", [])
         if a.get("household") == "Yash_Household" and a.get("excess_liquidity") is not None
