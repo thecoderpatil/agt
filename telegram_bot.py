@@ -76,6 +76,7 @@ finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 # Sprint C pre-step: canonical home is now agt_equities/config.py
 from agt_equities.config import (  # noqa: E402
     PAPER_MODE, HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, ACTIVE_ACCOUNTS,
+    MARGIN_ACCOUNTS,
 )
 
 IB_HOST         = "127.0.0.1"
@@ -1401,21 +1402,17 @@ else:
     ACCOUNT_LABELS = _LIVE_ACCOUNT_LABELS
 
 # ---------------------------------------------------------------------------
-# Margin-eligible accounts for Rule 2 EL% calculation
-# Roth IRA and Traditional IRA are EXCLUDED — they cannot deploy margin
-# or sell naked CSPs. See Rulebook v5, Rule 2.
+# Margin-eligible accounts — Sprint D: MARGIN_ACCOUNTS imported from config.py
+# ACCOUNT_NAMES: display labels for IB subscription routing
 # ---------------------------------------------------------------------------
-_LIVE_MARGIN_ACCOUNTS = {"U21971297", "U22388499"}
 _LIVE_ACCOUNT_NAMES = {
     "U21971297": "Personal Brokerage",
     "U22388499": "Brother Brokerage",
 }
 if PAPER_MODE:
-    MARGIN_ACCOUNTS = set(ACCOUNT_TO_HOUSEHOLD.keys())
     ACCOUNT_NAMES = {acct: f"Paper-{hh.replace('_Household', '')}"
                      for acct, hh in ACCOUNT_TO_HOUSEHOLD.items()}
 else:
-    MARGIN_ACCOUNTS = _LIVE_MARGIN_ACCOUNTS
     ACCOUNT_NAMES = _LIVE_ACCOUNT_NAMES
 
 # ---------------------------------------------------------------------------

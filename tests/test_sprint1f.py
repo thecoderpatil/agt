@@ -784,5 +784,116 @@ class TestTopStripBreatheClass(unittest.TestCase):
             )
 
 
+# ── Sprint D: margin config + Rule 6 regression ─────────────────────
+
+class TestMarginEligibleAccountsLiveMode(unittest.TestCase):
+    """D test #1: MARGIN_ELIGIBLE_ACCOUNTS has correct live-mode values."""
+
+    def test_live_mode_values(self):
+        from agt_equities.config import MARGIN_ELIGIBLE_ACCOUNTS, PAPER_MODE
+        if not PAPER_MODE:
+            self.assertEqual(
+                MARGIN_ELIGIBLE_ACCOUNTS,
+                {"Yash_Household": ["U21971297"], "Vikram_Household": ["U22388499"]},
+            )
+
+
+class TestMarginAccountsIsFrozenset(unittest.TestCase):
+    """D test #2: MARGIN_ACCOUNTS is frozenset with correct derived contents."""
+
+    def test_is_frozenset(self):
+        from agt_equities.config import MARGIN_ACCOUNTS, MARGIN_ELIGIBLE_ACCOUNTS
+        self.assertIsInstance(MARGIN_ACCOUNTS, frozenset)
+        expected = frozenset(
+            acct for accts in MARGIN_ELIGIBLE_ACCOUNTS.values() for acct in accts
+        )
+        self.assertEqual(MARGIN_ACCOUNTS, expected)
+
+
+class TestRule6DerivesVikramFromConfig(unittest.TestCase):
+    """D test #3: Rule 6 reads Vikram account from config, not hardcoded."""
+
+    def test_rule_6_uses_config_account(self):
+        from agt_equities.rule_engine import PortfolioState, evaluate_rule_6, AccountELSnapshot
+
+        # Build PortfolioState with Vikram's configured account in account_el
+        from agt_equities.config import MARGIN_ELIGIBLE_ACCOUNTS
+        vikram_acct_id = MARGIN_ELIGIBLE_ACCOUNTS["Vikram_Household"][0]
+
+        ps = PortfolioState(
+            household_nlv={"Vikram_Household": 100000.0},
+            household_el={"Vikram_Household": 30000.0},
+            active_cycles=[],
+            spots={},
+            betas={},
+            industries={},
+            sector_overrides={},
+            vix=18.0,
+            report_date="20260409",
+            account_el={
+                vikram_acct_id: AccountELSnapshot(
+                    excess_liquidity=25000.0,
+                    net_liquidation=100000.0,
+                    timestamp="2026-04-09T10:00:00",
+                    stale=False,
+                ),
+            },
+            account_nlv={vikram_acct_id: 100000.0},
+        )
+        result = evaluate_rule_6(ps, "Vikram_Household")
+        self.assertEqual(result.status, "GREEN")
+        self.assertAlmostEqual(result.raw_value, 25.0)  # 25000/100000 * 100
+
+
+class TestRule6HandlesMissingVikramConfig(unittest.TestCase):
+    """D test #4: Rule 6 returns GREEN when Vikram config is empty."""
+
+    def test_missing_vikram_returns_green(self):
+        from unittest.mock import patch
+        from agt_equities.rule_engine import PortfolioState, evaluate_rule_6
+
+        ps = PortfolioState(
+            household_nlv={"Vikram_Household": 100000.0},
+            household_el={},
+            active_cycles=[],
+            spots={},
+            betas={},
+            industries={},
+            sector_overrides={},
+            vix=18.0,
+            report_date="20260409",
+        )
+        with patch("agt_equities.rule_engine.MARGIN_ELIGIBLE_ACCOUNTS",
+                    {"Yash_Household": ["U21971297"]}):
+            result = evaluate_rule_6(ps, "Vikram_Household")
+        self.assertEqual(result.status, "GREEN")
+        self.assertIn("no Vikram margin-eligible account configured", result.message)
+
+
+class TestNoHardcodedAccountIdsInRuleEngine(unittest.TestCase):
+    """D test #5: AST guard — no U-prefixed 8-digit string literals in rule_engine.py."""
+
+    def test_no_hardcoded_account_ids(self):
+        import ast
+        import re
+        re_path = os.path.join(
+            os.path.dirname(__file__), "..", "agt_equities", "rule_engine.py"
+        )
+        with open(re_path) as f:
+            tree = ast.parse(f.read())
+
+        pattern = re.compile(r"^U\d{8}$")
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if pattern.match(node.value):
+                    found.append((node.lineno, node.value))
+
+        self.assertEqual(
+            found, [],
+            f"Hardcoded account IDs in rule_engine.py: {found}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

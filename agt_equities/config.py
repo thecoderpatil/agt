@@ -9,6 +9,8 @@ Exported:
     HOUSEHOLD_MAP           — forward map: household → [account_ids]
     ACCOUNT_TO_HOUSEHOLD    — derived inverse: account_id → household
     ACTIVE_ACCOUNTS         — list of all account IDs in HOUSEHOLD_MAP
+    MARGIN_ELIGIBLE_ACCOUNTS — household → margin-eligible account IDs
+    MARGIN_ACCOUNTS         — frozenset of all margin-eligible account IDs
 """
 from __future__ import annotations
 
@@ -58,3 +60,21 @@ ACCOUNT_TO_HOUSEHOLD: Dict[str, str] = {
 }
 
 ACTIVE_ACCOUNTS: List[str] = list(ACCOUNT_TO_HOUSEHOLD)
+
+# ── Margin-eligible accounts (Sprint D) ──
+# IRA accounts excluded — can't deploy margin or sell naked CSPs.
+# Per Rulebook v5 Rule 2. Paper mode treats all accounts as margin-eligible.
+_LIVE_MARGIN_ELIGIBLE: Dict[str, List[str]] = {
+    "Yash_Household": ["U21971297"],
+    "Vikram_Household": ["U22388499"],
+}
+
+MARGIN_ELIGIBLE_ACCOUNTS: Dict[str, List[str]] = (
+    {hh: list(accts) for hh, accts in HOUSEHOLD_MAP.items()}
+    if PAPER_MODE
+    else _LIVE_MARGIN_ELIGIBLE
+)
+
+MARGIN_ACCOUNTS: frozenset = frozenset(
+    acct for accts in MARGIN_ELIGIBLE_ACCOUNTS.values() for acct in accts
+)

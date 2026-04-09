@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Optional
 
+from agt_equities.config import MARGIN_ELIGIBLE_ACCOUNTS
 from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 
 logger = logging.getLogger(__name__)
@@ -233,10 +234,7 @@ _VIX_EL_TABLE_V9 = [
 # Stage 1 implementation used all-account NLV (Reading 1) which
 # silently diluted Yash ratio by including $152K Roth NLV in
 # denominator. Corrected 2026-04-07 Phase 3A.5a triage.
-MARGIN_ELIGIBLE_ACCOUNTS: dict[str, list[str]] = {
-    "Yash_Household": ["U21971297"],          # Individual only
-    "Vikram_Household": ["U22388499"],        # Single account
-}
+# Sprint D: MARGIN_ELIGIBLE_ACCOUNTS now imported from agt_equities.config (paper-aware).
 
 def evaluate_rule_2(ps: PortfolioState, household: str) -> RuleEvaluation:
     """Rule 2: EL deployment governor.
@@ -741,7 +739,7 @@ def stage_stock_sale_via_smart_friction(
 
 
 def evaluate_rule_6(ps: PortfolioState, household: str) -> RuleEvaluation:
-    """Rule 6: Vikram IND (U22388499) EL ≥ 20% of NLV.
+    """Rule 6: Vikram Household margin account EL ≥ 20% of NLV.
 
     4-tier status per Rulebook v9 lines 138-149:
       ratio >= 0.25         → GREEN  (healthy buffer above floor)
@@ -765,8 +763,19 @@ def evaluate_rule_6(ps: PortfolioState, household: str) -> RuleEvaluation:
             message="Rule 6 applies only to Vikram_Household",
         )
 
+    # Sprint D: derive Vikram margin account from config (paper-aware)
+    vikram_accts = MARGIN_ELIGIBLE_ACCOUNTS.get("Vikram_Household", [])
+    if not vikram_accts:
+        return RuleEvaluation(
+            rule_id="rule_6", rule_name="Vikram EL Floor",
+            household=household, ticker=None,
+            raw_value=None, status="GREEN",
+            message="Rule 6: no Vikram margin-eligible account configured",
+        )
+    vikram_acct_id = vikram_accts[0]
+
     # Try account-level data first (Phase 3A.5a), fall back to household_el
-    vikram_acct = ps.account_el.get("U22388499")
+    vikram_acct = ps.account_el.get(vikram_acct_id)
     if vikram_acct is not None:
         el = vikram_acct.excess_liquidity
         nlv = vikram_acct.net_liquidation
