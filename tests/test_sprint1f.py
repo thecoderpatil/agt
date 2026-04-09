@@ -672,5 +672,98 @@ class TestBuildTopStripNavMatchesBuildState(_TopStripDBMixin, unittest.TestCase)
             trade_repo.DB_PATH = orig_db_path
 
 
+# ── Polish G2: Underwater Positions tests ────────────────────────────
+
+class TestBuildUnderwaterRowsFilter(unittest.TestCase):
+    """G2 test #1: _build_underwater_rows filters correctly."""
+
+    def test_filter_logic(self):
+        from agt_deck.main import _build_underwater_rows
+        cycles = [
+            # Included: DTE <= 5
+            {"ticker": "AAPL", "household": "Yash", "nearest_dte": 3,
+             "unreal_pct": -5.0, "unreal_dollar": -500, "open_short_calls": 1},
+            # Included: loss > 15% AND |$loss| >= $1500
+            {"ticker": "MSFT", "household": "Yash", "nearest_dte": 10,
+             "unreal_pct": -20.0, "unreal_dollar": -2000, "open_short_calls": 0},
+            # Excluded: DTE=10, loss=10% (neither threshold met)
+            {"ticker": "GOOG", "household": "Vikram", "nearest_dte": 10,
+             "unreal_pct": -10.0, "unreal_dollar": -800, "open_short_calls": 1},
+        ]
+        result = _build_underwater_rows(cycles)
+        tickers = [r["ticker"] for r in result]
+        self.assertEqual(len(result), 2)
+        self.assertIn("AAPL", tickers)
+        self.assertIn("MSFT", tickers)
+        self.assertNotIn("GOOG", tickers)
+
+
+class TestBuildUnderwaterRowsSort(unittest.TestCase):
+    """G2 test #2: _build_underwater_rows sorts by unreal_pct asc."""
+
+    def test_sort_order(self):
+        from agt_deck.main import _build_underwater_rows
+        cycles = [
+            {"ticker": "A", "household": "Yash", "nearest_dte": 2,
+             "unreal_pct": -5.0, "unreal_dollar": -500, "open_short_calls": 0},
+            {"ticker": "B", "household": "Yash", "nearest_dte": 1,
+             "unreal_pct": -30.0, "unreal_dollar": -3000, "open_short_calls": 1},
+            {"ticker": "C", "household": "Vikram", "nearest_dte": 3,
+             "unreal_pct": -15.0, "unreal_dollar": -1500, "open_short_calls": 0},
+        ]
+        result = _build_underwater_rows(cycles)
+        pcts = [r["unreal_pct"] for r in result]
+        self.assertEqual(pcts, [-30.0, -15.0, -5.0])
+
+
+class TestBuildCureDataIncludesUnderwater(unittest.TestCase):
+    """G2 test #3: _build_cure_data return dict contains 'underwater' key."""
+
+    def test_underwater_key_present(self):
+        from unittest.mock import patch, MagicMock
+        from agt_equities import trade_repo
+        from pathlib import Path
+        import tempfile
+
+        # Create minimal temp DB for build_state + _build_cure_data
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        db_path = tmp.name
+        tmp.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE master_log_nav (account_id TEXT, report_date TEXT, total TEXT)")
+        conn.execute("INSERT INTO master_log_nav VALUES ('U21971297', '20260409', '200000')")
+        conn.execute("CREATE TABLE beta_cache (ticker TEXT PRIMARY KEY, beta REAL DEFAULT 1.0, fetched_ts TEXT DEFAULT (datetime('now')))")
+        conn.execute("CREATE TABLE bucket3_dynamic_exit_log (audit_id TEXT PRIMARY KEY, trade_date TEXT, ticker TEXT, household TEXT, desk_mode TEXT DEFAULT 'PEACETIME', action_type TEXT DEFAULT 'CC', household_nlv REAL DEFAULT 0, underlying_spot_at_render REAL DEFAULT 0, final_status TEXT DEFAULT 'STAGED', last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("CREATE TABLE master_log_change_in_nav (account_id TEXT, starting_value TEXT, ending_value TEXT, twr TEXT, deposits_withdrawals TEXT, asset_transfers TEXT)")
+        conn.execute("CREATE TABLE glide_paths (id INTEGER PRIMARY KEY, household_id TEXT, rule_id TEXT, ticker TEXT, baseline_value REAL, target_value REAL, start_date TEXT, target_date TEXT, pause_conditions TEXT, notes TEXT, accelerator_clause TEXT, UNIQUE(household_id, rule_id, ticker))")
+        conn.execute("CREATE TABLE mode_history (id INTEGER PRIMARY KEY, timestamp TEXT, old_mode TEXT, new_mode TEXT, trigger_rule TEXT, trigger_household TEXT, trigger_value REAL, notes TEXT)")
+        conn.commit()
+
+        orig_db_path = trade_repo.DB_PATH
+        trade_repo.DB_PATH = Path(db_path)
+        try:
+            with patch("agt_deck.main.get_vix", return_value=18.0), \
+                 patch("agt_deck.main.get_spots", return_value={}), \
+                 patch("agt_deck.main.load_active_cycles", return_value=[]), \
+                 patch("agt_deck.main.build_cycles_table", return_value=[]):
+                from agt_deck.main import _build_cure_data
+                result = _build_cure_data(conn)
+
+            self.assertIn("underwater", result)
+            self.assertIn("underwater_grouped", result)
+            self.assertIsInstance(result["underwater"], list)
+            self.assertIsInstance(result["underwater_grouped"], list)
+        finally:
+            trade_repo.DB_PATH = orig_db_path
+            conn.close()
+            try:
+                import os
+                os.unlink(db_path)
+            except OSError:
+                pass  # Windows may hold lock briefly after close
+
+
 if __name__ == "__main__":
     unittest.main()

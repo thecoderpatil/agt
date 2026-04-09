@@ -338,6 +338,44 @@ def build_cycles_table() -> list[dict]:
     return rows
 
 
+# ── Underwater Positions helper (shared by command_deck + cure_console) ──
+
+ATTENTION_MIN_LOSS_DOLLAR = 1500
+
+
+def _build_underwater_rows(cycles: list) -> list[dict]:
+    """Filter + sort attention rows for Underwater Positions panel.
+
+    Filter: DTE <= 5 OR (loss > 15% AND |$loss| >= $1500).
+    Enriches each row with has_cc (cycle.open_short_calls > 0).
+    Sort: unreal_pct ascending (biggest loss first), household alpha tiebreak.
+    """
+    attention = [
+        r for r in cycles
+        if (r["nearest_dte"] is not None and r["nearest_dte"] <= 5)
+        or (r["unreal_pct"] is not None and r["unreal_pct"] < -15
+            and r["unreal_dollar"] is not None
+            and abs(r["unreal_dollar"]) >= ATTENTION_MIN_LOSS_DOLLAR)
+    ]
+    for a in attention:
+        a["has_cc"] = a.get("open_short_calls", 0) > 0
+    attention.sort(key=lambda r: (
+        r["unreal_pct"] if r["unreal_pct"] is not None else 0,
+        r.get("household", ""),
+    ))
+    return attention
+
+
+def _group_underwater_by_household(rows: list) -> list[tuple]:
+    """Group underwater rows by household, alpha order. Empty households omitted."""
+    from collections import OrderedDict
+    groups: OrderedDict = OrderedDict()
+    for r in rows:
+        hh = r.get("household", "Unknown")
+        groups.setdefault(hh, []).append(r)
+    return sorted(groups.items())
+
+
 # ── Routes ────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
@@ -350,22 +388,8 @@ async def command_deck(request: Request):
         recon = queries.get_recon_summary(conn)
         recent_orders = queries.get_recent_orders(conn)
 
-        # Underwater positions — DTE ≤ 5 OR (loss > 15% AND > $1500)
-        ATTENTION_MIN_LOSS_DOLLAR = 1500
-        attention = [
-            r for r in cycles
-            if (r["nearest_dte"] is not None and r["nearest_dte"] <= 5)
-            or (r["unreal_pct"] is not None and r["unreal_pct"] < -15
-                and r["unreal_dollar"] is not None and abs(r["unreal_dollar"]) >= ATTENTION_MIN_LOSS_DOLLAR)
-        ]
-        # CC-aware indicator: check if position has active covered calls
-        for a in attention:
-            a["has_cc"] = a.get("open_short_calls", 0) > 0
-        # Sort: biggest loss first, household alphabetical as tiebreak
-        attention.sort(key=lambda r: (
-            r["unreal_pct"] if r["unreal_pct"] is not None else 0,
-            r.get("household", ""),
-        ))
+        attention = _build_underwater_rows(cycles)
+        attention_grouped = _group_underwater_by_household(attention)
 
         # Account pills
         nav_by_acct = top["nav_by_acct"]
@@ -385,6 +409,7 @@ async def command_deck(request: Request):
             "fills": fills,
             "recon": recon,
             "attention": attention,
+            "attention_grouped": attention_grouped,
             "pills": pills,
             "token": request.query_params.get("t", ""),
             "ACCOUNT_ALIAS": queries.ACCOUNT_ALIAS,
@@ -600,6 +625,11 @@ def _build_cure_data(conn) -> dict:
         logger.warning("_build_cure_data: get_staged_dynamic_exits failed: %s", e)
         staged_exits = []
 
+    # G2: Underwater Positions for Cure Console (uses build_cycles_table for dict rows)
+    cycles_for_underwater = build_cycles_table()
+    underwater = _build_underwater_rows(cycles_for_underwater)
+    underwater_grouped = _group_underwater_by_household(underwater)
+
     return {
         "mode": mode,
         "households": hh_sections,
@@ -608,6 +638,8 @@ def _build_cure_data(conn) -> dict:
         "transitions": transitions,
         "top": top,
         "staged_exits": staged_exits,
+        "underwater": underwater,
+        "underwater_grouped": underwater_grouped,
     }
 
 
