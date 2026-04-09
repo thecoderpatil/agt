@@ -119,7 +119,7 @@ class TestNavFreshness(unittest.TestCase):
         except OSError:
             pass
 
-    def _build(self):
+    def _build(self, live_nlv=None):
         """Call build_state with mocked trade_repo."""
         from agt_equities.state_builder import build_state
 
@@ -133,7 +133,7 @@ class TestNavFreshness(unittest.TestCase):
         ):
             # Patch the deferred import inside build_state
             with patch("agt_equities.state_builder.trade_repo", mock_trade_repo, create=True):
-                return build_state(db_path=self._db_path)
+                return build_state(db_path=self._db_path, live_nlv=live_nlv)
 
     def test_live_nav_preferred_when_fresh(self):
         """el_snapshot <120s old → live NLV wins over Flex."""
@@ -146,7 +146,7 @@ class TestNavFreshness(unittest.TestCase):
         snap = self._build()
 
         self.assertAlmostEqual(snap.nav_by_account["U21971297"], 95_000.0)
-        self.assertEqual(snap.nav_source_by_account["U21971297"], "live_ibkr")
+        self.assertEqual(snap.nav_source_by_account["U21971297"], "live_db")
 
     def test_flex_fallback_when_stale(self):
         """el_snapshot >120s old → Flex EOD wins."""
@@ -170,6 +170,37 @@ class TestNavFreshness(unittest.TestCase):
 
         self.assertAlmostEqual(snap.nav_by_account["U21971297"], 100_000.0)
         self.assertEqual(snap.nav_source_by_account["U21971297"], "flex_eod")
+
+
+    def test_live_injected_nlv_wins_over_db(self):
+        """live_nlv param (Tier 1) wins over el_snapshots (Tier 2) and Flex (Tier 3)."""
+        _seed_flex_nav(self._db_path, "U21971297", 100_000.0)
+        _seed_el_snapshot(
+            self._db_path, "U21971297", "Yash_Household",
+            nlv=95_000.0, seconds_ago=30,
+        )
+
+        snap = self._build(live_nlv={"U21971297": 92_000.0})
+
+        self.assertAlmostEqual(snap.nav_by_account["U21971297"], 92_000.0)
+        self.assertEqual(snap.nav_source_by_account["U21971297"], "live_injected")
+
+    def test_live_nlv_partial_injection(self):
+        """live_nlv for one account; other account falls through to Tier 2/3."""
+        _seed_flex_nav(self._db_path, "U21971297", 100_000.0)
+        _seed_flex_nav(self._db_path, "U22388499", 80_000.0)
+        _seed_el_snapshot(
+            self._db_path, "U22388499", "Vikram_Household",
+            nlv=78_000.0, seconds_ago=30,
+        )
+        # Only inject live_nlv for U21971297
+        snap = self._build(live_nlv={"U21971297": 92_000.0})
+
+        self.assertAlmostEqual(snap.nav_by_account["U21971297"], 92_000.0)
+        self.assertEqual(snap.nav_source_by_account["U21971297"], "live_injected")
+        # U22388499 has fresh el_snapshot → Tier 2
+        self.assertAlmostEqual(snap.nav_by_account["U22388499"], 78_000.0)
+        self.assertEqual(snap.nav_source_by_account["U22388499"], "live_db")
 
 
 if __name__ == "__main__":

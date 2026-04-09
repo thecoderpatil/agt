@@ -230,6 +230,7 @@ def _open_readonly(db_path: str) -> sqlite3.Connection:
 def build_state(
     db_path: Optional[str] = None,
     live_positions: Optional[List[dict]] = None,
+    live_nlv: Optional[Dict[str, float]] = None,
 ) -> DeskSnapshot:
     """Build a point-in-time snapshot of desk state.
 
@@ -243,6 +244,10 @@ def build_state(
             (telegram_bot) fetches from IB and passes in. When None,
             DeskSnapshot.live_positions is an empty list and a warning
             records the absence.
+        live_nlv: optional caller-injected per-account NLV from IBKR
+            accountSummary (0-second freshness). When provided, takes
+            priority over el_snapshots and master_log_nav for matching
+            account IDs.
 
     Raises:
         ValueError: if HOUSEHOLD_MAP is empty or NAV query returns zero rows.
@@ -279,11 +284,17 @@ def build_state(
             "NAV query returned zero rows — master_log_nav is empty or DB path is wrong"
         )
 
-    # Overlay live NLV from el_snapshots for accounts with fresh readings
+    # NAV overlay: 3-tier priority
+    # 1. live_nlv param (0-second, caller-injected from accountSummary)
+    # 2. el_snapshots fresh (<120s, via 30s writer job)
+    # 3. master_log_nav (Flex EOD fallback, already in nav_by_account)
     nav_source_by_account: Dict[str, str] = {}
+
+    # Tier 2: el_snapshots query
+    db_live_nav: Dict[str, float] = {}
     try:
-        with _open_readonly(db_path) as snap_conn:
-            _snap_rows = snap_conn.execute("""
+        with _open_readonly(db_path) as _snap_conn:
+            _snap_rows = _snap_conn.execute("""
                 SELECT e1.account_id, e1.nlv
                 FROM el_snapshots e1
                 WHERE e1.id = (
@@ -293,16 +304,20 @@ def build_state(
                 AND e1.nlv IS NOT NULL
                 AND (julianday('now') - julianday(e1.timestamp)) * 86400 <= ?
             """, (120,)).fetchall()
-            live_nav = {r["account_id"]: r["nlv"] for r in _snap_rows}
+            db_live_nav = {r["account_id"]: r["nlv"] for r in _snap_rows}
     except Exception:
         # el_snapshots may not exist in test DBs or pre-Sprint-1B schemas.
         # Silently fall back to Flex-only NAV — not an operational warning.
-        live_nav = {}
+        db_live_nav = {}
 
+    # Apply priority: injected > db_live > flex_eod
     for acct_id in nav_by_account:
-        if acct_id in live_nav:
-            nav_by_account[acct_id] = live_nav[acct_id]
-            nav_source_by_account[acct_id] = "live_ibkr"
+        if live_nlv and acct_id in live_nlv:
+            nav_by_account[acct_id] = live_nlv[acct_id]
+            nav_source_by_account[acct_id] = "live_injected"
+        elif acct_id in db_live_nav:
+            nav_by_account[acct_id] = db_live_nav[acct_id]
+            nav_source_by_account[acct_id] = "live_db"
         else:
             nav_source_by_account[acct_id] = "flex_eod"
 
