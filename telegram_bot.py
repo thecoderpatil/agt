@@ -102,6 +102,10 @@ CLAUDE_MODEL_OPUS    = "claude-opus-4-6"
 # Process-local — on restart, all ATTESTED rows re-deliver (idempotent via
 # TRANSMITTING atomic lock in handle_dex_callback).
 _dispatched_audits: set[str] = set()
+
+# Sprint 1A/1D: /halt killswitch
+_HALTED: bool = False
+
 MAX_HISTORY          = 50
 MAX_ROUNDS           = 15
 MAX_TOKENS_PER_REPLY = 8192
@@ -4689,6 +4693,16 @@ async def handle_orders_callback(
 
                 if target_trade:
                     target_trade.order.lmtPrice = round(nat_val, 2)
+                    # Sprint 1A: unified pre-trade gate
+                    gate_ok, gate_reason = await _pre_trade_gates(
+                        target_trade.order, target_trade.contract,
+                        {"site": "orders_match_mid", "audit_id": None,
+                         "household": ACCOUNT_TO_HOUSEHOLD.get(o.get("account_id"))},
+                    )
+                    if not gate_ok:
+                        logger.warning("Match Mid blocked by gate: %s", gate_reason)
+                        failed_count += 1
+                        continue
                     ib_conn.placeOrder(target_trade.contract, target_trade.order)
                     matched_count += 1
                 else:
@@ -7027,6 +7041,21 @@ async def handle_dex_callback(
         order = _build_adaptive_sell_order(qty, row['limit_price'], account_id)
         order.orderRef = audit_id  # Followup #17: cryptographic 1:1 link for orphan recovery
 
+        # Sprint 1A: unified pre-trade gate (defense-in-depth)
+        gate_ok, gate_reason = await _pre_trade_gates(
+            order, contract,
+            {"site": "dex", "audit_id": audit_id, "household": row["household"]},
+        )
+        if not gate_ok:
+            logger.error("DEX TRANSMIT blocked: audit_id=%s reason=%s", audit_id, gate_reason)
+            try:
+                await query.edit_message_text(
+                    f"\U0001f6ab GATE BLOCKED: {ticker} {audit_id[:8]}...\n{gate_reason}",
+                )
+            except Exception:
+                pass
+            return
+
         trade = ib_conn.placeOrder(contract, order)
         ib_order_id = trade.order.orderId if trade else 0
     except Exception as ib_err:
@@ -7119,6 +7148,94 @@ async def handle_dex_callback(
         )
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Sprint 1A: Unified pre-trade safety gates
+# ---------------------------------------------------------------------------
+
+PRE_TRADE_NOTIONAL_CEILING = 25_000
+
+
+async def _pre_trade_gates(
+    order,
+    contract,
+    context: dict,
+) -> tuple[bool, str]:
+    """Unified pre-trade safety gates. Returns (allowed, reason).
+
+    If allowed=False, caller MUST NOT call placeOrder and MUST alert
+    operator with reason. Fail-closed: any exception → block.
+
+    context keys:
+        site: "dex" | "orders_match_mid" | "legacy_approve"
+        audit_id: str | None  (non-None triggers F20 NULL guard)
+        household: str | None
+    """
+    try:
+        site = context.get("site", "unknown")
+        audit_id = context.get("audit_id")
+
+        # Gate 0: Halt killswitch (Sprint 1D)
+        if _HALTED:
+            return (False, "Desk halted via /halt — restart bot to resume")
+
+        # Gate 1: Mode gate — WARTIME blocks non-DEX sites
+        mode = _get_current_desk_mode()
+        if mode == "WARTIME" and site != "dex":
+            return (False, f"WARTIME blocks {site}; only DEX path allowed")
+
+        # Gate 2: Notional ceiling ($25k)
+        sec_type = getattr(contract, "secType", None)
+        qty = abs(getattr(order, "totalQuantity", 0) or 0)
+        if sec_type == "OPT":
+            strike = getattr(contract, "strike", None)
+            if not strike or strike <= 0:
+                return (False, "Notional gate: OPT with missing/zero strike — fail-closed")
+            notional = qty * strike * 100
+        elif sec_type == "STK":
+            price = getattr(order, "lmtPrice", None)
+            if not price or price <= 0:
+                return (False, "Notional gate: STK with missing/zero lmtPrice — fail-closed")
+            notional = qty * price
+        else:
+            notional = 0
+
+        if notional > PRE_TRADE_NOTIONAL_CEILING:
+            return (False, f"Notional ${notional:,.0f} exceeds ${PRE_TRADE_NOTIONAL_CEILING:,} ceiling")
+
+        # Gate 3: Non-wheel filter — only OPT and STK allowed
+        if sec_type not in ("OPT", "STK"):
+            return (False, f"Non-wheel trade blocked (secType={sec_type}); use TWS directly")
+
+        # Gate 4: F20 NULL guard — defense-in-depth for DEX path
+        if audit_id is not None:
+            try:
+                with closing(_get_db_connection()) as conn:
+                    row = conn.execute(
+                        "SELECT originating_account_id FROM bucket3_dynamic_exit_log "
+                        "WHERE audit_id = ?",
+                        (audit_id,),
+                    ).fetchone()
+                    if row and not row["originating_account_id"]:
+                        with conn:
+                            conn.execute(
+                                "UPDATE bucket3_dynamic_exit_log "
+                                "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
+                                "WHERE audit_id = ? AND final_status IN ('ATTESTED', 'TRANSMITTING')",
+                                (audit_id,),
+                            )
+                        return (False, f"F20 NULL guard: row {audit_id[:8]}... has no originating_account_id")
+            except Exception as f20_exc:
+                logger.warning("F20 gate check failed: %s", f20_exc)
+                return (False, f"F20 gate error: {f20_exc}")
+
+        # Gate 5: All gates passed
+        return (True, "")
+
+    except Exception as exc:
+        logger.exception("_pre_trade_gates failed: %s", exc)
+        return (False, f"gate error: {exc}")
 
 
 def _build_adaptive_sell_order(
@@ -7235,6 +7352,16 @@ async def _place_single_order(
             exchange="SMART",
         )
         order = _build_adaptive_sell_order(qty, bid, acct_id)
+
+        # Sprint 1A: unified pre-trade gate
+        gate_ok, gate_reason = await _pre_trade_gates(
+            order, contract,
+            {"site": "legacy_approve", "audit_id": None,
+             "household": ACCOUNT_TO_HOUSEHOLD.get(acct_id)},
+        )
+        if not gate_ok:
+            logger.warning("Legacy approve blocked: #%d %s — %s", db_id, ticker, gate_reason)
+            return False, f"#{db_id} {ticker} — gate blocked: {gate_reason}"
 
         # Warn if placing outside market hours — DAY orders won't execute until next session
         now_et = _datetime.now(ET)
@@ -11405,6 +11532,41 @@ async def _scan_orphaned_transmitting_rows(ib_conn, app_bot):
             logger.error("orphan_scan: Telegram alert failed: %s", tg_exc)
 
 
+def _pin_mode_on_startup() -> str | None:
+    """Cold-start mode pin: reset WARTIME → PEACETIME on bot restart.
+
+    If the last mode_history row is WARTIME, insert a PEACETIME transition
+    with trigger_rule='cold_start_pin'. Operator must explicitly re-declare
+    WARTIME if still warranted.
+
+    Returns alert text if pin fired, None otherwise.
+    """
+    try:
+        from agt_equities.mode_engine import get_current_mode, log_mode_transition
+        with closing(_get_db_connection()) as conn:
+            last_mode = get_current_mode(conn)
+            if last_mode != "WARTIME":
+                logger.info("Cold-start mode pin: last mode was %s, no action", last_mode)
+                return None
+            log_mode_transition(
+                conn, "WARTIME", "PEACETIME",
+                trigger_rule="cold_start_pin",
+                notes=(
+                    "Bot restarted while in WARTIME. Auto-pinned to PEACETIME. "
+                    "Operator must explicitly re-declare WARTIME if still warranted."
+                ),
+            )
+            logger.warning("Cold-start mode pin: last mode was WARTIME, pinned to PEACETIME")
+            return (
+                "\U0001f6a8 COLD-START MODE PIN\n"
+                "Last session was WARTIME. Auto-pinned to PEACETIME on restart.\n"
+                "If WARTIME is still warranted, use /declare_wartime."
+            )
+    except Exception as exc:
+        logger.exception("Cold-start mode pin failed: %s", exc)
+        return None
+
+
 async def post_init(app) -> None:
     try:
         ib_conn = await ensure_ib_connected()
@@ -11426,6 +11588,14 @@ async def post_init(app) -> None:
         await _scan_orphaned_transmitting_rows(ib_conn, app.bot)
     except Exception as exc:
         logger.error("Orphan scan failed: %s — bot continues without scan", exc)
+
+    # Sprint 1A: cold-start mode pin (WARTIME → PEACETIME on restart)
+    try:
+        alert = _pin_mode_on_startup()
+        if alert:
+            await _alert_telegram(alert)
+    except Exception as exc:
+        logger.error("Cold-start mode pin alert failed: %s — continuing", exc)
 # ---------------------------------------------------------------------------
 # Beta Impl 3: ATTESTED row poller (R6 — 10s interval, idempotent delivery)
 # ---------------------------------------------------------------------------
