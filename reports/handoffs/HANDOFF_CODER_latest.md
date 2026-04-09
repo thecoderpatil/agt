@@ -1,9 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
 **Last updated:** 2026-04-09
-**Status:** Sprint 1 (A-F) + Cleanup A + Sprint B + Sprint C + Sprint D + Cure Polish COMPLETE. Paper-ready.
-**Tests:** 608/608 passing. Runtime: ~30s.
-**Next:** P3.2 paper run (pending paper account provisioning).
+**Status:** Sprint 1 (A-F) + Cleanup A + Sprint B + Sprint C + Sprint D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix COMPLETE. P3.2-alt pre-flight Day 0 done.
+**Tests:** 620/620 passing. Runtime: ~30s.
+**Next:** P3.2-alt Day 1 cold boot + smoke (read-only live against IBKR).
 
 ---
 
@@ -109,14 +109,14 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 
 ## Current State
 
-- **Tests:** 608/608 (589 baseline through Sprint B + 8 Sprint C1 build_state + 2 Sprint C2 build_top_strip + 3 G2 underwater + 1 G7 breathe + 5 Sprint D margin/rule6)
+- **Tests:** 620/620 (608 through Sprint D + 1 hotfix cure_data + 3 PTB AGTFormattedBot + 1 dump_rules smoke + 5 execution_gate + 2 placeOrder AST guard)
 - **Mode:** PEACETIME
-- **Production DB:** CLEAN
-- **Walker:** fully closed through W3.8 + special dividend fix (.net_cash)
+- **Production DB:** CLEAN, backed up as `agt_desk.db.p3.2alt.bak`
+- **Walker:** fully closed through W3.8 + special dividend fix (.net_cash). 14 active cycles (8 Yash + 6 Vikram).
 - **telegram_bot.py:** ~9,500 lines (down from 12,180 after Cleanup A purge)
 - **Cure Console:** live at `/cure`, Health Strip (10s EL refresh), Lifecycle Queue (10s), Underwater Positions (grouped by household, CC column), linear-breathing top strip
 - **Smart Friction:** Polymorphic. TOCTOU desk_mode guard.
-- **Telegram commands (pruned Sprint 1D):** /start, /status, /orders, /budget, /clear, /reconnect, /vrp, /think, /deep, /approve, /reject, /declare_peacetime, /mode, /cure, /recover_transmitting, /halt
+- **Telegram commands (pruned Sprint 1D):** /start, /status, /orders, /budget, /clear, /reconnect, /vrp, /think, /deep, /approve, /reject, /declare_peacetime, /mode, /cure, /recover_transmitting, /halt, /resume
 - **Killed commands:** /health, /cycles, /ledger, /fills, /dashboard, /cc, /mode1, /scan, /rollcheck, /declare_wartime, /sync_universe, /cleanup_blotter, /status_orders, /stop, /dynamic_exit, /override, /override_earnings, /reconcile, /clear_quarantine
 - **R9 compositor:** WIRED (Sprint B Unit 1). evaluate_all(ps, hh, conn=conn) passes conn for real R9.
 - **Gate 1:** DEDUPED (Sprint B Unit 3). Staging calls canonical evaluate_gate_1.
@@ -127,7 +127,11 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 - **PRAGMA tuning:** WAL + synchronous=FULL + wal_autocheckpoint=4000 + busy_timeout=5000.
 - **DeskSnapshot SSOT (Sprint C):** `build_state()` returns frozen DeskSnapshot (NAV, cycles, betas, DEX encumbrance). `build_top_strip` consumes it.
 - **Config centralized (Sprint C + D):** HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, MARGIN_ELIGIBLE_ACCOUNTS, MARGIN_ACCOUNTS, PAPER_MODE all in `agt_equities/config.py`. Paper-aware. Rule engine imports from config (no hardcoded account IDs).
-- **P3.2 protocol:** `protocols/P3_2_paper_run_protocol.md` — ready to execute on paper account arrival.
+- **Execution kill-switch:** `AGT_EXECUTION_ENABLED` env var (default OFF) + `_HALTED` in-process + `execution_state` DB row. Triple-gate OR logic. All 3 placeOrder sites wrapped. AST guard test enforces. `/halt` persists to DB, `/resume CONFIRM` clears.
+- **AGTFormattedBot:** ExtBot subclass replaces monkey-patch for PTB 22.7 compat. Applies `_format_outbound` (paper + mode prefix) to send_message + edit_message_text.
+- **P3.2-alt protocol:** `protocols/P3_2alt_read_only_live_protocol.md`. P3.2 paper superseded.
+- **dump_rules.py:** `scripts/dump_rules.py` — one-shot rule evaluator for Day 1.4 smoke test. Verified against live DB: 14 cycles, R11 Yash 2.16x / Vikram 2.85x, R9 Red Alert active both households.
+- **P3.2-alt pre-flight:** Day 0 complete. Kill-switch verified, DB backed up, git tag `p3.2alt-start` at `04c1d20`.
 - **GitLab:** `git@gitlab.com:agt-group2/agt-equities-desk.git` (SSH `@yashpatil1`)
 - **GitHub mirror:** push mirror from GitLab (verified)
 - **Litestream:** continuous DB replication to Cloudflare R2
@@ -199,11 +203,27 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 
 **Resolved DEX pre-flight Blockers 1-3.** Paper run unblocked.
 
+## Completed Work — Hotfixes + Safety
+
+| Item | What | Commit |
+|------|------|--------|
+| Hotfix | Restore `get_betas` import in `_build_cure_data` (Sprint C2 fallout) | `13d1db8` |
+| Hotfix | `AGT_DECK_TOKEN` read after `load_dotenv` (config import order) | `617f590` |
+| PTB 22.7 | `AGTFormattedBot(ExtBot)` subclass replaces monkey-patch | `d2ab6d6` |
+| Kill-switch | `execution_gate.py` + `execution_state` DB table + 3 placeOrder wraps + `/halt` persist + `/resume CONFIRM` | `7c821ad` |
+| P3.2-alt | Protocol doc + P3.2 paper marked superseded | `04c1d20` |
+| Doc hygiene | Stale test counts + anchors refreshed | `7c45a6f` |
+| dump_rules | `scripts/dump_rules.py` one-shot rule evaluator for Day 1.4 | `177ad25` |
+
 ---
 
 ## In Flight
 
-**P3.2 Paper Run** — protocol written (`protocols/P3_2_paper_run_protocol.md`), blocked on IBKR paper account provisioning.
+**P3.2-alt Read-Only Live** — Day 0 pre-flight complete. Day 1 cold boot pending operator availability.
+- Protocol: `protocols/P3_2alt_read_only_live_protocol.md`
+- Git tag: `p3.2alt-start` at `04c1d20`
+- DB backup: `agt_desk.db.p3.2alt.bak`
+- Kill-switch: triple-gate verified (env OFF + DB disabled=1 + _HALTED=False)
 
 ---
 
@@ -264,6 +284,10 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 27. **Rule 6 dynamic** (Sprint D) — Vikram account derived from `MARGIN_ELIGIBLE_ACCOUNTS["Vikram_Household"][0]`, not hardcoded. Returns GREEN if config empty.
 28. **Underwater Positions** (G2) — present on BOTH command_deck and cure_console. Grouped by household, dedicated CC column, ▼ sort indicator. Shared `_build_underwater_rows()` helper.
 29. **Breathe animation** (G7) — `.breathe` class on `<header>`, cascades to `.num` children. `:not(.animate-pulse)` excludes WARTIME badges. Hover pauses, reduced-motion disables.
+30. **Execution kill-switch** — triple-gate OR logic: env `AGT_EXECUTION_ENABLED` (default OFF) + `_HALTED` in-process + `execution_state` DB row. All 3 `placeOrder` sites wrapped with `assert_execution_enabled()`. AST guard test enforces. `/halt` persists to DB (survives restart). `/resume CONFIRM` clears.
+31. **AGTFormattedBot** (PTB 22.7) — `ExtBot` subclass overrides `send_message` + `edit_message_text` to apply `_format_outbound`. Replaces monkey-patch broken by `TelegramObject._frozen` lockdown. Wired via `ApplicationBuilder().bot(AGTFormattedBot(...))`.
+32. **`_build_cure_data` get_betas** (hotfix) — deferred import restored inside `_build_cure_data` after Sprint C2 removed it from `build_top_strip`. Followup #33 will plumb DeskSnapshot betas properly.
+33. **dump_rules.py** — `scripts/dump_rules.py` standalone rule evaluator. Read-only, no IB, no telegram_bot. Consumes rule_engine + Walker + yfinance + DB. For P3.2-alt Day 1.4 smoke test.
 
 ---
 
