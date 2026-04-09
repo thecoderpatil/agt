@@ -441,7 +441,7 @@ def _build_household_el(top: dict, hh_nlv: dict) -> dict:
 
 def _build_cure_data(conn) -> dict:
     """Assemble Cure Console data from rule engine + glide paths."""
-    from agt_equities.rule_engine import PortfolioState, evaluate_all, compute_leverage_pure, evaluate_rule_9_composite
+    from agt_equities.rule_engine import PortfolioState, evaluate_all, compute_leverage_pure
     from agt_equities.mode_engine import (
         get_current_mode, load_glide_paths, evaluate_glide_path,
         get_recent_transitions,
@@ -499,7 +499,7 @@ def _build_cure_data(conn) -> dict:
     all_evals = []
     hh_sections = {}
     for hh in households:
-        evals = evaluate_all(ps, hh)
+        evals = evaluate_all(ps, hh, conn=conn)  # Sprint B: conn enables real R9 compositor
 
         # Sprint 1F Fix 4: soften paused evals → GREEN before rendering + R9
         for ev in evals:
@@ -509,13 +509,8 @@ def _build_cure_data(conn) -> dict:
                 ev.status = "GREEN"
                 ev.message = f"{ev.message} [paused: {pause_reason}]"
 
-        # Sprint 1F Fix 4: wire real R9 compositor (replaces stub)
-        try:
-            r9_real = evaluate_rule_9_composite(evals, hh, conn)
-            # Replace the stub R9 eval in the list
-            evals = [ev if ev.rule_id != "rule_9" else r9_real for ev in evals]
-        except Exception as r9_exc:
-            logger.warning("R9 compositor failed for %s: %s — keeping stub", hh, r9_exc)
+        # Sprint B: R9 compositor now wired directly in evaluate_all(conn=conn).
+        # Sprint 1F Fix 4 duplicate wiring removed.
 
         all_evals.extend(evals)
 

@@ -1314,10 +1314,23 @@ def evaluate_gate_2(
     )
 
 
-def evaluate_rule_9(ps: PortfolioState, household: str) -> RuleEvaluation:
-    """Rule 9: Red Alert (2+ simultaneous breaches). NOT IMPLEMENTED."""
+def evaluate_rule_9(
+    ps: PortfolioState,
+    household: str,
+    prior_evals: list[RuleEvaluation] | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> RuleEvaluation:
+    """Rule 9: Red Alert Compositor (2+ simultaneous breaches).
+
+    Sprint B: wired to evaluate_rule_9_composite. Requires prior_evals
+    (R1-R8 results) and conn (for red_alert_state persistence).
+    Falls back to stub if either is missing (backward compat for tests).
+    """
+    if prior_evals is not None and conn is not None:
+        return evaluate_rule_9_composite(prior_evals, household, conn)
+    # Fallback stub for callers that don't provide evals/conn
     return _stub_rule("rule_9", "Red Alert", household,
-                       "meta-rule over R1-R8, pending foundation rules")
+                       "meta-rule over R1-R8 (no prior_evals provided)")
 
 def evaluate_rule_10(ps: PortfolioState, household: str) -> RuleEvaluation:
     """Rule 10: Exclusions. Config rule — not evaluable."""
@@ -1490,8 +1503,16 @@ def evaluate_rule_9_composite(
 # Evaluate all rules for a household
 # ---------------------------------------------------------------------------
 
-def evaluate_all(ps: PortfolioState, household: str) -> list[RuleEvaluation]:
-    """Run all 11 rule evaluators for one household. Returns flat list."""
+def evaluate_all(
+    ps: PortfolioState,
+    household: str,
+    conn: sqlite3.Connection | None = None,
+) -> list[RuleEvaluation]:
+    """Run all 11 rule evaluators for one household. Returns flat list.
+
+    If conn is provided, R9 compositor runs with real breach detection.
+    Otherwise R9 falls back to stub (backward compat for tests without DB).
+    """
     results = []
     results.extend(evaluate_rule_1(ps, household))
     results.append(evaluate_rule_2(ps, household))
@@ -1501,7 +1522,8 @@ def evaluate_all(ps: PortfolioState, household: str) -> list[RuleEvaluation]:
     results.append(evaluate_rule_6(ps, household))
     results.extend(evaluate_rule_7(ps, household))
     results.append(evaluate_rule_8(ps, household))
-    results.append(evaluate_rule_9(ps, household))
+    # R9 reads R1-R8 results; pass them so compositor can evaluate breaches
+    results.append(evaluate_rule_9(ps, household, prior_evals=results, conn=conn))
     results.append(evaluate_rule_10(ps, household))
     results.append(evaluate_rule_11(ps, household))
     return results
