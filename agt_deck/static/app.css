@@ -2,3 +2,21 @@
 * { box-sizing: border-box; }
 table { border-collapse: collapse; }
 .htmx-settling { opacity: 0.8; transition: opacity 0.3s ease; }
+
+/* G7: linear-breathing top strip — signals liveness on numeric values */
+@keyframes breathe {
+  0%, 100% { opacity: 1.0; }
+  50%      { opacity: 0.82; }
+}
+
+.breathe .num:not(.animate-pulse) {
+  animation: breathe 4s linear infinite;
+}
+
+.breathe:hover .num {
+  animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .breathe .num { animation: none; }
+}

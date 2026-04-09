@@ -765,5 +765,24 @@ class TestBuildCureDataIncludesUnderwater(unittest.TestCase):
                 pass  # Windows may hold lock briefly after close
 
 
+# ── Polish G7: breathe animation smoke test ──────────────────────────
+
+class TestTopStripBreatheClass(unittest.TestCase):
+    """G7: top strip <header> has breathe class in both templates."""
+
+    def test_breathe_class_present(self):
+        for template_name in ("command_deck.html", "cure_console.html"):
+            path = os.path.join(
+                os.path.dirname(__file__), "..", "agt_deck", "templates", template_name
+            )
+            with open(path) as f:
+                html = f.read()
+            self.assertIn(
+                'class="breathe sticky',
+                html,
+                f"{template_name} top strip <header> must have 'breathe' class",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
