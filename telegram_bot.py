@@ -7166,6 +7166,29 @@ async def _discover_positions(
         except Exception as exc:
             logger.warning("_discover_positions: staged orders query failed: %s", exc)
 
+    # ── Sprint B Unit 2: DEX encumbrance from bucket3_dynamic_exit_log ──
+    dex_sell_calls: dict[str, int] = {}  # "hh|ticker" -> contracts
+    try:
+        with closing(_get_db_connection()) as conn:
+            dex_rows = conn.execute(
+                "SELECT ticker, household, contracts, shares, action_type "
+                "FROM bucket3_dynamic_exit_log "
+                "WHERE final_status IN ('STAGED', 'ATTESTED', 'TRANSMITTING')"
+            ).fetchall()
+        for dr in dex_rows:
+            tk = dr["ticker"]
+            hh = dr["household"]
+            # CC: contracts encumber shares; STK_SELL: shares encumber directly
+            if dr["action_type"] == "CC":
+                enc = dr["contracts"] or 0
+            else:
+                enc = (dr["shares"] or 0) // 100  # STK_SELL: convert shares to contract-equivalent
+            if hh and tk and enc > 0:
+                dk = f"{hh}|{tk}"
+                dex_sell_calls[dk] = dex_sell_calls.get(dk, 0) + enc
+    except Exception as exc:
+        logger.warning("_discover_positions: DEX encumbrance query failed: %s", exc)
+
     # ── Group raw positions by household + root ticker ──
     raw: dict[str, dict[str, dict]] = {}  # household -> ticker -> accumulator
     for pos in positions:
@@ -7386,7 +7409,8 @@ async def _discover_positions(
         pos_key = f"{hh}|{tkr}"
         working_contracts = working_sell_calls.get(pos_key, 0)
         staged_contracts = staged_sell_calls.get(pos_key, 0)
-        covered_contracts = filled_contracts + working_contracts + staged_contracts
+        dex_contracts = dex_sell_calls.get(pos_key, 0)  # Sprint B Unit 2
+        covered_contracts = filled_contracts + working_contracts + staged_contracts + dex_contracts
         uncov_shares = max(0, total_shares - (covered_contracts * 100))
 
         position_rec = {
