@@ -3451,16 +3451,6 @@ def _annualized_cc_roi(
     return (float(premium) / float(capital_base)) * (365.0 / float(dte)) * 100.0
 
 
-def _calculate_walk_away_profit(
-    strike: float,
-    premium: float,
-    adjusted_basis: float,
-) -> float:
-    """Walk-away P&L per share. Delegates to walker.compute_walk_away_pnl().
-    Kept as thin wrapper for backward compatibility with existing call sites."""
-    from agt_equities.walker import compute_walk_away_pnl
-    result = compute_walk_away_pnl(adjusted_basis, strike, premium, quantity=1, multiplier=1)
-    return result.walk_away_pnl_per_share
 
 
 def _prob_itm(
@@ -4421,121 +4411,8 @@ def _build_household_call_tickets(
     return tickets, split_lines, remaining
 
 
-def _legacy_build_cc_ladder_views(
-    data: dict,
-    expiry_index: int = 0,
-    strike_offset: int = 0,
-) -> tuple[str, InlineKeyboardMarkup]:
-    expirations = data.get("expirations", [])
-    if not expirations:
-        empty = "<b>Covered Call Ladder</b>\n<pre>No ladder data available.</pre>"
-        return empty, InlineKeyboardMarkup([])
-
-    expiry_index = max(0, min(expiry_index, len(expirations) - 1))
-    expiry = expirations[expiry_index]
-    visible_rows = expiry.get("rows", [])
-    strike_offset = int(expiry.get("strike_offset", strike_offset))
-
-    ticker = html.escape(str(data.get("ticker", "UNKNOWN")))
-    household_id = html.escape(str(data.get("household_id", "UNKNOWN")))
-    share_quantity = _format_share_quantity(float(data.get("total_unencumbered_shares", 0)))
-    paper_cost_basis = float(data.get("paper_cost_basis", 0.0))
-    adjusted_cost_basis = float(data.get("adjusted_cost_basis", 0.0))
-    live_price = float(data.get("live_price", 0.0))
-    contracts = int(data.get("total_unencumbered_contracts", 0))
-    encumbered = int(data.get("short_call_encumbered_shares", 0))
-    working_encumbered = int(data.get("working_call_encumbered_shares", 0))
-
-    lines = [
-        f"<b>{ticker}</b> — {share_quantity} Shares | Cost Basis: ${cost_basis:.2f}",
-        f"Current Market Price: ${live_price:.2f}",
-        "<pre>",
-        (
-            f"Expiry: {expiry.get('date', '?')} (DTE {expiry.get('dte', '?')})  "
-            f"| Contracts: {contracts}"
-        ),
-    ]
-    if encumbered:
-        lines.append(f"Existing Short Calls: {encumbered}")
-    lines.extend([
-        "",
-        f"Showing {start + 1}-{start + len(visible_rows)} of {len(rows)} strikes",
-        "Strike       Premium      Ann ROI",
-        "---------------------------------",
-    ])
-
-    for row in visible_rows:
-        strike_label = f"{_format_strike_label(float(row['strike']))}C"
-        premium = float(row["premium"])
-        annualized_roi = float(row["annualized_roi"])
-        lines.append(
-            f"{strike_label:<12}${premium:>6.2f}      {annualized_roi:>6.2f}%"
-        )
-
-    lines.append("</pre>")
-    html_text = "\n".join(lines)
-
-    keyboard_rows = []
-    for offset, row in enumerate(visible_rows):
-        absolute_index = start + offset
-        strike_label = _format_strike_label(float(row["strike"]))
-        keyboard_rows.append([
-            InlineKeyboardButton(
-                f"Select {strike_label}C",
-                callback_data=f"cc:select:{expiry_index}:{absolute_index}",
-            )
-        ])
-
-    if start + page_size < len(rows):
-        keyboard_rows.append([
-            InlineKeyboardButton(
-                "Show Next 5 Strikes ⬇️",
-                callback_data="cc:page:next",
-            )
-        ])
-
-    if len(expirations) > 1:
-        other_index = 1 if expiry_index == 0 else 0
-        other_date = expirations[other_index].get("date", "Next")
-        keyboard_rows.append([
-            InlineKeyboardButton(
-                f"Switch to {other_date} Expiry 🗓️",
-                callback_data=f"cc:exp:{other_index}",
-            )
-        ])
-
-    return html_text, InlineKeyboardMarkup(keyboard_rows)
 
 
-async def _legacy_send_cc_ladder_dashboard(update: Update, chat_id: int, result_json: str) -> str:
-    import json as _json
-
-    data = _json.loads(result_json)
-    if "error" in data:
-        raise ValueError("Covered call ladder returned error — skip dashboard")
-
-    html_text, keyboard = _build_cc_ladder_views(data, expiry_index=0, page=0)
-    msg = await update.message.reply_text(
-        text=html_text,
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
-
-    dashboard_cache[chat_id] = {
-        "msg_id": msg.message_id,
-        "tool": "run_cc_ladder",
-        "created_at": _datetime.now(),
-        "_raw_data": data,
-        "cc_state": {
-            "expiry_index": 0,
-            "page": 0,
-        },
-    }
-
-    return _json.dumps({
-        "dashboard_sent": True,
-        "summary": data.get("summary", "Covered call ladder sent."),
-    })
 
 
 # ── Dashboard button layouts ────────────────────────────────────────────
