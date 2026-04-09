@@ -7,6 +7,30 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _fetchall(conn: sqlite3.Connection, sql: str, params=()) -> list:
+    """Execute SELECT with explicit cursor lifecycle (DR Q1.5 fix).
+
+    Python 3.11+ cursor GC regression can cause 'database is locked'
+    on Windows multi-process. Explicit close prevents this.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+        return cur.fetchall()
+    finally:
+        cur.close()
+
+
+def _fetchone(conn: sqlite3.Connection, sql: str, params=()):
+    """Single-row fetch with explicit cursor lifecycle."""
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+        return cur.fetchone()
+    finally:
+        cur.close()
+
 ACCOUNT_ALIAS = {
     "U21971297": "Yash Ind",
     "U22076329": "Yash Roth",
@@ -43,7 +67,7 @@ def get_portfolio_nav(conn: sqlite3.Connection) -> dict:
     known NAV. Fix 1 / Sprint 1F.
     """
     try:
-        rows = conn.execute("""
+        rows = _fetchall(conn, """
             SELECT m1.account_id, CAST(m1.total AS REAL) as nav
             FROM master_log_nav m1
             WHERE m1.report_date = (
@@ -51,7 +75,7 @@ def get_portfolio_nav(conn: sqlite3.Connection) -> dict:
                 FROM master_log_nav m2
                 WHERE m2.account_id = m1.account_id
             )
-        """).fetchall()
+        """)
         result = {}
         for r in rows:
             result[r["account_id"]] = r["nav"]
