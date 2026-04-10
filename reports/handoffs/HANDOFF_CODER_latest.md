@@ -322,6 +322,13 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 38. **NAV 3-tier priority** (#43 + #43v2) — `build_state()` NAV: (1) `live_nlv` param → "live_injected", (2) el_snapshots <120s → "live_db", (3) master_log_nav → "flex_eod". `nav_source_by_account` on DeskSnapshot tracks provenance. `agt_deck/main.py` top-strip caller now wires `live_nlv_dict`.
 39. **mode_transitions seed** (Day 2 live test) — 3 OVERWEIGHT rows (ADBE Yash, ADBE Vikram, PYPL Vikram) backdated to 2026-04-01 for watchdog calendar gate bypass. `days_overweight=8 >= 7` (EVERY_CYCLE tier).
 40. **R9 runtime confirmed** (#5b survey) — R9 fires RED both households (Condition A: 2+ simultaneous R1 RED). `red_alert_state` table shows ON with conditions A+B. Cure Console banner rendering is separate display-layer issue, not rule engine bug.
+41. **V2 Smart Yield Walk-Down** — R8 candidate engine respects Adjusted Cost Basis and 10% Anti-Rip floor. V1 emergency kill-switch logic archived to `agt_equities/archive_wartime_v1.py`.
+42. **Defensive Roll Engine** — `evaluate_defensive_rolls()` in rule_engine.py. Triggers at 0.40 Delta inflection, 98% proximity, or Friday trap. Level 1: Roll Up-and-Out. Level 2: Same-strike time buy. Level 3: CRITICAL_ALERT. All credit calculations use mid-to-mid pricing.
+43. **`_scan_and_stage_defensive_rolls`** — Injected into 3:30 PM watchdog (after all DB housekeeping). Scans short calls via `reqPositionsAsync`, fetches Greeks/Ask/Bid, computes short_mid, stages BAG combo tickets to `pending_orders`. Human-in-the-loop: operator executes via `/approve`.
+44. **`_build_adaptive_roll_combo`** — BAG combo order builder. Action=BUY, negative limit price ensures net credit. Adaptive Urgent priority. Used by `_place_single_order` when `sec_type=BAG`.
+45. **`_place_single_order` BAG routing** — Dispatches on `sec_type`: OPT → standard CC flow (duplicate + capacity checks), BAG → combo roll flow (capacity checks bypassed — rolls are net-zero). Both paths share `_pre_trade_gates` + `assert_execution_enabled`.
+46. **Yield walker mid pricing** — `_walk_mode1_chain` and `_walk_harvest_chain` compute `mid = (bid+ask)/2`, use mid for annualized yield calc, output mid as `"bid"` key (preserves downstream schema). Adaptive Patient priority.
+47. **Cold-start wartime pin** (`532cb7c`) — Bot checks live leverage on startup. Pins to WARTIME when leverage >= 1.50x. Prevents false PEACETIME on restart during margin stress.
 
 ---
 
