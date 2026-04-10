@@ -8399,6 +8399,146 @@ async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
 _scheduled_mode1 = _scheduled_cc
 
 
+# ── V2 Defensive Roll Protocol ─────────────────────────────────────────
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class OptDTO:
+    """Data Transfer Object for option chain compatibility with rule_engine."""
+    strike: float
+    bid: float
+    expiry: str = ""
+    mid: float = 0.0
+
+
+async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
+    """
+    Fetches active short calls, evaluates Delta/Ask, and runs the V2 Roll Protocol.
+    Returns a list of alert strings for Telegram.
+    """
+    if _HALTED:
+        return []
+
+    from datetime import date
+    from agt_equities.rule_engine import evaluate_defensive_rolls
+    import math
+
+    alerts = []
+    try:
+        positions = await ib_conn.reqPositionsAsync()
+        short_calls = [
+            p for p in positions
+            if p.position < 0
+            and getattr(p.contract, "secType", "") == "OPT"
+            and getattr(p.contract, "right", "") == "C"
+            and p.contract.symbol.upper() not in EXCLUDED_TICKERS
+        ]
+
+        if not short_calls:
+            return []
+
+        ib_conn.reqMarketDataType(4)  # Set once for the connection
+
+        for pos in short_calls:
+            ticker = pos.contract.symbol.upper()
+            strike = pos.contract.strike
+
+            # Calculate DTE
+            exp_fmt = str(pos.contract.lastTradeDateOrContractMonth)
+            try:
+                exp_date = date(int(exp_fmt[:4]), int(exp_fmt[4:6]), int(exp_fmt[6:8]))
+                dte = (exp_date - date.today()).days
+            except (ValueError, TypeError):
+                continue
+
+            # Fetch Spot
+            try:
+                spot = await _ibkr_get_spot(ticker)
+            except Exception as exc:
+                logger.warning("Failed to fetch spot for %s roll evaluation: %s", ticker, exc)
+                continue
+
+            # Fetch Greeks and Ask Price
+            qual_contracts = await ib_conn.qualifyContractsAsync(pos.contract)
+            if not qual_contracts:
+                continue
+
+            ticker_data = ib_conn.reqMktData(qual_contracts[0], "106", False, False)
+            await asyncio.sleep(2)  # Linear wait acceptable for EOD watchdog (<10 positions)
+
+            # Extract Ask and Delta
+            ask = getattr(ticker_data, "ask", getattr(ticker_data, "delayedAsk", None))
+            delta = None
+            if getattr(ticker_data, "modelGreeks", None):
+                delta = ticker_data.modelGreeks.delta
+            elif getattr(ticker_data, "bidGreeks", None):
+                delta = ticker_data.bidGreeks.delta
+
+            ib_conn.cancelMktData(qual_contracts[0])
+
+            if ask is None or delta is None or math.isnan(ask) or math.isnan(delta):
+                continue
+
+            # Fetch future chains for the evaluation engine
+            future_chains = {}
+            try:
+                expirations = await _ibkr_get_expirations(ticker)
+                for tgt_exp in expirations:
+                    try:
+                        tgt_date = date.fromisoformat(tgt_exp)
+                        tgt_dte = (tgt_date - date.today()).days
+                        if 7 <= tgt_dte <= 90:
+                            chain_data = await _ibkr_get_chain(ticker, tgt_exp, right='C')
+                            objs = []
+                            for c in chain_data:
+                                objs.append(OptDTO(
+                                    strike=float(c["strike"]),
+                                    bid=float(c.get("bid", 0)),
+                                ))
+                            future_chains[tgt_dte] = objs
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.warning("Failed to fetch chains for %s roll evaluation: %s", ticker, e)
+                continue
+
+            # Run deterministic evaluation
+            roll_decision = evaluate_defensive_rolls(
+                ticker=ticker,
+                short_call_strike=strike,
+                short_call_dte=dte,
+                short_call_delta=abs(float(delta)),
+                short_call_ask=float(ask),
+                spot=float(spot),
+                future_chains=future_chains,
+            )
+
+            if roll_decision:
+                action = roll_decision.get("action")
+                if action == "CRITICAL_ALERT_NO_ROLL_AVAILABLE":
+                    alerts.append(
+                        f"\U0001f6a8 CRITICAL: {ticker} ${strike}C "
+                        f"(Delta: {abs(delta):.2f}) triggered defense, "
+                        f"but NO NET CREDIT rolls exist. Margin risk elevated."
+                    )
+                else:
+                    alerts.append(
+                        f"\U0001f6e1\ufe0f ROLL TRIGGERED: {ticker} ${strike}C "
+                        f"(Delta: {abs(delta):.2f})\n"
+                        f"Action: {action}\n"
+                        f"Target: Roll to ${roll_decision['sell_strike']}C "
+                        f"at DTE {roll_decision['target_dte']}\n"
+                        f"Est. Net Credit: ${roll_decision['net_credit']:.2f}\n"
+                        f"Please execute manually via TWS."
+                    )
+
+    except Exception as exc:
+        logger.warning("Defensive roll scan failed: %s", exc)
+
+    return alerts
+
+
 async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Daily 3:30 PM ET — roll alerts, mode transitions, Rule 8 triggers."""
     try:
@@ -8679,6 +8819,14 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
                             await asyncio.sleep(3)
         except Exception as de_exc:
             logger.warning("Watchdog Dynamic Exit check failed: %s", de_exc)
+
+        # ── V2 Defensive Roll Protocol (Evaluated after DB housekeeping) ──
+        try:
+            ib_conn = await ensure_ib_connected()
+            roll_alerts = await _scan_and_stage_defensive_rolls(ib_conn)
+            alerts.extend(roll_alerts)
+        except Exception as roll_exc:
+            logger.warning("Watchdog defensive roll protocol failed: %s", roll_exc)
 
         # Send alerts
         if alerts:
