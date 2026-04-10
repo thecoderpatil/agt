@@ -6189,19 +6189,40 @@ def _build_adaptive_sell_order(
     qty: int,
     limit_price: float,
     account_id: str,
+    priority: str = "Patient",
 ) -> ib_async.Order:
-    """
-    Build a SELL order using IB Adaptive algo (Patient priority).
-    This is the ONLY order builder in the system — all trades go through here.
-    Adaptive does not support GTC; all orders are DAY.
-    """
+    """Builds a single-leg adaptive order."""
     order = ib_async.Order()
     order.action = "SELL"
     order.totalQuantity = qty
     order.orderType = "LMT"
     order.lmtPrice = round(limit_price, 2)
     order.algoStrategy = "Adaptive"
-    order.algoParams = [ib_async.TagValue("adaptivePriority", "Patient")]
+    order.algoParams = [ib_async.TagValue("adaptivePriority", priority)]
+    order.tif = "DAY"
+    order.account = account_id
+    order.transmit = True
+    return order
+
+
+def _build_adaptive_roll_combo(
+    qty: int,
+    net_credit_mid: float,
+    account_id: str,
+    priority: str = "Urgent",
+) -> ib_async.Order:
+    """
+    Builds an IBKR BAG combo order for a Roll.
+    Action = BUY executes the legs exactly as defined (Buy 1, Sell 1).
+    Negative Limit Price ensures a Net Credit.
+    """
+    order = ib_async.Order()
+    order.action = "BUY"
+    order.totalQuantity = qty
+    order.orderType = "LMT"
+    order.lmtPrice = -abs(round(net_credit_mid, 2))
+    order.algoStrategy = "Adaptive"
+    order.algoParams = [ib_async.TagValue("adaptivePriority", priority)]
     order.tif = "DAY"
     order.account = account_id
     order.transmit = True
@@ -7709,11 +7730,16 @@ async def _walk_mode1_chain(
                 continue
 
             raw_bid = row.get("bid")
+            raw_ask = row.get("ask")
             bid = float(raw_bid) if pd.notna(raw_bid) else 0.0
-            if bid < MODE1_ABSOLUTE_BID_FLOOR:
+            ask = float(raw_ask) if pd.notna(raw_ask) else 0.0
+
+            mid = round((bid + ask) / 2.0, 2) if bid and ask else bid
+
+            if mid < MODE1_ABSOLUTE_BID_FLOOR:
                 continue
 
-            annualized = (bid / spot) * (365 / dte) * 100 if spot > 0 else 0
+            annualized = (mid / spot) * (365 / dte) * 100 if spot > 0 else 0
             otm_pct = ((strike - spot) / spot) * 100
 
             if annualized >= MODE1_MIN_ANNUALIZED_PCT:
@@ -7723,7 +7749,7 @@ async def _walk_mode1_chain(
                     "expiry": exp_str,
                     "dte": dte,
                     "strike": round(strike, 2),
-                    "bid": round(bid, 2),
+                    "bid": mid,  # Overridden to Mid per V2 Execution Spec
                     "annualized": round(annualized, 2),
                     "otm_pct": round(otm_pct, 2),
                     "low_yield": low_yield,
@@ -7791,11 +7817,16 @@ async def _walk_harvest_chain(
         for _, row in viable.iterrows():
             strike = float(row["strike"])
             raw_bid = row.get("bid")
+            raw_ask = row.get("ask")
             bid = float(raw_bid) if pd.notna(raw_bid) else 0.0
-            if bid < HARVEST_ABSOLUTE_BID_FLOOR:
+            ask = float(raw_ask) if pd.notna(raw_ask) else 0.0
+
+            mid = round((bid + ask) / 2.0, 2) if bid and ask else bid
+
+            if mid < HARVEST_ABSOLUTE_BID_FLOOR:
                 continue
 
-            annualized = (bid / strike) * (365 / dte) * 100 if strike > 0 else 0
+            annualized = (mid / strike) * (365 / dte) * 100 if strike > 0 else 0
             otm_pct = ((strike - spot) / spot) * 100 if spot > 0 else 0
 
             if annualized < HARVEST_MIN_ANNUALIZED_PCT:
@@ -7805,14 +7836,14 @@ async def _walk_harvest_chain(
                 continue
 
             # Walk-away P&L per share = strike + premium - adjusted_basis
-            walk_away_pnl = _compute_walk_away_pnl(adjusted_basis, strike, bid, quantity=1, multiplier=1).walk_away_pnl_per_share
+            walk_away_pnl = _compute_walk_away_pnl(adjusted_basis, strike, mid, quantity=1, multiplier=1).walk_away_pnl_per_share
 
             return {
                 "ticker": ticker,
                 "expiry": exp_str,
                 "dte": dte,
                 "strike": round(strike, 2),
-                "bid": round(bid, 2),
+                "bid": mid,  # Overridden to Mid per V2 Execution Spec
                 "annualized": round(annualized, 2),
                 "otm_pct": round(otm_pct, 2),
                 "walk_away_pnl": round(walk_away_pnl, 2),
@@ -8408,8 +8439,8 @@ class OptDTO:
     """Data Transfer Object for option chain compatibility with rule_engine."""
     strike: float
     bid: float
-    expiry: str = ""
-    mid: float = 0.0
+    mid: float
+    expiry: str
 
 
 async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
@@ -8467,8 +8498,10 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
             ticker_data = ib_conn.reqMktData(qual_contracts[0], "106", False, False)
             await asyncio.sleep(2)  # Linear wait acceptable for EOD watchdog (<10 positions)
 
-            # Extract Ask and Delta
+            # Extract Mid and Delta
             ask = getattr(ticker_data, "ask", getattr(ticker_data, "delayedAsk", None))
+            bid = getattr(ticker_data, "bid", getattr(ticker_data, "delayedBid", None))
+
             delta = None
             if getattr(ticker_data, "modelGreeks", None):
                 delta = ticker_data.modelGreeks.delta
@@ -8477,8 +8510,10 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
 
             ib_conn.cancelMktData(qual_contracts[0])
 
-            if ask is None or delta is None or math.isnan(ask) or math.isnan(delta):
+            if ask is None or bid is None or delta is None or math.isnan(ask) or math.isnan(bid) or math.isnan(delta):
                 continue
+
+            short_mid = round((float(bid) + float(ask)) / 2.0, 2)
 
             # Fetch future chains for the evaluation engine
             future_chains = {}
@@ -8492,9 +8527,12 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
                             chain_data = await _ibkr_get_chain(ticker, tgt_exp, right='C')
                             objs = []
                             for c in chain_data:
+                                c_bid = float(c.get("bid", 0))
+                                c_ask = float(c.get("ask", 0))
+                                c_mid = round((c_bid + c_ask) / 2.0, 2) if c_bid and c_ask else c_bid
                                 objs.append(OptDTO(
                                     strike=float(c["strike"]),
-                                    bid=float(c.get("bid", 0)),
+                                    bid=c_bid, mid=c_mid, expiry=tgt_exp,
                                 ))
                             future_chains[tgt_dte] = objs
                     except Exception:
@@ -8509,7 +8547,7 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
                 short_call_strike=strike,
                 short_call_dte=dte,
                 short_call_delta=abs(float(delta)),
-                short_call_ask=float(ask),
+                short_call_mid=short_mid,
                 spot=float(spot),
                 future_chains=future_chains,
             )
@@ -8520,18 +8558,58 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
                     alerts.append(
                         f"\U0001f6a8 CRITICAL: {ticker} ${strike}C "
                         f"(Delta: {abs(delta):.2f}) triggered defense, "
-                        f"but NO NET CREDIT rolls exist. Margin risk elevated."
+                        f"but NO NET CREDIT rolls exist."
                     )
                 else:
-                    alerts.append(
-                        f"\U0001f6e1\ufe0f ROLL TRIGGERED: {ticker} ${strike}C "
-                        f"(Delta: {abs(delta):.2f})\n"
-                        f"Action: {action}\n"
-                        f"Target: Roll to ${roll_decision['sell_strike']}C "
-                        f"at DTE {roll_decision['target_dte']}\n"
-                        f"Est. Net Credit: ${roll_decision['net_credit']:.2f}\n"
-                        f"Please execute manually via TWS."
+                    # 1. Qualify the new Option Contract
+                    sell_exp_fmt = roll_decision["sell_expiry"].replace("-", "")
+                    sell_contract = ib_async.Option(
+                        symbol=ticker,
+                        lastTradeDateOrContractMonth=sell_exp_fmt,
+                        strike=roll_decision["sell_strike"],
+                        right="C",
+                        exchange="SMART",
                     )
+                    qual_sell = await ib_conn.qualifyContractsAsync(sell_contract)
+
+                    if qual_sell:
+                        # 2. Build the BAG Contract (Combo)
+                        bag = ib_async.Contract(
+                            symbol=ticker, secType="BAG",
+                            exchange="SMART", currency="USD",
+                        )
+                        leg1 = ib_async.ComboLeg(
+                            conId=pos.contract.conId, ratio=1,
+                            action="BUY", exchange="SMART",
+                        )
+                        leg2 = ib_async.ComboLeg(
+                            conId=qual_sell[0].conId, ratio=1,
+                            action="SELL", exchange="SMART",
+                        )
+                        bag.comboLegs = [leg1, leg2]
+
+                        # 3. Build Adaptive Urgent Combo Order
+                        qty = abs(pos.position)
+                        order = _build_adaptive_roll_combo(
+                            qty, roll_decision["net_credit"],
+                            pos.account, priority="Urgent",
+                        )
+
+                        # 4. Execute (kill-switch gated)
+                        assert_execution_enabled(in_process_halted=_HALTED)
+                        trade = ib_conn.placeOrder(bag, order)
+
+                        alerts.append(
+                            f"\U0001f6e1\ufe0f ROLL EXECUTED: {ticker} "
+                            f"${strike}C -> ${roll_decision['sell_strike']}C\n"
+                            f"Algo: Adaptive Urgent @ Mid "
+                            f"(${roll_decision['net_credit']:.2f} Credit)\n"
+                            f"IB Order ID: {trade.order.orderId}"
+                        )
+                    else:
+                        alerts.append(
+                            f"\u26a0\ufe0f Failed to qualify {ticker} roll contract."
+                        )
 
     except Exception as exc:
         logger.warning("Defensive roll scan failed: %s", exc)

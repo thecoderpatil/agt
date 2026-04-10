@@ -1562,13 +1562,14 @@ def evaluate_defensive_rolls(
     short_call_strike: float,
     short_call_dte: int,
     short_call_delta: float,
-    short_call_ask: float,
+    short_call_mid: float,
     spot: float,
     future_chains: dict,  # pre-fetched nested dict {target_dte: [OptionContractDTO]}
 ) -> dict | None:
     """
     100% Mechanical Extrinsic Capture Roll Trigger.
     Evaluates open CC positions for risk and stages Net Credit Up-and-Outs.
+    Uses Mid prices for credit calculation per V2 Execution Spec.
     """
     from datetime import datetime
 
@@ -1591,14 +1592,15 @@ def evaluate_defensive_rolls(
         up_strikes = sorted([o for o in chain if o.strike > short_call_strike], key=lambda x: x.strike, reverse=True)
 
         for opt in up_strikes:
-            net_credit = opt.bid - short_call_ask
+            net_credit = opt.mid - short_call_mid
             if net_credit >= 0.01:
                 return {
                     "action": "ROLL_UP_OUT",
                     "buy_strike": short_call_strike,
                     "sell_strike": opt.strike,
+                    "sell_expiry": opt.expiry,
                     "target_dte": target_dte,
-                    "net_credit": round(net_credit, 2)
+                    "net_credit": round(net_credit, 2),
                 }
 
     # LEVEL 2 & 3: Fallbacks (Same Strike, Buy Time to reset Delta)
@@ -1607,14 +1609,15 @@ def evaluate_defensive_rolls(
         chain = future_chains.get(target_dte, [])
         for opt in chain:
             if opt.strike == short_call_strike:
-                net_credit = opt.bid - short_call_ask
+                net_credit = opt.mid - short_call_mid
                 if net_credit >= 0.01:
                     return {
                         "action": "ROLL_SAME_STRIKE",
                         "buy_strike": short_call_strike,
                         "sell_strike": opt.strike,
+                        "sell_expiry": opt.expiry,
                         "target_dte": target_dte,
-                        "net_credit": round(net_credit, 2)
+                        "net_credit": round(net_credit, 2),
                     }
 
     return {"action": "CRITICAL_ALERT_NO_ROLL_AVAILABLE"}
