@@ -8711,15 +8711,21 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
                 continue
 
             # STATE 1 — ASSIGN (Microstructure Trap)
-            if extrinsic_value <= spread or extrinsic_value <= 0.05:
+            if intrinsic_value > 0 and (
+                extrinsic_value <= spread or extrinsic_value <= 0.05
+            ):
                 alerts.append(
                     f"[ASSIGN] {ticker} Extrinsic exhausted. Parity breached. Defense standing down."
                 )
                 continue
 
             # STATE 2 — HARVEST (Capital Efficiency)
-            entry_credit = abs(float(getattr(pos, "avgCost", 0.0) or 0.0)) / 100.0
-            pnl_pct = ((entry_credit - ask) / entry_credit) if entry_credit > 0 else 0.0
+            initial_credit = abs(float(getattr(pos, "avgCost", 0.0) or 0.0)) / 100.0
+            pnl_pct = (
+                (initial_credit - ask) / initial_credit
+                if initial_credit > 0
+                else 0.0
+            )
             ray = (ask / strike) * (365 / dte) if strike > 0 and dte > 0 else float("inf")
             if pnl_pct >= 0.85 or ray < 0.10:
                 ticket = {
@@ -9897,10 +9903,13 @@ async def _poll_attested_rows(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 _el_last_write: dict[str, float] = {}  # {account_id: last_write_epoch}
+_apex_last_alert: dict[str, float] = {}  # {account_id: last_alert_epoch}
 _EL_WRITE_DEBOUNCE_SECONDS = 30
 
 
-async def _el_snapshot_writer_job(context) -> None:
+async def _el_snapshot_writer_job(
+    context: ContextTypes.DEFAULT_TYPE | None,
+) -> None:
     """Poll accountSummary and write EL snapshots to DB for Cure Console.
 
     Runs every 30s. Writes one row per account to el_snapshots.
@@ -9916,7 +9925,7 @@ async def _el_snapshot_writer_job(context) -> None:
 
         now = time.time()
         _WANTED = {"NetLiquidation", "ExcessLiquidity", "BuyingPower"}
-        acct_data: dict[str, dict] = {}
+        acct_data: dict[str, dict[str, float]] = {}
 
         for item in summary:
             if item.account not in ACTIVE_ACCOUNTS:
@@ -9928,22 +9937,35 @@ async def _el_snapshot_writer_job(context) -> None:
 
         for acct_id, data in acct_data.items():
             excess_liquidity = float(data.get("ExcessLiquidity") or 0.0)
-            net_liquidation = float(data.get("NetLiquidation") or 0.0)
-            el_pct = (excess_liquidity / net_liquidation) if net_liquidation > 0 else 0.0
+            nlv = float(data.get("NetLiquidation") or 0.0)
+            if nlv <= 0:
+                continue
 
-            if net_liquidation > 0 and el_pct <= 0.08:
-                # TODO STATE 0 Tied-Unwind execution:
-                # 1. Identify paired covered stock / short-call inventory to unwind.
-                # 2. Compute autonomous tied-unwind sizing across affected accounts.
-                # 3. Stage + transmit the unwind path without Telegram approval.
-                try:
-                    if getattr(context, "bot", None):
-                        await context.bot.send_message(
-                            chat_id=AUTHORIZED_USER_ID,
-                            text="[🚨 APEX SURVIVAL: Excess Liquidity < 8%. Executing Tied-Unwinds!]",
-                        )
-                except Exception as alert_exc:
-                    logger.warning("State 0 alert failed for %s: %s", acct_id, alert_exc)
+            if acct_id in MARGIN_ACCOUNTS:
+                el_pct = excess_liquidity / nlv
+
+                if el_pct <= 0.08:
+                    # TODO: Implement synchronous tied-unwind execution:
+                    # 1. Identify paired covered stock / short-call inventory to unwind.
+                    # 2. Compute autonomous tied-unwind sizing across affected accounts.
+                    # 3. Stage + transmit the unwind path without Telegram approval.
+                    if now - _apex_last_alert.get(acct_id, 0.0) > 900:
+                        try:
+                            if getattr(context, "bot", None):
+                                await context.bot.send_message(
+                                    chat_id=AUTHORIZED_USER_ID,
+                                    text="[🚨 APEX SURVIVAL: Excess Liquidity < 8%. Executing Tied-Unwinds!]",
+                                )
+                            _apex_last_alert[acct_id] = now
+                        except Exception as alert_exc:
+                            logger.warning("State 0 alert failed for %s: %s", acct_id, alert_exc)
+                    continue
+                else:
+                    if acct_id in _apex_last_alert:
+                        del _apex_last_alert[acct_id]
+            else:
+                if acct_id in _apex_last_alert:
+                    del _apex_last_alert[acct_id]
 
             # Debounce: skip if last write <30s ago
             last = _el_last_write.get(acct_id, 0)
@@ -9962,7 +9984,7 @@ async def _el_snapshot_writer_job(context) -> None:
                                 acct_id,
                                 hh,
                                 excess_liquidity,
-                                net_liquidation,
+                                nlv,
                                 data.get("BuyingPower"),
                             ),
                         )

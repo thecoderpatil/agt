@@ -93,6 +93,8 @@ class TestElSnapshotWriter(unittest.TestCase):
     @patch("telegram_bot.AUTHORIZED_USER_ID", 999999)
     @patch("telegram_bot.ACTIVE_ACCOUNTS", ["U21971297"])
     @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U21971297": "Yash_Household"})
+    @patch("telegram_bot.MARGIN_ACCOUNTS", ["U21971297"])
+    @patch("telegram_bot._apex_last_alert", {})
     @patch("telegram_bot._el_last_write", {})
     @patch("telegram_bot._get_db_connection")
     @patch("telegram_bot.ensure_ib_connected")
@@ -117,6 +119,103 @@ class TestElSnapshotWriter(unittest.TestCase):
             chat_id=999999,
             text="[🚨 APEX SURVIVAL: Excess Liquidity < 8%. Executing Tied-Unwinds!]",
         )
+
+    @patch("telegram_bot.AUTHORIZED_USER_ID", 999999)
+    @patch("telegram_bot.ACTIVE_ACCOUNTS", ["U21971297"])
+    @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U21971297": "Yash_Household"})
+    @patch("telegram_bot.MARGIN_ACCOUNTS", ["U21971297"])
+    @patch("telegram_bot._el_last_write", {})
+    @patch("telegram_bot._get_db_connection")
+    @patch("telegram_bot.ensure_ib_connected")
+    def test_writer_debounces_apex_survival_alert_for_15_minutes(self, mock_ib, mock_db):
+        import asyncio
+        import telegram_bot
+
+        mock_db.side_effect = lambda: self._get_conn()
+        mock_conn = AsyncMock()
+        mock_conn.accountSummaryAsync = AsyncMock(return_value=[
+            SimpleNamespace(account="U21971297", tag="NetLiquidation", value="100000"),
+            SimpleNamespace(account="U21971297", tag="ExcessLiquidity", value="7000"),
+            SimpleNamespace(account="U21971297", tag="BuyingPower", value="14000"),
+        ])
+        mock_ib.return_value = mock_conn
+
+        telegram_bot._apex_last_alert = {"U21971297": time.time()}
+        bot = AsyncMock()
+        context = SimpleNamespace(bot=bot)
+        asyncio.get_event_loop().run_until_complete(telegram_bot._el_snapshot_writer_job(context))
+
+        bot.send_message.assert_not_awaited()
+        self.assertEqual(self._count_rows(), 0)
+
+    @patch("telegram_bot.AUTHORIZED_USER_ID", 999999)
+    @patch("telegram_bot.ACTIVE_ACCOUNTS", ["U21971297"])
+    @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U21971297": "Yash_Household"})
+    @patch("telegram_bot.MARGIN_ACCOUNTS", ["U21971297"])
+    @patch("telegram_bot._el_last_write", {})
+    @patch("telegram_bot._get_db_connection")
+    @patch("telegram_bot.ensure_ib_connected")
+    def test_writer_clears_apex_lock_after_recovery(self, mock_ib, mock_db):
+        import asyncio
+        import telegram_bot
+
+        mock_db.side_effect = lambda: self._get_conn()
+        mock_conn = AsyncMock()
+        mock_conn.accountSummaryAsync = AsyncMock(side_effect=[
+            [
+                SimpleNamespace(account="U21971297", tag="NetLiquidation", value="100000"),
+                SimpleNamespace(account="U21971297", tag="ExcessLiquidity", value="20000"),
+                SimpleNamespace(account="U21971297", tag="BuyingPower", value="40000"),
+            ],
+            [
+                SimpleNamespace(account="U21971297", tag="NetLiquidation", value="100000"),
+                SimpleNamespace(account="U21971297", tag="ExcessLiquidity", value="7000"),
+                SimpleNamespace(account="U21971297", tag="BuyingPower", value="14000"),
+            ],
+        ])
+        mock_ib.return_value = mock_conn
+
+        telegram_bot._apex_last_alert = {"U21971297": time.time()}
+        bot = AsyncMock()
+        context = SimpleNamespace(bot=bot)
+
+        asyncio.get_event_loop().run_until_complete(telegram_bot._el_snapshot_writer_job(context))
+        self.assertNotIn("U21971297", telegram_bot._apex_last_alert)
+
+        asyncio.get_event_loop().run_until_complete(telegram_bot._el_snapshot_writer_job(context))
+        bot.send_message.assert_awaited_once_with(
+            chat_id=999999,
+            text="[🚨 APEX SURVIVAL: Excess Liquidity < 8%. Executing Tied-Unwinds!]",
+        )
+
+    @patch("telegram_bot.AUTHORIZED_USER_ID", 999999)
+    @patch("telegram_bot.ACTIVE_ACCOUNTS", ["U22076329"])
+    @patch("telegram_bot.MARGIN_ACCOUNTS", ["U21971297", "U22388499"])
+    @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U22076329": "Yash_Household"})
+    @patch("telegram_bot._el_last_write", {})
+    @patch("telegram_bot._get_db_connection")
+    @patch("telegram_bot.ensure_ib_connected")
+    def test_writer_skips_apex_survival_for_cash_accounts(self, mock_ib, mock_db):
+        import asyncio
+        import telegram_bot
+
+        mock_db.side_effect = lambda: self._get_conn()
+        mock_conn = AsyncMock()
+        mock_conn.accountSummaryAsync = AsyncMock(return_value=[
+            SimpleNamespace(account="U22076329", tag="NetLiquidation", value="100000"),
+            SimpleNamespace(account="U22076329", tag="ExcessLiquidity", value="2000"),
+            SimpleNamespace(account="U22076329", tag="BuyingPower", value="2000"),
+        ])
+        mock_ib.return_value = mock_conn
+
+        telegram_bot._apex_last_alert = {"U22076329": time.time()}
+        bot = AsyncMock()
+        context = SimpleNamespace(bot=bot)
+        asyncio.get_event_loop().run_until_complete(telegram_bot._el_snapshot_writer_job(context))
+
+        bot.send_message.assert_not_awaited()
+        self.assertNotIn("U22076329", telegram_bot._apex_last_alert)
+        self.assertEqual(self._count_rows(), 1)
 
     @patch("telegram_bot.ACTIVE_ACCOUNTS", ["U21971297"])
     @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U21971297": "Yash_Household"})

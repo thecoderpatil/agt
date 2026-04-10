@@ -20,6 +20,63 @@ class TestV2StateRouter(unittest.TestCase):
         "initial_basis": 120.0,
         "adjusted_basis": 110.0,
     })
+    @patch("telegram_bot._ibkr_get_spot", new_callable=AsyncMock, return_value=80.0)
+    def test_router_does_not_assign_otm_microstructure_false_positive(
+        self,
+        mock_spot,
+        mock_ledger,
+        mock_append,
+    ):
+        import telegram_bot
+
+        today = telegram_bot._date.today()
+        expiry = (today + telegram_bot._timedelta(days=30)).strftime("%Y%m%d")
+        current_contract = SimpleNamespace(
+            symbol="PYPL",
+            strike=100.0,
+            secType="OPT",
+            right="C",
+            lastTradeDateOrContractMonth=expiry,
+            conId=111,
+        )
+        pos = SimpleNamespace(
+            account="U1",
+            position=-1,
+            avgCost=-20.0,
+            contract=current_contract,
+        )
+
+        ib_conn = MagicMock()
+        ib_conn.reqPositionsAsync = AsyncMock(return_value=[pos])
+        ib_conn.reqMarketDataType = MagicMock()
+        ib_conn.reqMktData = MagicMock(return_value=SimpleNamespace(
+            ask=0.01,
+            bid=0.00,
+            modelGreeks=SimpleNamespace(delta=0.05),
+            bidGreeks=None,
+        ))
+        ib_conn.cancelMktData = MagicMock()
+
+        async def _qualify(contract):
+            return [SimpleNamespace(conId=getattr(contract, "conId", 0) or 222)]
+
+        ib_conn.qualifyContractsAsync = AsyncMock(side_effect=_qualify)
+
+        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn))
+
+        self.assertNotIn(
+            "[ASSIGN] PYPL Extrinsic exhausted. Parity breached. Defense standing down.",
+            alerts,
+        )
+        self.assertEqual(alerts, ["[HARVEST] PYPL Capital dead. Staging BTC."])
+        mock_append.assert_called_once()
+
+    @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
+    @patch("telegram_bot.append_pending_tickets")
+    @patch("telegram_bot._load_premium_ledger_snapshot", return_value={
+        "initial_basis": 120.0,
+        "adjusted_basis": 110.0,
+    })
     @patch("telegram_bot._ibkr_get_spot", new_callable=AsyncMock, return_value=95.0)
     def test_router_stages_state2_harvest_btc(
         self,
@@ -71,6 +128,62 @@ class TestV2StateRouter(unittest.TestCase):
         self.assertEqual(ticket["action"], "BUY")
         self.assertEqual(ticket["ticker"], "AAPL")
         self.assertEqual(ticket["limit_price"], 0.20)
+
+    @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
+    @patch("telegram_bot.append_pending_tickets")
+    @patch("telegram_bot._load_premium_ledger_snapshot", return_value={
+        "initial_basis": 600.0,
+        "adjusted_basis": 550.0,
+    })
+    @patch("telegram_bot._ibkr_get_spot", new_callable=AsyncMock, return_value=450.0)
+    def test_router_harvests_massive_winner_even_with_penny_ask(
+        self,
+        mock_spot,
+        mock_ledger,
+        mock_append,
+    ):
+        import telegram_bot
+
+        today = telegram_bot._date.today()
+        expiry = (today + telegram_bot._timedelta(days=14)).strftime("%Y%m%d")
+        current_contract = SimpleNamespace(
+            symbol="ADBE",
+            strike=500.0,
+            secType="OPT",
+            right="C",
+            lastTradeDateOrContractMonth=expiry,
+            conId=111,
+        )
+        pos = SimpleNamespace(
+            account="U1",
+            position=-1,
+            avgCost=-1.00,
+            contract=current_contract,
+        )
+
+        ib_conn = MagicMock()
+        ib_conn.reqPositionsAsync = AsyncMock(return_value=[pos])
+        ib_conn.reqMarketDataType = MagicMock()
+        ib_conn.reqMktData = MagicMock(return_value=SimpleNamespace(
+            ask=0.01,
+            bid=0.00,
+            modelGreeks=SimpleNamespace(delta=0.03),
+            bidGreeks=None,
+        ))
+        ib_conn.cancelMktData = MagicMock()
+
+        async def _qualify(contract):
+            return [SimpleNamespace(conId=getattr(contract, "conId", 0) or 222)]
+
+        ib_conn.qualifyContractsAsync = AsyncMock(side_effect=_qualify)
+
+        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn))
+
+        self.assertEqual(alerts, ["[HARVEST] ADBE Capital dead. Staging BTC."])
+        mock_append.assert_called_once()
+        ticket = mock_append.call_args.args[0][0]
+        self.assertEqual(ticket["action"], "BUY")
+        self.assertEqual(ticket["limit_price"], 0.01)
 
     @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
     @patch("telegram_bot.append_pending_tickets")
