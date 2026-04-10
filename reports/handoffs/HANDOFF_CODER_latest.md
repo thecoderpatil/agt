@@ -1,9 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
 **Last updated:** 2026-04-09
-**Status:** Sprint 1 (A-F) + Cleanup A + Sprint B + Sprint C + Sprint D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix COMPLETE. P3.2-alt Day 1 in progress. Day 2 findings (#10, #12, #4, #43) shipped.
-**Tests:** 634/634 passing. Runtime: ~30s.
-**Next:** P3.2-alt Day 2 continued — kill-switch live test (watchdog seeded), R9 banner investigation, caller wiring for live_nlv.
+**Status:** Sprint 1 (A-F) + Cleanup A + Sprint B + Sprint C + Sprint D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix COMPLETE. P3.2-alt Day 2 findings (#10, #12, #4, #43), R9 reporting fix, wartime cold-start pin, V2 Smart Yield Walk-Down, Defensive Roll Engine, and adaptive roll execution updates shipped.
+**Tests:** 634/634 passing. Runtime: ~20s.
+**Next:** P3.2-alt live follow-through — kill-switch live test (watchdog seeded) and Cure Console R9 banner investigation.
 
 ---
 
@@ -32,9 +32,10 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 `C:\AGT_Telegram_Bridge\`
 
 **Key files you touch most:**
-- `telegram_bot.py` — main bot entry, ~9,500 lines (post-Cleanup A purge from 12,180)
+- `telegram_bot.py` — main bot entry, ~9,500 lines (post-Cleanup A purge from 12,180), cold-start wartime pin + adaptive roll combo execution/staging
 - `agt_equities/walker.py` — pure function, source of truth for cycles
-- `agt_equities/rule_engine.py` — rule evaluators (R1-R7/R9/R11 real, R8/R10 stubs) + Gate 1/2, sweeper, is_ticker_locked, stage_stock_sale_via_smart_friction. R9 compositor NOW WIRED (Sprint B).
+- `agt_equities/rule_engine.py` — rule evaluators (R1-R7/R9/R11 real, R8/R10 evaluator stubs) + Gate 1/2, V2 Smart Yield Walk-Down candidate engine, Defensive Roll engine, sweeper, is_ticker_locked, stage_stock_sale_via_smart_friction. R9 compositor NOW WIRED (Sprint B).
+- `agt_equities/archive_wartime_v1.py` — archived Emergency Kill-Switch / Capital Velocity reference logic
 - `agt_equities/mode_engine.py` — 3-mode state machine + LeverageHysteresisTracker + cold-start WARTIME pin
 - `agt_equities/seed_baselines.py` — glide path + sector override + initial mode seed data (NULL ticker dedupe fix)
 - `agt_equities/flex_sync.py` — EOD master log writer + walker warnings persist + desk_state regen + git auto-push
@@ -73,7 +74,7 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 - PEACETIME → normal ops
 - AMBER → block `/scan` and new CSP; exits/rolls allowed; Smart Friction uses PEACETIME flow; Gate 2 sizing 25%
 - WARTIME → block `/scan` AND `/cc`; Cure Console only; Smart Friction uses Integer Lock; 3-strike bypass
-- Cold-start pin: WARTIME auto-resets to PEACETIME on bot restart (Sprint 1A)
+- Cold-start pin: startup pins to WARTIME immediately when live leverage >= 1.50x; no-op if already WARTIME
 
 **Canonical DB connection pattern (BINDING — Followup #9 ruling):**
 ```python
@@ -109,7 +110,7 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 
 ## Current State
 
-- **Tests:** 634/634 (620 baseline + 3 dex_revert + 3 cure_command + 3 r7_earnings + 3 nav_freshness + 2 nav_live_nlv)
+- **Tests:** 634/634 passing on `python -m pytest -q tests`
 - **Mode:** PEACETIME
 - **Production DB:** CLEAN, backed up as `agt_desk.db.p3.2alt.bak`. mode_transitions seeded with 3 OVERWEIGHT rows (2026-04-01 backdate) for watchdog live test.
 - **Walker:** fully closed through W3.8 + special dividend fix (.net_cash). 14 active cycles (8 Yash + 6 Vikram).
@@ -118,14 +119,17 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 - **Smart Friction:** Polymorphic. TOCTOU desk_mode guard.
 - **Telegram commands (pruned Sprint 1D):** /start, /status, /orders, /budget, /clear, /reconnect, /vrp, /think, /deep, /approve, /reject, /declare_peacetime, /mode, /cure, /recover_transmitting, /halt, /resume
 - **Killed commands:** /health, /cycles, /ledger, /fills, /dashboard, /cc, /mode1, /scan, /rollcheck, /declare_wartime, /sync_universe, /cleanup_blotter, /status_orders, /stop, /dynamic_exit, /override, /override_earnings, /reconcile, /clear_quarantine
-- **R9 compositor:** WIRED (Sprint B Unit 1). evaluate_all(ps, hh, conn=conn) passes conn for real R9.
+- **R9 compositor:** WIRED (Sprint B Unit 1). evaluate_all(ps, hh, conn=conn) passes conn for real R9. Reporting string now correctly shows 4-condition denominator.
 - **Gate 1:** DEDUPED (Sprint B Unit 3). Staging calls canonical evaluate_gate_1.
 - **DEX overlay:** FIXED (Sprint B Unit 2). _discover_positions reads STAGED/ATTESTED/TRANSMITTING encumbrance.
 - **Beta cache:** Daily 04:00 refresh job. Both top strip and rule engine use same cached betas.
 - **EL snapshots:** 30s writer job. Top strip and PortfolioState read from el_snapshots table.
 - **R7 corporate intel:** Daily 05:00 refresh job. evaluate_rule_7 reads cache. Bug fixed: evaluate_all now forwards conn= to R7 (enables operator overrides). Provider handles yfinance 1.2.0 datetime.date return type.
 - **PRAGMA tuning:** WAL + synchronous=FULL + wal_autocheckpoint=4000 + busy_timeout=5000.
-- **DeskSnapshot SSOT (Sprint C + #43):** `build_state()` returns frozen DeskSnapshot (NAV, cycles, betas, DEX encumbrance). 3-tier NAV: live_nlv param > el_snapshots (<120s) > Flex EOD. `nav_source_by_account` tracks provenance. `build_top_strip` consumes it.
+- **DeskSnapshot SSOT (Sprint C + #43):** `build_state()` returns frozen DeskSnapshot (NAV, cycles, betas, DEX encumbrance). 3-tier NAV: live_nlv param > el_snapshots (<120s) > Flex EOD. `nav_source_by_account` tracks provenance. `build_top_strip` now injects `live_nlv_dict` and consumes it.
+- **Cold-start wartime pin (Priority 4):** startup checks live `accountSummaryAsync()` NLV + live spots before watchdog/polling loops. If any household leverage is >= 1.50x, it logs WARTIME with reason `Cold-start pin: leverage >= 1.50x`.
+- **Dynamic Exit engine:** V1 Emergency Kill-Switch logic archived to `agt_equities/archive_wartime_v1.py`. Active candidate selection in `rule_engine.py` is V2 Smart Yield Walk-Down. `evaluate_defensive_rolls()` appended for 0.40 delta / Friday Trap defense.
+- **Adaptive execution path:** Adaptive Mid combos automated; current HEAD routes adaptive roll combos through human-in-the-loop staging.
 - **Config centralized (Sprint C + D):** HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, MARGIN_ELIGIBLE_ACCOUNTS, MARGIN_ACCOUNTS, PAPER_MODE all in `agt_equities/config.py`. Paper-aware. Rule engine imports from config (no hardcoded account IDs).
 - **Execution kill-switch:** `AGT_EXECUTION_ENABLED` env var (default OFF) + `_HALTED` in-process + `execution_state` DB row. Triple-gate OR logic. All 3 placeOrder sites wrapped. AST guard test enforces. `/halt` persists to DB, `/resume CONFIRM` clears. DEX TRANSMIT handler reverts TRANSMITTING→CANCELLED on gate/kill-switch failure (Finding #10).
 - **AGTFormattedBot:** ExtBot subclass replaces monkey-patch for PTB 22.7 compat. Applies `_format_outbound` (paper + mode prefix) to send_message + edit_message_text.
@@ -223,19 +227,30 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 | #12 | `/cure` auto-detect LAN host via UDP socket trick + `AGT_DECK_HOST` env override + `AGT_DECK_PORT`. Removed manual Tailscale hint. | `41e3e02` |
 | #4 | R7 dual fix: (A) yfinance 1.2.0 returns `datetime.date`, not `datetime.datetime` — isinstance dispatch. (B) `evaluate_all` was not forwarding `conn=` to `evaluate_rule_7` — operator overrides were dead code. | `ad275b3` |
 | #43 | NAV freshness: `build_state()` overlays live NLV from el_snapshots (<120s) over Flex EOD. `nav_source_by_account` field on DeskSnapshot for observability. | `bdeb4af` |
-| #43 v2 | `live_nlv` injection param on `build_state()` for 0-second freshness. 3-tier priority: injected > db_live > flex_eod. No caller wiring yet. | `019d118` |
+| #43 v2 | `live_nlv` injection param on `build_state()` for 0-second freshness. 3-tier priority: injected > db_live > flex_eod. `agt_deck/main.py` top-strip caller now wires `live_nlv_dict`. | `019d118` |
+
+## Completed Work — Post-Handoff HEAD
+
+| Commit | What |
+|--------|------|
+| `49aa7c0` | R9 reporting string fixed from 3-condition to 4-condition denominator. Deck render path updated. |
+| `532cb7c` | Cold-start wartime pin now checks live leverage before startup loops and pins into WARTIME when leverage >= 1.50x. |
+| `d65a536` | Archived Wartime V1 capital-velocity logic. Active Rule 8 candidate engine replaced with V2 Smart Yield Walk-Down. Defensive Roll Engine appended. |
+| `c5f7665` | Adaptive Mid combo execution path upgraded to full automation. |
+| `4528c38` | Adaptive roll combos routed through human-in-the-loop staging on top of adaptive combo plumbing. |
 
 ---
 
 ## In Flight
 
-**P3.2-alt Read-Only Live** — Day 1 complete, Day 2 findings shipped. Kill-switch live test pending (watchdog seeded).
+**P3.2-alt Read-Only Live** — Day 2 findings + V2 execution engine shipped. Kill-switch live test pending (watchdog seeded).
 - Protocol: `protocols/P3_2alt_read_only_live_protocol.md`
 - Git tag: `p3.2alt-start` at `04c1d20`
 - DB backup: `agt_desk.db.p3.2alt.bak`
 - Kill-switch: triple-gate verified (env OFF + DB disabled=1 + _HALTED=False)
 - mode_transitions: seeded 3 OVERWEIGHT rows (ADBE×2, PYPL×1) backdated to 2026-04-01 for watchdog staging test
 - R9 runtime harness (`scripts/debug_r9.py`, throwaway): confirmed R9 fires RED both households, red_alert_state ON with conditions A+B
+- V2 execution: Yield walkers use mid price, rolls staged as BAG combos in `pending_orders`, operator executes via `/approve`
 
 ---
 
@@ -279,7 +294,7 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 10. **Trust-tier cooldown** (Sprint 1D) — 10s (T0), 5s (T1), 0s (T2) via `AGT_TRUST_TIER` env. CancelledError → row stays ATTESTED.
 11. **STAGED coalescing** (Sprint 1D) — 60s buffer, 15s flush job. Critical alerts bypass buffer.
 12. **Paper mode** (Sprint 1C) — `AGT_PAPER_MODE=1`, ports 4002/7497, `[PAPER]` prefix, nickel/dime rounding, blue banner.
-13. **Cold-start pin** (Sprint 1A) — WARTIME auto-resets to PEACETIME on restart.
+13. **Cold-start pin** (Priority 4) — startup checks live `accountSummaryAsync()` + live spots and pins into WARTIME if any household leverage is >= 1.50x. No reset-to-PEACETIME behavior remains.
 14. **Beta cache** (Sprint 1F) — daily 04:00 refresh, startup run if empty. Both deck and rule engine read from beta_cache table.
 15. **EL snapshots** (Sprint 1B) — 30s writer job in bot, deck reads from table. Health Strip polls every 10s.
 16. **Glide-path softening** (Sprint 1F) — paused evals softened to GREEN before template render and R9 compositor.
@@ -304,7 +319,7 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 35. **`/cure` auto-detect** (Finding #12) — `_detect_deck_host()` priority: AGT_DECK_HOST env > UDP socket LAN auto-detect > 127.0.0.1 fallback. `AGT_DECK_PORT` env (default 8787).
 36. **R7 conn forwarding** (Finding #4) — `evaluate_all` now passes `conn=conn` to `evaluate_rule_7`. Operator overrides in `bucket3_earnings_overrides` are now reachable. 10 overrides currently active (expires 2026-04-14).
 37. **yfinance 1.2.0 compat** (Finding #4) — Provider extraction uses `isinstance(raw, datetime)` / `isinstance(raw, date)` dispatch. Silent `except Exception: pass` replaced with `logger.warning`.
-38. **NAV 3-tier priority** (#43 + #43v2) — `build_state()` NAV: (1) `live_nlv` param → "live_injected", (2) el_snapshots <120s → "live_db", (3) master_log_nav → "flex_eod". `nav_source_by_account` on DeskSnapshot tracks provenance. No callers wire `live_nlv` yet.
+38. **NAV 3-tier priority** (#43 + #43v2) — `build_state()` NAV: (1) `live_nlv` param → "live_injected", (2) el_snapshots <120s → "live_db", (3) master_log_nav → "flex_eod". `nav_source_by_account` on DeskSnapshot tracks provenance. `agt_deck/main.py` top-strip caller now wires `live_nlv_dict`.
 39. **mode_transitions seed** (Day 2 live test) — 3 OVERWEIGHT rows (ADBE Yash, ADBE Vikram, PYPL Vikram) backdated to 2026-04-01 for watchdog calendar gate bypass. `days_overweight=8 >= 7` (EVERY_CYCLE tier).
 40. **R9 runtime confirmed** (#5b survey) — R9 fires RED both households (Condition A: 2+ simultaneous R1 RED). `red_alert_state` table shows ON with conditions A+B. Cure Console banner rendering is separate display-layer issue, not rule engine bug.
 
