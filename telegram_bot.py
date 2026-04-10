@@ -6245,81 +6245,101 @@ async def _place_single_order(
     bid = payload.get("limit_price", 0)
     acct_id = payload.get("account_id", "")
     label = ACCOUNT_LABELS.get(acct_id, acct_id)
+    sec_type = payload.get("sec_type", "OPT")
 
     try:
         ib_conn = await ensure_ib_connected()
 
         expiry_fmt = expiry.replace("-", "")
 
-        # Safety check: prevent duplicate short calls
-        positions = None
-        try:
-            positions = cached_positions
-            if positions is None:
-                positions = await ib_conn.reqPositionsAsync()
-            for pos in positions:
-                if (pos.account == acct_id
-                        and pos.contract.symbol == ticker
-                        and pos.contract.secType == "OPT"
-                        and getattr(pos.contract, "right", "") == "C"
-                        and pos.contract.strike == strike
-                        and str(pos.contract.lastTradeDateOrContractMonth).replace("-", "") == expiry_fmt
-                        and pos.position < 0):
-                    # Already have this exact short call
+        if sec_type == "OPT":
+            # Safety check: prevent duplicate short calls
+            positions = None
+            try:
+                positions = cached_positions
+                if positions is None:
+                    positions = await ib_conn.reqPositionsAsync()
+                for pos in positions:
+                    if (pos.account == acct_id
+                            and pos.contract.symbol == ticker
+                            and pos.contract.secType == "OPT"
+                            and getattr(pos.contract, "right", "") == "C"
+                            and pos.contract.strike == strike
+                            and str(pos.contract.lastTradeDateOrContractMonth).replace("-", "") == expiry_fmt
+                            and pos.position < 0):
+                        # Already have this exact short call
+                        with closing(_get_db_connection()) as conn:
+                            with conn:
+                                conn.execute(
+                                    "UPDATE pending_orders SET status = 'duplicate_skipped' WHERE id = ?",
+                                    (db_id,),
+                                )
+                        return False, f"#{db_id} {ticker} ${strike:.0f}C {expiry} — duplicate, already held"
+            except Exception as dup_exc:
+                logger.warning("Duplicate check failed for #%d: %s (proceeding anyway)", db_id, dup_exc)
+
+            # ── Verify account has uncovered capacity ──
+            try:
+                positions_list = cached_positions or positions or []
+                acct_long_shares = 0
+                acct_short_contracts = 0
+                for pos in positions_list:
+                    if pos.account != acct_id:
+                        continue
+                    if pos.contract.symbol.upper() != ticker:
+                        continue
+                    if pos.contract.secType == "STK" and pos.position > 0:
+                        acct_long_shares += int(pos.position)
+                    elif (pos.contract.secType == "OPT"
+                          and getattr(pos.contract, "right", "") == "C"
+                          and pos.position < 0):
+                        acct_short_contracts += abs(int(pos.position))
+
+                acct_uncovered = (acct_long_shares - acct_short_contracts * 100) // 100
+                if qty > acct_uncovered:
                     with closing(_get_db_connection()) as conn:
                         with conn:
                             conn.execute(
-                                "UPDATE pending_orders SET status = 'duplicate_skipped' WHERE id = ?",
+                                "UPDATE pending_orders SET status = 'rejected_naked' WHERE id = ?",
                                 (db_id,),
                             )
-                    return False, f"#{db_id} {ticker} ${strike:.0f}C {expiry} — duplicate, already held"
-        except Exception as dup_exc:
-            logger.warning("Duplicate check failed for #%d: %s (proceeding anyway)", db_id, dup_exc)
-
-        # ── Verify account has uncovered capacity ──
-        try:
-            positions_list = cached_positions or positions or []
-            acct_long_shares = 0
-            acct_short_contracts = 0
-            for pos in positions_list:
-                if pos.account != acct_id:
-                    continue
-                if pos.contract.symbol.upper() != ticker:
-                    continue
-                if pos.contract.secType == "STK" and pos.position > 0:
-                    acct_long_shares += int(pos.position)
-                elif (pos.contract.secType == "OPT"
-                      and getattr(pos.contract, "right", "") == "C"
-                      and pos.position < 0):
-                    acct_short_contracts += abs(int(pos.position))
-
-            acct_uncovered = (acct_long_shares - acct_short_contracts * 100) // 100
-            if qty > acct_uncovered:
-                with closing(_get_db_connection()) as conn:
-                    with conn:
-                        conn.execute(
-                            "UPDATE pending_orders SET status = 'rejected_naked' WHERE id = ?",
-                            (db_id,),
-                        )
-                return False, (
-                    f"#{db_id} {ticker} ${strike:.0f}C: REJECTED — "
-                    f"account {label} has {acct_uncovered}c uncovered capacity "
-                    f"but order needs {qty}c. Would create naked short."
+                    return False, (
+                        f"#{db_id} {ticker} ${strike:.0f}C: REJECTED — "
+                        f"account {label} has {acct_uncovered}c uncovered capacity "
+                        f"but order needs {qty}c. Would create naked short."
+                    )
+            except Exception as cap_exc:
+                logger.warning(
+                    "Capacity check failed for #%d (proceeding with caution): %s",
+                    db_id, cap_exc,
                 )
-        except Exception as cap_exc:
-            logger.warning(
-                "Capacity check failed for #%d (proceeding with caution): %s",
-                db_id, cap_exc,
-            )
 
-        contract = ib_async.Option(
-            symbol=ticker,
-            lastTradeDateOrContractMonth=expiry_fmt,
-            strike=strike,
-            right="C",
-            exchange="SMART",
-        )
-        order = _build_adaptive_sell_order(qty, _round_to_nickel(bid), acct_id)
+        if sec_type == "BAG":
+            contract = ib_async.Contract(
+                symbol=ticker, secType="BAG",
+                exchange="SMART", currency="USD",
+            )
+            combo_legs = []
+            for leg_data in payload.get("combo_legs", []):
+                combo_legs.append(ib_async.ComboLeg(
+                    conId=leg_data["conId"],
+                    ratio=leg_data["ratio"],
+                    action=leg_data["action"],
+                    exchange=leg_data["exchange"],
+                ))
+            contract.comboLegs = combo_legs
+            order = _build_adaptive_roll_combo(qty, abs(bid), acct_id, priority="Urgent")
+        elif sec_type == "OPT":
+            contract = ib_async.Option(
+                symbol=ticker,
+                lastTradeDateOrContractMonth=expiry_fmt,
+                strike=strike,
+                right="C",
+                exchange="SMART",
+            )
+            order = _build_adaptive_sell_order(qty, _round_to_nickel(bid), acct_id)
+        else:
+            return False, f"#{db_id} Unsupported sec_type {sec_type}"
 
         # Sprint 1A: unified pre-trade gate
         gate_ok, gate_reason = await _pre_trade_gates(
@@ -8573,38 +8593,54 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
                     qual_sell = await ib_conn.qualifyContractsAsync(sell_contract)
 
                     if qual_sell:
-                        # 2. Build the BAG Contract (Combo)
-                        bag = ib_async.Contract(
-                            symbol=ticker, secType="BAG",
-                            exchange="SMART", currency="USD",
-                        )
-                        leg1 = ib_async.ComboLeg(
-                            conId=pos.contract.conId, ratio=1,
-                            action="BUY", exchange="SMART",
-                        )
-                        leg2 = ib_async.ComboLeg(
-                            conId=qual_sell[0].conId, ratio=1,
-                            action="SELL", exchange="SMART",
-                        )
-                        bag.comboLegs = [leg1, leg2]
+                        # 2. Build the BAG Contract (Combo) — for conId capture
+                        leg1_conId = pos.contract.conId
+                        leg2_conId = qual_sell[0].conId
 
-                        # 3. Build Adaptive Urgent Combo Order
+                        # 3. Stage the BAG Combo in pending_orders
                         qty = abs(pos.position)
-                        order = _build_adaptive_roll_combo(
-                            qty, roll_decision["net_credit"],
-                            pos.account, priority="Urgent",
-                        )
+                        from datetime import datetime as _dt_now
+                        ticket = {
+                            "timestamp": _dt_now.now().isoformat(),
+                            "account_id": pos.account,
+                            "account_label": ACCOUNT_LABELS.get(pos.account, pos.account),
+                            "ticker": ticker,
+                            "sec_type": "BAG",
+                            "action": "BUY",
+                            "quantity": qty,
+                            "order_type": "LMT",
+                            "limit_price": -abs(round(roll_decision["net_credit"], 2)),
+                            "status": "staged",
+                            "transmit": True,
+                            "strategy": "Defensive Roll",
+                            "combo_legs": [
+                                {
+                                    "conId": leg1_conId,
+                                    "ratio": 1,
+                                    "action": "BUY",
+                                    "exchange": "SMART",
+                                    "strike": strike,
+                                    "expiry": exp_fmt,
+                                },
+                                {
+                                    "conId": leg2_conId,
+                                    "ratio": 1,
+                                    "action": "SELL",
+                                    "exchange": "SMART",
+                                    "strike": roll_decision["sell_strike"],
+                                    "expiry": sell_exp_fmt,
+                                },
+                            ],
+                        }
 
-                        # 4. Execute (kill-switch gated)
-                        assert_execution_enabled(in_process_halted=_HALTED)
-                        trade = ib_conn.placeOrder(bag, order)
+                        await asyncio.to_thread(append_pending_tickets, [ticket])
 
                         alerts.append(
-                            f"\U0001f6e1\ufe0f ROLL EXECUTED: {ticker} "
+                            f"\U0001f6e1\ufe0f ROLL STAGED: {ticker} "
                             f"${strike}C -> ${roll_decision['sell_strike']}C\n"
                             f"Algo: Adaptive Urgent @ Mid "
                             f"(${roll_decision['net_credit']:.2f} Credit)\n"
-                            f"IB Order ID: {trade.order.orderId}"
+                            f"Use /approve to execute."
                         )
                     else:
                         alerts.append(
