@@ -342,6 +342,48 @@ CHAIN_WALKER_MIN_MID: float = 0.05
 # ticker to avoid overlapping snapshot subscriptions.
 CHAIN_WALKER_INTER_EXPIRY_DELAY_S: float = 0.5
 
+# ─── Phase 5 strike band (C6.1 fix — interval-based floor) ──────
+# Per Architect dispatch 2026-04-11 (C6.1 greenlight), following
+# paper-run triage of 2026-04-11 CHRW failure.
+#
+# The C5 implementation used lowest_low_21d as the Phase 5 strike
+# band lower bound. In the 2026-04-11 paper run, CHRW was trading
+# at $163.49 with a 21-day low of $160.45 — a band of only $3.04
+# wide. IBKR's reqSecDefOptParams returned zero strikes in that
+# band because CHRW does not actually list $2.50 strikes at the
+# $160 price level despite OCC rules suggesting it could, and the
+# chain fetch raised "No strikes in range" for every expiry,
+# dropping CHRW from the run entirely.
+#
+# Fix: compute the band floor as spot - (expected_interval × 5).
+# The "5" guarantees at least 5 strike increments below spot. The
+# expected_interval is CONSERVATIVELY overestimated — we assume
+# $5 grids where OCC rules suggest $2.50 is possible, because
+# real-world chains are often wider than theoretical rules allow.
+
+# Strike interval estimates for computing the Phase 5 strike band
+# lower bound. CONSERVATIVE — intentionally overestimates interval
+# width to guarantee walkable bands even for illiquid names whose
+# actual strike grid is wider than OCC rules suggest.
+#
+# Real-world example (2026-04-11 paper run): CHRW at $163 spot had
+# zero strikes in the band [$160.45, $163.49] despite OCC rules
+# saying $2.50 strikes should be available. Conservative sizing
+# with $5 interval (not $2.50) prevents this class of failure.
+#
+# These are NOT the actual strike intervals IBKR returns via
+# reqSecDefOptParams — they are estimates used ONLY to compute the
+# band lower bound in chain_walker.py. The actual chain fetched
+# from IBKR returns whatever strikes the exchange actually lists.
+STRIKE_INTERVAL_UNDER_25: float = 2.5    # real range $1-$2.50, we assume $2.50
+STRIKE_INTERVAL_UNDER_100: float = 5.0   # real range $2.50-$5, we assume $5
+STRIKE_INTERVAL_100_PLUS: float = 5.0    # real range $5+, we assume $5
+
+# Minimum number of strike increments to guarantee in the Phase 5
+# strike band below spot. The band lower bound is computed as
+# spot - (expected_interval × CHAIN_WALKER_MIN_STRIKES_IN_BAND).
+CHAIN_WALKER_MIN_STRIKES_IN_BAND: int = 5
+
 
 # ─── Phase 6: RAY (Ratio of Annualized Yield) filter ────────────
 # Per Architect dispatch + Yash ruling 2026-04-11 (C6 greenlight).

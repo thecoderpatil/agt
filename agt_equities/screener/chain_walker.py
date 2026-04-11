@@ -65,6 +65,56 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Strike band floor helpers — pure functions, no I/O (C6.1)
+# ---------------------------------------------------------------------------
+
+def _expected_strike_interval(spot: float) -> float:
+    """Return a CONSERVATIVE strike interval estimate for a price level.
+
+    Intentionally overestimates interval width — real-world option
+    chains often trade on wider grids than OCC theoretical rules
+    suggest, especially for illiquid mid-caps. Being conservative
+    guarantees the Phase 5 strike band contains multiple walkable
+    strikes regardless of actual chain density.
+
+    The boundaries (25, 100) use strict `<` so spot == 25 falls into
+    the UNDER_100 bucket and spot == 100 falls into the 100_PLUS
+    bucket. Per the dispatch spec.
+
+    Returns the estimated interval in dollars.
+    """
+    if spot < 25:
+        return config.STRIKE_INTERVAL_UNDER_25
+    elif spot < 100:
+        return config.STRIKE_INTERVAL_UNDER_100
+    else:
+        return config.STRIKE_INTERVAL_100_PLUS
+
+
+def _compute_strike_band_floor(spot: float) -> float:
+    """Compute the Phase 5 strike band lower bound.
+
+    Returns spot - (expected_interval × CHAIN_WALKER_MIN_STRIKES_IN_BAND).
+    Does NOT consult lowest_low_21d — that field is intentionally
+    carried forward as metadata on the StrikeCandidate/RAYCandidate
+    dataclass chain but NOT used as a strike filter per Architect
+    ruling 2026-04-11.
+
+    Guarantees the resulting band [floor, spot] always contains at
+    least CHAIN_WALKER_MIN_STRIKES_IN_BAND strike increments, even
+    for tight-pullback names where spot is close to recent lows.
+
+    Returns float dollars. May return a negative value for pathological
+    inputs (spot < interval × min_strikes), in which case the floor
+    effectively becomes "every listed put strike" — that is acceptable
+    because IBKR's reqSecDefOptParams will not return negative strikes.
+    """
+    interval = _expected_strike_interval(spot)
+    floor = spot - (interval * config.CHAIN_WALKER_MIN_STRIKES_IN_BAND)
+    return floor
+
+
+# ---------------------------------------------------------------------------
 # Expiry selection helper — pure function, no I/O
 # ---------------------------------------------------------------------------
 
@@ -264,6 +314,15 @@ async def run_phase_5(
             continue
 
         # ── Step C/D: walk each selected expiry ───────────────
+        # C6.1: strike band lower bound is now interval-based, not
+        # lowest_low_21d-based. lowest_low_21d is still carried forward
+        # in the dataclass chain (VolArmorCandidate → StrikeCandidate →
+        # RAYCandidate) but is NOT used as a filter here. Per Architect
+        # ruling 2026-04-11 following the paper-run CHRW failure where
+        # spot was only 1.9% above the 21-day low and the resulting
+        # band was too narrow for IBKR's actual strike grid.
+        strike_floor = _compute_strike_band_floor(candidate.spot)
+
         ticker_strike_count = 0
         for idx, (expiry_str, dte) in enumerate(selected):
             try:
@@ -272,7 +331,7 @@ async def run_phase_5(
                     ticker,
                     expiry_str,
                     right="P",
-                    min_strike=candidate.lowest_low_21d,
+                    min_strike=strike_floor,
                     max_strike=candidate.spot,
                 )
             except IBKRChainError as exc:

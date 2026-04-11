@@ -791,6 +791,135 @@ def test_22_per_ticker_exception_does_not_abort_batch(monkeypatch):
 # 23. Final log line
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# C6.1 — Interval-based strike band floor (replaces lowest_low_21d)
+# ---------------------------------------------------------------------------
+#
+# Per Architect ruling 2026-04-11 after the paper run CHRW failure:
+# Phase 5's strike band lower bound is now computed as
+# spot - (expected_interval × CHAIN_WALKER_MIN_STRIKES_IN_BAND).
+# lowest_low_21d is still carried forward as a dataclass field but
+# NOT used as a strike filter.
+
+
+def test_c61_strike_interval_under_25():
+    """_expected_strike_interval returns 2.5 for spot < $25."""
+    assert chain_walker._expected_strike_interval(20.0) == 2.5
+    assert chain_walker._expected_strike_interval(5.0) == 2.5
+    assert chain_walker._expected_strike_interval(24.99) == 2.5
+
+
+def test_c61_strike_interval_under_100():
+    """_expected_strike_interval returns 5.0 for $25 <= spot < $100.
+
+    Note: spot == 25 is NOT in the < 25 bucket, so it maps to 5.0.
+    The boundary semantics matter — this test locks the `< 25` vs
+    `< 100` branching in _expected_strike_interval.
+    """
+    assert chain_walker._expected_strike_interval(50.0) == 5.0
+    assert chain_walker._expected_strike_interval(99.99) == 5.0
+    assert chain_walker._expected_strike_interval(25.0) == 5.0  # boundary
+
+
+def test_c61_strike_interval_100_plus():
+    """_expected_strike_interval returns 5.0 for spot >= $100."""
+    assert chain_walker._expected_strike_interval(100.0) == 5.0
+    assert chain_walker._expected_strike_interval(163.49) == 5.0  # CHRW paper run
+    assert chain_walker._expected_strike_interval(1500.0) == 5.0
+
+
+def test_c61_compute_strike_band_floor_chrw_regression():
+    """Regression test for 2026-04-11 paper run CHRW failure.
+
+    CHRW was trading at $163.49 with a 21-day low of $160.45. Under
+    C5's logic, the strike band was [160.45, 163.49] — IBKR returned
+    zero strikes because that 3-dollar band was too narrow for the
+    actual chain grid. Under C6.1, the floor is computed as
+    spot - (5.0 × 5) = $138.49, giving a $25 band that guarantees at
+    least 5 walkable strike increments regardless of chain density.
+    """
+    floor = chain_walker._compute_strike_band_floor(163.49)
+    assert abs(floor - 138.49) < 0.01
+    # Band width sanity check
+    band_width = 163.49 - floor
+    assert abs(band_width - 25.0) < 0.01
+
+
+def test_c61_compute_strike_band_floor_ignores_lowest_low():
+    """Structural contract test: _compute_strike_band_floor depends
+    ONLY on spot — no hidden state, no candidate object parameter.
+
+    This locks the ruling that lowest_low_21d is NOT consulted as a
+    strike filter. Two calls with the same spot value must return
+    the same floor, proving there is no hidden state dependency.
+    """
+    # Sub-$25 bucket (2.5 × 5 = 12.5 dollar band)
+    floor_small_a = chain_walker._compute_strike_band_floor(20.0)
+    floor_small_b = chain_walker._compute_strike_band_floor(20.0)
+    assert floor_small_a == floor_small_b
+    assert abs(floor_small_a - 7.5) < 1e-9  # 20 - (2.5 * 5) = 7.5
+
+    # $25-$100 bucket (5 × 5 = 25 dollar band)
+    floor_mid = chain_walker._compute_strike_band_floor(50.0)
+    assert abs(floor_mid - 25.0) < 1e-9   # 50 - (5 * 5) = 25
+
+    # $100+ bucket (5 × 5 = 25 dollar band)
+    floor_large = chain_walker._compute_strike_band_floor(200.0)
+    assert abs(floor_large - 175.0) < 1e-9  # 200 - 25 = 175
+
+    # Signature-level proof: the function does not accept
+    # lowest_low_21d or any candidate object. If the signature
+    # drifted, this import-level attribute check would fail.
+    import inspect
+    sig = inspect.signature(chain_walker._compute_strike_band_floor)
+    assert list(sig.parameters.keys()) == ["spot"]
+
+
+def test_c61_run_phase_5_passes_interval_floor_not_lowest_low(monkeypatch):
+    """Run-level proof: chain_walker.run_phase_5 calls
+    ib_chains.get_chain_for_expiry with min_strike equal to
+    _compute_strike_band_floor(candidate.spot), NOT
+    candidate.lowest_low_21d.
+
+    This is the coverage gap the dispatch intended the "amend the
+    stale min_strike test" instruction to address — no such stale
+    test existed in C5 (my C5 test fixture recorded min_strike
+    into chain_calls but never asserted on it), so this test
+    provides the missing coverage proactively.
+    """
+    f1 = _next_friday() + timedelta(days=7)
+    # Use a candidate where spot and lowest_low_21d would produce
+    # DIFFERENT floors, so the assertion is discriminating.
+    # spot=200 → interval=5.0 → floor = 200 - (5 * 5) = 175
+    # lowest_low_21d=180 → C5 would have passed 180 as min_strike
+    # The assertion below distinguishes these two values.
+    cand = _make_vol_armor_candidate(
+        "INTERVAL", spot=200.0, lowest_low_21d=180.0,
+    )
+    rows = [_build_fake_chain_row(strike=190.0)]
+
+    with _MockIBChains(
+        monkeypatch,
+        expirations_by_ticker={"INTERVAL": [f1.isoformat()]},
+        chain_by_key={("INTERVAL", f1.isoformat()): rows},
+    ) as mock:
+        _run(chain_walker.run_phase_5([cand], _STUB_IB))
+
+    # Exactly one chain fetch call was made
+    assert len(mock.chain_calls) == 1
+    call = mock.chain_calls[0]
+    # C6.1: min_strike must be the interval-based floor, NOT lowest_low_21d
+    expected_floor = chain_walker._compute_strike_band_floor(200.0)  # 175.0
+    assert abs(call["min_strike"] - expected_floor) < 1e-9
+    assert abs(call["min_strike"] - 175.0) < 1e-9
+    # Explicit regression: the floor is NOT lowest_low_21d
+    assert call["min_strike"] != 180.0
+    # max_strike still spot (unchanged from C5)
+    assert abs(call["max_strike"] - 200.0) < 1e-9
+    # right still 'P'
+    assert call["right"] == "P"
+
+
 def test_23_final_log_contains_all_required_tokens(monkeypatch, caplog):
     f1 = _next_friday() + timedelta(days=7)
     cand = _make_vol_armor_candidate("LOGCHECK")
