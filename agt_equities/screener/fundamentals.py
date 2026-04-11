@@ -231,6 +231,15 @@ def _extract_fundamentals(
     capex = _most_recent_value(cashflow, _CF_CAPEX)
 
     # ── short interest (info-only, with two-key fallback) ──────────
+    # C3.7 Fix 1: fail-OPEN when both data paths are unavailable.
+    # Rationale: yfinance shortPercentOfFloat is None for ~20-30% of
+    # tickers. Fail-closed would silently drop a meaningful fraction
+    # of viable candidates for the wrong reason. Missing data is NOT
+    # equivalent to "high short interest" — treat it as 0% and emit
+    # a warning so operator has audit visibility. The fallback path
+    # (sharesShort / floatShares) is preserved ahead of the fail-open
+    # — real data is always preferred when available.
+    ticker_symbol_for_log = str(info.get("symbol") or info.get("shortName") or "?")
     short_interest_pct: float | None = _info_get_float(info, "shortPercentOfFloat")
     if short_interest_pct is None:
         shares_short = _info_get_float(info, "sharesShort")
@@ -238,7 +247,12 @@ def _extract_fundamentals(
         if shares_short is not None and float_shares is not None and float_shares > 0:
             short_interest_pct = shares_short / float_shares
     if short_interest_pct is None:
-        raise _DropReason("short_interest_unavailable")
+        logger.warning(
+            "[screener.fundamentals] SHORT_INTEREST_UNAVAILABLE "
+            "ticker=%s — treating as 0%% (fail-open per C3.7)",
+            ticker_symbol_for_log,
+        )
+        short_interest_pct = 0.0
 
     # ── effective tax rate (optional, defaulted) ──────────────────
     tax_rate = _info_get_float(info, "effectiveTaxRate")
@@ -317,14 +331,39 @@ def _compute_fcf_yield(raw: _RawFundamentals) -> float:
 def _compute_net_debt_to_ebitda(raw: _RawFundamentals) -> float:
     """Net Debt / EBITDA: (total_debt - cash) / ebitda.
 
-    Raises _DropReason if EBITDA is zero or negative (the ratio is
-    meaningless under negative EBITDA — it would flip sign and pass
-    the gate spuriously).
-    """
-    if raw.ebitda <= 0:
-        raise _DropReason("degenerate_denominator:ebitda")
+    C3.7 Fix 2: check `net_debt <= 0` BEFORE the EBITDA guard.
+    TIKR calibration 2026-04-11 revealed that mega-cap tech (NVDA,
+    GOOGL, AAPL, META) and Berkshire carry NEGATIVE net debt — more
+    cash on the balance sheet than total debt. A net-cash company
+    has no leverage to service, so the leverage gate must pass
+    UNCONDITIONALLY regardless of EBITDA sign. The old C3 logic
+    dropped net-cash names with temporarily negative EBITDA via
+    degenerate_denominator:ebitda when it should pass cleanly.
 
+    Sentinel: net-cash companies return 0.0 as the sentinel for
+    "no leverage". Downstream phases (3.5, 4, 5, 6) cannot
+    distinguish "exactly zero leverage" from "net cash" via this
+    field alone. Acceptable for C3.7 — the distinction doesn't
+    affect any downstream gate logic. If it ever does, introduce
+    a separate leverage_state field in a future sprint.
+
+    New failure mode: positive net debt AND negative/zero EBITDA.
+    This is a genuine credit risk (real leverage, no earnings to
+    service it) and is rejected with a more specific reason.
+    """
     net_debt = raw.total_debt - raw.cash
+
+    # Net cash short-circuit — company has more cash than debt,
+    # no leverage to service, pass unconditionally.
+    if net_debt <= 0:
+        return 0.0
+
+    # Positive net debt with no earnings to service it — genuine
+    # credit risk. Reject with a specific reason that distinguishes
+    # this case from the clean net-cash path above.
+    if raw.ebitda <= 0:
+        raise _DropReason("degenerate_denominator:positive_net_debt_negative_ebitda")
+
     ratio = net_debt / raw.ebitda
     if math.isnan(ratio) or math.isinf(ratio):
         raise _DropReason("nan_computation:net_debt_to_ebitda")

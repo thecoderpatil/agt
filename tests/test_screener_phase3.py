@@ -556,7 +556,15 @@ def test_16_cashflow_missing_op_cf_drops(caplog):
     assert any("field_missing:Operating Cash Flow" in r.message for r in caplog.records)
 
 
-def test_17_ebitda_zero_drops(caplog):
+def test_17_ebitda_zero_with_positive_net_debt_drops(caplog):
+    """C3.7 update: ebitda <= 0 now only fails when net_debt > 0.
+    With the happy ticker's total_debt=10B and cash=8B (net_debt=+2B),
+    setting ebitda=0 triggers the positive-net-debt-negative-ebitda
+    path rather than the old plain degenerate_denominator:ebitda.
+    See test_27_net_cash_with_negative_ebitda_passes for the case
+    where net_debt <= 0 causes the leverage gate to short-circuit
+    to 0.0 regardless of ebitda sign.
+    """
     upstream = _make_universe_tc("EBITDAZERO")
     ft = _make_happy_ticker()
     ft.income_stmt = _is({
@@ -568,7 +576,10 @@ def test_17_ebitda_zero_drops(caplog):
     with caplog.at_level(logging.WARNING, logger="agt_equities.screener.fundamentals"):
         result = fundamentals.run_phase_3([upstream], yf_ticker_factory=factory, heartbeat_interval=0)
     assert result == []
-    assert any("degenerate_denominator:ebitda" in r.message for r in caplog.records)
+    assert any(
+        "degenerate_denominator:positive_net_debt_negative_ebitda" in r.message
+        for r in caplog.records
+    )
 
 
 def test_18_invested_capital_zero_drops(caplog):
@@ -591,15 +602,29 @@ def test_18_invested_capital_zero_drops(caplog):
     assert any("degenerate_denominator:invested_capital" in r.message for r in caplog.records)
 
 
-def test_19_short_interest_unavailable_drops(caplog):
+def test_19_short_interest_unavailable_fails_open(caplog):
+    """C3.7 Fix 1: short interest missing from both shortPercentOfFloat
+    AND sharesShort/floatShares now fails OPEN (treats as 0%) rather
+    than dropping the candidate. yfinance's shortPercentOfFloat is None
+    for ~20-30% of tickers — fail-closed would silently starve the
+    candidate pool for the wrong reason.
+
+    Regression guard: the candidate must SURVIVE Phase 3 (assuming
+    other four metrics pass), its short_interest_pct must be 0.0,
+    and the SHORT_INTEREST_UNAVAILABLE warning log must fire.
+    """
     upstream = _make_universe_tc("SINOPE")
     ft = _make_happy_ticker()
     ft.info = {"effectiveTaxRate": 0.21}  # neither shortPercentOfFloat nor sharesShort/floatShares
     factory = _make_factory({"SINOPE": ft})
     with caplog.at_level(logging.WARNING, logger="agt_equities.screener.fundamentals"):
         result = fundamentals.run_phase_3([upstream], yf_ticker_factory=factory, heartbeat_interval=0)
-    assert result == []
-    assert any("short_interest_unavailable" in r.message for r in caplog.records)
+    # Candidate must now SURVIVE fail-open
+    assert len(result) == 1
+    assert result[0].ticker == "SINOPE"
+    assert result[0].short_interest_pct == 0.0
+    # Warning log must fire
+    assert any("SHORT_INTEREST_UNAVAILABLE" in r.message for r in caplog.records)
 
 
 def test_20_total_assets_zero_drops(caplog):
@@ -739,3 +764,202 @@ def test_26_no_finnhub_imports_in_fundamentals():
             violations.append(f"forbidden name reference: {node.id}")
 
     assert not violations, "fundamentals.py isolation violation: " + ", ".join(violations)
+
+
+# ---------------------------------------------------------------------------
+# C3.7 — Semantic fix coverage (short interest fail-open + net cash bypass)
+# ---------------------------------------------------------------------------
+
+def test_27_short_interest_fallback_still_works():
+    """C3.7 regression: the sharesShort / floatShares fallback path MUST
+    still work when shortPercentOfFloat is None but the two-key fallback
+    is available. Fail-open must not short-circuit real data that can
+    still be computed from the alternate keys.
+    """
+    upstream = _make_universe_tc("FALLBACK")
+    ft = _make_happy_ticker()
+    # Remove shortPercentOfFloat, provide sharesShort + floatShares
+    ft.info = {
+        "effectiveTaxRate": 0.21,
+        "sharesShort": 3_000_000,
+        "floatShares": 100_000_000,  # → 3% short interest
+    }
+    factory = _make_factory({"FALLBACK": ft})
+    result = fundamentals.run_phase_3([upstream], yf_ticker_factory=factory, heartbeat_interval=0)
+    assert len(result) == 1
+    assert result[0].ticker == "FALLBACK"
+    # Ratio: 3M / 100M = 0.03 (NOT 0.0 from fail-open)
+    assert abs(result[0].short_interest_pct - 0.03) < 1e-9
+
+
+def test_28_net_cash_with_positive_ebitda_passes():
+    """C3.7 Fix 2: a net-cash company (total_debt < cash) passes the
+    leverage gate unconditionally with the 0.0 sentinel.
+
+    total_debt = 5B, cash = 200B, ebitda = 100B  →  net_debt = -195B
+    C3.7 short-circuits to nd_ebitda = 0.0 regardless of ebitda sign.
+    """
+    upstream = _make_universe_tc("NETCASH_POS")
+    ft = _make_happy_ticker()
+    ft.balance_sheet = _bs({
+        "Total Assets": 300_000_000_000,
+        "Total Liabilities Net Minority Interest": 50_000_000_000,
+        "Working Capital": 60_000_000_000,
+        "Retained Earnings": 150_000_000_000,
+        "Stockholders Equity": 200_000_000_000,
+        "Total Debt": 5_000_000_000,
+        "Cash And Cash Equivalents": 200_000_000_000,
+    })
+    ft.income_stmt = _is({
+        "Total Revenue": 300_000_000_000,
+        "EBIT": 50_000_000_000,
+        "EBITDA": 100_000_000_000,
+    })
+    factory = _make_factory({"NETCASH_POS": ft})
+    result = fundamentals.run_phase_3([upstream], yf_ticker_factory=factory, heartbeat_interval=0)
+    assert len(result) == 1
+    assert result[0].net_debt_to_ebitda == 0.0
+    # Underlying raw: net_debt = 5 - 200 = -195B (negative = net cash)
+
+
+def test_29_net_cash_with_negative_ebitda_passes():
+    """C3.7 Fix 2: the load-bearing test case. A net-cash company with
+    TEMPORARILY NEGATIVE EBITDA must pass the leverage gate. The old
+    C3 logic dropped this case via degenerate_denominator:ebitda, which
+    was semantically wrong — no leverage means no leverage risk,
+    regardless of current-quarter earnings.
+
+    total_debt = 50B, cash = 200B, ebitda = -10B  →  net_debt = -150B
+    """
+    upstream = _make_universe_tc("NETCASH_NEG_EBITDA")
+    ft = _make_happy_ticker()
+    ft.balance_sheet = _bs({
+        "Total Assets": 300_000_000_000,
+        "Total Liabilities Net Minority Interest": 50_000_000_000,
+        "Working Capital": 60_000_000_000,
+        "Retained Earnings": 150_000_000_000,
+        "Stockholders Equity": 200_000_000_000,
+        "Total Debt": 50_000_000_000,
+        "Cash And Cash Equivalents": 200_000_000_000,
+    })
+    ft.income_stmt = _is({
+        "Total Revenue": 300_000_000_000,
+        "EBIT": 50_000_000_000,    # positive EBIT keeps Altman Z + ROIC happy
+        "EBITDA": -10_000_000_000,  # temporarily negative (e.g. one-time charge)
+    })
+    factory = _make_factory({"NETCASH_NEG_EBITDA": ft})
+    result = fundamentals.run_phase_3([upstream], yf_ticker_factory=factory, heartbeat_interval=0)
+    # CRITICAL: under old C3 this dropped. Under C3.7 it survives.
+    assert len(result) == 1
+    assert result[0].ticker == "NETCASH_NEG_EBITDA"
+    assert result[0].net_debt_to_ebitda == 0.0
+
+
+def test_30_positive_net_debt_with_negative_ebitda_fails(caplog):
+    """C3.7 Fix 2 companion case: POSITIVE net_debt with negative
+    EBITDA is a genuine credit risk (real leverage, no earnings to
+    service it). Must fail with the new specific drop reason
+    `degenerate_denominator:positive_net_debt_negative_ebitda`
+    (not the old generic `degenerate_denominator:ebitda`).
+
+    total_debt = 500B, cash = 50B, ebitda = -10B  →  net_debt = +450B
+    """
+    upstream = _make_universe_tc("POSDEBT_NEG_EBITDA")
+    ft = _make_happy_ticker()
+    ft.balance_sheet = _bs({
+        "Total Assets": 1_000_000_000_000,
+        "Total Liabilities Net Minority Interest": 600_000_000_000,
+        "Working Capital": 15_000_000_000,
+        "Retained Earnings": 30_000_000_000,
+        "Stockholders Equity": 75_000_000_000,
+        "Total Debt": 500_000_000_000,
+        "Cash And Cash Equivalents": 50_000_000_000,
+    })
+    ft.income_stmt = _is({
+        "Total Revenue": 100_000_000_000,
+        "EBIT": 30_000_000_000,
+        "EBITDA": -10_000_000_000,
+    })
+    factory = _make_factory({"POSDEBT_NEG_EBITDA": ft})
+    with caplog.at_level(logging.WARNING, logger="agt_equities.screener.fundamentals"):
+        result = fundamentals.run_phase_3([upstream], yf_ticker_factory=factory, heartbeat_interval=0)
+    assert result == []
+    assert any(
+        "degenerate_denominator:positive_net_debt_negative_ebitda" in r.message
+        for r in caplog.records
+    )
+
+
+def test_31_positive_net_debt_above_threshold_fails_on_filter(caplog):
+    """C3.7 regression: the normal positive-net-debt path still works
+    after Fix 2. When ND/EBITDA computes cleanly but exceeds the 3.0
+    threshold, the candidate fails via filter_fail (not via any of the
+    new C3.7 degenerate reasons).
+
+    total_debt = 400B, cash = 50B, ebitda = 100B  →  ND/EBITDA = 3.5
+    (above MAX_NET_DEBT_TO_EBITDA = 3.0)
+    """
+    upstream = _make_universe_tc("HIGH_LEVERAGE")
+    ft = _make_happy_ticker()
+    ft.balance_sheet = _bs({
+        "Total Assets": 1_000_000_000_000,
+        "Total Liabilities Net Minority Interest": 500_000_000_000,
+        "Working Capital": 15_000_000_000,
+        "Retained Earnings": 30_000_000_000,
+        "Stockholders Equity": 75_000_000_000,
+        "Total Debt": 400_000_000_000,
+        "Cash And Cash Equivalents": 50_000_000_000,
+    })
+    ft.income_stmt = _is({
+        "Total Revenue": 300_000_000_000,
+        "EBIT": 30_000_000_000,
+        "EBITDA": 100_000_000_000,
+    })
+    factory = _make_factory({"HIGH_LEVERAGE": ft})
+    with caplog.at_level(logging.WARNING, logger="agt_equities.screener.fundamentals"):
+        result = fundamentals.run_phase_3([upstream], yf_ticker_factory=factory, heartbeat_interval=0)
+    assert result == []
+    # Must be filter_fail, NOT any of the C3.7 degenerate reasons
+    assert any("filter_fail" in r.message for r in caplog.records)
+    assert not any(
+        "degenerate_denominator:positive_net_debt_negative_ebitda" in r.message
+        for r in caplog.records
+    )
+
+
+def test_32_short_interest_fail_open_and_net_cash_combined():
+    """Stack both C3.7 fixes: a net-cash company with NO short interest
+    data must survive Phase 3 with short_interest_pct=0.0 AND
+    net_debt_to_ebitda=0.0.
+
+    Realistic scenario: a mega-cap tech name with a huge cash hoard
+    where yfinance happens to not have shortPercentOfFloat populated.
+    Before C3.7 this would have dropped twice (once for SI, once for
+    the net-cash negative EBITDA path if earnings were temporarily soft).
+    """
+    upstream = _make_universe_tc("MEGATECH")
+    ft = _make_happy_ticker()
+    # No short interest data at all
+    ft.info = {"effectiveTaxRate": 0.21}
+    # Net cash position
+    ft.balance_sheet = _bs({
+        "Total Assets": 400_000_000_000,
+        "Total Liabilities Net Minority Interest": 60_000_000_000,
+        "Working Capital": 80_000_000_000,
+        "Retained Earnings": 180_000_000_000,
+        "Stockholders Equity": 250_000_000_000,
+        "Total Debt": 10_000_000_000,
+        "Cash And Cash Equivalents": 150_000_000_000,
+    })
+    ft.income_stmt = _is({
+        "Total Revenue": 400_000_000_000,
+        "EBIT": 80_000_000_000,
+        "EBITDA": 120_000_000_000,
+    })
+    factory = _make_factory({"MEGATECH": ft})
+    result = fundamentals.run_phase_3([upstream], yf_ticker_factory=factory, heartbeat_interval=0)
+    assert len(result) == 1
+    out = result[0]
+    assert out.ticker == "MEGATECH"
+    assert out.short_interest_pct == 0.0  # Fix 1 applied
+    assert out.net_debt_to_ebitda == 0.0   # Fix 2 applied (net_debt = -140B)
