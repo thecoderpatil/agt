@@ -124,3 +124,87 @@ class TechnicalCandidate:
             bband_upper=bband_upper,
             lowest_low_21d=lowest_low_21d,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class FundamentalCandidate:
+    """Output of Phase 3 — a ticker that passed the fundamental fortress.
+
+    Phase 3 verifies (against TTM/most-recent-quarter yfinance data):
+      - Altman Z-Score        > MIN_ALTMAN_Z         (3.0)
+      - FCF Yield             >= MIN_FCF_YIELD       (0.04)
+      - Net Debt / EBITDA     <= MAX_NET_DEBT_TO_EBITDA (3.0)
+      - ROIC                  >= MIN_ROIC            (0.10)
+      - Short Interest        <= MAX_SHORT_INTEREST  (0.10)
+
+    Carries forward ALL Phase 1 + Phase 2 fields per the dispatch's
+    "downstream phases can keep enriching without re-joining" principle.
+    Field name mapping at the carry-forward boundary:
+        TechnicalCandidate.current_price  →  FundamentalCandidate.spot
+        TechnicalCandidate.bband_middle   →  FundamentalCandidate.bband_mid
+    Other field names are unchanged.
+
+    Fields `name` and `lowest_low_21d` are also carried forward beyond
+    the dispatch's explicit field list — `lowest_low_21d` is needed by
+    Phase 5's strike-floor sanity check, and `name` is operator-readable
+    identification in the final output table.
+    """
+    # Phase 1 carry-forward
+    ticker: str
+    name: str
+    sector: str
+    country: str
+    market_cap_usd: float
+    # Phase 2 carry-forward (renamed per dispatch: spot, bband_mid)
+    spot: float
+    sma_200: float
+    rsi_14: float
+    bband_lower: float
+    bband_mid: float
+    bband_upper: float
+    lowest_low_21d: float
+    # Phase 3 fundamental fortress fields
+    altman_z: float
+    fcf_yield: float            # free cash flow / market cap, as fraction
+    net_debt_to_ebitda: float   # leverage ratio
+    roic: float                 # return on invested capital, as fraction
+    short_interest_pct: float   # short interest as fraction of float
+
+    @classmethod
+    def from_technical(
+        cls,
+        upstream: TechnicalCandidate,
+        *,
+        altman_z: float,
+        fcf_yield: float,
+        net_debt_to_ebitda: float,
+        roic: float,
+        short_interest_pct: float,
+    ) -> "FundamentalCandidate":
+        """Construct a FundamentalCandidate from a TechnicalCandidate.
+
+        Centralizes the carry-forward + field-rename logic so Phase 3
+        doesn't have to know about TechnicalCandidate's field naming
+        conventions. The two name remappings happen here:
+            current_price  →  spot
+            bband_middle   →  bband_mid
+        """
+        return cls(
+            ticker=upstream.ticker,
+            name=upstream.name,
+            sector=upstream.sector,
+            country=upstream.country,
+            market_cap_usd=upstream.market_cap_usd,
+            spot=upstream.current_price,
+            sma_200=upstream.sma_200,
+            rsi_14=upstream.rsi_14,
+            bband_lower=upstream.bband_lower,
+            bband_mid=upstream.bband_middle,
+            bband_upper=upstream.bband_upper,
+            lowest_low_21d=upstream.lowest_low_21d,
+            altman_z=altman_z,
+            fcf_yield=fcf_yield,
+            net_debt_to_ebitda=net_debt_to_ebitda,
+            roic=roic,
+            short_interest_pct=short_interest_pct,
+        )

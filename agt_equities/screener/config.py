@@ -92,12 +92,53 @@ YFINANCE_HISTORY_INTERVAL: str = "1d"
 #   ROIC >= 0.12
 #   Short_Interest_Pct_Float <= 0.05
 #
-ALTMAN_Z_MIN: float = 3.0
-FCF_YIELD_MIN: float = 0.05
-NET_DEBT_TO_EBITDA_MAX: float = 2.0
-ROIC_MIN: float = 0.12
-MAX_SHORT_INTEREST_PCT_FLOAT: float = 0.05  # moved from Phase 1 → Phase 3
-                                            # under the Finnhub Free pivot
+# ─── Phase 3: fundamentals thresholds ────────────────────────────
+# All thresholds per Architect dispatch 2026-04-11 (C3 greenlight).
+# A candidate must pass ALL five filters to survive Phase 3.
+#
+# DELTA from C2 placeholder values: the dispatch loosens four of the
+# five gates relative to the original Master Specification reading
+# (which appears to have been calibrated tight enough to yield zero
+# survivors). These are the authoritative working values.
+
+# Altman Z-Score: credit-risk composite. Z > 3.0 = "safe zone".
+# Rulebook rationale: we do not sell CSPs on names with meaningful
+# bankruptcy-cycle exposure. Wheel assignment must not land us in a
+# distressed name at the bottom of a credit cycle.
+# Predicate: altman_z > MIN_ALTMAN_Z (strict greater-than per dispatch)
+MIN_ALTMAN_Z: float = 3.0
+
+# Free cash flow yield: FCF / market cap. Minimum 4%.
+# Rulebook rationale: positive, material FCF is the cleanest signal
+# that the company is self-funding and not dilution-dependent.
+# Predicate: fcf_yield >= MIN_FCF_YIELD
+MIN_FCF_YIELD: float = 0.04
+
+# Net Debt / EBITDA: leverage. Maximum 3.0.
+# Rulebook rationale: above 3.0x, interest coverage risk rises
+# sharply in a rates-up environment; assignment risk on the CSP
+# and recovery risk on subsequent Wheel cycles both increase.
+# Predicate: net_debt_to_ebitda <= MAX_NET_DEBT_TO_EBITDA
+MAX_NET_DEBT_TO_EBITDA: float = 3.0
+
+# Return on invested capital: minimum 10%.
+# Rulebook rationale: ROIC below WACC (call it ~8% as a floor)
+# means the company is destroying value on reinvestment. Wheel
+# assignment into value-destroying names is a structural loser.
+# Predicate: roic >= MIN_ROIC
+MIN_ROIC: float = 0.10
+
+# Short interest as % of float: maximum 10%.
+# Rulebook rationale: high short interest above 10% signals
+# institutional skepticism and raises the probability of a
+# negative-surprise drawdown during our hold period.
+# Predicate: short_interest_pct <= MAX_SHORT_INTEREST
+MAX_SHORT_INTEREST: float = 0.10
+
+# Default effective tax rate when ticker.info["effectiveTaxRate"] is
+# unavailable. 21% matches the US federal corporate rate post-TCJA.
+# Used for the NOPAT computation in ROIC: nopat = ebit * (1 - tax).
+DEFAULT_EFFECTIVE_TAX_RATE: float = 0.21
 
 
 # ---------------------------------------------------------------------------
