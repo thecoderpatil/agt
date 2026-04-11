@@ -141,6 +141,51 @@ MAX_SHORT_INTEREST: float = 0.10
 DEFAULT_EFFECTIVE_TAX_RATE: float = 0.21
 
 
+# ─── Phase 3.5: correlation fit thresholds ───────────────────────
+# Per Architect dispatch + Yash ruling 2026-04-11 (C3.5 greenlight).
+# Phase 3.5 sits between fundamentals (Phase 3) and volatility (Phase 4),
+# rejecting candidates that are too closely correlated with the existing
+# Wheel book. Global fit — no per-household routing. Wheel candidate
+# universe is identical across all households per Yash's ruling.
+
+# Rule 4 correlation threshold. A candidate is rejected if its
+# |correlation| with ANY existing holding exceeds this value.
+# Pearson correlation of daily returns.
+# Rationale: Portfolio Risk Rulebook v10 Rule 4. Tightening below
+# 0.60 starves the candidate pool; loosening above 0.60 admits
+# closet-clone exposure. Do NOT tune without an Architect amendment.
+# Predicate: max(|corr(candidate, h)| for h in effective_holdings)
+#            <= MAX_HOLDING_CORRELATION
+MAX_HOLDING_CORRELATION: float = 0.60
+
+# Correlation window: trailing trading days used for the pairwise
+# correlation computation. The Phase 2 dataframe covers ~295 trading
+# days (14mo); we slice the last 90 for correlation. Rationale:
+# 90 days balances stability (enough sample) against regime sensitivity
+# (a 2-year window would wash out recent correlation changes).
+CORRELATION_WINDOW_DAYS: int = 90
+
+# Minimum return observations that must overlap between a candidate
+# and the holdings window. Below this, the correlation is not
+# trustworthy and the candidate is dropped fail-closed. Rationale:
+# an IPO with 20 days of history can produce spurious near-zero
+# correlation against the book. 60 trading days is a ~3-month
+# minimum track record.
+MIN_CORRELATION_OVERLAP_DAYS: int = 60
+
+# Tickers excluded from the "current holdings" list when computing
+# Phase 3.5 correlation fit. These are residual / fully-amortized /
+# legacy positions, not active Wheel state. New CSP candidates should
+# be evaluated against the active Wheel book only.
+# Yash ruling 2026-04-11: the Wheel candidate universe is identical
+# across all households, so this list is global, not per-household.
+CORRELATION_HOLDINGS_EXCLUSIONS: frozenset[str] = frozenset({
+    "SLS",
+    "GTLB",
+    "TRAW.CVR",
+})
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 — Volatility & event armor
 # ---------------------------------------------------------------------------

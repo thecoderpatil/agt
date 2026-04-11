@@ -25,6 +25,10 @@ tests/test_screener_isolation.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas as pd  # noqa: F401  (type-hint only — keeps stdlib-only isolation)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,4 +211,111 @@ class FundamentalCandidate:
             net_debt_to_ebitda=net_debt_to_ebitda,
             roic=roic,
             short_interest_pct=short_interest_pct,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Phase2Output:
+    """Output of Phase 2 — survivors plus the price history dataframe.
+
+    The dataframe is retained across phase boundaries so Phase 3.5 can
+    compute pairwise correlations without a second yfinance download.
+    Phase 3 ignores the dataframe; Phase 3.5 consumes it.
+
+    BREAKING CHANGE in C3.5: Phase 2's return type changed from
+    `list[TechnicalCandidate]` to `Phase2Output`. Callers that previously
+    iterated the result directly must now access `.survivors`.
+
+    Attributes:
+        survivors:     List of TechnicalCandidate — tickers that passed
+                       trend + RSI + BBand pullback gates.
+        price_history: MultiIndex-columns pd.DataFrame from yf.download
+                       with group_by="ticker". Shape: (n_days, n_tickers
+                       * n_fields). Top column level is the ticker symbol;
+                       second level is OHLCV field name. Phase 3.5 slices
+                       via `.xs("Close", level=1, axis=1)`.
+
+                       Critically, this contains the FULL Phase 2 universe
+                       (post-Phase-1 survivors), not just the Phase 2
+                       gate survivors. Phase 3.5 needs history for tickers
+                       that were dropped by the pullback gate so they're
+                       still available as correlation references.
+
+                       Typed as Any to preserve stdlib-only isolation.
+                       Real type is pandas.DataFrame.
+    """
+    survivors: list["TechnicalCandidate"]
+    price_history: Any  # pd.DataFrame — stdlib-only isolation
+
+
+@dataclass(frozen=True, slots=True)
+class CorrelationCandidate:
+    """Output of Phase 3.5 — a fundamentally-strong ticker that is also
+    uncorrelated with the current Wheel book.
+
+    Phase 3.5 verifies:
+        max(|corr(candidate, holding)|) <= MAX_HOLDING_CORRELATION
+            across every holding in `current_holdings` (after applying
+            CORRELATION_HOLDINGS_EXCLUSIONS)
+        AND
+        the candidate is NOT already a current holding (post-exclusion)
+        AND
+        the candidate has >= MIN_CORRELATION_OVERLAP_DAYS of return
+        observations overlapping with the holdings window
+
+    Carries forward ALL Phase 1 + Phase 2 + Phase 3 fields. Adds the
+    maximum |correlation| against the holdings book + the holding that
+    produced it for audit / Phase 6 RAY scoring.
+    """
+    # All FundamentalCandidate fields (carry-forward, verbatim)
+    ticker: str
+    name: str
+    sector: str
+    country: str
+    market_cap_usd: float
+    spot: float
+    sma_200: float
+    rsi_14: float
+    bband_lower: float
+    bband_mid: float
+    bband_upper: float
+    lowest_low_21d: float
+    altman_z: float
+    fcf_yield: float
+    net_debt_to_ebitda: float
+    roic: float
+    short_interest_pct: float
+    # Phase 3.5 additions
+    max_abs_correlation: float
+    most_correlated_holding: str
+
+    @classmethod
+    def from_fundamental(
+        cls,
+        upstream: "FundamentalCandidate",
+        *,
+        max_abs_correlation: float,
+        most_correlated_holding: str,
+    ) -> "CorrelationCandidate":
+        """Construct a CorrelationCandidate from a FundamentalCandidate."""
+        return cls(
+            ticker=upstream.ticker,
+            name=upstream.name,
+            sector=upstream.sector,
+            country=upstream.country,
+            market_cap_usd=upstream.market_cap_usd,
+            spot=upstream.spot,
+            sma_200=upstream.sma_200,
+            rsi_14=upstream.rsi_14,
+            bband_lower=upstream.bband_lower,
+            bband_mid=upstream.bband_mid,
+            bband_upper=upstream.bband_upper,
+            lowest_low_21d=upstream.lowest_low_21d,
+            altman_z=upstream.altman_z,
+            fcf_yield=upstream.fcf_yield,
+            net_debt_to_ebitda=upstream.net_debt_to_ebitda,
+            roic=upstream.roic,
+            short_interest_pct=upstream.short_interest_pct,
+            max_abs_correlation=max_abs_correlation,
+            most_correlated_holding=most_correlated_holding,
         )

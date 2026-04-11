@@ -41,7 +41,11 @@ import numpy as np
 import pandas as pd
 
 from agt_equities.screener import config
-from agt_equities.screener.types import TechnicalCandidate, UniverseTicker
+from agt_equities.screener.types import (
+    Phase2Output,
+    TechnicalCandidate,
+    UniverseTicker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -308,22 +312,31 @@ def run_phase_2(
     survivors: list[UniverseTicker],
     *,
     yf_download_fn: Callable[[list[str]], dict[str, pd.DataFrame]] | None = None,
-) -> list[TechnicalCandidate]:
+) -> Phase2Output:
     """Execute Phase 2: batched yfinance download + indicator gate.
 
+    BREAKING CHANGE in C3.5: returns Phase2Output (not a bare list of
+    survivors). The wrapper bundles the survivor list with the raw
+    yfinance price-history dataframe so Phase 3.5 can compute pairwise
+    correlations against the full Phase 2 universe without re-downloading.
+
     Args:
-        survivors: Phase 1 output. Empty list returns empty list.
+        survivors: Phase 1 output. Empty list returns Phase2Output with
+            empty survivors and empty price_history.
         yf_download_fn: optional injection point for tests. Default is
             _default_yf_download which wraps yfinance.download. Tests
             inject a fixture function returning {ticker: DataFrame}.
 
     Returns:
-        List of TechnicalCandidate survivors. Failed/missing tickers
-        are silently dropped (fail-closed per Architect ruling).
+        Phase2Output(survivors=..., price_history=...) — the price_history
+        is a MultiIndex DataFrame containing OHLCV history for ALL Phase 1
+        survivors (not just the Phase 2 gate survivors). Phase 3.5 needs
+        the full universe so it can correlate against tickers that were
+        dropped by the pullback gate but are still active book holdings.
     """
     if not survivors:
         logger.info("Phase 2: empty input, returning empty result")
-        return []
+        return Phase2Output(survivors=[], price_history=pd.DataFrame())
 
     download_fn = yf_download_fn if yf_download_fn is not None else _default_yf_download
     symbols = [t.ticker for t in survivors]
@@ -336,7 +349,7 @@ def run_phase_2(
     download_result = download_fn(symbols)
     if not download_result:
         logger.warning("Phase 2: download returned empty result, no survivors")
-        return []
+        return Phase2Output(survivors=[], price_history=pd.DataFrame())
 
     candidates: list[TechnicalCandidate] = []
     for upstream in survivors:
@@ -347,8 +360,26 @@ def run_phase_2(
         if candidate is not None:
             candidates.append(candidate)
 
+    # Reconstruct a MultiIndex DataFrame from the per-ticker dict so
+    # Phase 3.5 can use pandas .xs() / column slicing. The keys become
+    # the top column level (ticker), and the original OHLCV columns
+    # become the second level. This matches yfinance.download's native
+    # group_by="ticker" output shape exactly.
+    try:
+        price_history = pd.concat(
+            list(download_result.values()),
+            keys=list(download_result.keys()),
+            axis=1,
+        )
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "Phase 2: price_history reconstruction failed (%s), "
+            "passing empty dataframe to Phase 3.5", exc,
+        )
+        price_history = pd.DataFrame()
+
     logger.info(
         "Phase 2 complete: %d/%d tickers in active pullback",
         len(candidates), len(survivors),
     )
-    return candidates
+    return Phase2Output(survivors=candidates, price_history=price_history)

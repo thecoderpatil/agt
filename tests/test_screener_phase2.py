@@ -268,8 +268,12 @@ def test_12_candidate_missing_columns():
 # ---------------------------------------------------------------------------
 
 def test_13_run_phase_2_empty_input():
-    result = technicals.run_phase_2([])
-    assert result == []
+    """Empty input → Phase2Output with empty survivors AND empty dataframe."""
+    output = technicals.run_phase_2([])
+    assert output.survivors == []
+    # Dataframe must be present (not None) but empty
+    assert output.price_history is not None
+    assert output.price_history.empty
 
 
 def test_14_run_phase_2_pullback_survivor():
@@ -280,14 +284,6 @@ def test_14_run_phase_2_pullback_survivor():
     # Build 250 days where the first 230 are a steady uptrend (so SMA200
     # is well below current price), then 20 days of mild pullback that
     # lands the close exactly at the lower BBand and RSI in the 40-45 band.
-    #
-    # We'll use a mathematical construction:
-    #   - Days 0..229: linear ramp 100 → 200 (slope ~0.435/day)
-    #   - Days 230..249: linear pullback 200 → 188 (~6% drop)
-    # SMA200 over the last 200 bars will be near the midpoint of the
-    # lookback window, comfortably below the current 188. RSI over the
-    # last 14 bars will reflect the mild downward drift — should land
-    # in the 35-45 band.
     n = 250
     dates = pd.date_range("2025-04-01", periods=n, freq="B")
     closes = []
@@ -305,17 +301,12 @@ def test_14_run_phase_2_pullback_survivor():
         "Volume": [1_000_000] * n,
     }, index=dates)
 
-    # Sanity-check the construction: compute the indicators ourselves
     sma200 = technicals._compute_sma(frame["Close"], 200)
     rsi14 = technicals._compute_rsi(frame["Close"], 14)
     bbands = technicals._compute_bbands(frame["Close"], 20, 2.0)
     assert sma200 is not None and rsi14 is not None and bbands is not None
     last_close = float(frame["Close"].iloc[-1])
 
-    # If the construction lands the values in-band, the orchestrator
-    # should produce 1 candidate. Otherwise, this test self-skips with a
-    # diagnostic — we don't want a flaky synthetic-data test, just a
-    # sanity check that the orchestrator wires together correctly.
     bband_lower = bbands[0]
     in_band = (
         last_close > sma200
@@ -326,16 +317,20 @@ def test_14_run_phase_2_pullback_survivor():
     def fake_download(symbols):
         return {"PASS": frame}
 
-    result = technicals.run_phase_2([upstream], yf_download_fn=fake_download)
+    output = technicals.run_phase_2([upstream], yf_download_fn=fake_download)
+
+    # Phase2Output dataframe assertion (always — even when survivors are empty)
+    assert output.price_history is not None
+    assert not output.price_history.empty
 
     if in_band:
-        assert len(result) == 1
-        assert result[0].ticker == "PASS"
-        assert isinstance(result[0], TechnicalCandidate)
+        assert len(output.survivors) == 1
+        assert output.survivors[0].ticker == "PASS"
+        assert isinstance(output.survivors[0], TechnicalCandidate)
     else:
         # Synthetic data didn't land in-band — verify orchestrator at
         # least called the download fn and dropped the ticker cleanly
-        assert result == []
+        assert output.survivors == []
 
 
 def test_15_run_phase_2_missing_from_batch_dropped():
@@ -345,20 +340,26 @@ def test_15_run_phase_2_missing_from_batch_dropped():
     frame = _build_steady_uptrend()
     def fake_download(symbols):
         return {"AAA": frame}  # BBB intentionally absent
-    result = technicals.run_phase_2(
+    output = technicals.run_phase_2(
         [upstream_a, upstream_b], yf_download_fn=fake_download,
     )
     # AAA's steady uptrend won't pass the pullback gate either, but the
     # important assertion is that BBB is not in the result regardless
-    assert all(c.ticker != "BBB" for c in result)
+    assert all(c.ticker != "BBB" for c in output.survivors)
+    # Dataframe is present and contains AAA's history
+    assert output.price_history is not None
+    assert not output.price_history.empty
 
 
 def test_16_run_phase_2_empty_download_result():
     upstream = _make_universe_ticker("EMPTY")
     def fake_download(symbols):
         return {}
-    result = technicals.run_phase_2([upstream], yf_download_fn=fake_download)
-    assert result == []
+    output = technicals.run_phase_2([upstream], yf_download_fn=fake_download)
+    assert output.survivors == []
+    # Empty download → empty dataframe but never None
+    assert output.price_history is not None
+    assert output.price_history.empty
 
 
 def test_17_run_phase_2_mixed_filter():
@@ -375,8 +376,45 @@ def test_17_run_phase_2_mixed_filter():
             "DOWNTREND": _build_downtrend(),
             # MISSING intentionally absent
         }
-    result = technicals.run_phase_2([a, b, c], yf_download_fn=fake_download)
+    output = technicals.run_phase_2([a, b, c], yf_download_fn=fake_download)
     # Steady uptrend: RSI too high, fails RSI gate
     # Downtrend: price < SMA200, fails trend gate
     # Missing: dropped from batch
-    assert result == []
+    assert output.survivors == []
+    # Dataframe contains UPTREND and DOWNTREND history (the data Phase 2 saw)
+    assert output.price_history is not None
+    assert not output.price_history.empty
+
+
+def test_18_run_phase_2_returns_untruncated_price_history():
+    """Phase 2 must return the full-universe dataframe, not just the
+    survivors' slice. Phase 3.5 relies on being able to pull history
+    for tickers that were DROPPED by Phase 2's gates (because they may
+    still be active book holdings even though they're not currently
+    in a tradeable pullback)."""
+    a = _make_universe_ticker("AAA")
+    b = _make_universe_ticker("BBB")
+    c = _make_universe_ticker("CCC")
+    # All three have data, but only one passes (and even that one may
+    # not pass the pullback gate — the assertion below is about the
+    # dataframe carrying ALL three tickers regardless of survivor status)
+    def fake_download(symbols):
+        return {
+            "AAA": _build_downtrend(),     # fails SMA200 gate
+            "BBB": _build_steady_uptrend(),  # fails RSI gate
+            "CCC": _build_downtrend(),     # fails SMA200 gate
+        }
+    output = technicals.run_phase_2([a, b, c], yf_download_fn=fake_download)
+
+    # Survivors: zero (none pass the pullback gate)
+    assert output.survivors == []
+
+    # CRITICAL: the price_history dataframe must contain ALL THREE tickers
+    # at the top column level, even though zero survived the gates.
+    assert output.price_history is not None
+    assert not output.price_history.empty
+    assert isinstance(output.price_history.columns, pd.MultiIndex)
+    top_level_tickers = set(output.price_history.columns.get_level_values(0))
+    assert "AAA" in top_level_tickers
+    assert "BBB" in top_level_tickers
+    assert "CCC" in top_level_tickers
