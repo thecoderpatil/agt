@@ -532,3 +532,113 @@ class StrikeCandidate:
             annualized_yield=annualized_yield,
             otm_pct=otm_pct,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RAYCandidate:
+    """Output of Phase 6 — terminal pipeline output.
+
+    A RAYCandidate is a StrikeCandidate whose annualized_yield falls
+    within [MIN_RAY * 100, MAX_RAY * 100] inclusive. Phase 6 is
+    filter-only — it does not rank, sort, or select winners.
+    Downstream consumers (orchestrator, Telegram display) decide
+    how to present or pick from the final candidate list.
+
+    Carries forward ALL 40 StrikeCandidate fields verbatim. Adds
+    one Phase 6 bookkeeping field (ray_decimal) that stores the
+    band-passing yield as a decimal for downstream convenience
+    (0.45 instead of 45.0 percent).
+    """
+    # StrikeCandidate carry-forward (verbatim — all 40 fields)
+    ticker: str
+    name: str
+    sector: str
+    country: str
+    market_cap_usd: float
+    spot: float
+    sma_200: float
+    rsi_14: float
+    bband_lower: float
+    bband_mid: float
+    bband_upper: float
+    lowest_low_21d: float
+    altman_z: float
+    fcf_yield: float
+    net_debt_to_ebitda: float
+    roic: float
+    short_interest_pct: float
+    max_abs_correlation: float
+    most_correlated_holding: str
+    ivr_pct: float
+    iv_latest: float
+    iv_52w_min: float
+    iv_52w_max: float
+    iv_bars_used: int
+    next_earnings: Any
+    ex_dividend_date: Any
+    calendar_source: str
+    expiry: str
+    dte: int
+    strike: float
+    bid: float
+    ask: float
+    mid: float
+    last: float
+    volume: int
+    open_interest: int
+    implied_vol: float
+    annualized_yield: float
+    otm_pct: float
+    # Phase 6 additions
+    ray_decimal: float              # annualized_yield / 100, e.g. 0.452 for 45.2%
+
+    @classmethod
+    def from_strike(
+        cls,
+        upstream: "StrikeCandidate",
+        *,
+        ray_decimal: float,
+    ) -> "RAYCandidate":
+        """Construct a RAYCandidate from a StrikeCandidate."""
+        return cls(
+            ticker=upstream.ticker,
+            name=upstream.name,
+            sector=upstream.sector,
+            country=upstream.country,
+            market_cap_usd=upstream.market_cap_usd,
+            spot=upstream.spot,
+            sma_200=upstream.sma_200,
+            rsi_14=upstream.rsi_14,
+            bband_lower=upstream.bband_lower,
+            bband_mid=upstream.bband_mid,
+            bband_upper=upstream.bband_upper,
+            lowest_low_21d=upstream.lowest_low_21d,
+            altman_z=upstream.altman_z,
+            fcf_yield=upstream.fcf_yield,
+            net_debt_to_ebitda=upstream.net_debt_to_ebitda,
+            roic=upstream.roic,
+            short_interest_pct=upstream.short_interest_pct,
+            max_abs_correlation=upstream.max_abs_correlation,
+            most_correlated_holding=upstream.most_correlated_holding,
+            ivr_pct=upstream.ivr_pct,
+            iv_latest=upstream.iv_latest,
+            iv_52w_min=upstream.iv_52w_min,
+            iv_52w_max=upstream.iv_52w_max,
+            iv_bars_used=upstream.iv_bars_used,
+            next_earnings=upstream.next_earnings,
+            ex_dividend_date=upstream.ex_dividend_date,
+            calendar_source=upstream.calendar_source,
+            expiry=upstream.expiry,
+            dte=upstream.dte,
+            strike=upstream.strike,
+            bid=upstream.bid,
+            ask=upstream.ask,
+            mid=upstream.mid,
+            last=upstream.last,
+            volume=upstream.volume,
+            open_interest=upstream.open_interest,
+            implied_vol=upstream.implied_vol,
+            annualized_yield=upstream.annualized_yield,
+            otm_pct=upstream.otm_pct,
+            ray_decimal=ray_decimal,
+        )

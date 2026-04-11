@@ -343,6 +343,34 @@ CHAIN_WALKER_MIN_MID: float = 0.05
 CHAIN_WALKER_INTER_EXPIRY_DELAY_S: float = 0.5
 
 
+# ─── Phase 6: RAY (Ratio of Annualized Yield) filter ────────────
+# Per Architect dispatch + Yash ruling 2026-04-11 (C6 greenlight).
+# Phase 6 is the terminal screener phase. Pure in-memory filter —
+# no network, no database, no provider. Takes a StrikeCandidate
+# list from Phase 5 and returns RAYCandidate entries whose
+# annualized_yield falls within [MIN_RAY * 100, MAX_RAY * 100]
+# inclusive. Phase 6 does NOT sort, rank, or select winners —
+# downstream consumers decide presentation.
+
+# RAY band: the canonical 30%/130% annualized yield window defined
+# by Rulebook Rule 7 Mode 2 CSP Operating Procedure. A candidate
+# strike must have annualized_yield in [MIN_RAY * 100, MAX_RAY * 100]
+# inclusive to survive Phase 6.
+#
+# Below MIN_RAY: yield doesn't compensate for the risk of selling
+# premium in the current market. Wait for IV expansion.
+#
+# Above MAX_RAY: unusually rich premium signals either a pricing
+# anomaly, an impending event not yet in our data, or a data
+# quality issue. Treat as too-hot-to-handle.
+#
+# Rationale: Rulebook Rule 7 Mode 2 Step 1 and Step 2 define the
+# 30%/130% band. This is the canonical AGT Wheel capture window
+# under Act 60. Do NOT tune without an Architect amendment.
+MIN_RAY: float = 0.30
+MAX_RAY: float = 1.30
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 — Volatility & event armor
 # ---------------------------------------------------------------------------
