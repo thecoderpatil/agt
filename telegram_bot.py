@@ -1652,17 +1652,56 @@ def _load_working_call_encumbrance(
     }
 
 
-def _load_premium_ledger_snapshot(household_id: str, ticker: str) -> dict | None:
+def _load_premium_ledger_snapshot(
+    household_id: str,
+    ticker: str,
+    account_id: str | None = None,
+) -> dict | None:
+    """Load cost basis snapshot for (household, ticker), optionally scoped to account.
+
+    ADR-006: when account_id is provided and READ_FROM_MASTER_LOG=True,
+    returns per-account adjusted basis via walker. When account_id is
+    provided and READ_FROM_MASTER_LOG=False, returns None with an explicit
+    log — legacy premium_ledger cannot resolve per-account precision, and
+    silently returning household aggregates under Act 60 is a compliance
+    defect.
+
+    When account_id is None (legacy callers: /cc digest, overweight scope,
+    glide path evaluators), returns household-aggregated basis via the
+    existing behavior.
+    """
     if READ_FROM_MASTER_LOG:
         try:
             from agt_equities import trade_repo
             trade_repo.DB_PATH = DB_PATH
-            cycles = trade_repo.get_active_cycles(
+            cycles = trade_repo.get_active_cycles_with_intraday_delta(
                 household=household_id, ticker=ticker.upper()
             )
             if not cycles:
                 return None
             c = cycles[0]
+
+            if account_id is not None:
+                # ADR-006: per-account resolution
+                paper_for_acct = c.paper_basis_for_account(account_id)
+                adj_for_acct = c.adjusted_basis_for_account(account_id)
+                if paper_for_acct is None:
+                    # Account holds no shares in this cycle
+                    return None
+                _, shares_for_acct = c._paper_basis_by_account.get(account_id, (0.0, 0.0))
+                premium_for_acct = c.premium_for_account(account_id)
+                return {
+                    "household_id": c.household_id,
+                    "ticker": c.ticker,
+                    "account_id": account_id,
+                    "initial_basis": round(paper_for_acct, 2),
+                    "total_premium_collected": round(premium_for_acct, 2),
+                    "shares_owned": int(shares_for_acct),
+                    "adjusted_basis": round(adj_for_acct, 2) if adj_for_acct is not None else None,
+                    "basis_truth_level": "WALKER_WITH_INTRADAY_DELTA",
+                }
+
+            # Legacy household-aggregated path (account_id is None)
             return {
                 "household_id": c.household_id,
                 "ticker": c.ticker,
@@ -1670,12 +1709,25 @@ def _load_premium_ledger_snapshot(household_id: str, ticker: str) -> dict | None
                 "total_premium_collected": round(c.premium_total, 2),
                 "shares_owned": int(c.shares_held),
                 "adjusted_basis": round(c.adjusted_basis, 2) if c.adjusted_basis is not None else None,
+                "basis_truth_level": "WALKER_WITH_INTRADAY_DELTA",
             }
         except Exception as exc:
-            logger.warning("master_log read failed for %s/%s, falling back to legacy: %s",
-                           household_id, ticker, exc)
+            logger.warning(
+                "master_log read failed for %s/%s (account=%s), falling back to legacy: %s",
+                household_id, ticker, account_id, exc,
+            )
 
-    # Legacy fallback
+    # Legacy fallback path — ADR-006: per-account requests fail closed here
+    if account_id is not None:
+        logger.warning(
+            "ACB_LEGACY_PER_ACCOUNT_DENIED: household=%s ticker=%s account=%s — "
+            "per-account ACB not available from legacy premium_ledger; "
+            "READ_FROM_MASTER_LOG must be True for per-account precision",
+            household_id, ticker, account_id,
+        )
+        return None
+
+    # Household-aggregated legacy path (unchanged)
     with closing(_get_db_connection()) as conn:
         row = conn.execute(
             """
@@ -1704,6 +1756,7 @@ def _load_premium_ledger_snapshot(household_id: str, ticker: str) -> dict | None
         "total_premium_collected": round(total_premium_collected, 2),
         "shares_owned": shares_owned,
         "adjusted_basis": round(adjusted_basis, 2) if adjusted_basis is not None else None,
+        "basis_truth_level": "LEGACY_LEDGER",
     }
 
 
@@ -8681,7 +8734,7 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
             return []
 
         ib_conn.reqMarketDataType(4)  # Set once for the connection
-        ledger_cache: dict[tuple[str, str], dict | None] = {}
+        ledger_cache: dict[tuple[str, str], dict | None] = {}  # key: (account_id, ticker) per ADR-006
 
         for pos in short_calls:
             ticker = pos.contract.symbol.upper()
@@ -8736,10 +8789,16 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
             extrinsic_value = ask - intrinsic_value
             spread = max(0.0, ask - bid)
 
-            ledger_key = (household, ticker)
+            # ADR-006: per-account key — household-aggregated basis is an
+            # Act 60 Chapter 2 compliance defect. The scan iterates positions
+            # per-account, so cache keys must be per-account too.
+            ledger_key = (acct_id, ticker)
             if ledger_key not in ledger_cache:
                 ledger_cache[ledger_key] = (
-                    await asyncio.to_thread(_load_premium_ledger_snapshot, household, ticker)
+                    await asyncio.to_thread(
+                        _load_premium_ledger_snapshot,
+                        household, ticker, acct_id,
+                    )
                     if household else None
                 )
             ledger_snapshot = ledger_cache.get(ledger_key)

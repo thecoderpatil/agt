@@ -365,6 +365,203 @@ def get_cycles_with_intraday_overlay(
     raise NotImplementedError("Phase 3 deliverable")
 
 
+def get_active_cycles_with_intraday_delta(
+    household: Optional[str] = None,
+    ticker: Optional[str] = None,
+    as_of_datetime: "datetime | None" = None,  # noqa: F821
+) -> list[Cycle]:
+    """Walker-derived cycles + same-day fill overlay (ADR-006).
+
+    Reads master_log_trades for authoritative state, then overlays
+    fill_log entries created after the most recent master_log_trades
+    last_synced_at watermark to produce a merged intraday view.
+    Idempotent and pure — does not write.
+
+    ADR-006 + dispatch addendum 2026-04-10: watermark source is
+    MAX(last_synced_at) FROM master_log_trades rather than a dedicated
+    flex_sync_log table (which does not exist). Known limitation:
+    if IBKR Flex reporting lags a same-day fill, the watermark may
+    advance while the specific lagged fill is neither in master_log
+    nor in the delta window. See Followup #9 for the reconciliation
+    gap long-term fix.
+
+    Args:
+        household: optional household filter
+        ticker: optional ticker filter
+        as_of_datetime: optional override for "now" (testing)
+
+    Returns:
+        list[Cycle] with master_log state plus same-day fills applied.
+    """
+    from contextlib import closing
+
+    # Step 1: get baseline walker cycles from master_log only
+    baseline_cycles = get_active_cycles(household=household, ticker=ticker)
+
+    # Step 2: find the master_log_trades watermark (ADR-006 addendum)
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=30.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT MAX(last_synced_at) as watermark FROM master_log_trades"
+            ).fetchone()
+            watermark = row["watermark"] if row and row["watermark"] else None
+    except Exception as exc:
+        logger.warning(
+            "intraday_delta: watermark lookup failed (%s), returning baseline", exc,
+        )
+        return baseline_cycles
+
+    if not watermark:
+        # No prior master_log data — return baseline as-is (no delta semantics possible)
+        return baseline_cycles
+
+    # Step 3: read fill_log delta since watermark
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=30.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            delta_rows = conn.execute(
+                "SELECT * FROM fill_log WHERE created_at > ? "
+                "ORDER BY created_at ASC, exec_id ASC",
+                (watermark,),
+            ).fetchall()
+    except Exception as exc:
+        logger.warning(
+            "intraday_delta: fill_log read failed (%s), returning baseline", exc,
+        )
+        return baseline_cycles
+
+    if not delta_rows:
+        return baseline_cycles
+
+    # Step 4: filter delta to the requested household/ticker scope
+    filtered_delta = []
+    for row in delta_rows:
+        if household is not None and row["household_id"] != household:
+            continue
+        if ticker is not None and row["ticker"] != ticker.upper():
+            continue
+        filtered_delta.append(row)
+
+    if not filtered_delta:
+        return baseline_cycles
+
+    # Step 5: convert fill_log rows to TradeEvent objects and rewalk
+    # Only rewalks cycles whose (household, ticker) appears in the delta.
+    affected_keys = {
+        (row["household_id"], row["ticker"]) for row in filtered_delta
+    }
+
+    merged_cycles = []
+    for cycle in baseline_cycles:
+        key = (cycle.household_id, cycle.ticker)
+        if key not in affected_keys:
+            merged_cycles.append(cycle)
+            continue
+
+        # Rebuild event list: original events + delta events
+        original_events = list(cycle.events)
+        delta_events = [
+            _fill_log_row_to_trade_event(row)
+            for row in filtered_delta
+            if (row["household_id"], row["ticker"]) == key
+        ]
+        merged_events = sorted(
+            original_events + delta_events,
+            key=lambda ev: (ev.date_time, ev.transaction_id or ""),
+        )
+
+        # Rewalk just this (household, ticker)
+        rewalked = walk_cycles(merged_events)
+        active_rewalked = [c for c in rewalked if c.status == "ACTIVE"]
+        if active_rewalked:
+            merged_cycles.append(active_rewalked[-1])
+        # else: delta closed the cycle — drop from active list
+
+    return merged_cycles
+
+
+def _fill_log_row_to_trade_event(row) -> TradeEvent:
+    """Convert a fill_log row to a walker TradeEvent for delta overlay (ADR-006).
+
+    fill_log schema (verified 2026-04-10): exec_id, ticker, action, quantity,
+    price, premium_delta, account_id, household_id, created_at.
+
+    action values: STK_BUY, STK_SELL, SELL_CALL, BUY_CALL, SELL_PUT, BUY_PUT.
+    """
+    action = row["action"]
+    ticker = row["ticker"]
+
+    # Map fill_log action to walker's buy_sell + asset_category + open_close
+    if action == "STK_BUY":
+        asset_category = "STK"
+        buy_sell = "BUY"
+        open_close = None
+        right = None
+    elif action == "STK_SELL":
+        asset_category = "STK"
+        buy_sell = "SELL"
+        open_close = None
+        right = None
+    elif action == "SELL_CALL":
+        asset_category = "OPT"
+        buy_sell = "SELL"
+        open_close = "O"
+        right = "C"
+    elif action == "BUY_CALL":
+        asset_category = "OPT"
+        buy_sell = "BUY"
+        open_close = "C"  # assume close (BTC); walker classifier may override
+        right = "C"
+    elif action == "SELL_PUT":
+        asset_category = "OPT"
+        buy_sell = "SELL"
+        open_close = "O"
+        right = "P"
+    elif action == "BUY_PUT":
+        asset_category = "OPT"
+        buy_sell = "BUY"
+        open_close = "C"
+        right = "P"
+    else:
+        raise ValueError(f"_fill_log_row_to_trade_event: unknown action {action!r}")
+
+    # Use created_at from fill_log row (ADR-006 addendum: fill_time does not exist)
+    # Format in DB: 'YYYY-MM-DD HH:MM:SS' via SQLite datetime('now')
+    fill_time_raw = row["created_at"] or ""
+    if "T" in fill_time_raw:
+        dt_part = fill_time_raw.split(".")[0].replace("T", ";")
+    else:
+        dt_part = fill_time_raw.replace(" ", ";")
+    trade_date = dt_part[:10].replace("-", "") if "-" in dt_part[:10] else dt_part[:8]
+    date_time = dt_part.replace("-", "").replace(":", "")[:15]
+
+    return TradeEvent(
+        source="INTRADAY_DELTA",
+        account_id=row["account_id"],
+        household_id=row["household_id"],
+        ticker=ticker,
+        trade_date=trade_date,
+        date_time=date_time,
+        ib_order_id=None,
+        transaction_id=row["exec_id"],
+        asset_category=asset_category,
+        right=right,
+        strike=None,
+        expiry=None,
+        buy_sell=buy_sell,
+        open_close=open_close,
+        quantity=float(row["quantity"] or 0),
+        trade_price=float(row["price"] or 0),
+        net_cash=float(row["premium_delta"] or 0),
+        fifo_pnl_realized=0.0,
+        transaction_type="IntradayDelta",
+        notes="",
+        currency="USD",
+        raw=dict(row),
+    )
+
+
 def verify_live_match(
     household: str,
     ticker: str,

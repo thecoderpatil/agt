@@ -135,6 +135,7 @@ class Cycle:
     open_long_puts:      int
     open_long_calls:     int
     _paper_basis_by_account: dict          # {account_id: (total_cost, total_shares)}
+    _premium_by_account: dict              # {account_id: total_premium_collected_for_this_account}
     premium_total:       float
     stock_cash_flow:     float
     realized_pnl:        float
@@ -168,6 +169,30 @@ class Cycle:
         if shares <= 0:
             return None
         return cost / shares
+
+    def premium_for_account(self, account_id: str) -> float:
+        """IRS-attributed premium for this account's legs in this cycle.
+
+        Returns 0.0 if the account has no attributed premium (e.g. the
+        account only holds stock, no options were written from it).
+        """
+        return self._premium_by_account.get(account_id, 0.0)
+
+    def adjusted_basis_for_account(self, account_id: str) -> float | None:
+        """Per-account adjusted basis: paper_basis - (premium / shares).
+
+        Matches IRS tax lot semantics. Returns None if the account holds
+        zero shares in this cycle (premium without shares is orphaned and
+        the router will naturally skip such cases).
+        """
+        paper = self.paper_basis_for_account(account_id)
+        if paper is None:
+            return None
+        _, shares = self._paper_basis_by_account.get(account_id, (0.0, 0.0))
+        if shares <= 0:
+            return None
+        premium = self.premium_for_account(account_id)
+        return paper - (premium / shares)
 
     @property
     def adjusted_basis(self) -> float | None:
@@ -288,6 +313,7 @@ def _new_cycle(
         open_long_puts=0,
         open_long_calls=0,
         _paper_basis_by_account={},
+        _premium_by_account={},
         premium_total=0.0,
         stock_cash_flow=0.0,
         realized_pnl=0.0,
@@ -343,6 +369,31 @@ def _reduce_paper_basis(cycle: Cycle, delta_shares: float, account_id: str) -> N
         cycle._paper_basis_by_account[account_id] = (new_cost, max(new_shares, 0))
 
 
+def _credit_premium_to_account(
+    cycle: Cycle, account_id: str, net_cash: float,
+) -> None:
+    """IRS-correct per-account premium attribution (ADR-006).
+
+    Premium is credited to the account that held the option leg, regardless
+    of where the underlying shares reside. This matches IRS tax treatment
+    for short premium income.
+
+    net_cash is signed: positive for CSP_OPEN/CC_OPEN/LONG_OPT_CLOSE (credit
+    received), negative for CSP_CLOSE/CC_CLOSE/LONG_OPT_OPEN (debit paid).
+    The attribution sums the signed values so the running total tracks
+    net premium realized by the account across the cycle.
+
+    Per ADR-006 ruling R1, this is called from EVERY branch where
+    cycle.premium_total is mutated, including EXPIRE_WORTHLESS,
+    ASSIGN_OPT_LEG, and EXERCISE_OPT_LEG, to preserve the invariant
+    household_aggregate == sum(per-account attributions).
+    """
+    if not account_id:
+        return
+    current = cycle._premium_by_account.get(account_id, 0.0)
+    cycle._premium_by_account[account_id] = current + net_cash
+
+
 def _apply_event(cycle: Cycle, ev: TradeEvent, et: EventType) -> None:
     """Apply a single classified event to a cycle's running state."""
     cycle.events.append(ev)
@@ -352,18 +403,22 @@ def _apply_event(cycle: Cycle, ev: TradeEvent, et: EventType) -> None:
     if et == EventType.CSP_OPEN:
         cycle.open_short_puts += int(ev.quantity)
         cycle.premium_total += ev.net_cash
+        _credit_premium_to_account(cycle, ev.account_id, ev.net_cash)
 
     elif et == EventType.CSP_CLOSE:
         cycle.open_short_puts = _guard_decrement(cycle.open_short_puts, int(ev.quantity), 'open_short_puts', ev)
         cycle.premium_total += ev.net_cash
+        _credit_premium_to_account(cycle, ev.account_id, ev.net_cash)
 
     elif et == EventType.CC_OPEN:
         cycle.open_short_calls += int(ev.quantity)
         cycle.premium_total += ev.net_cash
+        _credit_premium_to_account(cycle, ev.account_id, ev.net_cash)
 
     elif et == EventType.CC_CLOSE:
         cycle.open_short_calls = _guard_decrement(cycle.open_short_calls, int(ev.quantity), 'open_short_calls', ev)
         cycle.premium_total += ev.net_cash
+        _credit_premium_to_account(cycle, ev.account_id, ev.net_cash)
 
     elif et == EventType.LONG_OPT_OPEN:
         if ev.right == 'C':
@@ -371,6 +426,7 @@ def _apply_event(cycle: Cycle, ev: TradeEvent, et: EventType) -> None:
         else:
             cycle.open_long_puts += int(ev.quantity)
         cycle.premium_total += ev.net_cash
+        _credit_premium_to_account(cycle, ev.account_id, ev.net_cash)
 
     elif et == EventType.LONG_OPT_CLOSE:
         if ev.right == 'C':
@@ -378,6 +434,7 @@ def _apply_event(cycle: Cycle, ev: TradeEvent, et: EventType) -> None:
         else:
             cycle.open_long_puts = _guard_decrement(cycle.open_long_puts, int(ev.quantity), 'open_long_puts', ev)
         cycle.premium_total += ev.net_cash
+        _credit_premium_to_account(cycle, ev.account_id, ev.net_cash)
 
     elif et == EventType.EXPIRE_WORTHLESS:
         # Determine if this is a SHORT or LONG option expiring.
@@ -407,6 +464,7 @@ def _apply_event(cycle: Cycle, ev: TradeEvent, et: EventType) -> None:
             else:
                 cycle.open_short_puts = _guard_decrement(cycle.open_short_puts, int(ev.quantity), 'open_short_puts', ev)
         cycle.premium_total += ev.net_cash
+        _credit_premium_to_account(cycle, ev.account_id, ev.net_cash)
 
     elif et == EventType.ASSIGN_OPT_LEG:
         if ev.right == 'C':
@@ -414,6 +472,7 @@ def _apply_event(cycle: Cycle, ev: TradeEvent, et: EventType) -> None:
         else:
             cycle.open_short_puts = _guard_decrement(cycle.open_short_puts, int(ev.quantity), 'open_short_puts', ev)
         cycle.premium_total += ev.net_cash
+        _credit_premium_to_account(cycle, ev.account_id, ev.net_cash)
 
     elif et == EventType.ASSIGN_STK_LEG:
         delta = ev.quantity
@@ -500,6 +559,7 @@ def _apply_event(cycle: Cycle, ev: TradeEvent, et: EventType) -> None:
         else:
             cycle.open_short_puts = _guard_decrement(cycle.open_short_puts, int(ev.quantity), 'open_short_puts', ev)
         cycle.premium_total += ev.net_cash
+        _credit_premium_to_account(cycle, ev.account_id, ev.net_cash)
 
     elif et == EventType.CARRYIN_STK:
         cycle.shares_held += ev.quantity
