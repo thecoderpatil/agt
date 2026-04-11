@@ -9,6 +9,7 @@ Cache: 5-minute TTL per ticker for expirations, 60s for chain data.
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -19,6 +20,119 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
+
+
+# ── C6.2: NaN-safe numeric coercion helpers ─────────────────────
+#
+# IBKR reqMktData can populate volume / openInterest / impliedVolatility
+# with NaN when the OPRA subscription is missing, when the strike is
+# illiquid, or when the snapshot arrives partial. Bare int(NaN) raises
+# ValueError, which crashed the entire chain fetch in the 2026-04-11
+# paper run for GD, HSY, and MPC across multiple expiries. These
+# helpers return a safe default on None / NaN / uncoercible input.
+#
+# Used by _build_chain_rows (the pure coercion loop extracted from
+# get_chain_for_expiry for unit testability per C6.2 dispatch ruling)
+# and by get_spot / get_spots_batch for the price extraction path.
+
+def _safe_int(v, default: int = 0) -> int:
+    """Coerce a value to int, returning default on None or NaN.
+
+    IBKR reqMktData can populate numeric fields with NaN when the
+    subscription is missing, the strike is illiquid, or data has
+    not yet arrived. Bare int(NaN) raises ValueError. This helper
+    catches None, NaN, and any other uncoercible value and returns
+    the default (typically 0).
+    """
+    if v is None:
+        return default
+    if isinstance(v, float) and math.isnan(v):
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    """Coerce a value to float, returning default on None or NaN.
+
+    Same rationale as _safe_int but for float-typed fields. Also
+    guards against float() succeeding on a NaN float input that
+    would otherwise propagate through downstream math unchanged.
+    """
+    if v is None:
+        return default
+    if isinstance(v, float) and math.isnan(v):
+        return default
+    try:
+        result = float(v)
+        if math.isnan(result):
+            return default
+        return result
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_chain_rows(tickers_data: dict) -> list[dict]:
+    """Build chain row dicts from a {strike: ticker_data} mapping.
+
+    Pure function — no IB dependency, no side effects. Extracted
+    from get_chain_for_expiry so the NaN-safe coercion loop can be
+    unit-tested without a FakeIB. Each value in tickers_data must
+    expose .bid, .ask, .last, .volume, .openInterest, and
+    .impliedVolatility attributes (duck-typed; pytest tests pass
+    types.SimpleNamespace instances).
+
+    Returns list of dicts shaped identically to the pre-C6.2
+    get_chain_for_expiry output:
+      {strike, bid, ask, last, volume, openInterest, impliedVol}
+
+    C6.2 semantics (BIT-IDENTICAL to C5/C6/C6.1 on valid data):
+      - NaN-safe via _safe_int / _safe_float on every numeric field
+      - Negative bid/ask/last/iv values clamped to 0.0 (preserves
+        the pre-C6.2 "> 0 else 0.0" semantic for valid negative
+        inputs, which were never legitimate anyway)
+      - Volume and openInterest are always int; others always float
+      - Strike is coerced via float(strike) to match pre-C6.2 output
+      - Output rows are in ascending strike order (caller sorts
+        tickers_data.items() before passing)
+    """
+    results = []
+    for strike, td in sorted(tickers_data.items()):
+        # NaN-safe coercion — IBKR can return NaN when subscription
+        # is missing or strike is illiquid. See C6.2 dispatch.
+        bid = _safe_float(td.bid)
+        ask = _safe_float(td.ask)
+        last = _safe_float(td.last)
+        vol = _safe_int(td.volume)
+        oi = _safe_int(td.openInterest)
+        iv = _safe_float(td.impliedVolatility)
+
+        # Preserve pre-C6.2 semantics: clamp negative prices / IV
+        # to zero. _safe_float handles NaN and None; this second
+        # pass handles the "valid-but-negative" case that the
+        # original `v if v > 0 else 0.0` idiom protected against.
+        if bid < 0:
+            bid = 0.0
+        if ask < 0:
+            ask = 0.0
+        if last < 0:
+            last = 0.0
+        if iv < 0:
+            iv = 0.0
+
+        results.append({
+            'strike': float(strike),
+            'bid': bid,
+            'ask': ask,
+            'last': last,
+            'volume': vol,
+            'openInterest': oi,
+            'impliedVol': iv,
+        })
+    return results
+
 
 # ── Error classification ──
 
@@ -217,7 +331,6 @@ async def get_chain_for_expiry(
         qualified = await ib.qualifyContractsAsync(*contracts)
 
         # Request snapshots
-        results = []
         tickers_data = {}
         for qc in qualified:
             if qc.conId == 0:
@@ -229,22 +342,10 @@ async def get_chain_for_expiry(
         import asyncio
         await asyncio.sleep(2)
 
-        for strike, td in sorted(tickers_data.items()):
-            bid = td.bid if td.bid and td.bid > 0 else 0.0
-            ask = td.ask if td.ask and td.ask > 0 else 0.0
-            last = td.last if td.last and td.last > 0 else 0.0
-            vol = td.volume if td.volume else 0
-            oi = td.openInterest if td.openInterest else 0
-
-            results.append({
-                'strike': float(strike),
-                'bid': float(bid),
-                'ask': float(ask),
-                'last': float(last),
-                'volume': int(vol),
-                'openInterest': int(oi),
-                'impliedVol': float(td.impliedVolatility or 0),
-            })
+        # C6.2: NaN-safe coercion loop extracted to _build_chain_rows
+        # as a pure module-level helper for unit testability. Preserves
+        # the pre-C6.2 output shape and valid-data semantics exactly.
+        results = _build_chain_rows(tickers_data)
 
         # Cancel market data subscriptions
         for td in tickers_data.values():
@@ -315,14 +416,18 @@ async def get_spot(ib, ticker: str) -> float:
         td = ib.reqMktData(qualified[0], '', False, False)
         await asyncio.sleep(2.0)
 
-        # Extract best price
+        # Extract best price (C6.2: NaN-safe via _safe_float)
         price = None
         for val in [td.last, td.close, td.marketPrice()]:
-            if val is not None and val > 0 and val != float('inf'):
-                price = float(val)
+            safe_val = _safe_float(val)
+            if safe_val > 0 and safe_val != float('inf'):
+                price = safe_val
                 break
-        if price is None and td.bid and td.ask and td.bid > 0 and td.ask > 0:
-            price = (float(td.bid) + float(td.ask)) / 2.0
+        if price is None:
+            safe_bid = _safe_float(td.bid)
+            safe_ask = _safe_float(td.ask)
+            if safe_bid > 0 and safe_ask > 0:
+                price = (safe_bid + safe_ask) / 2.0
 
         try:
             ib.cancelMktData(qualified[0])
@@ -389,15 +494,19 @@ async def get_spots_batch(ib, tickers: list[str]) -> dict[str, float]:
 
         await asyncio.sleep(2.5)
 
-        # Collect prices
+        # Collect prices (C6.2: NaN-safe via _safe_float)
         for qc, (tk, td) in ticker_map.items():
             price = None
             for val in [td.last, td.close, td.marketPrice()]:
-                if val is not None and val > 0 and val != float('inf'):
-                    price = float(val)
+                safe_val = _safe_float(val)
+                if safe_val > 0 and safe_val != float('inf'):
+                    price = safe_val
                     break
-            if price is None and td.bid and td.ask and td.bid > 0 and td.ask > 0:
-                price = (float(td.bid) + float(td.ask)) / 2.0
+            if price is None:
+                safe_bid = _safe_float(td.bid)
+                safe_ask = _safe_float(td.ask)
+                if safe_bid > 0 and safe_ask > 0:
+                    price = (safe_bid + safe_ask) / 2.0
 
             try:
                 ib.cancelMktData(qc)
