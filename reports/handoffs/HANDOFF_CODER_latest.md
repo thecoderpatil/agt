@@ -1,9 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
-**Last updated:** 2026-04-09
-**Status:** Sprint 1 (A-F) + Cleanup A + Sprint B + Sprint C + Sprint D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix COMPLETE. P3.2-alt Day 2 findings (#10, #12, #4, #43), R9 reporting fix, wartime cold-start pin, V2 Smart Yield Walk-Down, Defensive Roll Engine, and adaptive roll execution updates shipped.
-**Tests:** 634/634 passing. Runtime: ~20s.
-**Next:** P3.2-alt live follow-through — kill-switch live test (watchdog seeded) and Cure Console R9 banner investigation.
+**Last updated:** 2026-04-11
+**Status:** Sprint 1 (A-F) + Cleanup A + Sprints B/C/D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix + P3.2-alt Day 2 findings + V2 Smart Yield Walk-Down + Defensive Roll Engine + adaptive roll execution + **ADR-005 V2 Router WARTIME whitelist/BAG/BTC cash-paid notional** + **ADR-006 ACB pipeline hardening (per-account precision + same-day delta)** + **Followups #9/#10/#11 doc** + **Act 60 Fortress CSP Screener C1→C6.1 (6 of 6 phases complete, live paper-run hotfix applied)** — all COMPLETE.
+**Tests:** 859/864 passing, 5 skipped, 0 failed. Runtime: ~41s. (baseline 634 → 859 = +225 tests across ADR-005 + ADR-006 + Screener C1-C6.1.)
+**Next:** C6.2 — NaN-safe coercion in `agt_equities/ib_chains.py` to resolve the GD/HSY/MPC class of paper-run failure (IBKR error 10091 / subscription edge cases). Pre-flight: verify `tests/test_ib_chains.py` exists and report before Architect dispatches C6.2.
 
 ---
 
@@ -60,6 +60,22 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
 - `agt_deck/static/app.css` — breathe animation keyframes + reduced-motion support
 - `protocols/P3_2_paper_run_protocol.md` — end-to-end paper run protocol
 - `launcher/` — one-click Windows desktop launcher (start_cure.bat, stop_cure.bat, AGT_Cure.vbs, install_shortcut.ps1)
+- `agt_equities/screener/` — Act 60 Fortress CSP Screener package (C1→C6.1, read-only side project)
+  - `__init__.py` — pipeline docstring reflecting Tech-First reorder
+  - `config.py` — single source of truth for all Phase 1-6 thresholds, exclusion lists, RAY band constants, IBKR courtesy delays
+  - `types.py` — frozen dataclasses: UniverseTicker, TechnicalCandidate, Phase2Output, FundamentalCandidate, CorrelationCandidate, VolArmorCandidate, StrikeCandidate, RAYCandidate (each with `from_upstream` classmethod for carry-forward)
+  - `cache.py` — file-backed TTL cache with atomic writes
+  - `finnhub_client.py` — async httpx wrapper with token-bucket rate limiter (50/min Free tier), exponential backoff retry, cache hit/miss counters
+  - `sp500_nasdaq100.csv` — 517-ticker universe seed (504 S&P 500 from iShares IVV + 13 NDX-only)
+  - `universe.py` — Phase 1 (Finnhub Free profile2 exclusions + structural REIT/MLP/BDC/trust/SPAC filter)
+  - `technicals.py` — Phase 2 (yfinance batch download + SMA200/RSI14/BBand pullback gate, returns Phase2Output with raw df hoisted for Phase 3.5)
+  - `fundamentals.py` — Phase 3 (yfinance per-ticker: Altman Z, FCF yield, net-cash bypass leverage gate, ROIC, short interest fail-open)
+  - `correlation.py` — Phase 3.5 (global correlation fit against current holdings with SLS/GTLB/TRAW.CVR exclusions + supplemental holdings download)
+  - `vol_event_armor.py` — Phase 4 (live IBKR reqHistoricalData IVR Option D + YFinanceCorporateIntelligenceProvider earnings/ex-div/corp-action gates)
+  - `chain_walker.py` — Phase 5 (ib_chains-routed option chain walk with interval-based strike floor, C6.1 fix)
+  - `ray_filter.py` — Phase 6 (sync terminal RAY band filter, NaN-safe)
+- `agt_equities/ib_chains.py` — low-level IBKR chain API (get_expirations, get_chain_for_expiry) — ONLY Phase 4/5 consumers are allowed to import ib_async
+- `scripts/probe_ibkr_historical_iv.py` — throwaway diagnostic that confirmed Option D IVR subscription viability on 2026-04-11 (AAPL 249 bars, MSFT 250 IVR 95.7%, SPY 250 IVR 23.8%)
 
 ---
 
@@ -110,7 +126,9 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 
 ## Current State
 
-- **Tests:** 634/634 passing on `python -m pytest -q tests`
+- **Tests:** 859/864 passing, 5 skipped, 0 failed on `python -m pytest -q tests` (~41s runtime)
+  - Full screener slice: 198/198 passing across 9 test files (isolation 3 + finnhub 17 + phase1 24 + phase2 18 + phase3 33 + correlation 22 + phase4 32 + phase5 29 + phase6 20)
+  - AST guard at `tests/test_screener_isolation.py` enforces: no screener file imports telegram_bot, V2 router, walker, trade_repo, rule_engine, mode_engine, or `_pre_trade_gates`. `ib_async` is whitelisted ONLY for `chain_walker.py` and `vol_event_armor.py`.
 - **Mode:** PEACETIME
 - **Production DB:** CLEAN, backed up as `agt_desk.db.p3.2alt.bak`. mode_transitions seeded with 3 OVERWEIGHT rows (2026-04-01 backdate) for watchdog live test.
 - **Walker:** fully closed through W3.8 + special dividend fix (.net_cash). 14 active cycles (8 Yash + 6 Vikram).
@@ -239,9 +257,66 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 | `c5f7665` | Adaptive Mid combo execution path upgraded to full automation. |
 | `4528c38` | Adaptive roll combos routed through human-in-the-loop staging on top of adaptive combo plumbing. |
 
+## Completed Work — ADR-005 (V2 Router WARTIME whitelist + BAG + BTC cash-paid notional)
+
+| Commit | What |
+|--------|------|
+| `729c5ba` | DIFF 1: `_pre_trade_gates` full body replacement. WARTIME whitelist = `("dex", "v2_router")`. OPT BUY uses cash-paid notional (premium × 100), OPT SELL keeps strike-notional. BAG combos get `qty * abs(lmtPrice) * 100` cash exposure. Gate 2 has explicit guards for zero qty, non-numeric lmtPrice, missing strike on SELL, negative lmtPrice on BUY, and unsupported secType. DIFF 2: `_place_single_order` routes by `payload["origin"]` → `v2_router` vs `legacy_approve` site. DIFF 3: `_scan_and_stage_defensive_rolls` docstring + mode banner in alerts, STATE 2 HARVEST and STATE 3 DEFEND ticket dicts tagged with `origin="v2_router"`, `v2_state`, and `v2_rationale`. New test file `tests/test_pre_trade_gates_v2.py` with 12 tests (WARTIME whitelist, BAG bands, BTC cash-paid, fail-closed regressions). Test fallout fixed in-commit: `test_bag_blocked` deleted (encoded pre-ADR invariant; BAG now allowed per CC4, covered by new test file), 4 V2 router alert-list assertions updated to include the mode banner per CC3. |
+
+## Completed Work — ADR-006 (ACB Pipeline Hardening)
+
+| Commit | What |
+|--------|------|
+| `b874d81` | Walker `Cycle._premium_by_account` for IRS-correct per-account attribution. All 9 `cycle.premium_total += ev.net_cash` sites paired with `_credit_premium_to_account(cycle, ev.account_id, ev.net_cash)` per ruling R1 (universalized — no EXPIRE_WORTHLESS exception). Walker `Cycle.premium_for_account()` / `adjusted_basis_for_account()` accessors. `_load_premium_ledger_snapshot` extended with `account_id` parameter (Act 60 compliance). Legacy fallback fail-closed when `account_id` provided. V2 router STATE_1/STATE_3 propagate `pos.account` through ACB lookup. `trade_repo.get_active_cycles_with_intraday_delta` same-day `fill_log` overlay using `MAX(last_synced_at)` from `master_log_trades` as watermark (Architect ruling after `flex_sync_log` table absence verified). New test file `tests/test_acb_per_account.py` with 6 unit tests + 5 skipped integration stubs. `cc_decision_log` audit wiring deferred to Followup #10. |
+
+## Completed Work — Followups doc
+
+| Commit | What |
+|--------|------|
+| `3bb8c81` | Appended Followups #9, #10, #11 to `FOLLOWUPS.md`. #9: intraday delta watermark reconciliation gap (pre-row reconciliation flag long-term fix). #10: `cc_decision_log` V2 router audit wiring (forensic infra, deferred from ADR-006). #11: empirical verification of `EXPIRE_WORTHLESS` `ev.net_cash` values (hygiene audit to determine whether the line at walker.py:410 is H1 dead code or H2 load-bearing). |
+
+## Completed Work — Act 60 Fortress CSP Screener (C1 → C6.1)
+
+Read-only side project. Six-phase pipeline that surfaces wheel-eligible cash-secured put candidates from an S&P 500 + NASDAQ 100 universe. Completely isolated from execution paths by AST guard (`tests/test_screener_isolation.py`). End-to-end runnable from a Python REPL — orchestrator wiring to `/scan` is a separate sprint (C7).
+
+| Commit | What | Tests added |
+|--------|------|-------------|
+| `9e223f2` | C1: package scaffolding. `agt_equities/screener/` with `__init__`, `cache.py` (file TTL cache, atomic writes), `finnhub_client.py` (async httpx + 50/min token-bucket rate limiter, backoff retry), `sp500_nasdaq100.csv` (517 deduplicated tickers from iShares IVV + Wikipedia NDX), `tests/test_screener_isolation.py` AST guard, `tests/test_screener_finnhub.py`. | +20 |
+| `81af518` | C2: Phase 1 (Finnhub Free profile2 exclusions) + Phase 2 (yfinance batch technicals). Adds `universe.py`, `technicals.py`, `config.py`, `types.py` (UniverseTicker, TechnicalCandidate). Bugfix in-commit: `_passes_sector` / `_passes_country` rejected whitespace-only strings correctly. | +34 |
+| `0092b35` | C2.1: cache hit rate instrumentation. `FinnhubClient.get_stats()` + Phase 1 final log line surfaces `cache_hits`/`cache_misses`/`hit_rate_pct`/`elapsed`. | +1 |
+| `56487aa` | C3: Phase 3 (yfinance per-ticker fundamentals). Altman Z-Score, FCF Yield, Net Debt/EBITDA, ROIC, Short Interest. `FundamentalCandidate` dataclass with carry-forward + field-rename (`current_price`→`spot`, `bband_middle`→`bband_mid`). Thresholds per Architect dispatch: Z>3.0, FCF≥4%, ND/EBITDA≤3.0, ROIC≥10%, SI≤10%. | +27 |
+| `570ce02` | C3.5: correlation-fit portfolio gate. Global fit (no per-household routing per Yash ruling). Pairwise |corr| ≤ 0.60 against effective holdings. `CORRELATION_HOLDINGS_EXCLUSIONS = {SLS, GTLB, TRAW.CVR}` applied before already-held check. Supplemental holdings download path for holdings not in Phase 2 df. **BREAKING CHANGE**: Phase 2 return type `list[TechnicalCandidate]` → `Phase2Output(survivors, price_history)`. 17 phase2 tests updated mechanically + 1 new for dataframe hoisting. | +23 |
+| `b1404df` | C3.6: structural exclusions. `EXCLUDED_SECTORS` expanded from 3 quality exclusions to 22 entries (REITs, MLPs, BDCs, trusts, SPACs, closed-end funds, shell companies). Per-ticker sector-drop log added to `universe.py` (tight-scoped to sector path only per Architect ruling after initial over-scope). Yash ruling 2026-04-11: wheel candidate universe is US-domiciled common-stock C-corporations only. | +6 |
+| `6f9744a` | C3.7: Phase 3 semantic fixes discovered during TIKR calibration. Fix 1: short interest fail-OPEN when both `shortPercentOfFloat` and `sharesShort/floatShares` unavailable (yfinance has SI=None for ~20-30% of tickers). Fix 2: net-cash bypass on leverage gate — net_debt ≤ 0 short-circuits to 0.0 sentinel, positive net_debt with negative EBITDA rejected with specific `positive_net_debt_negative_ebitda` reason. Fixes the NVDA/GOOGL/AAPL/META/BRK.A class of false rejection. Downstream grep audit confirmed no consumer misinterprets the 0.0 sentinel. | +6 (net; 2 existing tests updated in-place) |
+| `329d16f` | C4: Phase 4 vol/event armor. **First screener phase with live IBKR calls.** IVR gate via `ib.reqHistoricalDataAsync(whatToShow="OPTION_IMPLIED_VOLATILITY")` — Option D per probe verification 2026-04-11 (AAPL 249 bars, MSFT 250 IVR 95.7%, SPY 250 IVR 23.8%, zero subscription errors). Corporate calendar gates via `YFinanceCorporateIntelligenceProvider` (earnings blackout 10d, ex-div blackout 5d, pending corp action). Two separate try/except blocks for IBKR vs calendar attribution. AST guard amended: `IBKR_WHITELIST += {"vol_event_armor.py"}`. `chain_walker.py` was pre-reserved in C1. | +32 |
+| `9425b29` | C5: Phase 5 IBKR option chain walker. Routes through `agt_equities.ib_chains.get_expirations` + `get_chain_for_expiry` — does NOT call ib_async directly. Walks two nearest Friday expiries per ticker (MIN_DTE 2, MAX_DTE 21). Puts only (right='P'). Original strike floor was `candidate.lowest_low_21d`. `StrikeCandidate` dataclass with all 40 upstream fields + expiry/dte/strike/bid/ask/mid/last/volume/OI/IV/annualized_yield/otm_pct. AST guard required zero amendment — `chain_walker.py` already in IBKR_WHITELIST from C1. | +23 |
+| `040c939` | C6: Phase 6 RAY band filter. SYNC function (first screener phase without I/O). Pure list-to-list: StrikeCandidate → RAYCandidate. 30%/130% inclusive band. NaN-safe guard (`math.isnan`) to prevent silent NaN pass-through. Filter-only — does NOT sort, rank, or select winners. Return order matches input order. Screener 6 of 6 phases complete. | +20 |
+| `b5885e4` | **C6.1: Phase 5 strike band fix** (paper-run hotfix). CHRW at $163.49 with 21-day low $160.45 failed in paper run — band was only $3.04 wide and IBKR returned zero strikes for that range. New interval-based floor: `spot - (expected_interval × 5)` where `expected_interval` is a CONSERVATIVE estimate ($2.50 under $25, $5.00 otherwise) intentionally overestimating OCC theoretical grids. `lowest_low_21d` remains in the dataclass chain as carried-forward metadata but is no longer used as a strike filter. **PUSHED to origin/main** (first screener commit pushed per dispatch instruction). | +6 |
+
+**Screener pipeline at C6.1 (runnable from a Python REPL, orchestrator wiring C7+):**
+
+```python
+universe = await run_phase_1(finnhub_client)                        # Phase 1
+tech_out = run_phase_2(universe)                                    # Phase 2 → Phase2Output
+fund_cands = run_phase_3(tech_out.survivors)                        # Phase 3
+corr_cands = run_phase_3_5(
+    fund_cands, tech_out.price_history, current_holdings,
+)                                                                    # Phase 3.5
+vol_cands = await run_phase_4(corr_cands, ib, calendar_provider)    # Phase 4
+strikes = await run_phase_5(vol_cands, ib)                          # Phase 5
+rays = run_phase_6(strikes)                                          # Phase 6 (sync)
+```
+
+Expected output shape: 5-30 `RAYCandidate` entries drawn from 2 nearest Friday expiries across ~8-15 Phase 4 survivors. C6.2 (next sprint) fixes NaN-safe coercion in `ib_chains.py` to resolve the GD/HSY/MPC class of paper-run failure (IBKR error 10091, subscription edge cases now paid).
+
 ---
 
 ## In Flight
+
+**Screener C6.2 (next sprint)** — NaN-safe coercion in `agt_equities/ib_chains.py`.
+- Target: resolve the GD/HSY/MPC class of paper-run failure from 2026-04-11. CHRW was fixed in C6.1 (strike band width). GD/HSY/MPC failed with IBKR error 10091 (OPRA subscription missing) which is now paid/live next week — but the defensive coercion in `ib_chains.py` still needs to handle edge cases where `reqMktData` returns `None`, `nan`, or invalid types for bid/ask/last/volume/OI/IV fields.
+- Pre-flight for Coder: verify whether `tests/test_ib_chains.py` exists before Architect dispatches C6.2. Report presence/absence to Architect.
+- Out of scope: live paper-run retry. That happens after C6.2 lands + OPRA subscription is live.
 
 **P3.2-alt Read-Only Live** — Day 2 findings + V2 execution engine shipped. Kill-switch live test pending (watchdog seeded).
 - Protocol: `protocols/P3_2alt_read_only_live_protocol.md`
@@ -251,6 +326,8 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 - mode_transitions: seeded 3 OVERWEIGHT rows (ADBE×2, PYPL×1) backdated to 2026-04-01 for watchdog staging test
 - R9 runtime harness (`scripts/debug_r9.py`, throwaway): confirmed R9 fires RED both households, red_alert_state ON with conditions A+B
 - V2 execution: Yield walkers use mid price, rolls staged as BAG combos in `pending_orders`, operator executes via `/approve`
+
+**Screener orchestrator (C7, separate sprint after C6.2)** — wiring the 6-phase pipeline to `/scan` in `telegram_bot.py`. Output is Markdown table via `reply_text(parse_mode="Markdown")`. Scheduled daily refresh at 06:00 ET alongside existing R7 corporate intel refresh. Single-ticker mode `/screener TICKER` for interactive checks. C8 optional: PXO cross-check layer.
 
 ---
 
@@ -271,10 +348,16 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 | 35 | `_discover_positions` swap (gated on #34) | Sprint C2 survey | Post-paper |
 | 36 | Dead helper sweep post-Sprint C (get_portfolio_nav, load_active_cycles, get_betas) | Sprint C2 | Post-paper |
 | 39 | Dedupe Underwater Positions rendering into shared Jinja macro | G2 | Post-paper |
+| 9 | Intraday delta watermark reconciliation gap (per-row reconciliation flag on fill_log long-term fix) | ADR-006 STEP 0 | Low now, Medium-High before multi-tenant |
+| 10 | `cc_decision_log` V2 router audit wiring (structured per-decision audit trail) | ADR-006 Blocker C | Low (`v2_rationale` text field is fallback) |
+| 11 | Empirical verification of `EXPIRE_WORTHLESS` `ev.net_cash` values (H1 dead code vs H2 load-bearing) | ADR-006 DIFF 1 triage | Low (hygiene) |
 | — | R4 pair mapping (glide_paths needs ticker_a/ticker_b ALTER) | Sprint 1F | Post-paper |
 | — | run_polling() → manual PTB init (if event loop starvation observed) | Sprint B Unit 5 | Post-paper |
 | — | Remaining query cursor hygiene migration | Sprint B Unit 7 | Post-paper |
 | — | Dead handler function BODIES still in telegram_bot.py (~3000 lines) | Cleanup A | Post-paper |
+| — | Screener log-level normalization (Phase 3 filter_fail warning→info, Phase 3.5 ALREADY_HELD warning→info, Phase 1 drop-path audit for remaining 4 paths) | C3.6 Delta 2 | Low, post-C6.2 |
+| — | Screener `cc_decision_log` integration for `/scan` decision audit trail (if structured queries become needed) | C3.6 planning | Low |
+| — | Screener Phase 1 heartbeat cache instrumentation parity review — ensure Phase 2/3/3.5/4/5/6 all surface cache hit rate in their final log lines | C2.1 pattern | Low, polish |
 
 **Closed followups:** ~~#2~~ R7 cache (Sprint 1F), ~~#4~~ yf_tkr regression, ~~#8~~ Gate 1 dedup (Sprint B), ~~#9~~ Connection leak, ~~#13~~ Cross-await refactor, ~~#17~~ orderRef linking, ~~#20~~ Sub-account routing, ~~#23~~ Graceful shutdown
 
@@ -329,6 +412,16 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 45. **`_place_single_order` BAG routing** — Dispatches on `sec_type`: OPT → standard CC flow (duplicate + capacity checks), BAG → combo roll flow (capacity checks bypassed — rolls are net-zero). Both paths share `_pre_trade_gates` + `assert_execution_enabled`.
 46. **Yield walker mid pricing** — `_walk_mode1_chain` and `_walk_harvest_chain` compute `mid = (bid+ask)/2`, use mid for annualized yield calc, output mid as `"bid"` key (preserves downstream schema). Adaptive Patient priority.
 47. **Cold-start wartime pin** (`532cb7c`) — Bot checks live leverage on startup. Pins to WARTIME when leverage >= 1.50x. Prevents false PEACETIME on restart during margin stress.
+48. **ADR-005 V2 router site** (`729c5ba`) — `_place_single_order` reads `payload["origin"]` to pick gate site: `v2_router` (WARTIME-whitelisted) vs `legacy_approve` (WARTIME-blocked). STATE_2 HARVEST and STATE_3 DEFEND ticket dicts built in `_scan_and_stage_defensive_rolls` include `origin="v2_router"`, `v2_state`, and `v2_rationale` fields for audit. Notional gate semantics: OPT BUY = `qty * lmtPrice * 100` (cash-paid), OPT SELL = `qty * strike * 100` (strike-notional), BAG = `qty * abs(lmtPrice) * 100`, STK = `qty * lmtPrice`. Zero qty and unsupported secType fail-closed.
+49. **ADR-006 per-account ACB** (`b874d81`) — `Cycle._premium_by_account` dict mirrors `_paper_basis_by_account`. All 9 `cycle.premium_total +=` sites in `walker.py:_apply_event` paired with `_credit_premium_to_account(cycle, ev.account_id, ev.net_cash)` per ruling R1 (no EXPIRE_WORTHLESS exception — universal). `Cycle.premium_for_account()` and `Cycle.adjusted_basis_for_account()` accessors produce per-account IRS-correct basis. `_load_premium_ledger_snapshot(household, ticker, account_id=None)` returns per-account dict when `account_id` provided + `READ_FROM_MASTER_LOG=True`; fails closed to None on legacy path when per-account is requested (Act 60 compliance). V2 router `_scan_and_stage_defensive_rolls` passes `pos.account` to the lookup.
+50. **Intraday delta watermark** (`b874d81`) — `trade_repo.get_active_cycles_with_intraday_delta()` overlays `fill_log` entries with `created_at > MAX(last_synced_at)` from `master_log_trades` as the watermark source (`flex_sync_log` table does not exist — verified during ADR-006 pre-flight). Known reconciliation gap logged as Followup #9: if Flex reporting lags a same-day fill, the fill becomes invisible to the walker intraday view for T+1→T+2 window. Acceptable for single-machine ops; needs per-row reconciliation flag before RIA multi-tenant.
+51. **Screener is read-only and isolated** — `agt_equities/screener/` is a side project that surfaces wheel-eligible CSP candidates. Zero coupling to execution paths. AST guard at `tests/test_screener_isolation.py` enforces that no screener file imports `telegram_bot`, `_pre_trade_gates`, `placeOrder`, `execution_gate`, `_HALTED`, V2 router symbols, `walker`, `trade_repo`, `rule_engine`, or `mode_engine`. `ib_async` is whitelisted ONLY for `vol_event_armor.py` (Phase 4 IVR) and `chain_walker.py` (Phase 5 chain walk, routed through `agt_equities.ib_chains`). Phase 5 uses `ib_chains.get_expirations` / `ib_chains.get_chain_for_expiry` — does NOT call `reqMktData` / `reqSecDefOptParams` / `qualifyContractsAsync` directly.
+52. **Screener Phase 5 strike floor is interval-based, not price-history** (`b5885e4`, C6.1) — Strike band lower bound is computed as `spot - (_expected_strike_interval(spot) × CHAIN_WALKER_MIN_STRIKES_IN_BAND)` where the interval is a CONSERVATIVE estimate ($2.50 under $25, $5 otherwise, intentionally overestimating OCC theoretical grids). Guarantees at least 5 walkable strikes regardless of chain density. `lowest_low_21d` remains a carried-forward dataclass field on `VolArmorCandidate` → `StrikeCandidate` → `RAYCandidate` but is NOT used as a filter. `_compute_strike_band_floor()` takes ONLY `spot` as input — verified structurally via `inspect.signature` in tests.
+53. **Screener Phase 3 net-cash sentinel** (`6f9744a`, C3.7) — `_compute_net_debt_to_ebitda` returns 0.0 sentinel when `net_debt <= 0` (total_debt ≤ cash) regardless of EBITDA sign. Fixes the mega-cap tech class of failure (NVDA, GOOGL, AAPL, META, BRK.A). Positive net_debt with negative EBITDA rejected with specific reason `degenerate_denominator:positive_net_debt_negative_ebitda`. Only arithmetic consumer of `net_debt_to_ebitda` is Phase 3's `_passes_fortress_filters` gate — the 0.0 sentinel passes the `<= 3.0` check correctly. Downstream phases (3.5, 4, 5, 6) only carry the field forward, they don't read it.
+54. **Screener Phase 3 SI fail-open** (`6f9744a`, C3.7) — When both `info.shortPercentOfFloat` and the `sharesShort/floatShares` fallback are None, `_extract_fundamentals` logs `SHORT_INTEREST_UNAVAILABLE` warning and sets `short_interest_pct = 0.0`. Yfinance has SI=None for ~20-30% of tickers; fail-closed would silently starve the candidate pool.
+55. **Screener universe exclusions** (`b1404df`, C3.6) — `config.EXCLUDED_SECTORS` contains 22 entries: 3 quality exclusions (Airlines, Biotechnology, Pharmaceuticals) + 19 structural exclusions (REITs in 6 variants, MLPs + Oil & Gas Storage bucket, BDCs + Asset Management & Custody Banks bucket, Closed-End Funds, Trust/Trusts/Royalty Trusts, SPACs/Blank Checks/Shell Companies). Bucket-level exclusions (Oil & Gas Storage, Asset Management) are intentionally aggressive — they strip MLPs/BDCs plus some legitimate C-corps (BLK, TROW). Trade-off: cost of false negative (missing BLK) < cost of false positive (admitting ARCC whose fundamentals break Phase 3 math).
+56. **Screener Phase 6 NaN guard** (`040c939`, C6) — `ray_filter.run_phase_6` uses `math.isnan()` explicitly in the malformed-data branch. Without it, a NaN `annualized_yield` would fall through all three comparison branches (NaN comparisons all return False) and silently pass as in-band. Test 12 locks the guard semantic.
+57. **IBKR historical IV subscription** (probe verified 2026-04-11) — `reqHistoricalDataAsync` with `whatToShow="OPTION_IMPLIED_VOLATILITY"` returns ~250 daily bars for US large-caps on the paid subscription. Probe at `scripts/probe_ibkr_historical_iv.py` ran against live Gateway at port 4001 with `clientId=99` (no collision with production bot's clientId=1). Verdict `SUBSCRIBED` unlocked Option D for C4. Throwaway script, uncommitted.
 
 ---
 
@@ -364,7 +457,23 @@ Always stop and report (do NOT auto-fix) on:
 
 1. Read this file end-to-end.
 2. Read `desk_state.md` at `C:\AGT_Telegram_Bridge\desk_state.md`.
-3. Run `git log --oneline -5` to confirm HEAD matches expected state.
+3. Run `git log --oneline -12` to confirm HEAD matches expected state. Expected top-of-tree (2026-04-11):
+   ```
+   b5885e4  screener C6.1: widen Phase 5 strike band ...        (origin/main)
+   040c939  screener C6:   Phase 6 (RAY filter - terminal)
+   9425b29  screener C5:   Phase 5 (IBKR option chain walker)
+   329d16f  screener C4:   Phase 4 (IVR + corporate calendar)
+   6f9744a  screener C3.7: Phase 3 semantic fixes
+   b1404df  screener C3.6: structural exclusions
+   570ce02  screener C3.5: correlation-fit portfolio gate
+   56487aa  screener C3:   fundamentals
+   0092b35  screener C2.1: cache instrumentation
+   81af518  screener C2:   Phase 1 + Phase 2
+   9e223f2  screener C1:   scaffolding
+   3bb8c81  followups #9 #10 #11
+   b874d81  ADR-006 ACB pipeline hardening
+   729c5ba  ADR-005 V2 router WARTIME whitelist + BAG + BTC cash-paid
+   ```
 4. Wait for Architect prompt. Do not start work autonomously.
 
 End of handoff.
