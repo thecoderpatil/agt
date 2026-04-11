@@ -293,6 +293,56 @@ MIN_IV_BARS: int = 200
 IBKR_HIST_DATA_COURTESY_DELAY_S: float = 0.1
 
 
+# ─── Phase 5: IBKR option chain walker ──────────────────────────
+# Per Architect dispatch + Yash ruling 2026-04-11 (C5 greenlight).
+# Phase 5 sits between Phase 4 (vol/event armor) and Phase 6 (RAY
+# filter). Walks the option chain for each VolArmorCandidate and
+# emits one StrikeCandidate per valid (expiry, strike) pair. Phase 6
+# picks the winners — Phase 5 just produces the universe.
+#
+# Data access: agt_equities.ib_chains.get_expirations +
+# get_chain_for_expiry. chain_walker.py never calls ib_async
+# directly; all IBKR interaction is routed through ib_chains.
+
+# Number of nearest Friday expiries to walk per candidate.
+# Yash ruling 2026-04-11: two nearest Fridays, no weekly/monthly
+# distinction. Phase 5 takes the first N future Friday expiries
+# from get_expirations() regardless of whether they are weeklies
+# or monthlies — both trade, both are liquid.
+CHAIN_WALKER_EXPIRY_COUNT: int = 2
+
+# Minimum DTE floor. We don't want expiries that land within 1
+# trading day (0 or 1 DTE) — those carry assignment risk before
+# operators can react. Rulebook CSP window is "3-10 DTE"
+# historically but we cast a slightly wider net here and let
+# Phase 6 narrow.
+CHAIN_WALKER_MIN_DTE: int = 2
+
+# Maximum DTE ceiling. Anything beyond 21 DTE is outside the
+# weekly CSP framework and gets filtered out regardless of whether
+# it happens to be one of the two nearest expiries.
+CHAIN_WALKER_MAX_DTE: int = 21
+
+# Strike filter: we walk puts BELOW spot (OTM puts for CSPs).
+# Floor: lowest_low_21d from Phase 2 — no put below the 21-day
+# low because yield drops off and risk/reward inverts. Ceiling:
+# spot itself (nearest-to-the-money put is the highest yield).
+# No tunable constant here — the filter uses per-candidate
+# spot + lowest_low_21d directly at call time.
+
+# Minimum mid price for a strike to be considered. Strikes with
+# mid < $0.05 have effectively zero yield and unreliable quotes.
+# Matches MODE1_ABSOLUTE_BID_FLOOR convention in the Rulebook.
+CHAIN_WALKER_MIN_MID: float = 0.05
+
+# Per-ticker rate limit courtesy delay between the two expiry
+# fetches. ib_chains.get_chain_for_expiry already has an internal
+# 2-second sleep waiting for reqMktData to populate. This adds
+# a small additional delay between the TWO expiry calls per
+# ticker to avoid overlapping snapshot subscriptions.
+CHAIN_WALKER_INTER_EXPIRY_DELAY_S: float = 0.5
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 — Volatility & event armor
 # ---------------------------------------------------------------------------

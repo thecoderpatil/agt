@@ -411,3 +411,124 @@ class VolArmorCandidate:
             ex_dividend_date=ex_dividend_date,
             calendar_source=calendar_source,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class StrikeCandidate:
+    """Output of Phase 5 — a single CSP strike on a single expiry.
+
+    Phase 5 walks the option chain for each VolArmorCandidate and emits
+    one StrikeCandidate per valid strike per expiry. Phase 6 (RAY filter)
+    consumes these and picks the winners.
+
+    A single VolArmorCandidate input typically produces
+    (strikes_in_band × 2 expiries) outputs — ~10-20 strikes per expiry
+    in the normal case, so 20-40 StrikeCandidates per upstream candidate.
+    Zero outputs is valid (no viable strikes, both expiries failed, etc.).
+
+    Carries forward ALL 28 VolArmorCandidate fields verbatim. Adds 12
+    Phase 5 fields describing the specific (expiry, strike) point in
+    the option chain.
+    """
+    # VolArmorCandidate carry-forward (verbatim)
+    ticker: str
+    name: str
+    sector: str
+    country: str
+    market_cap_usd: float
+    spot: float
+    sma_200: float
+    rsi_14: float
+    bband_lower: float
+    bband_mid: float
+    bband_upper: float
+    lowest_low_21d: float
+    altman_z: float
+    fcf_yield: float
+    net_debt_to_ebitda: float
+    roic: float
+    short_interest_pct: float
+    max_abs_correlation: float
+    most_correlated_holding: str
+    ivr_pct: float
+    iv_latest: float
+    iv_52w_min: float
+    iv_52w_max: float
+    iv_bars_used: int
+    next_earnings: Any
+    ex_dividend_date: Any
+    calendar_source: str
+    # Phase 5 additions
+    expiry: str                 # YYYY-MM-DD (the IBKR expiry this strike came from)
+    dte: int                    # days to expiration (computed at Phase 5 time)
+    strike: float               # strike price
+    bid: float                  # from IBKR chain
+    ask: float                  # from IBKR chain
+    mid: float                  # (bid + ask) / 2
+    last: float                 # from IBKR chain
+    volume: int                 # from IBKR chain
+    open_interest: int          # from IBKR chain (renamed from openInterest)
+    implied_vol: float          # from IBKR chain (renamed from impliedVol)
+    annualized_yield: float     # (mid / strike) * (365 / dte) * 100, as percent
+    otm_pct: float              # (spot - strike) / spot * 100, as percent
+
+    @classmethod
+    def from_vol_armor(
+        cls,
+        upstream: "VolArmorCandidate",
+        *,
+        expiry: str,
+        dte: int,
+        strike: float,
+        bid: float,
+        ask: float,
+        mid: float,
+        last: float,
+        volume: int,
+        open_interest: int,
+        implied_vol: float,
+        annualized_yield: float,
+        otm_pct: float,
+    ) -> "StrikeCandidate":
+        """Construct a StrikeCandidate from a VolArmorCandidate + per-strike data."""
+        return cls(
+            ticker=upstream.ticker,
+            name=upstream.name,
+            sector=upstream.sector,
+            country=upstream.country,
+            market_cap_usd=upstream.market_cap_usd,
+            spot=upstream.spot,
+            sma_200=upstream.sma_200,
+            rsi_14=upstream.rsi_14,
+            bband_lower=upstream.bband_lower,
+            bband_mid=upstream.bband_mid,
+            bband_upper=upstream.bband_upper,
+            lowest_low_21d=upstream.lowest_low_21d,
+            altman_z=upstream.altman_z,
+            fcf_yield=upstream.fcf_yield,
+            net_debt_to_ebitda=upstream.net_debt_to_ebitda,
+            roic=upstream.roic,
+            short_interest_pct=upstream.short_interest_pct,
+            max_abs_correlation=upstream.max_abs_correlation,
+            most_correlated_holding=upstream.most_correlated_holding,
+            ivr_pct=upstream.ivr_pct,
+            iv_latest=upstream.iv_latest,
+            iv_52w_min=upstream.iv_52w_min,
+            iv_52w_max=upstream.iv_52w_max,
+            iv_bars_used=upstream.iv_bars_used,
+            next_earnings=upstream.next_earnings,
+            ex_dividend_date=upstream.ex_dividend_date,
+            calendar_source=upstream.calendar_source,
+            expiry=expiry,
+            dte=dte,
+            strike=strike,
+            bid=bid,
+            ask=ask,
+            mid=mid,
+            last=last,
+            volume=volume,
+            open_interest=open_interest,
+            implied_vol=implied_vol,
+            annualized_yield=annualized_yield,
+            otm_pct=otm_pct,
+        )
