@@ -130,20 +130,6 @@ class TestNotionalGate(unittest.TestCase):
         self.assertIn("fail-closed", reason)
 
 
-class TestNonWheelFilter(unittest.TestCase):
-    """Gate 3: non-wheel filter."""
-
-    @patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
-    def test_bag_blocked(self, _mock):
-        from telegram_bot import _pre_trade_gates
-        ok, reason = _run(_pre_trade_gates(
-            _mock_order(), _mock_contract(sec_type="BAG", strike=100.0),
-            {"site": "dex", "audit_id": None, "household": "Yash_Household"},
-        ))
-        self.assertFalse(ok)
-        self.assertIn("Non-wheel", reason)
-
-
 class TestF20NullGuard(unittest.TestCase):
     """Gate 4: F20 NULL originating_account_id guard."""
 

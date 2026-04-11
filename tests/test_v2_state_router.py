@@ -14,6 +14,7 @@ def _run(coro):
 
 class TestV2StateRouter(unittest.TestCase):
 
+    @patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
     @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
     @patch("telegram_bot.append_pending_tickets")
     @patch("telegram_bot._load_premium_ledger_snapshot", return_value={
@@ -26,6 +27,7 @@ class TestV2StateRouter(unittest.TestCase):
         mock_spot,
         mock_ledger,
         mock_append,
+        mock_mode,
     ):
         import telegram_bot
 
@@ -68,9 +70,16 @@ class TestV2StateRouter(unittest.TestCase):
             "[ASSIGN] PYPL Extrinsic exhausted. Parity breached. Defense standing down.",
             alerts,
         )
-        self.assertEqual(alerts, ["[HARVEST] PYPL Capital dead. Staging BTC."])
+        self.assertEqual(
+            alerts,
+            [
+                "━━ V2 Router [mode=PEACETIME] ━━",
+                "[HARVEST] PYPL Capital dead. Staging BTC.",
+            ],
+        )
         mock_append.assert_called_once()
 
+    @patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
     @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
     @patch("telegram_bot.append_pending_tickets")
     @patch("telegram_bot._load_premium_ledger_snapshot", return_value={
@@ -83,6 +92,7 @@ class TestV2StateRouter(unittest.TestCase):
         mock_spot,
         mock_ledger,
         mock_append,
+        mock_mode,
     ):
         import telegram_bot
 
@@ -121,7 +131,13 @@ class TestV2StateRouter(unittest.TestCase):
 
         alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn))
 
-        self.assertEqual(alerts, ["[HARVEST] AAPL Capital dead. Staging BTC."])
+        self.assertEqual(
+            alerts,
+            [
+                "━━ V2 Router [mode=PEACETIME] ━━",
+                "[HARVEST] AAPL Capital dead. Staging BTC.",
+            ],
+        )
         mock_append.assert_called_once()
         ticket = mock_append.call_args.args[0][0]
         self.assertEqual(ticket["sec_type"], "OPT")
@@ -129,6 +145,7 @@ class TestV2StateRouter(unittest.TestCase):
         self.assertEqual(ticket["ticker"], "AAPL")
         self.assertEqual(ticket["limit_price"], 0.20)
 
+    @patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
     @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
     @patch("telegram_bot.append_pending_tickets")
     @patch("telegram_bot._load_premium_ledger_snapshot", return_value={
@@ -141,6 +158,7 @@ class TestV2StateRouter(unittest.TestCase):
         mock_spot,
         mock_ledger,
         mock_append,
+        mock_mode,
     ):
         import telegram_bot
 
@@ -179,12 +197,19 @@ class TestV2StateRouter(unittest.TestCase):
 
         alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn))
 
-        self.assertEqual(alerts, ["[HARVEST] ADBE Capital dead. Staging BTC."])
+        self.assertEqual(
+            alerts,
+            [
+                "━━ V2 Router [mode=PEACETIME] ━━",
+                "[HARVEST] ADBE Capital dead. Staging BTC.",
+            ],
+        )
         mock_append.assert_called_once()
         ticket = mock_append.call_args.args[0][0]
         self.assertEqual(ticket["action"], "BUY")
         self.assertEqual(ticket["limit_price"], 0.01)
 
+    @patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
     @patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
     @patch("telegram_bot.append_pending_tickets")
     @patch("telegram_bot._ibkr_get_chain", new_callable=AsyncMock)
@@ -201,6 +226,7 @@ class TestV2StateRouter(unittest.TestCase):
         mock_expirations,
         mock_chain,
         mock_append,
+        mock_mode,
     ):
         import telegram_bot
 
@@ -247,7 +273,13 @@ class TestV2StateRouter(unittest.TestCase):
 
         alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn))
 
-        self.assertEqual(alerts, ["[DEFEND] AAPL EV-Accretive Roll staged."])
+        self.assertEqual(
+            alerts,
+            [
+                "━━ V2 Router [mode=PEACETIME] ━━",
+                "[DEFEND] AAPL EV-Accretive Roll staged.",
+            ],
+        )
         mock_append.assert_called_once()
         ticket = mock_append.call_args.args[0][0]
         self.assertEqual(ticket["sec_type"], "BAG")

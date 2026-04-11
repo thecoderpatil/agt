@@ -6122,47 +6122,74 @@ async def _pre_trade_gates(
     operator with reason. Fail-closed: any exception → block.
 
     context keys:
-        site: "dex" | "orders_match_mid" | "legacy_approve"
+        site: "dex" | "legacy_approve" | "v2_router" | "orders_match_mid"
         audit_id: str | None  (non-None triggers F20 NULL guard)
         household: str | None
+
+    ADR-005: v2_router is the canonical Wartime defensive surface and
+    is whitelisted alongside dex. BAG combos are permitted for V2
+    STATE_3_DEFEND rolls. BTC and BAG notional use cash-paid semantics
+    rather than strike-notional, since they extinguish obligations
+    rather than create them.
     """
     try:
         site = context.get("site", "unknown")
         audit_id = context.get("audit_id")
 
-        # Gate 0: Halt killswitch (Sprint 1D)
+        # Gate 0: Halt killswitch (Sprint 1D) — unchanged
         if _HALTED:
             return (False, "Desk halted via /halt — restart bot to resume")
 
-        # Gate 1: Mode gate — WARTIME blocks non-DEX sites
+        # Gate 1: Mode gate — WARTIME whitelist (ADR-005 R4)
         mode = _get_current_desk_mode()
-        if mode == "WARTIME" and site != "dex":
-            return (False, f"WARTIME blocks {site}; only DEX path allowed")
+        WARTIME_ALLOWED_SITES = ("dex", "v2_router")
+        if mode == "WARTIME" and site not in WARTIME_ALLOWED_SITES:
+            return (False, f"WARTIME blocks {site}; allowed: {WARTIME_ALLOWED_SITES}")
 
-        # Gate 2: Notional ceiling ($25k)
+        # Gate 2: Notional ceiling ($25k cash exposure) — ADR-005 CC1
         sec_type = getattr(contract, "secType", None)
         qty = abs(getattr(order, "totalQuantity", 0) or 0)
+        if qty <= 0:
+            return (False, "Notional gate: zero quantity — fail-closed")
+
+        order_action = str(getattr(order, "action", "") or "").upper()
+        try:
+            limit_price = float(getattr(order, "lmtPrice", 0) or 0)
+        except (TypeError, ValueError):
+            return (False, "Notional gate: non-numeric lmtPrice — fail-closed")
+
         if sec_type == "OPT":
-            strike = getattr(contract, "strike", None)
-            if not strike or strike <= 0:
-                return (False, "Notional gate: OPT with missing/zero strike — fail-closed")
-            notional = qty * strike * 100
+            if order_action == "BUY":
+                # BTC: cash exposure is premium paid, not strike-notional
+                if limit_price < 0:
+                    return (False, "Notional gate: OPT BUY with negative lmtPrice — fail-closed")
+                notional = qty * limit_price * 100
+            else:
+                # SELL (CSP/CC): worst-case obligation is strike * 100
+                strike = getattr(contract, "strike", None)
+                if not strike or strike <= 0:
+                    return (False, "Notional gate: OPT SELL with missing/zero strike — fail-closed")
+                notional = qty * strike * 100
         elif sec_type == "STK":
-            price = getattr(order, "lmtPrice", None)
-            if not price or price <= 0:
+            if not limit_price or limit_price <= 0:
                 return (False, "Notional gate: STK with missing/zero lmtPrice — fail-closed")
-            notional = qty * price
+            notional = qty * limit_price
+        elif sec_type == "BAG":
+            # ADR-005 CC1: BAG net debit/credit cash exposure.
+            # Combo legs net out structurally; cap on actual cash movement.
+            notional = qty * abs(limit_price) * 100
         else:
-            notional = 0
+            return (False, f"Notional gate: unsupported secType {sec_type} — fail-closed")
 
         if notional > PRE_TRADE_NOTIONAL_CEILING:
             return (False, f"Notional ${notional:,.0f} exceeds ${PRE_TRADE_NOTIONAL_CEILING:,} ceiling")
 
-        # Gate 3: Non-wheel filter — only OPT and STK allowed
-        if sec_type not in ("OPT", "STK"):
+        # Gate 3: Non-wheel filter — OPT, STK, BAG (ADR-005 CC4)
+        ALLOWED_SECTYPES = ("OPT", "STK", "BAG")
+        if sec_type not in ALLOWED_SECTYPES:
             return (False, f"Non-wheel trade blocked (secType={sec_type}); use TWS directly")
 
-        # Gate 4: F20 NULL guard — defense-in-depth for DEX path
+        # Gate 4: F20 NULL guard — unchanged (DEX path only)
         if audit_id is not None:
             try:
                 with closing(_get_db_connection()) as conn:
@@ -6386,14 +6413,25 @@ async def _place_single_order(
         else:
             return False, f"#{db_id} Unsupported sec_type {sec_type}"
 
-        # Sprint 1A: unified pre-trade gate
+        # Sprint 1A: unified pre-trade gate.
+        # ADR-005: V2 router payloads carry origin="v2_router" so they
+        # route through the WARTIME-whitelisted v2_router site.
+        try:
+            payload_origin = str(payload.get("origin") or "legacy_approve")
+        except Exception:
+            payload_origin = "legacy_approve"
+        gate_site = "v2_router" if payload_origin == "v2_router" else "legacy_approve"
+
         gate_ok, gate_reason = await _pre_trade_gates(
             order, contract,
-            {"site": "legacy_approve", "audit_id": None,
+            {"site": gate_site, "audit_id": None,
              "household": ACCOUNT_TO_HOUSEHOLD.get(acct_id)},
         )
         if not gate_ok:
-            logger.warning("Legacy approve blocked: #%d %s — %s", db_id, ticker, gate_reason)
+            logger.warning(
+                "%s blocked: #%d %s — %s",
+                gate_site, db_id, ticker, gate_reason,
+            )
             return False, f"#{db_id} {ticker} — gate blocked: {gate_reason}"
 
         # Warn if placing outside market hours — DAY orders won't execute until next session
@@ -8609,14 +8647,26 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
     V2 master router for open short calls.
     Routes each live short call through States 1-3 in lexicographical order.
     Returns a list of alert strings for Telegram.
+
+    ADR-005: V2 is WARTIME-allowed via the v2_router site in
+    _pre_trade_gates. Mode is logged here for operator visibility but
+    is NOT gated at staging — execution gate enforces it.
     """
     if _HALTED:
-        return []
+        logger.info("V2 router: skipped (desk halted)")
+        return ["[V2 ROUTER] Skipped — desk halted via /halt."]
 
     from datetime import date
     import math
 
-    alerts = []
+    try:
+        current_mode = _get_current_desk_mode()
+    except Exception as mode_exc:
+        logger.warning("V2 router: mode lookup failed (%s) — assuming PEACETIME", mode_exc)
+        current_mode = "PEACETIME"
+
+    alerts: list[str] = [f"━━ V2 Router [mode={current_mode}] ━━"]
+    logger.info("V2 router: scan starting in mode=%s", current_mode)
     try:
         positions = await ib_conn.reqPositionsAsync()
         short_calls = [
@@ -8745,6 +8795,12 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
                     "transmit": True,
                     "strategy": "V2 Harvest BTC",
                     "mode": "STATE_2_HARVEST",
+                    "origin": "v2_router",
+                    "v2_state": "HARVEST",
+                    "v2_rationale": (
+                        f"pnl_pct={pnl_pct:.3f} ray={ray:.3f} "
+                        f"initial_credit={initial_credit:.2f} ask={ask:.2f}"
+                    ),
                 }
                 try:
                     await asyncio.to_thread(append_pending_tickets, [ticket])
@@ -8854,6 +8910,13 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
                             "transmit": True,
                             "strategy": "V2 EV-Accretive Roll",
                             "mode": "STATE_3_DEFEND",
+                            "origin": "v2_router",
+                            "v2_state": "DEFEND",
+                            "v2_rationale": (
+                                f"adjusted_basis={adjusted_basis:.2f} spot={spot:.2f} "
+                                f"delta={delta:.3f} ev_ratio={best_roll['ev_ratio']:.2f} "
+                                f"debit={best_roll['debit_paid']:.2f}"
+                            ),
                             "strike": best_roll["sell_strike"],
                             "expiry": best_roll["sell_expiry_ib"],
                             "right": "C",
