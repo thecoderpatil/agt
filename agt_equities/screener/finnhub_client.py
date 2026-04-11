@@ -160,6 +160,15 @@ class FinnhubClient:
 
         self.rate_limiter = FinnhubRateLimiter(calls_per_minute=calls_per_minute)
 
+        # C2.1: cache hit/miss counters for run-level instrumentation.
+        # Incremented inside _get_cached(): hit when the TTL-checked
+        # cache returns a stored value, miss when a successful HTTP
+        # fetch is then written to cache. Failed fetches and missing
+        # API key paths do NOT increment misses (they're not cache
+        # decisions, they're upstream failures).
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
+
         # httpx client — single shared instance for connection pooling.
         # transport= override is the test-injection point (httpx.MockTransport).
         client_kwargs: dict[str, Any] = {
@@ -183,6 +192,26 @@ class FinnhubClient:
             await self._client.aclose()
         except Exception as exc:
             logger.warning("FinnhubClient.aclose failed: %s", exc)
+
+    def get_stats(self) -> dict:
+        """Return cache hit/miss counters and computed hit rate.
+
+        Used by Phase 1 / Phase 4 final-log instrumentation to surface
+        cache effectiveness in operator-facing run summaries. Hit rate
+        is the ratio of cache_hits to (cache_hits + cache_misses); if
+        no cache decisions have been made yet, returns 0.0.
+
+        Failed fetches (network errors, 429-exhausted, missing API key)
+        are NOT counted in either bucket — they're upstream failures
+        that bypass the cache decision entirely.
+        """
+        total = self._cache_hits + self._cache_misses
+        hit_rate = (self._cache_hits / total * 100) if total else 0.0
+        return {
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "hit_rate_pct": round(hit_rate, 1),
+        }
 
     # ------------------------------------------------------------------
     # Public endpoint methods — each follows the same shape:
@@ -266,20 +295,23 @@ class FinnhubClient:
         # Step 1: cache lookup
         cached = screener_cache.cache_get(category, key, ttl_seconds=ttl)
         if cached is not None:
+            self._cache_hits += 1
             return cached
 
         # Step 2: API call (rate-limited, retried)
         if not self.api_key:
-            return None  # fail-soft when key is missing
+            return None  # fail-soft when key is missing (not a cache miss)
 
         result = await self._request_with_retry(
             endpoint, params, allow_list_response=allow_list_response,
         )
         if result is None:
-            return None
+            return None  # upstream failure, not a cache miss
 
-        # Step 3: cache the response
+        # Step 3: cache the response — counts as a miss because we had
+        # to fetch fresh data and populate the cache for next time
         screener_cache.cache_put(category, key, result)
+        self._cache_misses += 1
         return result
 
     async def _request_with_retry(

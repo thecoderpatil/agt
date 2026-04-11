@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import time
 from pathlib import Path
 
 from agt_equities.screener import config
@@ -229,6 +230,8 @@ async def run_phase_1(
         total,
     )
 
+    start_ts = time.monotonic()
+
     for idx, ticker in enumerate(seed, start=1):
         try:
             profile = await client.get_profile2(ticker)
@@ -252,8 +255,13 @@ async def run_phase_1(
                 idx, total, len(survivors),
             )
 
+    elapsed = time.monotonic() - start_ts
+    stats = client.get_stats()
     logger.info(
-        "Phase 1 complete: %d/%d tickers passed exclusions",
-        len(survivors), total,
+        "Phase 1 complete: processed=%d survivors=%d dropped=%d "
+        "cache_hits=%d cache_misses=%d hit_rate=%.1f%% elapsed=%.1fs",
+        total, len(survivors), total - len(survivors),
+        stats["cache_hits"], stats["cache_misses"],
+        stats["hit_rate_pct"], elapsed,
     )
     return survivors

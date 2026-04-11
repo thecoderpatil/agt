@@ -320,3 +320,80 @@ def test_17_run_phase_1_empty_input(tmp_cache):
         finally:
             await client.aclose()
     _run(run())
+
+
+# ---------------------------------------------------------------------------
+# C2.1 — Cache hit rate instrumentation in the final log line
+# ---------------------------------------------------------------------------
+
+def test_18_phase1_final_log_surfaces_cache_stats(tmp_cache, caplog):
+    """The final Phase 1 log line must surface cache_hits, cache_misses,
+    hit_rate, elapsed, AND the 'Phase 1 complete' marker.
+
+    Setup: pre-populate the cache for one ticker (forces a hit) and leave
+    another uncached (forces a miss). Run Phase 1 with both tickers and
+    capture the final log message via caplog.
+    """
+    import logging
+
+    # Pre-populate cache for HIT_TICKER — counts as a hit when run_phase_1
+    # calls get_profile2(HIT_TICKER)
+    screener_cache.cache_put(
+        "finnhub/profile2", "HIT_TICKER",
+        {
+            "name": "Cached Co", "country": "US",
+            "marketCapitalization": 50000.0,  # $50B
+            "finnhubIndustry": "Technology",
+        },
+    )
+
+    # MISS_TICKER is not in cache — triggers an HTTP call (counts as miss)
+    handler = _build_profile_handler({
+        "MISS_TICKER": {
+            "name": "Fresh Co", "country": "US",
+            "marketCapitalization": 50000.0,
+            "finnhubIndustry": "Technology",
+        },
+    })
+
+    async def run():
+        client = FinnhubClient(api_key="test_key", transport=httpx.MockTransport(handler))
+        try:
+            with caplog.at_level(logging.INFO, logger="agt_equities.screener.universe"):
+                await universe.run_phase_1(
+                    client,
+                    tickers=["HIT_TICKER", "MISS_TICKER"],
+                    heartbeat_interval=0,
+                )
+        finally:
+            await client.aclose()
+
+    _run(run())
+
+    # Find the final "Phase 1 complete" line
+    complete_lines = [
+        r.message for r in caplog.records if "Phase 1 complete" in r.message
+    ]
+    assert len(complete_lines) == 1, (
+        f"Expected exactly one 'Phase 1 complete' line, got {len(complete_lines)}: "
+        f"{complete_lines}"
+    )
+    final_line = complete_lines[0]
+
+    # Assert all five required tokens are present
+    required_tokens = (
+        "Phase 1 complete",
+        "cache_hits=",
+        "cache_misses=",
+        "hit_rate=",
+        "elapsed=",
+    )
+    for token in required_tokens:
+        assert token in final_line, (
+            f"Missing token {token!r} in final log line: {final_line!r}"
+        )
+
+    # Defensive: confirm the counters reflect the test setup (1 hit, 1 miss)
+    assert "cache_hits=1" in final_line
+    assert "cache_misses=1" in final_line
+    assert "hit_rate=50.0%" in final_line
