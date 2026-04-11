@@ -243,6 +243,56 @@ CORRELATION_HOLDINGS_EXCLUSIONS: frozenset[str] = frozenset({
 })
 
 
+# ─── Phase 4: volatility / event armor thresholds ───────────────
+# Per Architect dispatch + probe verification 2026-04-11 (C4 greenlight).
+# Phase 4 sits between Phase 3.5 correlation and Phase 5 option chains.
+# Uses LIVE IBKR reqHistoricalDataAsync for IVR (Option D) and the
+# existing YFinanceCorporateIntelligenceProvider for earnings / ex-div /
+# pending corporate action gates.
+
+# Minimum IV Rank. A candidate must be in at least the 30th percentile
+# of its own trailing 1-year IV range. Rationale: Wheel sellers monetize
+# IV richness. Names at the 5th percentile of their own IV history are
+# cheap-premium names — yield will not compensate for risk. 30% is a
+# relatively permissive floor; can be tuned upward if Phase 4 output
+# is too fat. Do NOT tune below 20% without an Architect amendment.
+# Predicate: ivr_pct >= MIN_IVR_PCT
+MIN_IVR_PCT: float = 30.0
+
+# Earnings window: no CSP may be initiated within this window of a
+# scheduled earnings release. Rulebook Rule 7 CSP earnings buffer
+# says 7 calendar days. We use 10 here to add a 3-day safety margin
+# against earnings date imprecision in the yfinance corporate
+# calendar cache. The Wall Street Horizon replacement at deployment
+# will allow tightening to 7.
+# Predicate: 0 <= days_to_earnings <= EARNINGS_BLACKOUT_DAYS → drop
+EARNINGS_BLACKOUT_DAYS: int = 10
+
+# Ex-dividend blackout: short calls face early-assignment risk on the
+# trading day before ex-dividend. We avoid opening new Wheel positions
+# on names with ex-div within this window.
+# Predicate: 0 <= days_to_ex_div <= EX_DIV_BLACKOUT_DAYS → drop
+EX_DIV_BLACKOUT_DAYS: int = 5
+
+# IBKR historical IV fetch duration string passed to
+# reqHistoricalDataAsync. "1 Y" produces ~252 trading-day bars, which
+# is the standard 52-week IV Rank denominator. Probe verification
+# 2026-04-11 confirmed AAPL=249, MSFT=250, SPY=250 bars from this call.
+IV_HISTORY_DURATION: str = "1 Y"
+
+# IVR minimum bar count — candidates with fewer than this many valid
+# IV bars are dropped fail-closed. Rationale: a short IV history
+# produces unstable percentile rankings. 200 bars ~= 10 months of
+# trading days, sufficient for a meaningful 52w range.
+MIN_IV_BARS: int = 200
+
+# Per-candidate IBKR rate limit courtesy delay (seconds). IBKR caps
+# historical data requests at ~60/minute on default market data
+# subscriptions. 0.1s between calls keeps ~15 candidates under the
+# cap with headroom.
+IBKR_HIST_DATA_COURTESY_DELAY_S: float = 0.1
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 — Volatility & event armor
 # ---------------------------------------------------------------------------

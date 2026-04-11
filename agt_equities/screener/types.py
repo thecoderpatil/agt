@@ -319,3 +319,95 @@ class CorrelationCandidate:
             max_abs_correlation=max_abs_correlation,
             most_correlated_holding=most_correlated_holding,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class VolArmorCandidate:
+    """Output of Phase 4 — a candidate that passed vol + event armor.
+
+    Phase 4 verifies (in order):
+      - IVR >= MIN_IVR_PCT                             (IBKR historical IV)
+      - No earnings within EARNINGS_BLACKOUT_DAYS      (CorporateCalendarDTO)
+      - No ex-dividend within EX_DIV_BLACKOUT_DAYS     (CorporateCalendarDTO)
+      - pending_corporate_action == CorporateActionType.NONE
+
+    Carries forward all CorrelationCandidate fields. Adds 8 new fields
+    capturing the IV snapshot and corporate calendar data used for the
+    gate decisions. Calendar fields are Optional[date] in the upstream
+    DTO but typed as Any here to avoid importing datetime into the
+    stdlib-isolated types module.
+    """
+    # CorrelationCandidate carry-forward (verbatim)
+    ticker: str
+    name: str
+    sector: str
+    country: str
+    market_cap_usd: float
+    spot: float
+    sma_200: float
+    rsi_14: float
+    bband_lower: float
+    bband_mid: float
+    bband_upper: float
+    lowest_low_21d: float
+    altman_z: float
+    fcf_yield: float
+    net_debt_to_ebitda: float
+    roic: float
+    short_interest_pct: float
+    max_abs_correlation: float
+    most_correlated_holding: str
+    # Phase 4 additions
+    ivr_pct: float               # 0-100 percentile
+    iv_latest: float             # most recent 30-day IV, decimal (0.278 = 27.8%)
+    iv_52w_min: float            # min IV over trailing ~252 trading days
+    iv_52w_max: float            # max IV over trailing ~252 trading days
+    iv_bars_used: int            # count of historical bars used (audit)
+    next_earnings: Any           # date | None (upstream Optional[date])
+    ex_dividend_date: Any        # date | None
+    calendar_source: str         # data_source from CorporateCalendarDTO
+
+    @classmethod
+    def from_correlation(
+        cls,
+        upstream: "CorrelationCandidate",
+        *,
+        ivr_pct: float,
+        iv_latest: float,
+        iv_52w_min: float,
+        iv_52w_max: float,
+        iv_bars_used: int,
+        next_earnings: Any,
+        ex_dividend_date: Any,
+        calendar_source: str,
+    ) -> "VolArmorCandidate":
+        """Construct a VolArmorCandidate from a CorrelationCandidate."""
+        return cls(
+            ticker=upstream.ticker,
+            name=upstream.name,
+            sector=upstream.sector,
+            country=upstream.country,
+            market_cap_usd=upstream.market_cap_usd,
+            spot=upstream.spot,
+            sma_200=upstream.sma_200,
+            rsi_14=upstream.rsi_14,
+            bband_lower=upstream.bband_lower,
+            bband_mid=upstream.bband_mid,
+            bband_upper=upstream.bband_upper,
+            lowest_low_21d=upstream.lowest_low_21d,
+            altman_z=upstream.altman_z,
+            fcf_yield=upstream.fcf_yield,
+            net_debt_to_ebitda=upstream.net_debt_to_ebitda,
+            roic=upstream.roic,
+            short_interest_pct=upstream.short_interest_pct,
+            max_abs_correlation=upstream.max_abs_correlation,
+            most_correlated_holding=upstream.most_correlated_holding,
+            ivr_pct=ivr_pct,
+            iv_latest=iv_latest,
+            iv_52w_min=iv_52w_min,
+            iv_52w_max=iv_52w_max,
+            iv_bars_used=iv_bars_used,
+            next_earnings=next_earnings,
+            ex_dividend_date=ex_dividend_date,
+            calendar_source=calendar_source,
+        )

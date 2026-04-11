@@ -64,10 +64,24 @@ FORBIDDEN_MODULES: frozenset[str] = frozenset({
     "agt_equities.mode_engine",
 })
 
-# ib_async whitelist: only Phase 5's chain_walker.py is allowed to import it.
-# Every other file in the screener package is blocked from importing ib_async.
+# ib_async whitelist: two files are allowed to import ib_async.
+#
+# vol_event_armor.py (Phase 4): needs reqHistoricalDataAsync with
+#   whatToShow="OPTION_IMPLIED_VOLATILITY" for the IVR gate. Added
+#   C4 after the IBKR subscription probe verified Option D viability
+#   on 2026-04-11 (AAPL/MSFT/SPY all returned 249-250 bars with zero
+#   subscription errors).
+#
+# chain_walker.py (Phase 5): will need full option chain access via
+#   reqSecDefOptParams + reqMktData. Added pre-emptively in C1 before
+#   Phase 5 was scoped. Not yet implemented.
+#
+# Every OTHER file in the screener package remains blocked from
+# importing ib_async. The guard test below will fail if this
+# whitelist is bypassed by any other file.
 IBKR_WHITELIST: frozenset[str] = frozenset({
     "chain_walker.py",
+    "vol_event_armor.py",
 })
 
 
