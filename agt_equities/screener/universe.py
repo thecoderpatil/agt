@@ -178,6 +178,15 @@ def _profile_to_universe_ticker(ticker: str, profile: dict) -> UniverseTicker | 
     if not _passes_market_cap(mc_usd):
         return None
     if not _passes_sector(sector):
+        # C3.6 delta: per-ticker drop log for the sector exclusion path
+        # (tight-scoped per Architect ruling 2026-04-11 — other Phase 1
+        # drop paths remain silent, will be audited as a follow-up).
+        # info-level because sector exclusion is expected behavior, not
+        # degenerate data. Matches Phase 3 / Phase 3.5 planned-drop logging.
+        logger.info(
+            "[screener.universe] TICKER_DROPPED_PHASE1_SECTOR_EXCLUDED "
+            "ticker=%s sector=%s", ticker, sector,
+        )
         return None
     if not _passes_country(country):
         return None

@@ -30,15 +30,72 @@ from __future__ import annotations
 # is applied as `market_cap_M >= MIN_MARKET_CAP_USD / 1_000_000`.
 MIN_MARKET_CAP_USD: int = 10_000_000_000
 
-# Sector exclusions. Spec: Airlines, Biotechnology, Pharmaceuticals.
-# Match against Finnhub's `finnhubIndustry` field, which uses these
-# exact category names (verified against Finnhub free tier responses).
-# Additional case-insensitive matching is applied at filter time so
-# minor capitalization drift in the API doesn't break the gate.
+# Sectors / sub-industries permanently excluded from the Wheel
+# candidate universe. Two kinds of exclusions coexist here:
+#
+# 1. QUALITY exclusions (original C1/C2 set) — sectors with
+#    structural Wheel incompatibility due to event risk,
+#    binary outcomes, or capital intensity:
+#      Airlines, Biotechnology, Pharmaceuticals
+#
+# 2. STRUCTURAL exclusions (added C3.6) — non-operating-corp
+#    legal structures whose fundamentals break the Phase 3
+#    thresholds for reasons that have nothing to do with
+#    business quality. Phase 3's Altman Z, FCF yield, ND/EBITDA,
+#    and ROIC are calibrated for operating C-corporations;
+#    REITs, MLPs, BDCs, trusts, and closed-end funds produce
+#    mechanically-distorted values in at least one of those
+#    metrics regardless of underlying business health.
+#
+# Yash ruling 2026-04-11 (AGT principle): the Wheel candidate
+# universe contains only US-domiciled common-stock C-corporations.
+# This is a permanent structural filter, not a quality filter.
+#
+# Finnhub taxonomy reference: these strings match the literal
+# values returned by profile2.finnhubIndustry. Case-insensitive
+# matching in _passes_sector (universe.py) absorbs minor casing
+# drift. If Finnhub changes its taxonomy substantially, this
+# frozenset must be updated.
+#
+# Known trade-off (Architect dispatch 2026-04-11 C3.6):
+# "Oil & Gas Storage & Transportation" and "Asset Management &
+# Custody Banks" are bucket-level exclusions. They correctly
+# strip MLPs (ET, EPD, MPLX, WES) and BDCs (ARCC, MAIN, BXSL)
+# but will also strip some legitimate C-corp operators in those
+# spaces (e.g., BLK, TROW). Err on the side of overinclusion —
+# cost of false negative (missing BLK) < cost of false positive
+# (admitting ARCC, whose fundamentals will mechanically break
+# Phase 3). Revisit with a narrower Finnhub-taxonomy-aware
+# filter in a follow-up sprint if post-C3.6 universe feels wrong.
 EXCLUDED_SECTORS: frozenset[str] = frozenset({
+    # ─── QUALITY exclusions (C1/C2) ───
     "Airlines",
     "Biotechnology",
     "Pharmaceuticals",
+    # ─── STRUCTURAL exclusions (C3.6) — REITs ───
+    "REIT",
+    "REITs",
+    "Real Estate Investment Trusts",
+    "Equity Real Estate Investment Trusts (REITs)",
+    "Mortgage Real Estate Investment Trusts (REITs)",
+    "Real Estate Investment Trusts (REITs)",
+    # ─── STRUCTURAL exclusions (C3.6) — MLPs and partnerships ───
+    "Master Limited Partnerships",
+    "MLPs",
+    "Oil & Gas Storage & Transportation",  # MLP-heavy Finnhub bucket
+    # ─── STRUCTURAL exclusions (C3.6) — BDCs and closed-end funds ───
+    "Business Development Companies",
+    "BDCs",
+    "Closed-End Funds",
+    "Asset Management & Custody Banks",  # BDC-heavy Finnhub bucket
+    # ─── STRUCTURAL exclusions (C3.6) — Trusts and other non-corp ───
+    "Trust",
+    "Trusts",
+    "Royalty Trusts",
+    # ─── STRUCTURAL exclusions (C3.6) — SPACs and shell entities ───
+    "Special Purpose Acquisition Companies",
+    "Blank Checks",
+    "Shell Companies",
 })
 
 # Country exclusions. Spec: China, Hong Kong, Macau.

@@ -326,6 +326,169 @@ def test_17_run_phase_1_empty_input(tmp_cache):
 # C2.1 — Cache hit rate instrumentation in the final log line
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# C3.6 — Structural exclusion tests (REITs, MLPs, BDCs, SPACs, trusts)
+# ---------------------------------------------------------------------------
+#
+# Phase 1 now excludes non-operating-corp legal structures in addition to
+# the original quality exclusions (Airlines/Biotech/Pharma). Tests verify
+# that each structural exclusion category fires the sector gate and emits
+# the TICKER_DROPPED_PHASE1_SECTOR_EXCLUDED log line.
+
+def _run_phase_1_single_ticker(
+    ticker: str, profile_body: dict, caplog,
+) -> list:
+    """Helper: run Phase 1 on exactly one ticker with a canned profile2
+    response. Returns the list of survivors. caplog captures INFO+WARNING
+    so exclusion log lines can be asserted."""
+    import logging
+    handler = _build_profile_handler({ticker: profile_body})
+
+    async def run():
+        client = FinnhubClient(api_key="test_key", transport=httpx.MockTransport(handler))
+        try:
+            with caplog.at_level(logging.INFO, logger="agt_equities.screener.universe"):
+                return await universe.run_phase_1(
+                    client, tickers=[ticker], heartbeat_interval=0,
+                )
+        finally:
+            await client.aclose()
+    return _run(run())
+
+
+def test_19_equity_reit_excluded(tmp_cache, caplog):
+    """REIT (Equity) must be dropped by the sector gate."""
+    survivors = _run_phase_1_single_ticker(
+        "SPG",
+        {
+            "name": "Simon Property Group",
+            "country": "US",
+            "marketCapitalization": 50000.0,  # $50B, well above MC floor
+            "finnhubIndustry": "Equity Real Estate Investment Trusts (REITs)",
+        },
+        caplog,
+    )
+    assert survivors == []
+    assert any(
+        "TICKER_DROPPED_PHASE1_SECTOR_EXCLUDED" in r.message and "SPG" in r.message
+        for r in caplog.records
+    )
+
+
+def test_20_mortgage_reit_excluded(tmp_cache, caplog):
+    """REIT (Mortgage) must also be dropped by the sector gate."""
+    survivors = _run_phase_1_single_ticker(
+        "NLY",
+        {
+            "name": "Annaly Capital Management",
+            "country": "US",
+            "marketCapitalization": 12000.0,
+            "finnhubIndustry": "Mortgage Real Estate Investment Trusts (REITs)",
+        },
+        caplog,
+    )
+    assert survivors == []
+    assert any(
+        "TICKER_DROPPED_PHASE1_SECTOR_EXCLUDED" in r.message and "NLY" in r.message
+        for r in caplog.records
+    )
+
+
+def test_21_mlp_via_oil_gas_storage_excluded(tmp_cache, caplog):
+    """MLPs are captured via the 'Oil & Gas Storage & Transportation'
+    bucket-level exclusion. This is intentionally aggressive — it strips
+    MLPs (ET, EPD, MPLX, WES) but will ALSO strip legitimate C-corp
+    storage operators in the same bucket. Known trade-off per Architect
+    dispatch 2026-04-11 C3.6 — err on the side of overinclusion because
+    admitting an MLP breaks Phase 3 math, while missing a legitimate
+    C-corp is recoverable by revisiting the filter later.
+    """
+    survivors = _run_phase_1_single_ticker(
+        "ET",
+        {
+            "name": "Energy Transfer LP",
+            "country": "US",
+            "marketCapitalization": 60000.0,
+            "finnhubIndustry": "Oil & Gas Storage & Transportation",
+        },
+        caplog,
+    )
+    assert survivors == []
+    assert any(
+        "TICKER_DROPPED_PHASE1_SECTOR_EXCLUDED" in r.message and "ET" in r.message
+        for r in caplog.records
+    )
+
+
+def test_22_bdc_via_asset_management_excluded(tmp_cache, caplog):
+    """BDCs are captured via the 'Asset Management & Custody Banks'
+    bucket-level exclusion. Same false-negative caveat as MLPs —
+    will also strip BLK/TROW which are legitimate asset managers.
+    Revisit in follow-up if post-C3.6 universe feels wrong.
+    """
+    survivors = _run_phase_1_single_ticker(
+        "ARCC",
+        {
+            "name": "Ares Capital Corporation",
+            "country": "US",
+            "marketCapitalization": 15000.0,
+            "finnhubIndustry": "Asset Management & Custody Banks",
+        },
+        caplog,
+    )
+    assert survivors == []
+    assert any(
+        "TICKER_DROPPED_PHASE1_SECTOR_EXCLUDED" in r.message and "ARCC" in r.message
+        for r in caplog.records
+    )
+
+
+def test_23_spac_excluded(tmp_cache, caplog):
+    """SPACs (Blank Check companies) must be dropped. Phase 3 cannot
+    evaluate a shell entity's fundamentals meaningfully."""
+    survivors = _run_phase_1_single_ticker(
+        "SHELLCO",
+        {
+            "name": "Some SPAC Inc",
+            "country": "US",
+            "marketCapitalization": 15000.0,
+            "finnhubIndustry": "Blank Checks",
+        },
+        caplog,
+    )
+    assert survivors == []
+    assert any(
+        "TICKER_DROPPED_PHASE1_SECTOR_EXCLUDED" in r.message and "SHELLCO" in r.message
+        for r in caplog.records
+    )
+
+
+def test_24_plain_c_corp_still_passes(tmp_cache, caplog):
+    """REGRESSION: the C3.6 expansion must not accidentally break
+    legitimate tech/consumer/industrial C-corps. AAPL's actual Finnhub
+    sub-industry is 'Technology Hardware, Storage and Peripherals'.
+    This string is NOT in EXCLUDED_SECTORS and must pass the gate.
+    """
+    survivors = _run_phase_1_single_ticker(
+        "AAPL",
+        {
+            "name": "Apple Inc",
+            "country": "US",
+            "marketCapitalization": 3500000.0,
+            "finnhubIndustry": "Technology Hardware, Storage and Peripherals",
+        },
+        caplog,
+    )
+    assert len(survivors) == 1
+    assert survivors[0].ticker == "AAPL"
+    assert survivors[0].sector == "Technology Hardware, Storage and Peripherals"
+    # Regression: no sector-exclusion log line should fire for AAPL
+    assert not any(
+        "TICKER_DROPPED_PHASE1_SECTOR_EXCLUDED" in r.message and "AAPL" in r.message
+        for r in caplog.records
+    )
+
+
 def test_18_phase1_final_log_surfaces_cache_stats(tmp_cache, caplog):
     """The final Phase 1 log line must surface cache_hits, cache_misses,
     hit_rate, elapsed, AND the 'Phase 1 complete' marker.
