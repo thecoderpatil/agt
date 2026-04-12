@@ -704,3 +704,263 @@ CSP_GATE_REGISTRY: list[tuple[str, CSPGate]] = [
     ("rule_6_vikram_el_floor", _csp_check_rule_6),
     ("rule_7_csp_procedure",   _csp_check_rule_7),
 ]
+
+
+
+# ---------------------------------------------------------------------------
+# M1.4: run_csp_allocator orchestrator + AllocatorResult
+# ---------------------------------------------------------------------------
+#
+# Pure orchestrator. Consumes RAY candidates + household snapshots and
+# iterates candidates × households, running CSP_GATE_REGISTRY, sizing,
+# and routing. Stages via an INJECTED staging_callback so the module
+# stays pure of telegram_bot dependencies. Per-run data (sector_map,
+# correlations, delta, etc.) is provided via an injected extras_provider
+# for the same reason.
+#
+# In-memory snapshot mutation between candidates prevents double-booking
+# cash when multiple candidates land on the same household.
+#
+# No IB, no DB, no cmd_scan integration. M1.5 will wire cmd_scan ->
+# run_csp_allocator with concrete extras_provider and staging_callback
+# implementations.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class AllocatorResult:
+    """Result of running the CSP allocator over a set of candidates."""
+    staged: list[dict] = field(default_factory=list)
+    skipped: list[dict] = field(default_factory=list)  # [{household, ticker, reason}]
+    errors: list[dict] = field(default_factory=list)   # [{household, ticker, error}]
+    digest_lines: list[str] = field(default_factory=list)
+
+    @property
+    def total_staged_contracts(self) -> int:
+        return sum(t.get("quantity", 0) for t in self.staged)
+
+    @property
+    def total_staged_notional(self) -> float:
+        return sum(
+            t.get("quantity", 0) * t.get("strike", 0) * 100
+            for t in self.staged
+        )
+
+
+def run_csp_allocator(
+    ray_candidates: list,
+    snapshots: dict[str, dict],
+    vix: float,
+    extras_provider: Callable[[dict, Any], dict],
+    staging_callback: Callable[[list[dict]], None] | None = None,
+) -> AllocatorResult:
+    """Run the CSP allocator over a set of RAY candidates.
+
+    For each (candidate, household) pair:
+      1. Build per-candidate extras dict via extras_provider(hh, candidate).
+         The provider supplies sector_map, correlations, delta,
+         days_to_earnings for the gates that need them.
+      2. Run all gates in CSP_GATE_REGISTRY order. First failure
+         short-circuits; the candidate is skipped for that household
+         with the failing gate's reason logged.
+      3. If all gates pass, size via _csp_size_household. Sub-integer
+         at 10% target → skip.
+      4. Route via _csp_route_to_accounts. Partial allocation allowed.
+         Empty routing result → skip.
+      5. Stage tickets via staging_callback if provided (None means
+         dry-run: compute everything but do not persist).
+      6. Mutate the in-memory snapshot to reduce buying power /
+         cash_available on the affected accounts so the next
+         candidate sees the reduced capacity.
+
+    Args:
+        ray_candidates: Screener output. Each must have .ticker,
+            .strike, .mid, .expiry (YYYY-MM-DD), .annualized_yield.
+        snapshots: Output of _fetch_household_buying_power_snapshot().
+            MUTATED IN PLACE as candidates are allocated — pass a
+            copy if the caller wants to preserve the original.
+        vix: Current VIX level for Rule 2 scaling.
+        extras_provider: Callable that returns the per-(hh, candidate)
+            extras dict. Injecting this keeps the orchestrator pure
+            of yfinance / DB / correlation-fetch dependencies — the
+            caller (cmd_scan in M1.5) supplies a concrete provider.
+        staging_callback: Optional. Called with each list of tickets
+            that passed gates+sizing+routing. None = dry-run.
+
+    Returns:
+        AllocatorResult with staged, skipped, errors, digest_lines.
+
+    Raises:
+        Never. All per-candidate errors are caught and logged to
+        result.errors so one broken candidate doesn't abort the run.
+    """
+    result = AllocatorResult()
+
+    for candidate in ray_candidates:
+        for hh_name, hh in snapshots.items():
+            try:
+                _process_one(
+                    hh, hh_name, candidate, vix,
+                    extras_provider, staging_callback, result,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "csp_allocator: unhandled error on %s/%s",
+                    hh_name, getattr(candidate, "ticker", "?"),
+                )
+                result.errors.append({
+                    "household": hh_name,
+                    "ticker": getattr(candidate, "ticker", "?"),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+    result.digest_lines = _format_digest(result)
+    return result
+
+
+def _process_one(
+    hh: dict,
+    hh_name: str,
+    candidate: Any,
+    vix: float,
+    extras_provider: Callable,
+    staging_callback: Callable | None,
+    result: AllocatorResult,
+) -> None:
+    """Process one (household, candidate) pair. Mutates hh + result."""
+    # Step 1: build extras
+    extras = extras_provider(hh, candidate) or {}
+
+    # Step 2: run gates in registry order, short-circuit on first fail
+    # Gate check uses n=1 as a feasibility probe; real sizing is below.
+    # This keeps gate semantics "can this household take ANY contracts"
+    # rather than "can it take N specific contracts."
+    for gate_name, gate_fn in CSP_GATE_REGISTRY:
+        passed, reason = gate_fn(hh, candidate, 1, vix, extras)
+        if not passed:
+            result.skipped.append({
+                "household": hh_name,
+                "ticker": candidate.ticker,
+                "reason": f"{gate_name}: {reason}",
+            })
+            return
+
+    # Step 3: size at household level
+    n_contracts = _csp_size_household(hh, candidate, vix)
+    if n_contracts < 1:
+        result.skipped.append({
+            "household": hh_name,
+            "ticker": candidate.ticker,
+            "reason": (
+                "sizing returned 0 "
+                "(sub-integer at 10% target or ceiling breach)"
+            ),
+        })
+        return
+
+    # Step 4: route across accounts (partial allowed)
+    tickets = _csp_route_to_accounts(n_contracts, hh, candidate)
+    if not tickets:
+        result.skipped.append({
+            "household": hh_name,
+            "ticker": candidate.ticker,
+            "reason": "no account has capacity for any integer contract",
+        })
+        return
+
+    # Step 5: stage (or dry-run)
+    if staging_callback is not None:
+        try:
+            staging_callback(tickets)
+        except Exception as exc:
+            logger.warning(
+                "csp_allocator: staging_callback failed for %s/%s: %s",
+                hh_name, candidate.ticker, exc,
+            )
+            result.errors.append({
+                "household": hh_name,
+                "ticker": candidate.ticker,
+                "error": f"staging failed: {exc}",
+            })
+            return
+
+    result.staged.extend(tickets)
+
+    # Step 6: mutate snapshot to prevent double-booking
+    collateral_per_contract = candidate.strike * 100
+    for t in tickets:
+        acct_id = t["account_id"]
+        acct = hh["accounts"][acct_id]
+        consumed = t["quantity"] * collateral_per_contract
+        if acct["margin_eligible"]:
+            acct["buying_power"] = max(
+                0.0, acct["buying_power"] - consumed,
+            )
+            # Margin used increases → EL drops by haircut amount
+            margin_impact = consumed * MAINTENANCE_MARGIN_HAIRCUT
+            hh["hh_margin_el"] = max(
+                0.0, hh["hh_margin_el"] - margin_impact,
+            )
+        else:
+            acct["cash_available"] = max(
+                0.0, acct["cash_available"] - consumed,
+            )
+
+    # Also update existing_csps so Rule 1 on NEXT candidate for same
+    # ticker sees the freshly-staged commitment
+    ticker = candidate.ticker.upper()
+    existing = hh.setdefault("existing_csps", {}).setdefault(
+        ticker,
+        {
+            "total_contracts": 0,
+            "strike": candidate.strike,
+            "notional_commitment": 0.0,
+        },
+    )
+    total_new_contracts = sum(t["quantity"] for t in tickets)
+    existing["total_contracts"] += total_new_contracts
+    existing["notional_commitment"] += (
+        total_new_contracts * collateral_per_contract
+    )
+
+
+def _format_digest(result: AllocatorResult) -> list[str]:
+    """Human-readable digest lines for Telegram output."""
+    lines: list[str] = []
+    if result.staged:
+        lines.append(
+            f"━━ CSP Allocator — {len(result.staged)} tickets staged ━━"
+        )
+        by_hh: dict[str, list] = {}
+        for t in result.staged:
+            by_hh.setdefault(t["household"], []).append(t)
+        for hh_name, tickets in by_hh.items():
+            short = hh_name.replace("_Household", "")
+            lines.append(f"\n[{short}]")
+            for t in tickets:
+                lines.append(
+                    f"  {t['ticker']} ${t['strike']:.0f}P x{t['quantity']} "
+                    f"@ ${t['limit_price']:.2f} "
+                    f"({t['annualized_yield']:.1f}% ann)"
+                )
+        lines.append(
+            f"\nTotal: {result.total_staged_contracts} contracts, "
+            f"${result.total_staged_notional:,.0f} notional"
+        )
+    if result.skipped:
+        lines.append(f"\nSkipped: {len(result.skipped)}")
+        # Show first 5 skip reasons, collapse the rest
+        for s in result.skipped[:5]:
+            short_hh = s["household"].replace("_Household", "")
+            lines.append(f"  {s['ticker']} [{short_hh}]: {s['reason']}")
+        if len(result.skipped) > 5:
+            lines.append(f"  ... and {len(result.skipped) - 5} more")
+    if result.errors:
+        lines.append(f"\n⚠️ Errors: {len(result.errors)}")
+        for e in result.errors[:3]:
+            lines.append(f"  {e['ticker']}: {e['error']}")
+    if not result.staged and not result.skipped and not result.errors:
+        lines.append("CSP Allocator: no candidates processed")
+    return lines

@@ -36,6 +36,7 @@ from agt_equities.config import (
 )
 from agt_equities.csp_allocator import (
     CSP_GATE_REGISTRY,
+    AllocatorResult,
     _csp_check_rule_1,
     _csp_check_rule_2,
     _csp_check_rule_3,
@@ -46,6 +47,7 @@ from agt_equities.csp_allocator import (
     _csp_size_household,
     _fetch_household_buying_power_snapshot,
     _vix_retain_pct,
+    run_csp_allocator,
 )
 
 
@@ -1201,3 +1203,341 @@ def test_registry_contains_all_six_gates_in_order():
         )
         assert isinstance(result[0], bool)
         assert isinstance(result[1], str)
+
+
+
+# ===========================================================================
+# M1.4: run_csp_allocator orchestrator tests
+# ===========================================================================
+#
+# The orchestrator is injection-based: both extras_provider and
+# staging_callback are passed in as parameters, so tests wire up
+# lambdas that capture into local lists. No real DB writes. No IB.
+# No telegram_bot imports in csp_allocator.py still stands.
+# ---------------------------------------------------------------------------
+
+
+def _empty_extras(hh, candidate):
+    """Default extras_provider for tests where gates don't need extras.
+
+    Rule 3 / Rule 4 fail-open on empty, Rule 7 reads missing keys as
+    None and passes, so {} is equivalent to 'no data holes encountered'.
+    """
+    return {}
+
+
+def test_orchestrator_dry_run_no_callback():
+    """One passing candidate, staging_callback=None → staged populated,
+    no exception, no side effects outside the result object."""
+    hh = _fake_hh_snapshot()
+    snapshots = {"Yash_Household": hh}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+    )
+    assert isinstance(result, AllocatorResult)
+    assert len(result.staged) >= 1
+    assert result.total_staged_contracts >= 1
+    assert result.errors == []
+
+
+def test_orchestrator_passes_tickets_to_staging_callback():
+    """staging_callback receives one list-of-tickets call per staged
+    candidate."""
+    captured: list[list[dict]] = []
+    hh = _fake_hh_snapshot()
+    snapshots = {"Yash_Household": hh}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=captured.append,
+    )
+    assert len(captured) == 1
+    assert captured[0] == result.staged
+    assert all(
+        t["ticker"] == "AAPL" and t["mode"] == "CSP_ENTRY"
+        for t in captured[0]
+    )
+
+
+def test_orchestrator_short_circuits_on_first_gate_fail():
+    """Rule 1 fails → skipped entry logs rule_1_concentration, no
+    tickets staged, no staging_callback invocation."""
+    hh = _fake_hh_snapshot(
+        existing_positions={
+            "META": {
+                "total_shares": 0, "spot": 0.0,
+                "current_value": 60_000.0,
+                "sector": "Interactive Media",
+            },
+        },
+    )
+    snapshots = {"Yash_Household": hh}
+    cand = _fake_candidate(ticker="META", strike=650.0)
+    captured: list = []
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=captured.append,
+    )
+    assert result.staged == []
+    assert captured == []
+    assert len(result.skipped) == 1
+    assert result.skipped[0]["reason"].startswith("rule_1_concentration:")
+    assert result.skipped[0]["ticker"] == "META"
+
+
+def test_orchestrator_skips_sub_integer_sizing():
+    """Tiny household: 1c collateral > 20% ceiling → sizing returns 0.
+
+    hh_nlv=$50K → ceiling=$10K. AAPL $150: 1c=$15K > $10K → sizing 0.
+    But Rule 1 gate also fires at n=1 feasibility probe with same
+    math, so this actually surfaces as rule_1 skip, not sizing skip.
+    To isolate the sizing path we need gates to pass at n=1 but
+    _csp_size_household to return 0 — that happens when the 10%
+    target is sub-integer AND neither c_low nor c_high fits Rule 2.
+
+    Simpler: hh_nlv=$500K (gates pass at n=1), hh_margin_nlv=$10K,
+    hh_margin_el=$10K. candidate AAPL $200, target=$50K → c_low=2,
+    c_high=3. At VIX=15: budget=$2K → headroom=$2K. 2c impact=$12K >
+    $2K → infeasible. 3c also. Sizing returns 0.
+    But at n=1 probe, Rule 2 margin impact = $200*100*1*0.30 = $6K >
+    $2K → Rule 2 fails first. So we still don't isolate.
+
+    The cleanest isolation: hh_margin_nlv=0 (IRA-only → Rule 2 skip)
+    + tiny hh_nlv so target/ceiling squeeze sizing to 0 without
+    tripping Rule 1 at n=1.
+
+    hh_nlv=$60K (ceiling=$12K). IRA-only. AAPL $50: 1c=$5K notional.
+    Rule 1 at n=1: $5K < $12K → pass.
+    Target=$6K. 1c=$5K, 2c=$10K. |5-6|=1, |10-6|=4 → pick 1 → returns 1.
+    Not zero.
+
+    Use AAPL $150 instead: 1c notional=$15K > $12K ceiling → Rule 1
+    at n=1 fails → skip is rule_1, not sizing.
+
+    Genuine sizing-zero path: target=$6K, 1c=$5.9K (eg $59 strike).
+    1c=$5.9K, 2c=$11.8K. Ceiling=$12K. 1c feasible ($5.9K <
+    $12K). 2c NOT feasible ($11.8K <$12K → actually feasible).
+    |5.9-6|=0.1, |11.8-6|=5.8 → picks 1.
+
+    Every concrete scenario that passes Rule 1 at n=1 and still
+    hits sizing=0 requires margin Rule 2 binding — but that also
+    fails at n=1 probe. The sizing-only skip is therefore only
+    reachable when hh_margin_nlv=0 AND target falls between 0 and 1.
+    target < 1c means 10% hh_nlv < collateral → hh_nlv < 10 * $100 * strike.
+    AAPL $150 strike → hh_nlv < $150K. Say hh_nlv=$80K, ceiling=$16K.
+    1c=$15K < $16K → Rule 1 passes at n=1.
+    c_low = int(8000/15000) = 0, c_high = 1.
+    1c feasible (15K < 16K). 0c not (c<1).
+    options=[1]. Pick 1 → returns 1. Still not zero.
+
+    Conclusion: with current feasibility semantics, sizing-only zero
+    path only reachable when BOTH c_low=0 AND c_high fails the
+    ceiling probe — which means 1c>=ceiling, which means Rule 1 at
+    n=1 also fails. The skip reason in practice will always be
+    rule_1_concentration for sub-integer at 10% target.
+
+    So this test verifies that when 1c ceiling is breached, the
+    skip is reported as a Rule 1 gate fail (the short-circuit path),
+    which is the actually-observable 'can't even size 1 contract'
+    case that matters for the orchestrator user.
+    """
+    hh = _fake_hh_snapshot(
+        hh_nlv=60_000.0,              # ceiling=$12K
+        hh_margin_nlv=0.0,            # IRA-only → Rule 2 skip
+        hh_margin_el=0.0,
+        accounts={
+            "U22076329": {
+                "account_id": "U22076329",
+                "nlv": 60_000.0,
+                "el": 0.0,
+                "buying_power": 0.0,
+                "cash_available": 60_000.0,
+                "margin_eligible": False,
+            },
+        },
+    )
+    snapshots = {"Yash_Household": hh}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)   # 1c=$15K > $12K
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+    )
+    assert result.staged == []
+    assert len(result.skipped) == 1
+    # Ceiling breach surfaces via Rule 1 gate short-circuit
+    assert "rule_1" in result.skipped[0]["reason"]
+
+
+def test_orchestrator_mutates_snapshot_between_candidates():
+    """Two candidates on the same household: mutation shrinks capacity.
+
+    Fixture: 1 margin account with tight buying_power. First
+    candidate consumes enough BP that the second candidate's router
+    cannot fit a single contract. Asserts the in-memory mutation is
+    visible across iterations.
+
+    hh_nlv=$200K (ceiling $40K, target $20K). One margin acct with
+    BP=$20K (fits exactly 1 × AAPL $150 @ $15K collateral).
+
+    Cand 1 (AAPL $150): target=$20K, c_low=1 ($15K), c_high=2 ($30K).
+      |15-20|=5, |30-20|=10 → picks 1. Route: acct fits 1 → staged 1.
+      Post-mutation BP = $20K - $15K = $5K.
+    Cand 2 (MSFT $150): sizing same → 1 contract. Route: BP=$5K <
+      $15K → max_fit=0 → no tickets → skipped with "no capacity".
+    """
+    hh = _fake_hh_snapshot(
+        hh_nlv=200_000.0,
+        hh_margin_nlv=200_000.0,
+        hh_margin_el=200_000.0,
+        accounts={
+            "U21971297": {
+                "account_id": "U21971297",
+                "nlv": 200_000.0,
+                "el": 200_000.0,
+                "buying_power": 20_000.0,    # fits exactly 1 × $15K
+                "cash_available": 20_000.0,
+                "margin_eligible": True,
+            },
+        },
+    )
+    snapshots = {"Yash_Household": hh}
+    cand_1 = _fake_candidate(ticker="AAPL", strike=150.0)
+    cand_2 = _fake_candidate(ticker="MSFT", strike=150.0)
+
+    result = run_csp_allocator(
+        [cand_1, cand_2], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+    )
+
+    # Group staged by ticker
+    by_ticker: dict[str, int] = {}
+    for t in result.staged:
+        by_ticker[t["ticker"]] = by_ticker.get(t["ticker"], 0) + t["quantity"]
+
+    aapl_q = by_ticker.get("AAPL", 0)
+    msft_q = by_ticker.get("MSFT", 0)
+
+    # First candidate must have staged something (1 contract for $15K)
+    assert aapl_q >= 1
+
+    # After mutation, buying_power dropped below 1c collateral
+    assert hh["accounts"]["U21971297"]["buying_power"] < 15_000.0
+
+    # Second candidate could not fit → stages strictly fewer than the
+    # first (or zero). Mutation is visible.
+    assert msft_q < aapl_q or msft_q == 0
+
+
+def test_orchestrator_existing_csps_updated_after_staging():
+    """After staging, hh['existing_csps'][ticker] must reflect the new
+    commitment. This is how Rule 1 for a SUBSEQUENT candidate on the
+    same ticker sees the freshly-booked notional."""
+    hh = _fake_hh_snapshot()
+    snapshots = {"Yash_Household": hh}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+    )
+    assert len(result.staged) >= 1
+    assert "AAPL" in hh["existing_csps"]
+    assert hh["existing_csps"]["AAPL"]["total_contracts"] >= 1
+    assert hh["existing_csps"]["AAPL"]["notional_commitment"] >= 15_000.0
+
+
+def test_orchestrator_catches_staging_callback_exceptions():
+    """staging_callback raising must not crash the run. Errors are
+    logged to result.errors; staged stays empty for the affected
+    candidate; no partial state leakage."""
+    def exploding_cb(tickets):
+        raise RuntimeError("simulated DB write failure")
+
+    hh = _fake_hh_snapshot()
+    snapshots = {"Yash_Household": hh}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=exploding_cb,
+    )
+    assert result.staged == []
+    assert len(result.errors) == 1
+    assert "staging failed" in result.errors[0]["error"]
+    assert "simulated DB write failure" in result.errors[0]["error"]
+    # Snapshot should NOT have been mutated (we abort before the mutation)
+    assert "AAPL" not in hh.get("existing_csps", {})
+
+
+def test_orchestrator_digest_format():
+    """Digest contains headers for staged/skipped/errors sections.
+    Empty result should not crash."""
+    # Build a synthetic result directly
+    result = AllocatorResult(
+        staged=[
+            {
+                "account_id": "U22076329",
+                "household": "Yash_Household",
+                "ticker": "AAPL",
+                "action": "SELL",
+                "sec_type": "OPT",
+                "right": "P",
+                "strike": 150.0,
+                "expiry": "20260516",
+                "quantity": 2,
+                "limit_price": 1.50,
+                "annualized_yield": 22.5,
+                "mode": "CSP_ENTRY",
+                "status": "staged",
+            },
+            {
+                "account_id": "U22388499",
+                "household": "Vikram_Household",
+                "ticker": "MSFT",
+                "action": "SELL",
+                "sec_type": "OPT",
+                "right": "P",
+                "strike": 400.0,
+                "expiry": "20260516",
+                "quantity": 1,
+                "limit_price": 3.00,
+                "annualized_yield": 18.2,
+                "mode": "CSP_ENTRY",
+                "status": "staged",
+            },
+        ],
+        skipped=[
+            {"household": "Yash_Household", "ticker": "NVDA",
+             "reason": "rule_1_concentration: test"},
+            {"household": "Yash_Household", "ticker": "GOOGL",
+             "reason": "rule_3_sector: test"},
+            {"household": "Vikram_Household", "ticker": "AMD",
+             "reason": "rule_4_correlation: test"},
+        ],
+        errors=[
+            {"household": "Yash_Household", "ticker": "XYZ",
+             "error": "staging failed: db locked"},
+        ],
+    )
+    # Import at call site to exercise the actual format function
+    from agt_equities.csp_allocator import _format_digest
+    lines = _format_digest(result)
+    joined = "\n".join(lines)
+    assert "tickets staged" in joined
+    assert "Skipped: 3" in joined
+    assert "Errors: 1" in joined
+    assert "AAPL" in joined
+    assert "MSFT" in joined
+
+    # Empty result must not crash
+    empty = AllocatorResult()
+    empty_lines = _format_digest(empty)
+    assert len(empty_lines) >= 1
+    assert "no candidates processed" in empty_lines[0]
