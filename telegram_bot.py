@@ -4529,6 +4529,7 @@ async def _send_command_menu(update: Update) -> None:
         "  /approve \u00b7 /reject \u2014 manage staged orders\n"
         "  /orders \u2014 live working orders\n"
         "  /cure \u2014 open Cure Console\n"
+        "  /csp_harvest \u2014 stage BTC on profitable short puts\n"
         "\n"
         "<b>Monitor</b>\n"
         "  /status \u2014 connection + account metrics\n"
@@ -6705,6 +6706,56 @@ async def cmd_rollcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as exc:
         logger.exception("cmd_rollcheck failed")
         await status_msg.edit_text(f"❌ Failed to run roll check: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# /csp_harvest — manual CSP profit-take sweep (M2, 2026-04-11)
+# ---------------------------------------------------------------------------
+
+async def cmd_csp_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/csp_harvest — scan open short puts and stage BTC tickets when
+    profit-capture thresholds are hit. Mirrors the V2 router STATE_2
+    HARVEST flow for puts instead of calls. Tickets land in
+    pending_tickets via append_pending_tickets for normal /approve flow.
+    """
+    if not is_authorized(update):
+        return
+
+    from agt_equities.csp_harvest import scan_csp_harvest_candidates
+
+    status_msg = await update.message.reply_text(
+        "\u23f3 Scanning short puts for profit-take harvest..."
+    )
+    try:
+        ib_conn = await ensure_ib_connected()
+
+        def _stage(tickets: list[dict]) -> None:
+            append_pending_tickets(tickets)
+
+        result = await scan_csp_harvest_candidates(ib_conn, staging_callback=_stage)
+
+        staged = result.get("staged", [])
+        skipped = result.get("skipped", [])
+        errors = result.get("errors", [])
+        alerts = result.get("alerts", [])
+
+        lines = ["\u2501\u2501 CSP Harvest \u2501\u2501"]
+        lines.append(
+            f"Staged: {len(staged)} | Skipped: {len(skipped)} | Errors: {len(errors)}"
+        )
+        if alerts:
+            lines.append("")
+            lines.extend(alerts)
+        if not staged and not alerts:
+            lines.append("No positions met harvest thresholds.")
+
+        msg = "\n".join(lines)
+        await status_msg.edit_text(
+            f"<pre>{html.escape(msg)}</pre>", parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.exception("cmd_csp_harvest failed")
+        await status_msg.edit_text(f"\u274c CSP harvest failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -9020,6 +9071,22 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
         alerts: list[str] = []
         today = _date.today()
 
+        # ── CSP harvest sweep (M2): stage BTC on profitable short puts ──
+        try:
+            from agt_equities.csp_harvest import scan_csp_harvest_candidates
+            ib_conn = await ensure_ib_connected()
+
+            def _stage_csp_harvest(tickets: list[dict]) -> None:
+                append_pending_tickets(tickets)
+
+            csp_result = await scan_csp_harvest_candidates(
+                ib_conn, staging_callback=_stage_csp_harvest,
+            )
+            for a in csp_result.get("alerts", []):
+                alerts.append(a)
+        except Exception as csp_exc:
+            logger.warning("Watchdog CSP harvest failed: %s", csp_exc)
+
         # ── Cache cleanup: purge expired dashboard + confirmation entries ──
         try:
             now_dt = _datetime.now()
@@ -10141,6 +10208,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("orders",    cmd_orders))
     app.add_handler(CommandHandler("rollcheck", cmd_rollcheck))
+    app.add_handler(CommandHandler("csp_harvest", cmd_csp_harvest))
     app.add_handler(CommandHandler("cc",        cmd_cc))
     app.add_handler(CommandHandler("budget",    cmd_budget))
     app.add_handler(CommandHandler("clear",     cmd_clear))
