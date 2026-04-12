@@ -38,7 +38,7 @@ no routing, no staging — those land in M1.2 through M1.5.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from agt_equities.config import (
     ACCOUNT_TO_HOUSEHOLD,
@@ -494,3 +494,213 @@ def _csp_route_to_accounts(
         remaining -= take
 
     return tickets
+
+
+
+# ---------------------------------------------------------------------------
+# M1.3: Rule gate predicate functions + composable registry
+# ---------------------------------------------------------------------------
+#
+# All gate functions share a uniform signature so CSP_GATE_REGISTRY can be
+# iterated trivially by the orchestrator (M1.5 cmd_scan) without any
+# per-gate dispatch logic.
+#
+#   gate(hh_snapshot, candidate, new_contracts, vix, extras)
+#     -> (passed: bool, reason: str)
+#
+# `extras` is an orchestrator-populated dict carrying per-run data that
+# gates need beyond the snapshot itself — sector_map, correlations,
+# delta, days_to_earnings, etc. Gates that need nothing from extras
+# simply ignore it. Missing extras data is fail-open per Rule 3 and
+# Rule 4 — the orchestrator is responsible for logging data holes.
+#
+# All gate functions are PURE. No IB calls. No DB writes. No side
+# effects. They read from hh_snapshot, candidate, and extras and
+# return a tuple.
+# ---------------------------------------------------------------------------
+
+CSPGate = Callable[[dict, Any, int, float, dict], tuple[bool, str]]
+# (hh_snapshot, candidate, new_contracts, vix, extras) -> (passed, reason)
+# extras: dict populated by orchestrator with per-run data gates need
+#   beyond the snapshot — sector_map, correlations, etc. Uniform
+#   signature keeps CSP_GATE_REGISTRY iteration trivially composable.
+
+
+def _csp_check_rule_1(hh, candidate, n, vix, extras) -> tuple[bool, str]:
+    """Rule 1: post-assignment household concentration < 20% NLV.
+
+    Existing exposure = (existing_shares × spot) + (open_csp_notional).
+    New exposure = strike × 100 × n (full assignment-notional).
+    Strict inequality < 20% household NLV.
+    """
+    hh_nlv = hh["hh_nlv"]
+    if hh_nlv <= 0:
+        return (False, "zero household NLV")
+    ticker = candidate.ticker.upper()
+    existing = 0.0
+    pos = hh.get("existing_positions", {}).get(ticker)
+    if pos:
+        existing += pos.get("current_value", 0.0)
+    csp = hh.get("existing_csps", {}).get(ticker)
+    if csp:
+        existing += csp.get("notional_commitment", 0.0)
+    new_notional = candidate.strike * 100 * n
+    total = existing + new_notional
+    ceiling = CSP_CEILING_NLV_PCT * hh_nlv
+    if total >= ceiling:
+        return (
+            False,
+            f"rule_1 post-trade exposure ${total:,.0f} "
+            f">= 20% ceiling ${ceiling:,.0f}",
+        )
+    return (True, "")
+
+
+def _csp_check_rule_2(hh, candidate, n, vix, extras) -> tuple[bool, str]:
+    """Rule 2: VIX-scaled margin headroom (worst-case 30% haircut).
+
+    Assumes all n new contracts route to margin accounts (worst case
+    at sizing). Margin impact = strike * 100 * n * 0.30.
+    """
+    hh_margin_nlv = hh["hh_margin_nlv"]
+    if hh_margin_nlv <= 0:
+        # No margin-eligible accounts → Rule 2 inapplicable (IRA-only)
+        return (True, "")
+    retain_pct = _vix_retain_pct(vix)
+    deployable_pct = 1.0 - retain_pct
+    hh_margin_el = hh["hh_margin_el"]
+    margin_used_pre = max(0.0, hh_margin_nlv - hh_margin_el)
+    margin_budget = hh_margin_nlv * deployable_pct
+    headroom = max(0.0, margin_budget - margin_used_pre)
+    new_impact = candidate.strike * 100 * n * MAINTENANCE_MARGIN_HAIRCUT
+    if new_impact > headroom:
+        return (
+            False,
+            f"rule_2 margin impact ${new_impact:,.0f} > "
+            f"headroom ${headroom:,.0f} (VIX {vix:.1f})",
+        )
+    return (True, "")
+
+
+def _csp_check_rule_3(hh, candidate, n, vix, extras) -> tuple[bool, str]:
+    """Rule 3: post-trade household sector count <= 2 per GICS industry group.
+
+    extras['sector_map']: dict[ticker -> industry_group] for existing
+      household tickers plus the candidate's own classification.
+
+    Fail-open on missing/unknown classification — the orchestrator is
+    responsible for logging data holes separately. This is INTENTIONAL
+    per Rulebook guidance: better to miss a reject than block every
+    trade on a bad sector feed.
+    """
+    sector_map = extras.get("sector_map", {})
+    candidate_sector = sector_map.get(candidate.ticker.upper())
+    if not candidate_sector or candidate_sector == "Unknown":
+        return (True, "")  # no classification → fail-open, log elsewhere
+    existing_tickers = set(hh.get("existing_positions", {}).keys())
+    existing_tickers |= set(hh.get("existing_csps", {}).keys())
+    # Don't double-count the candidate itself if already held
+    existing_tickers.discard(candidate.ticker.upper())
+    same_sector_count = sum(
+        1 for t in existing_tickers
+        if sector_map.get(t) == candidate_sector
+    )
+    # Post-trade this candidate becomes the (same_sector_count + 1)-th name
+    if same_sector_count + 1 > 2:
+        return (
+            False,
+            f"rule_3 sector '{candidate_sector}' would hold "
+            f"{same_sector_count + 1} names (limit 2)",
+        )
+    return (True, "")
+
+
+def _csp_check_rule_4(hh, candidate, n, vix, extras) -> tuple[bool, str]:
+    """Rule 4: no existing household position with >0.6 6-mo correlation.
+
+    extras['correlations']: dict[(ticker_a, ticker_b) -> float] for
+      candidate vs every existing household ticker. Order-independent
+      lookup — check both (a,b) and (b,a).
+
+    Fail-open on missing correlation data — same rationale as Rule 3.
+    """
+    correlations = extras.get("correlations", {})
+    candidate_ticker = candidate.ticker.upper()
+    existing_tickers = set(hh.get("existing_positions", {}).keys())
+    existing_tickers |= set(hh.get("existing_csps", {}).keys())
+    existing_tickers.discard(candidate_ticker)
+    for other in existing_tickers:
+        corr = (
+            correlations.get((candidate_ticker, other))
+            or correlations.get((other, candidate_ticker))
+        )
+        if corr is None:
+            continue  # missing data → fail-open, log elsewhere
+        if abs(corr) > 0.6:
+            return (
+                False,
+                f"rule_4 correlation with {other} = {corr:.2f} "
+                f"exceeds 0.6 limit",
+            )
+    return (True, "")
+
+
+def _csp_check_rule_6(hh, candidate, n, vix, extras) -> tuple[bool, str]:
+    """Rule 6: Vikram-household-only EL floor check.
+
+    Hardcoded to Vikram_Household for M1.3 per Rulebook V10 line 169.
+    Generalization to 'any margin-eligible household with configured
+    floor' is a post-May refactor item.
+    """
+    if hh["household"] != "Vikram_Household":
+        return (True, "")
+    hh_margin_nlv = hh["hh_margin_nlv"]
+    hh_margin_el = hh["hh_margin_el"]
+    if hh_margin_nlv <= 0:
+        return (True, "")
+    el_pct = hh_margin_el / hh_margin_nlv
+    # Rule 6: floor at 20%, freeze entries below
+    if el_pct < 0.20:
+        return (
+            False,
+            f"rule_6 Vikram EL {el_pct*100:.1f}% below 20% floor — "
+            f"frozen for new entries",
+        )
+    return (True, "")
+
+
+def _csp_check_rule_7(hh, candidate, n, vix, extras) -> tuple[bool, str]:
+    """Rule 7 CSP Operating Procedure: delta, earnings, working orders.
+
+    extras['delta']: float (absolute delta of candidate short put)
+    extras['days_to_earnings']: int or None
+
+    Rulebook V10 line 291: delta <= 0.25
+    Rulebook V10 line 293: no CSP within 7 calendar days of earnings
+    Rulebook V10 line 302: no working/staged order on the same ticker
+    """
+    delta = extras.get("delta")
+    if delta is not None and abs(delta) > 0.25:
+        return (False, f"rule_7 delta {abs(delta):.2f} > 0.25 limit")
+    dte_earnings = extras.get("days_to_earnings")
+    if dte_earnings is not None and 0 <= dte_earnings <= 7:
+        return (
+            False,
+            f"rule_7 earnings in {dte_earnings}d (< 7d blackout)",
+        )
+    ticker = candidate.ticker.upper()
+    if ticker in hh.get("working_order_tickers", set()):
+        return (False, f"rule_7 working order exists on {ticker}")
+    if ticker in hh.get("staged_order_tickers", set()):
+        return (False, f"rule_7 staged order exists on {ticker}")
+    return (True, "")
+
+
+CSP_GATE_REGISTRY: list[tuple[str, CSPGate]] = [
+    ("rule_1_concentration",   _csp_check_rule_1),
+    ("rule_2_el_deployment",   _csp_check_rule_2),
+    ("rule_3_sector",          _csp_check_rule_3),
+    ("rule_4_correlation",     _csp_check_rule_4),
+    ("rule_6_vikram_el_floor", _csp_check_rule_6),
+    ("rule_7_csp_procedure",   _csp_check_rule_7),
+]

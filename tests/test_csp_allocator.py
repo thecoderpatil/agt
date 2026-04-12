@@ -35,6 +35,13 @@ from agt_equities.config import (
     MARGIN_ACCOUNTS,
 )
 from agt_equities.csp_allocator import (
+    CSP_GATE_REGISTRY,
+    _csp_check_rule_1,
+    _csp_check_rule_2,
+    _csp_check_rule_3,
+    _csp_check_rule_4,
+    _csp_check_rule_6,
+    _csp_check_rule_7,
     _csp_route_to_accounts,
     _csp_size_household,
     _fetch_household_buying_power_snapshot,
@@ -871,3 +878,326 @@ def test_route_ticket_shape_fields():
     assert t["annualized_yield"] == pytest.approx(0.225)
     assert t["mode"] == "CSP_ENTRY"
     assert t["status"] == "staged"
+
+
+
+# ===========================================================================
+# M1.3: Rule gate predicate tests (_csp_check_rule_* + CSP_GATE_REGISTRY)
+# ===========================================================================
+#
+# Each gate function is pure: (hh, candidate, n, vix, extras) -> (bool, str).
+# Tests build minimal extras dicts, only populating the keys the gate under
+# test actually reads. Rule 3 and Rule 4 are documented fail-open on missing
+# data — the orchestrator logs holes separately.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Rule 1 (concentration)
+# ---------------------------------------------------------------------------
+
+def test_rule_1_passes_clean_household():
+    """Clean household, 1c AAPL @ $150 = $15K < 20% of $261K → pass."""
+    hh = _fake_hh_snapshot()
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    passed, reason = _csp_check_rule_1(hh, cand, 1, 18.0, {})
+    assert passed is True
+    assert reason == ""
+
+
+def test_rule_1_rejects_at_ceiling():
+    """Post-trade exposure exactly at 20% ceiling → strict < fails.
+
+    hh_nlv=$261K → ceiling=$52.2K. Existing value = $52.2K - $15K = $37.2K,
+    plus 1c new = $15K → exactly $52.2K. Strict < fails → reject.
+    """
+    hh = _fake_hh_snapshot(
+        existing_positions={
+            "AAPL": {
+                "total_shares": 186,
+                "spot": 200.0,
+                "current_value": 37_200.0,  # hits ceiling exactly with 1c
+                "sector": "Technology Hardware",
+            },
+        },
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    passed, reason = _csp_check_rule_1(hh, cand, 1, 18.0, {})
+    assert passed is False
+    assert "rule_1" in reason
+    assert "ceiling" in reason
+
+
+def test_rule_1_includes_existing_csp_notional():
+    """Existing CSP notional combines with new CSP notional in Rule 1.
+
+    hh_nlv=$261K, ceiling=$52.2K. Existing CSP on AAPL w/ notional $40K.
+    New 1c AAPL @ $150 = $15K. Total = $55K ≥ $52.2K → reject.
+    """
+    hh = _fake_hh_snapshot(
+        existing_csps={
+            "AAPL": {
+                "total_contracts": 2,
+                "strike": 200.0,
+                "notional_commitment": 40_000.0,
+            },
+        },
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    passed, reason = _csp_check_rule_1(hh, cand, 1, 18.0, {})
+    assert passed is False
+    assert "rule_1" in reason
+
+
+# ---------------------------------------------------------------------------
+# Rule 2 (VIX-scaled margin deployment)
+# ---------------------------------------------------------------------------
+
+def test_rule_2_ira_only_household_passes():
+    """hh_margin_nlv=0 → Rule 2 inapplicable → always pass."""
+    hh = _fake_hh_snapshot(
+        hh_margin_nlv=0.0,
+        hh_margin_el=0.0,
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    passed, reason = _csp_check_rule_2(hh, cand, 10, 18.0, {})
+    assert passed is True
+    assert reason == ""
+
+
+def test_rule_2_vix_15_restrictive():
+    """VIX=15 → 20% deployment cap. Configure so 5c fails.
+
+    hh_margin_nlv=$100K, hh_margin_el=$100K.
+    Budget @ VIX15 = $100K * 20% = $20K, headroom=$20K.
+    5c AAPL $200 → $100K * 0.30 = $30K impact > $20K → reject.
+    """
+    hh = _fake_hh_snapshot(
+        hh_nlv=1_000_000.0,
+        hh_margin_nlv=100_000.0,
+        hh_margin_el=100_000.0,
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=200.0)
+    passed, reason = _csp_check_rule_2(hh, cand, 5, 15.0, {})
+    assert passed is False
+    assert "rule_2" in reason
+    assert "margin impact" in reason
+
+
+def test_rule_2_vix_45_loose():
+    """VIX=45 → 60% deployment cap → same 5c now fits.
+
+    Same margin fixture as above. Budget @ VIX45 = $100K * 60% = $60K.
+    5c impact = $30K < $60K → pass.
+    """
+    hh = _fake_hh_snapshot(
+        hh_nlv=1_000_000.0,
+        hh_margin_nlv=100_000.0,
+        hh_margin_el=100_000.0,
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=200.0)
+    passed, reason = _csp_check_rule_2(hh, cand, 5, 45.0, {})
+    assert passed is True
+    assert reason == ""
+
+
+# ---------------------------------------------------------------------------
+# Rule 3 (GICS industry group concentration)
+# ---------------------------------------------------------------------------
+
+def test_rule_3_rejects_third_name_in_sector():
+    """Sector already has 2 names; candidate is a 3rd → reject."""
+    hh = _fake_hh_snapshot(
+        existing_positions={
+            "MSFT": {
+                "total_shares": 100, "spot": 400.0,
+                "current_value": 40_000.0,
+                "sector": "Software - Application",
+            },
+            "ORCL": {
+                "total_shares": 200, "spot": 125.0,
+                "current_value": 25_000.0,
+                "sector": "Software - Application",
+            },
+        },
+    )
+    cand = _fake_candidate(ticker="CRM", strike=250.0)
+    extras = {
+        "sector_map": {
+            "MSFT": "Software - Application",
+            "ORCL": "Software - Application",
+            "CRM":  "Software - Application",
+        },
+    }
+    passed, reason = _csp_check_rule_3(hh, cand, 1, 18.0, extras)
+    assert passed is False
+    assert "rule_3" in reason
+    assert "Software - Application" in reason
+
+
+def test_rule_3_unknown_sector_fails_open():
+    """Unknown classification → pass (fail-open, documented behavior)."""
+    hh = _fake_hh_snapshot(
+        existing_positions={
+            "MSFT": {
+                "total_shares": 100, "spot": 400.0,
+                "current_value": 40_000.0,
+                "sector": "Software - Application",
+            },
+            "ORCL": {
+                "total_shares": 200, "spot": 125.0,
+                "current_value": 25_000.0,
+                "sector": "Software - Application",
+            },
+        },
+    )
+    cand = _fake_candidate(ticker="WEIRDCO", strike=30.0)
+    # sector_map returns "Unknown" for candidate → fail-open
+    extras = {"sector_map": {"WEIRDCO": "Unknown"}}
+    passed, reason = _csp_check_rule_3(hh, cand, 1, 18.0, extras)
+    assert passed is True
+    assert reason == ""
+
+
+# ---------------------------------------------------------------------------
+# Rule 4 (correlation)
+# ---------------------------------------------------------------------------
+
+def test_rule_4_rejects_high_correlation():
+    """Existing NVDA, candidate AMD, |corr|=0.75 > 0.6 → reject."""
+    hh = _fake_hh_snapshot(
+        existing_positions={
+            "NVDA": {
+                "total_shares": 50, "spot": 900.0,
+                "current_value": 45_000.0,
+                "sector": "Semiconductors",
+            },
+        },
+    )
+    cand = _fake_candidate(ticker="AMD", strike=140.0)
+    extras = {
+        "correlations": {
+            ("AMD", "NVDA"): 0.75,
+        },
+    }
+    passed, reason = _csp_check_rule_4(hh, cand, 1, 18.0, extras)
+    assert passed is False
+    assert "rule_4" in reason
+    assert "NVDA" in reason
+    assert "0.75" in reason
+
+
+def test_rule_4_missing_data_fails_open():
+    """Empty correlations dict → no data → pass (fail-open)."""
+    hh = _fake_hh_snapshot(
+        existing_positions={
+            "NVDA": {
+                "total_shares": 50, "spot": 900.0,
+                "current_value": 45_000.0,
+                "sector": "Semiconductors",
+            },
+        },
+    )
+    cand = _fake_candidate(ticker="AMD", strike=140.0)
+    extras = {"correlations": {}}
+    passed, reason = _csp_check_rule_4(hh, cand, 1, 18.0, extras)
+    assert passed is True
+    assert reason == ""
+
+
+# ---------------------------------------------------------------------------
+# Rule 6 (Vikram EL floor)
+# ---------------------------------------------------------------------------
+
+def test_rule_6_non_vikram_household_passes():
+    """Rule 6 only applies to Vikram_Household; others always pass."""
+    hh = _fake_hh_snapshot(
+        household="Yash_Household",
+        hh_margin_nlv=100_000.0,
+        hh_margin_el=5_000.0,       # would be 5% EL, but Yash → skip
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    passed, reason = _csp_check_rule_6(hh, cand, 1, 18.0, {})
+    assert passed is True
+    assert reason == ""
+
+
+def test_rule_6_vikram_below_floor_rejected():
+    """Vikram_Household @ 15% EL ratio → below 20% floor → reject."""
+    hh = _fake_hh_snapshot(
+        household="Vikram_Household",
+        hh_margin_nlv=100_000.0,
+        hh_margin_el=15_000.0,   # 15% EL ratio → below 20% floor
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    passed, reason = _csp_check_rule_6(hh, cand, 1, 18.0, {})
+    assert passed is False
+    assert "rule_6" in reason
+    assert "Vikram" in reason
+
+
+# ---------------------------------------------------------------------------
+# Rule 7 (CSP operating procedure — delta, earnings, working orders)
+# ---------------------------------------------------------------------------
+
+def test_rule_7_delta_over_limit_rejected():
+    """Delta 0.30 > 0.25 → reject."""
+    hh = _fake_hh_snapshot()
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    extras = {"delta": -0.30}  # negative short-put delta
+    passed, reason = _csp_check_rule_7(hh, cand, 1, 18.0, extras)
+    assert passed is False
+    assert "rule_7" in reason
+    assert "delta" in reason
+
+
+def test_rule_7_earnings_in_5_days_rejected():
+    """Earnings in 5 days → within 7-day blackout → reject."""
+    hh = _fake_hh_snapshot()
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    extras = {"delta": -0.20, "days_to_earnings": 5}
+    passed, reason = _csp_check_rule_7(hh, cand, 1, 18.0, extras)
+    assert passed is False
+    assert "rule_7" in reason
+    assert "earnings" in reason
+
+
+def test_rule_7_working_order_on_ticker_rejected():
+    """Existing working order on same ticker → reject."""
+    hh = _fake_hh_snapshot()
+    hh["working_order_tickers"] = {"AAPL"}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    extras = {"delta": -0.20, "days_to_earnings": 30}
+    passed, reason = _csp_check_rule_7(hh, cand, 1, 18.0, extras)
+    assert passed is False
+    assert "rule_7" in reason
+    assert "working order" in reason
+
+
+# ---------------------------------------------------------------------------
+# Registry structural test
+# ---------------------------------------------------------------------------
+
+def test_registry_contains_all_six_gates_in_order():
+    """CSP_GATE_REGISTRY names must match the expected list in order."""
+    expected = [
+        "rule_1_concentration",
+        "rule_2_el_deployment",
+        "rule_3_sector",
+        "rule_4_correlation",
+        "rule_6_vikram_el_floor",
+        "rule_7_csp_procedure",
+    ]
+    actual = [name for name, _ in CSP_GATE_REGISTRY]
+    assert actual == expected
+    assert len(CSP_GATE_REGISTRY) == 6
+    # All entries must be callable with the uniform gate signature
+    hh = _fake_hh_snapshot()
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    for name, fn in CSP_GATE_REGISTRY:
+        result = fn(hh, cand, 1, 18.0, {})
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"{name} did not return a 2-tuple"
+        )
+        assert isinstance(result[0], bool)
+        assert isinstance(result[1], str)
