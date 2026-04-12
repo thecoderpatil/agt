@@ -50,6 +50,44 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# M1.2 sizing + routing constants
+# ---------------------------------------------------------------------------
+
+# Rule 1 / Rule 2 sizing parameters. See Rulebook V10 lines 67 (Rule 1
+# ceiling) and 86 (Rule 2 VIX-scaled deployment governor).
+
+CSP_TARGET_NLV_PCT = 0.10           # Target per-trade sizing as % household NLV
+CSP_CEILING_NLV_PCT = 0.20          # Rule 1 hard ceiling (post-assignment)
+MAINTENANCE_MARGIN_HAIRCUT = 0.30   # Conservative Reg T + buffer for Rule 2
+                                    # post-assignment margin impact estimate
+
+# VIX → EL retention % table (Rule 2). Each row is (lo_inclusive,
+# hi_exclusive, retain_pct). "Retain" is the fraction of margin NLV
+# that must be HELD BACK from deployment. Deployable fraction is
+# therefore (1 - retain_pct).
+VIX_RETAIN_TABLE = [
+    (0.0,   20.0, 0.80),   # VIX <20  → retain 80%, deploy 20%
+    (20.0,  25.0, 0.70),
+    (25.0,  30.0, 0.60),
+    (30.0,  40.0, 0.50),
+    (40.0,  999.0, 0.40),  # VIX ≥40 → retain 40%, deploy 60% (cap)
+]
+
+
+def _vix_retain_pct(vix: float) -> float:
+    """Return required EL retention pct for a given VIX level (Rule 2).
+
+    Lookup is inclusive-lo / exclusive-hi. VIX values outside the table's
+    coverage (negative or NaN-like) fall through to the safe default
+    (80% retention, 20% deployment). Pure function.
+    """
+    for lo, hi, retain in VIX_RETAIN_TABLE:
+        if lo <= vix < hi:
+            return retain
+    return 0.80  # safe default
+
+
+# ---------------------------------------------------------------------------
 # HouseholdSnapshot shape (returned by _fetch_household_buying_power_snapshot)
 # ---------------------------------------------------------------------------
 #
@@ -285,3 +323,174 @@ async def _fetch_household_buying_power_snapshot(
         }
 
     return snapshots
+
+
+# ---------------------------------------------------------------------------
+# M1.2: pure sizing function
+# ---------------------------------------------------------------------------
+
+def _csp_size_household(
+    hh_snapshot: dict,
+    candidate,         # RAYCandidate: .ticker, .strike, .mid, .expiry, .dte
+    vix: float,
+) -> int:
+    """Compute target contract count for one candidate in one household.
+
+    Returns 0 if the candidate fails Rule 1 or Rule 2 at any contract
+    count, or cannot fit even 1 integer contract. Otherwise returns
+    the integer contract count closest to 10% household NLV target,
+    preferring lower count on tie.
+
+    Rule 1 (hard ceiling, line 67 of Rulebook V10):
+      Post-assignment household exposure must stay strictly below
+      20% household NLV. Exposure = (existing_shares × spot) +
+      (existing_csp_notional) + (new_csp_notional at strike).
+
+    Rule 2 (VIX-scaled deployment governor, line 86):
+      Worst-case-at-sizing: assumes all new contracts route to margin
+      accounts. New margin impact = strike × 100 × contracts × 0.30
+      (conservative haircut). Must fit within VIX-scaled margin
+      headroom on the household's margin-eligible accounts.
+
+    Pure function — no IB, no DB, no side effects.
+    """
+    hh_nlv = hh_snapshot["hh_nlv"]
+    if hh_nlv <= 0:
+        return 0
+
+    strike = candidate.strike
+    collateral_per_contract = strike * 100
+    if collateral_per_contract <= 0:
+        return 0
+
+    target_dollars = CSP_TARGET_NLV_PCT * hh_nlv
+    ceiling_dollars = CSP_CEILING_NLV_PCT * hh_nlv
+
+    # Existing household exposure on this name (Rule 1 baseline)
+    ticker = candidate.ticker.upper()
+    existing = 0.0
+    existing_pos = hh_snapshot.get("existing_positions", {}).get(ticker)
+    if existing_pos:
+        existing += existing_pos.get("current_value", 0.0)
+    existing_csp = hh_snapshot.get("existing_csps", {}).get(ticker)
+    if existing_csp:
+        existing += existing_csp.get("notional_commitment", 0.0)
+
+    # Rule 2 VIX-scaled margin headroom
+    retain_pct = _vix_retain_pct(vix)
+    deployable_pct = 1.0 - retain_pct
+    hh_margin_nlv = hh_snapshot["hh_margin_nlv"]
+    hh_margin_el = hh_snapshot["hh_margin_el"]
+    margin_used_pre = max(0.0, hh_margin_nlv - hh_margin_el)
+    margin_budget = hh_margin_nlv * deployable_pct
+    margin_headroom = max(0.0, margin_budget - margin_used_pre)
+
+    # Candidate integer contract counts: floor and ceil around target
+    target_contracts_float = target_dollars / collateral_per_contract
+    c_low = int(target_contracts_float)
+    c_high = c_low + 1
+
+    def _feasible(c: int) -> bool:
+        if c < 1:
+            return False
+        new_notional = c * collateral_per_contract
+        # Rule 1: post-assignment household exposure strict < 20% NLV
+        if existing + new_notional >= ceiling_dollars:
+            return False
+        # Rule 2: worst-case margin impact (assume all margin-routed)
+        new_margin_impact = new_notional * MAINTENANCE_MARGIN_HAIRCUT
+        if new_margin_impact > margin_headroom:
+            return False
+        return True
+
+    options = [c for c in (c_low, c_high) if _feasible(c)]
+    if not options:
+        return 0
+
+    # Pick closest to 10% target dollars, prefer lower count on tie
+    return min(
+        options,
+        key=lambda c: (
+            abs(c * collateral_per_contract - target_dollars),
+            c,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# M1.2: pure routing function
+# ---------------------------------------------------------------------------
+
+def _csp_route_to_accounts(
+    n_contracts: int,
+    hh_snapshot: dict,
+    candidate,
+) -> list[dict]:
+    """Route n_contracts across accounts in a household, IRA-first.
+
+    Ordering: non-margin (IRA) accounts first sorted by cash_available
+    desc, then margin-eligible accounts sorted by buying_power desc.
+    Greedy fill. Partial allocation allowed — returns whatever fit,
+    possibly less than n_contracts. Empty list if nothing fits.
+
+    Each returned ticket is a dict matching the pending_orders payload
+    shape used by append_pending_tickets.
+
+    Pure function — no IB, no DB, no side effects.
+    """
+    if n_contracts < 1:
+        return []
+
+    collateral = candidate.strike * 100
+    if collateral <= 0:
+        return []
+
+    # IRA first (margin_eligible=False), margin last.
+    # Within each group, largest capacity first for efficient packing.
+    # The sort key returns a (group, neg_capacity) tuple:
+    #   group=0 for IRA, group=1 for margin
+    #   capacity is cash_available for IRA, buying_power for margin
+    ordered = sorted(
+        hh_snapshot["accounts"].values(),
+        key=lambda a: (
+            0 if not a["margin_eligible"] else 1,
+            -(
+                a["cash_available"]
+                if not a["margin_eligible"]
+                else a["buying_power"]
+            ),
+        ),
+    )
+
+    remaining = n_contracts
+    tickets: list[dict] = []
+    for acct in ordered:
+        if remaining == 0:
+            break
+        capacity = (
+            acct["cash_available"]
+            if not acct["margin_eligible"]
+            else acct["buying_power"]
+        )
+        max_fit = int(capacity // collateral)
+        take = min(remaining, max_fit)
+        if take < 1:
+            continue
+        tickets.append({
+            "account_id": acct["account_id"],
+            "household": hh_snapshot["household"],
+            "ticker": candidate.ticker.upper(),
+            "action": "SELL",
+            "sec_type": "OPT",
+            "right": "P",
+            "strike": float(candidate.strike),
+            "expiry": candidate.expiry.replace("-", ""),  # YYYYMMDD
+            "quantity": take,
+            "limit_price": float(candidate.mid),
+            "annualized_yield": float(candidate.annualized_yield),
+            "mode": "CSP_ENTRY",
+            "status": "staged",
+        })
+        remaining -= take
+
+    return tickets

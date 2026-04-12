@@ -34,7 +34,12 @@ from agt_equities.config import (
     HOUSEHOLD_MAP,
     MARGIN_ACCOUNTS,
 )
-from agt_equities.csp_allocator import _fetch_household_buying_power_snapshot
+from agt_equities.csp_allocator import (
+    _csp_route_to_accounts,
+    _csp_size_household,
+    _fetch_household_buying_power_snapshot,
+    _vix_retain_pct,
+)
 
 
 def _run(coro):
@@ -552,3 +557,317 @@ def test_snapshot_working_and_staged_order_tickers():
     yash = result["Yash_Household"]
     assert yash["working_order_tickers"] == {"NVDA"}
     assert yash["staged_order_tickers"] == {"GOOGL"}
+
+
+
+# ===========================================================================
+# M1.2: _csp_size_household + _csp_route_to_accounts — pure function tests
+# ===========================================================================
+
+def _fake_candidate(
+    ticker: str = "AAPL",
+    strike: float = 150.0,
+    mid: float = 1.50,
+    expiry: str = "2026-05-16",
+    dte: int = 35,
+    annualized_yield: float = 0.22,
+) -> SimpleNamespace:
+    """Build a minimal RAYCandidate duck-type for allocator unit tests."""
+    return SimpleNamespace(
+        ticker=ticker,
+        strike=strike,
+        mid=mid,
+        expiry=expiry,
+        dte=dte,
+        annualized_yield=annualized_yield,
+    )
+
+
+def _fake_hh_snapshot(
+    household: str = "Yash_Household",
+    hh_nlv: float = 261_000.0,
+    hh_margin_nlv: float = 109_000.0,
+    hh_margin_el: float = 109_000.0,   # no pre-existing margin usage
+    accounts: dict | None = None,
+    existing_positions: dict | None = None,
+    existing_csps: dict | None = None,
+) -> dict:
+    """Build a minimal HouseholdSnapshot for allocator unit tests.
+
+    Defaults model a Yash-shaped household with ~$261K NLV split
+    across one $109K margin account and two IRAs totalling $152K.
+    Override any kwarg to drive specific test paths.
+    """
+    if accounts is None:
+        accounts = {
+            "U21971297": {
+                "account_id": "U21971297",
+                "nlv": 109_000.0,
+                "el": 109_000.0,
+                "buying_power": 200_000.0,
+                "cash_available": 200_000.0,
+                "margin_eligible": True,
+            },
+            "U22076329": {
+                "account_id": "U22076329",
+                "nlv": 100_000.0,
+                "el": 0.0,
+                "buying_power": 0.0,
+                "cash_available": 100_000.0,
+                "margin_eligible": False,
+            },
+            "U22076184": {
+                "account_id": "U22076184",
+                "nlv": 52_000.0,
+                "el": 0.0,
+                "buying_power": 0.0,
+                "cash_available": 52_000.0,
+                "margin_eligible": False,
+            },
+        }
+    return {
+        "household": household,
+        "hh_nlv": hh_nlv,
+        "hh_margin_nlv": hh_margin_nlv,
+        "hh_margin_el": hh_margin_el,
+        "accounts": accounts,
+        "existing_positions": existing_positions or {},
+        "existing_csps": existing_csps or {},
+        "working_order_tickers": set(),
+        "staged_order_tickers": set(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sizing tests (8)
+# ---------------------------------------------------------------------------
+
+def test_size_returns_zero_for_zero_nlv_household():
+    """Degenerate hh_nlv=0 must short-circuit to 0 contracts."""
+    hh = _fake_hh_snapshot(hh_nlv=0.0, hh_margin_nlv=0.0, hh_margin_el=0.0)
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    assert _csp_size_household(hh, cand, vix=18.0) == 0
+
+
+def test_size_returns_zero_when_one_contract_exceeds_rule1_ceiling():
+    """META $650 1c = $65K = ~25% of $261K household → exceeds 20%
+    ceiling → returns 0."""
+    hh = _fake_hh_snapshot()  # hh_nlv=261K, ceiling=$52.2K
+    cand = _fake_candidate(ticker="META", strike=650.0)
+    # 1c notional = $65K ≥ $52.2K → infeasible at any count
+    assert _csp_size_household(hh, cand, vix=18.0) == 0
+
+
+def test_size_picks_closest_to_10pct_target():
+    """hh_nlv=$261K, AAPL $150: target=$26.1K, 1c=$15K, 2c=$30K.
+    |15 - 26.1| = 11.1, |30 - 26.1| = 3.9 → picks 2 contracts.
+    """
+    hh = _fake_hh_snapshot()
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    assert _csp_size_household(hh, cand, vix=18.0) == 2
+
+
+def test_size_prefers_lower_on_tie():
+    """Exact midpoint between c_low and c_high → prefer lower.
+
+    hh_nlv=$225K → target=$22.5K. AAPL $150: 1c=$15K, 2c=$30K.
+    |15-22.5|=7.5, |30-22.5|=7.5 → tie → picks 1.
+    """
+    hh = _fake_hh_snapshot(
+        hh_nlv=225_000.0,
+        hh_margin_nlv=225_000.0,
+        hh_margin_el=225_000.0,
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    assert _csp_size_household(hh, cand, vix=18.0) == 1
+
+
+def test_size_respects_rule1_with_existing_position():
+    """Existing exposure pushes post-trade over 20% ceiling → 0.
+
+    hh_nlv=$261K, ceiling=$52.2K. AAPL $150, 1c notional=$15K.
+    Existing AAPL position worth $40K. 1c → $55K total > $52.2K → 0.
+    2c → $70K → also over. → 0.
+    """
+    hh = _fake_hh_snapshot(
+        existing_positions={
+            "AAPL": {
+                "total_shares": 200,
+                "spot": 200.0,
+                "current_value": 40_000.0,
+                "sector": "Technology Hardware",
+            },
+        },
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    assert _csp_size_household(hh, cand, vix=18.0) == 0
+
+
+def test_size_respects_vix_rule2_at_low_vix():
+    """Low VIX → retain 80%, deploy 20% → tight margin headroom.
+
+    Configure margin_nlv so 20% deployment cannot accommodate the
+    natural 10%-target contract count. The function must reduce the
+    count to what Rule 2 allows.
+
+    hh_nlv=$1M, hh_margin_nlv=$100K, no pre-use.
+    AAPL $200: target=$100K, c_low=5 ($100K exact).
+    5c margin impact = $100K*0.30 = $30K.
+    At VIX=15: budget = $100K * 20% = $20K → headroom=$20K → 5c fails.
+    4c impact = $80K*0.30 = $24K → still fails.
+    3c impact = $60K*0.30 = $18K → fits, BUT feasibility probes
+    only c_low (5) and c_high (6), so both fail → returns 0.
+
+    This asserts that the _feasible() narrow-search semantics hold:
+    Rule 2 binding + c_low/c_high infeasible → 0.
+    """
+    hh = _fake_hh_snapshot(
+        hh_nlv=1_000_000.0,
+        hh_margin_nlv=100_000.0,
+        hh_margin_el=100_000.0,
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=200.0)
+    assert _csp_size_household(hh, cand, vix=15.0) == 0
+
+
+def test_size_respects_vix_rule2_at_elevated_vix():
+    """Elevated VIX → retain less, deploy more → looser headroom.
+
+    Same inputs as the low-VIX test, but VIX=35 → retain 50%,
+    deploy 50%, budget=$50K. 5c impact=$30K < $50K → c_low=5 feasible.
+    c_high=6 impact=$36K < $50K → feasible, but 6c notional=$120K
+    is further from $100K target than 5c=$100K → picks 5.
+    """
+    hh = _fake_hh_snapshot(
+        hh_nlv=1_000_000.0,
+        hh_margin_nlv=100_000.0,
+        hh_margin_el=100_000.0,
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=200.0)
+    assert _csp_size_household(hh, cand, vix=35.0) == 5
+
+
+def test_size_returns_zero_when_margin_headroom_exhausted():
+    """Pre-existing margin usage consumes entire budget → headroom=0.
+
+    hh_margin_nlv=$109K, hh_margin_el=$5K → used_pre=$104K.
+    Any VIX budget is well under $104K → headroom=0 → every new
+    contract has impact > 0 → infeasible → 0.
+    """
+    hh = _fake_hh_snapshot(
+        hh_margin_nlv=109_000.0,
+        hh_margin_el=5_000.0,
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    assert _csp_size_household(hh, cand, vix=18.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Routing tests (4)
+# ---------------------------------------------------------------------------
+
+def test_route_ira_first_then_margin():
+    """2 contracts, IRAs have plenty of room → all go to IRAs, not margin.
+
+    Default fixture: two IRAs (U22076329 $100K, U22076184 $52K) plus
+    one margin acct. AAPL $150 collateral = $15K/contract.
+    Largest IRA first (U22076329, $100K cash) fits 6 contracts easily
+    → both tickets land there, none on margin.
+    """
+    hh = _fake_hh_snapshot()
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    tickets = _csp_route_to_accounts(2, hh, cand)
+    assert len(tickets) == 1                        # single bulk ticket
+    assert tickets[0]["account_id"] == "U22076329"  # largest IRA
+    assert tickets[0]["quantity"] == 2
+    # Crucially: nothing on the margin account
+    assert all(t["account_id"] != "U21971297" for t in tickets)
+
+
+def test_route_partial_when_household_cannot_fit_all():
+    """Request 10 contracts but combined capacity only fits 6 → returns 6."""
+    hh = _fake_hh_snapshot(
+        accounts={
+            "U22076329": {
+                "account_id": "U22076329",
+                "nlv": 50_000.0,
+                "el": 0.0,
+                "buying_power": 0.0,
+                "cash_available": 50_000.0,        # fits 3 @ $15K
+                "margin_eligible": False,
+            },
+            "U21971297": {
+                "account_id": "U21971297",
+                "nlv": 50_000.0,
+                "el": 50_000.0,
+                "buying_power": 50_000.0,          # fits 3 @ $15K
+                "cash_available": 50_000.0,
+                "margin_eligible": True,
+            },
+        },
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    tickets = _csp_route_to_accounts(10, hh, cand)
+    total = sum(t["quantity"] for t in tickets)
+    assert total == 6   # partial fill: all 6 that fit, not 10
+
+
+def test_route_spills_from_ira_to_margin_when_ira_full():
+    """IRA has capacity for 2 contracts, request 5 → 2 to IRA, 3 to margin."""
+    hh = _fake_hh_snapshot(
+        accounts={
+            "U22076329": {
+                "account_id": "U22076329",
+                "nlv": 30_000.0,
+                "el": 0.0,
+                "buying_power": 0.0,
+                "cash_available": 30_000.0,        # fits 2 @ $15K
+                "margin_eligible": False,
+            },
+            "U21971297": {
+                "account_id": "U21971297",
+                "nlv": 200_000.0,
+                "el": 200_000.0,
+                "buying_power": 200_000.0,        # fits 13 @ $15K
+                "cash_available": 200_000.0,
+                "margin_eligible": True,
+            },
+        },
+    )
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    tickets = _csp_route_to_accounts(5, hh, cand)
+    by_acct = {t["account_id"]: t["quantity"] for t in tickets}
+    assert by_acct["U22076329"] == 2   # IRA filled first
+    assert by_acct["U21971297"] == 3   # margin takes the spill
+    assert sum(by_acct.values()) == 5
+
+
+def test_route_ticket_shape_fields():
+    """Verify every expected field is present on a ticket dict."""
+    hh = _fake_hh_snapshot()
+    cand = _fake_candidate(
+        ticker="aapl",          # lowercase — must be upcased in output
+        strike=150.0,
+        mid=1.50,
+        expiry="2026-05-16",    # must be normalized to YYYYMMDD
+        dte=35,
+        annualized_yield=0.225,
+    )
+    tickets = _csp_route_to_accounts(1, hh, cand)
+    assert len(tickets) == 1
+    t = tickets[0]
+    # Field presence + canonical values
+    assert t["account_id"] == "U22076329"   # largest IRA
+    assert t["household"] == "Yash_Household"
+    assert t["ticker"] == "AAPL"            # upcased
+    assert t["action"] == "SELL"
+    assert t["sec_type"] == "OPT"
+    assert t["right"] == "P"
+    assert t["strike"] == 150.0
+    assert isinstance(t["strike"], float)
+    assert t["expiry"] == "20260516"        # normalized
+    assert t["quantity"] == 1
+    assert t["limit_price"] == pytest.approx(1.50)
+    assert t["annualized_yield"] == pytest.approx(0.225)
+    assert t["mode"] == "CSP_ENTRY"
+    assert t["status"] == "staged"
