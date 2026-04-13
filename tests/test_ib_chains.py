@@ -193,6 +193,7 @@ def test_build_chain_rows_valid_data_bit_identical():
         "volume": 350,
         "openInterest": 1200,
         "impliedVol": 0.325,
+        "delta": None,  # SimpleNamespace has no modelGreeks
     }
 
 
@@ -236,6 +237,63 @@ def test_build_chain_rows_multiple_strikes_sorted():
     rows = _build_chain_rows(tickers_data)
     assert len(rows) == 3
     assert [r["strike"] for r in rows] == [145.0, 150.0, 155.0]
+
+
+# ---------------------------------------------------------------------------
+# Sprint-1.2: _build_chain_rows delta extraction tests
+# ---------------------------------------------------------------------------
+
+def test_build_chain_rows_delta_from_model_greeks():
+    """Row dict contains 'delta' as float when modelGreeks.delta is valid."""
+    mg = SimpleNamespace(delta=0.25)
+    fake_td = SimpleNamespace(
+        bid=1.50, ask=1.60, last=1.55,
+        volume=200, openInterest=800, impliedVolatility=0.30,
+        modelGreeks=mg,
+    )
+    rows = _build_chain_rows({150.0: fake_td})
+    assert len(rows) == 1
+    assert rows[0]["delta"] == pytest.approx(0.25)
+    assert isinstance(rows[0]["delta"], float)
+
+
+def test_build_chain_rows_delta_none_when_no_model_greeks():
+    """Row dict contains 'delta': None when modelGreeks is absent."""
+    fake_td = SimpleNamespace(
+        bid=1.50, ask=1.60, last=1.55,
+        volume=200, openInterest=800, impliedVolatility=0.30,
+    )
+    rows = _build_chain_rows({150.0: fake_td})
+    assert len(rows) == 1
+    assert rows[0]["delta"] is None
+
+
+def test_build_chain_rows_delta_none_when_model_greeks_delta_none():
+    """Row dict contains 'delta': None when modelGreeks.delta is None."""
+    mg = SimpleNamespace(delta=None)
+    fake_td = SimpleNamespace(
+        bid=1.50, ask=1.60, last=1.55,
+        volume=200, openInterest=800, impliedVolatility=0.30,
+        modelGreeks=mg,
+    )
+    rows = _build_chain_rows({150.0: fake_td})
+    assert len(rows) == 1
+    assert rows[0]["delta"] is None
+
+
+def test_build_chain_rows_row_not_dropped_on_delta_failure():
+    """Row is NOT dropped when delta extraction fails — len unchanged."""
+    mg = SimpleNamespace(delta="not_a_number")  # will fail float()
+    fake_td = SimpleNamespace(
+        bid=1.50, ask=1.60, last=1.55,
+        volume=200, openInterest=800, impliedVolatility=0.30,
+        modelGreeks=mg,
+    )
+    rows = _build_chain_rows({150.0: fake_td})
+    assert len(rows) == 1
+    assert rows[0]["delta"] is None
+    # Other fields still valid
+    assert rows[0]["bid"] == pytest.approx(1.50)
 
 
 # ---------------------------------------------------------------------------

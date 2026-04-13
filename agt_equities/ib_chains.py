@@ -122,6 +122,16 @@ def _build_chain_rows(tickers_data: dict) -> list[dict]:
         if iv < 0:
             iv = 0.0
 
+        # Sprint-1.2: extract modelGreeks.delta for inception_delta tracking.
+        # Defensive: None-safe at every layer. Never drop rows on missing delta.
+        delta_val = None
+        try:
+            mg = getattr(td, "modelGreeks", None)
+            if mg is not None and getattr(mg, "delta", None) is not None:
+                delta_val = float(mg.delta)
+        except (TypeError, ValueError, AttributeError):
+            delta_val = None
+
         results.append({
             'strike': float(strike),
             'bid': bid,
@@ -130,6 +140,7 @@ def _build_chain_rows(tickers_data: dict) -> list[dict]:
             'volume': vol,
             'openInterest': oi,
             'impliedVol': iv,
+            'delta': delta_val,
         })
     return results
 

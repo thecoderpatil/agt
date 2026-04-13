@@ -8056,6 +8056,16 @@ async def _walk_mode1_chain(
 
             if annualized >= MODE1_MIN_ANNUALIZED_PCT:
                 low_yield = annualized < MODE1_LOW_YIELD_PCT
+                # Sprint-1.2: extract inception_delta from chain DTO
+                try:
+                    raw_delta = row.get("delta")
+                    inception_delta = float(raw_delta) if raw_delta is not None else None
+                except (TypeError, ValueError) as _id_exc:
+                    logger.warning(
+                        "inception_delta extraction failed for %s %.1f%s: %s",
+                        ticker, strike, "C", _id_exc,
+                    )
+                    inception_delta = None
                 return {
                     "ticker": ticker,
                     "expiry": exp_str,
@@ -8066,6 +8076,7 @@ async def _walk_mode1_chain(
                     "otm_pct": round(otm_pct, 2),
                     "low_yield": low_yield,
                     "dte_range": f"{min_dte}-{max_dte}",
+                    "inception_delta": inception_delta,
                 }
 
         return None
@@ -8150,6 +8161,16 @@ async def _walk_harvest_chain(
                 assigned_basis, strike, mid, quantity=1, multiplier=1
             ).walk_away_pnl_per_share
 
+            # Sprint-1.2: extract inception_delta from chain DTO
+            try:
+                raw_delta = row.get("delta")
+                inception_delta = float(raw_delta) if raw_delta is not None else None
+            except (TypeError, ValueError) as _id_exc:
+                logger.warning(
+                    "inception_delta extraction failed for %s %.1f%s: %s",
+                    ticker, strike, "C", _id_exc,
+                )
+                inception_delta = None
             return {
                 "ticker": ticker,
                 "expiry": exp_str,
@@ -8160,6 +8181,7 @@ async def _walk_harvest_chain(
                 "otm_pct": round(otm_pct, 2),
                 "walk_away_pnl": round(walk_away_pnl, 2),
                 "dte_range": f"{min_dte}-{max_dte}",
+                "inception_delta": inception_delta,
             }
 
         return None
