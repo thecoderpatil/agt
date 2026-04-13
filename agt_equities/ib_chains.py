@@ -128,7 +128,7 @@ def _build_chain_rows(tickers_data: dict) -> list[dict]:
         try:
             mg = getattr(td, "modelGreeks", None)
             if mg is not None and getattr(mg, "delta", None) is not None:
-                delta_val = float(mg.delta)
+                delta_val = abs(float(mg.delta))  # sprint-1.5: unsigned delta magnitude — see HANDOFF_ARCHITECT_v20
         except (TypeError, ValueError, AttributeError):
             delta_val = None
 

@@ -297,6 +297,40 @@ def test_build_chain_rows_row_not_dropped_on_delta_failure():
 
 
 # ---------------------------------------------------------------------------
+# Sprint-1.5: abs() wrap — negative delta becomes positive
+# ---------------------------------------------------------------------------
+
+def test_build_chain_rows_negative_delta_becomes_positive():
+    """Short call modelGreeks.delta is negative (e.g. -0.35).
+    Sprint-1.5 abs() wrap must store 0.35 in the row dict."""
+    mg = SimpleNamespace(delta=-0.35)
+    fake_td = SimpleNamespace(
+        bid=1.50, ask=1.60, last=1.55,
+        volume=200, openInterest=800, impliedVolatility=0.30,
+        modelGreeks=mg,
+    )
+    rows = _build_chain_rows({150.0: fake_td})
+    assert len(rows) == 1
+    assert rows[0]["delta"] == pytest.approx(0.35)
+    assert isinstance(rows[0]["delta"], float)
+
+
+def test_build_chain_rows_positive_delta_unchanged():
+    """Long call / positive modelGreeks.delta (e.g. +0.35).
+    abs() wrap is a no-op — value passes through unchanged."""
+    mg = SimpleNamespace(delta=0.35)
+    fake_td = SimpleNamespace(
+        bid=1.50, ask=1.60, last=1.55,
+        volume=200, openInterest=800, impliedVolatility=0.30,
+        modelGreeks=mg,
+    )
+    rows = _build_chain_rows({150.0: fake_td})
+    assert len(rows) == 1
+    assert rows[0]["delta"] == pytest.approx(0.35)
+    assert isinstance(rows[0]["delta"], float)
+
+
+# ---------------------------------------------------------------------------
 # 7-10. _get_canonical_strikes_for_expiry + per-expiry filtering tests
 # (C7.1 dispatch — per-expiry strike validation via reqContractDetailsAsync)
 # ---------------------------------------------------------------------------
