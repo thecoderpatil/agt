@@ -8007,8 +8007,13 @@ async def _walk_mode1_chain(
         mid_target = (min_dte + max_dte) // 2
         exp_str, dte = min(candidates, key=lambda x: abs(x[1] - mid_target))
 
-        strike_floor = max(0.0, adjusted_basis)
-        strike_ceiling = max(strike_floor, adjusted_basis + (spot * 0.10))
+        # Strike range per Rulebook Rule 7 Mode 1 + V2 Router refactor:
+        # No write-time ACB floor — assignment-below-basis protection
+        # lives in the V2 Router rolling path, not here. Walker hunts
+        # from 3% OTM above spot up to 20% above adjusted basis,
+        # prefers highest strike with viable premium.
+        strike_floor = max(0.0, spot * 1.03)
+        strike_ceiling = max(strike_floor, adjusted_basis * 1.20)
 
         try:
             chain_data = await _ibkr_get_chain(ticker, exp_str, right='C',

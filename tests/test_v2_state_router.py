@@ -313,7 +313,12 @@ class TestV2ChainWalkers(unittest.TestCase):
         result = _run(telegram_bot._walk_mode1_chain("AAPL", 80.0, 100.0, (14, 30)))
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["strike"], 105.0)
+        # Per C7.2: strike_floor=spot*1.03=82.4,
+        # strike_ceiling=acb*1.20=120.0. Walker iterates descending,
+        # picks highest strike with viable premium. At spot=80,
+        # acb=100: strike 110 is the highest strike in the test
+        # fixture's mock chain with bid above the floor.
+        self.assertEqual(result["strike"], 110.0)
 
     @patch("telegram_bot._ibkr_get_chain", new_callable=AsyncMock)
     @patch("telegram_bot._ibkr_get_expirations", new_callable=AsyncMock)
