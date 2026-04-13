@@ -27,16 +27,29 @@ C6.2 core infra change by the ib_chains public API.
 """
 from __future__ import annotations
 
+import asyncio
 import math
+import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from agt_equities.ib_chains import (
     _build_chain_rows,
+    _get_canonical_strikes_for_expiry,
     _safe_float,
     _safe_int,
 )
+from agt_equities import ib_chains
+
+
+@pytest.fixture(autouse=True)
+def _reset_chain_caches():
+    """Clear all ib_chains caches between tests."""
+    ib_chains._chain_cache.clear()
+    ib_chains._per_expiry_strikes.clear()
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -223,3 +236,130 @@ def test_build_chain_rows_multiple_strikes_sorted():
     rows = _build_chain_rows(tickers_data)
     assert len(rows) == 3
     assert [r["strike"] for r in rows] == [145.0, 150.0, 155.0]
+
+
+# ---------------------------------------------------------------------------
+# 7-10. _get_canonical_strikes_for_expiry + per-expiry filtering tests
+# (C7.1 dispatch — per-expiry strike validation via reqContractDetailsAsync)
+# ---------------------------------------------------------------------------
+
+def _make_contract_details(strike: float):
+    """Build a minimal ContractDetails-shaped object for testing."""
+    contract = SimpleNamespace(strike=strike)
+    return SimpleNamespace(contract=contract)
+
+
+class TestCanonicalStrikesForExpiry(unittest.IsolatedAsyncioTestCase):
+    """C7.1: per-expiry canonical strike validation tests."""
+
+    def setUp(self):
+        ib_chains._chain_cache.clear()
+        ib_chains._per_expiry_strikes.clear()
+
+    async def test_caches_result(self):
+        """reqContractDetailsAsync is called only once; second call hits cache."""
+        mock_ib = MagicMock()
+        mock_ib.reqContractDetailsAsync = AsyncMock(return_value=[
+            _make_contract_details(80.0),
+            _make_contract_details(81.0),
+            _make_contract_details(82.0),
+        ])
+
+        result1 = await _get_canonical_strikes_for_expiry(
+            mock_ib, "TEST", "20260417", "P",
+        )
+        result2 = await _get_canonical_strikes_for_expiry(
+            mock_ib, "TEST", "20260417", "P",
+        )
+
+        assert result1 == {80.0, 81.0, 82.0}
+        assert result2 == {80.0, 81.0, 82.0}
+        assert mock_ib.reqContractDetailsAsync.call_count == 1
+
+    async def test_handles_empty(self):
+        """Empty response from IBKR caches empty set, does not raise."""
+        mock_ib = MagicMock()
+        mock_ib.reqContractDetailsAsync = AsyncMock(return_value=[])
+
+        result = await _get_canonical_strikes_for_expiry(
+            mock_ib, "DEAD", "20260501", "C",
+        )
+        assert result == set()
+
+        result2 = await _get_canonical_strikes_for_expiry(
+            mock_ib, "DEAD", "20260501", "C",
+        )
+        assert result2 == set()
+        assert mock_ib.reqContractDetailsAsync.call_count == 1
+
+    async def test_handles_exception(self):
+        """Exception in reqContractDetailsAsync caches empty set, does not propagate."""
+        mock_ib = MagicMock()
+        mock_ib.reqContractDetailsAsync = AsyncMock(
+            side_effect=Exception("connection lost"),
+        )
+
+        result = await _get_canonical_strikes_for_expiry(
+            mock_ib, "FAIL", "20260515", "P",
+        )
+        assert result == set()
+
+        result2 = await _get_canonical_strikes_for_expiry(
+            mock_ib, "FAIL", "20260515", "P",
+        )
+        assert result2 == set()
+        assert mock_ib.reqContractDetailsAsync.call_count == 1
+
+    async def test_filters_phantom_strikes(self):
+        """Union strikes not in the per-expiry canonical set are excluded
+        from qualifyContractsAsync — the root fix for UBER/CRM Error 200."""
+        mock_ib = MagicMock()
+
+        # Seed the union strike cache (normally populated by get_expirations)
+        ib_chains._chain_cache["UBER"] = ib_chains.CachedChain(
+            expirations=["2026-04-17"],
+            fetched_at=9999999999.0,
+        )
+        ib_chains._chain_cache["UBER"]._all_strikes = [
+            77.5, 78.0, 79.0, 80.0, 81.0, 82.5,
+        ]
+
+        # Seed canonical strikes for this specific expiry: only 78-81 exist
+        ib_chains._per_expiry_strikes[("UBER", "20260417", "C")] = {
+            78.0, 79.0, 80.0, 81.0,
+        }
+
+        # qualifyContractsAsync: return contracts with valid conIds
+        async def fake_qualify(*contracts):
+            result = []
+            for c in contracts:
+                qualified = SimpleNamespace(
+                    conId=100 + int(c.strike),
+                    strike=c.strike,
+                    symbol=c.symbol,
+                )
+                result.append(qualified)
+            return result
+
+        mock_ib.qualifyContractsAsync = fake_qualify
+
+        def fake_mkt_data(contract, *args):
+            return SimpleNamespace(
+                bid=1.0, ask=1.1, last=1.05,
+                volume=100, openInterest=500, impliedVolatility=0.3,
+                contract=contract,
+            )
+        mock_ib.reqMktData = fake_mkt_data
+        mock_ib.cancelMktData = MagicMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await ib_chains.get_chain_for_expiry(
+                mock_ib, "UBER", "2026-04-17", right="C",
+                min_strike=77.0, max_strike=83.0,
+            )
+
+        # Only the 4 canonical strikes should produce rows
+        returned_strikes = {r["strike"] for r in result}
+        assert returned_strikes == {78.0, 79.0, 80.0, 81.0}
+        assert 77.5 not in returned_strikes
+        assert 82.5 not in returned_strikes

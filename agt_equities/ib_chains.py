@@ -175,6 +175,13 @@ _chain_cache: dict[str, CachedChain] = {}
 EXPIRY_CACHE_TTL = 300  # 5 minutes
 CHAIN_CACHE_TTL = 60    # 60 seconds
 
+# Per-(ticker, expiry, right) canonical strike cache.
+# IBKR's reqSecDefOptParamsAsync returns the UNION of strikes
+# across all expirations. This cache stores the actual valid
+# strike list for each specific expiry, fetched via
+# reqContractDetailsAsync on a partial Option contract.
+_per_expiry_strikes: dict[tuple[str, str, str], set[float]] = {}
+
 
 def invalidate_cache(ticker: str | None = None) -> None:
     """Clear chain cache for a ticker, or all."""
@@ -280,6 +287,63 @@ async def get_expirations(ib, ticker: str) -> list[str]:
         raise IBKRChainError(f"Chain fetch failed for {ticker}: {exc}", error_class) from exc
 
 
+async def _get_canonical_strikes_for_expiry(
+    ib, ticker: str, expiry_ib: str, right: str,
+) -> set[float]:
+    """Return the set of strikes that actually exist for this
+    specific (ticker, expiry, right) combination at SMART.
+
+    Cached per-session. Cache key is (ticker, expiry_ib, right).
+    Uses reqContractDetailsAsync with a partial Option contract
+    (no strike) — IBKR returns all listed strikes for that
+    expiry as separate ContractDetails entries.
+
+    On any failure, returns empty set (caller handles).
+    """
+    cache_key = (ticker, expiry_ib, right)
+    if cache_key in _per_expiry_strikes:
+        return _per_expiry_strikes[cache_key]
+
+    try:
+        from ib_async import Option
+        partial = Option(
+            symbol=ticker,
+            lastTradeDateOrContractMonth=expiry_ib,
+            right=right,
+            exchange='SMART',
+            currency='USD',
+        )
+        details = await ib.reqContractDetailsAsync(partial)
+        if not details:
+            logger.warning(
+                "ib_chains: reqContractDetailsAsync empty for "
+                "%s %s %s — caching empty set",
+                ticker, expiry_ib, right,
+            )
+            _per_expiry_strikes[cache_key] = set()
+            return set()
+
+        canonical = {
+            float(cd.contract.strike)
+            for cd in details
+            if cd.contract.strike and cd.contract.strike > 0
+        }
+        _per_expiry_strikes[cache_key] = canonical
+        logger.info(
+            "ib_chains: cached %d canonical strikes for %s %s %s",
+            len(canonical), ticker, expiry_ib, right,
+        )
+        return canonical
+    except Exception as exc:
+        logger.warning(
+            "ib_chains: _get_canonical_strikes_for_expiry failed "
+            "for %s %s %s: %s — caching empty set as guard",
+            ticker, expiry_ib, right, exc,
+        )
+        _per_expiry_strikes[cache_key] = set()
+        return set()
+
+
 async def get_chain_for_expiry(
     ib, ticker: str, expiry: str, right: str = 'C',
     min_strike: float = 0, max_strike: float = 999999,
@@ -320,6 +384,43 @@ async def get_chain_for_expiry(
 
         # Convert expiry to YYYYMMDD
         expiry_ib = expiry.replace("-", "")
+
+        # Filter against canonical per-expiry strikes — eliminates phantom
+        # strike+expiry combinations that the union list would otherwise
+        # include. Without this filter, walker generates Option contracts
+        # for strikes that don't exist for the specific expiry, causing
+        # Error 200 / No security definition errors at reqMktData time.
+        canonical_strikes = await _get_canonical_strikes_for_expiry(
+            ib, ticker, expiry_ib, right,
+        )
+        if canonical_strikes:
+            before_count = len(strikes)
+            strikes = [s for s in strikes if s in canonical_strikes]
+            filtered_count = before_count - len(strikes)
+            if filtered_count > 0:
+                logger.info(
+                    "ib_chains: filtered %d phantom strikes for %s %s %s "
+                    "(kept %d of %d)",
+                    filtered_count, ticker, expiry_ib, right,
+                    len(strikes), before_count,
+                )
+        else:
+            # Empty canonical set means reqContractDetailsAsync failed or
+            # the expiry has no listed strikes. Fall through to the
+            # existing conId==0 guard rather than failing here — this
+            # preserves backward compatibility for any path that worked
+            # before this fix.
+            logger.warning(
+                "ib_chains: empty canonical set for %s %s %s — "
+                "falling back to union list (legacy behavior)",
+                ticker, expiry_ib, right,
+            )
+
+        if not strikes:
+            raise IBKRNoDataError(
+                f"No canonical strikes for {ticker} {expiry} in range "
+                f"[{min_strike}, {max_strike}]"
+            )
 
         # Build contracts and request market data
         contracts = []
