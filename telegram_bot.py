@@ -2051,6 +2051,7 @@ def _apply_fill_atomically(
     premium_delta: float,
     account_id: str,
     household_id: str,
+    inception_delta: float | None = None,
 ) -> bool:
     """Atomic: dedup via INSERT OR IGNORE + ledger UPSERT. Single transaction."""
     try:
@@ -2061,11 +2062,13 @@ def _apply_fill_atomically(
                     """
                     INSERT OR IGNORE INTO fill_log
                         (exec_id, ticker, action, quantity, price,
-                         premium_delta, account_id, household_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         premium_delta, account_id, household_id,
+                         inception_delta)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (exec_id, ticker, action, quantity, price,
-                     premium_delta, account_id, household_id),
+                     premium_delta, account_id, household_id,
+                     inception_delta),
                 )
                 if cur.rowcount == 0:
                     return False  # Duplicate — already processed
@@ -2158,6 +2161,59 @@ def _credit_premium(household: str, ticker: str, amount: float) -> bool:
         return False
 
 
+def _lookup_inception_delta_from_payload(perm_id: int) -> float | None:
+    """Look up inception_delta from pending_orders.payload via permId join.
+
+    Returns None on any failure mode (no match, malformed payload,
+    missing key, non-float value, DB error). Never raises.
+
+    Mirrors the canonical permId join pattern from _r5_on_exec_details
+    (telegram_bot.py:1884-1893), adapted for read-only metadata extraction:
+      - No ib_order_id fallback (metadata enrichment only)
+      - No orphan_order_events write on miss
+      - Read-only DB pattern (closing() alone, no transaction)
+    """
+    if not perm_id:
+        return None
+
+    try:
+        with closing(_get_db_connection()) as conn:
+            row = conn.execute(
+                "SELECT payload FROM pending_orders "
+                "WHERE ib_perm_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (perm_id,),
+            ).fetchone()
+            if row is None:
+                logger.info(
+                    "no pending_orders match for permId=%s "
+                    "(manual order or pre-sprint-1.2 row)",
+                    perm_id,
+                )
+                return None
+
+            payload = json.loads(row[0])
+            value = payload.get("inception_delta")
+            if value is None:
+                return None
+            return float(value)
+
+    except (json.JSONDecodeError, sqlite3.Error) as e:
+        logger.warning(
+            "pending_orders payload lookup failed for "
+            "permId=%s: %s",
+            perm_id, e,
+        )
+        return None
+    except (TypeError, ValueError) as e:
+        logger.warning(
+            "malformed inception_delta in payload for "
+            "permId=%s: %s",
+            perm_id, e,
+        )
+        return None
+
+
 def _on_cc_fill(trade, fill):
     """SELL CALL filled — credit CC premium to ledger (atomic)."""
     try:
@@ -2185,12 +2241,19 @@ def _on_cc_fill(trade, fill):
         fill_qty = abs(execution.shares)
         total_premium = round(fill_price * 100 * fill_qty, 2)
 
+        # Sprint-1.3: extract inception_delta from pending_orders payload
+        perm_id = getattr(order, 'permId', None) or 0
+        inception_delta = _lookup_inception_delta_from_payload(perm_id)
+
         if _apply_fill_atomically(execution.execId, ticker, "SELL_CALL",
                                   fill_qty, fill_price, total_premium,
-                                  acct_id, household):
+                                  acct_id, household,
+                                  inception_delta=inception_delta):
             logger.info(
-                "CC premium: %s %s +$%.2f (%d contracts @ $%.2f)",
+                "CC premium: %s %s +$%.2f (%d contracts @ $%.2f) "
+                "inception_delta=%s",
                 household, ticker, total_premium, fill_qty, fill_price,
+                inception_delta,
             )
     except Exception as exc:
         logger.exception("_on_cc_fill failed: %s", exc)
