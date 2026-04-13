@@ -332,5 +332,91 @@ class TestOnCcFillIntegration(unittest.TestCase):
         self.assertIsNone(val)
 
 
+# ---------------------------------------------------------------------------
+# Sprint-1.7: _offload_fill_handler done-callback exception capture
+# ---------------------------------------------------------------------------
+
+
+def test_offload_fill_handler_logs_executor_thread_exceptions():
+    """Future with set_exception → ERROR log with handler name + message.
+
+    Tests _log_future_exception callback in isolation by extracting it
+    from the wrapper's closure. Uses a temporary log handler attached
+    directly to the agt_bridge logger (which has propagate=False).
+    """
+    import concurrent.futures
+    import logging
+    from telegram_bot import _offload_fill_handler
+
+    def my_failing_handler(trade, fill):
+        raise RuntimeError("test handler exception")
+
+    wrapped = _offload_fill_handler(my_failing_handler)
+
+    # Extract _log_future_exception from wrapper's closure.
+    # wrapper closes over _log_future_exception (defined just before it
+    # in _offload_fill_handler). The inner 'wrapper' function is the
+    # return value of _offload_fill_handler. Its __closure__ cells contain
+    # the closure variables: _log_future_exception and sync_handler.
+    log_future_exc_cb = None
+    for cell in wrapped.__closure__:
+        val = cell.cell_contents
+        if callable(val) and getattr(val, '__name__', '') == '_log_future_exception':
+            log_future_exc_cb = val
+            break
+
+    assert log_future_exc_cb is not None, \
+        "_log_future_exception not found in wrapper closure"
+
+    # Attach a temporary handler to capture log records directly
+    agt_logger = logging.getLogger("agt_bridge")
+    captured_records = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record):
+            captured_records.append(record)
+
+    handler = _CaptureHandler(level=logging.ERROR)
+    agt_logger.addHandler(handler)
+    try:
+        test_future = concurrent.futures.Future()
+        test_future.set_exception(RuntimeError("test handler exception"))
+        log_future_exc_cb(test_future)
+    finally:
+        agt_logger.removeHandler(handler)
+
+    assert len(captured_records) >= 1, "No ERROR log record captured"
+    assert captured_records[0].levelno == logging.ERROR
+    assert "my_failing_handler" in captured_records[0].message
+    assert "test handler exception" in captured_records[0].message
+
+
+def test_offload_fill_handler_done_callback_handles_cancelled_future():
+    """Cancelled Future → callback handles gracefully, no crash."""
+    import concurrent.futures
+    from telegram_bot import _offload_fill_handler
+
+    def my_handler(trade, fill):
+        pass
+
+    wrapped = _offload_fill_handler(my_handler)
+
+    # Extract _log_future_exception from closure
+    log_future_exc_cb = None
+    for cell in wrapped.__closure__:
+        val = cell.cell_contents
+        if callable(val) and getattr(val, '__name__', '') == '_log_future_exception':
+            log_future_exc_cb = val
+            break
+
+    assert log_future_exc_cb is not None, \
+        "_log_future_exception not found in wrapper closure"
+
+    # Cancelled future — callback must handle gracefully, no crash
+    cancelled_future = concurrent.futures.Future()
+    cancelled_future.cancel()
+    log_future_exc_cb(cancelled_future)  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

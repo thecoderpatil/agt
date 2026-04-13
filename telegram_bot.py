@@ -1769,12 +1769,37 @@ def _offload_fill_handler(sync_handler):
     """
     Wrap a synchronous fill handler so its DB work runs in a
     thread pool instead of blocking the asyncio event loop.
+
+    Sprint-1.7: any exception raised inside the executor thread is
+    captured via Future.add_done_callback and logged with full
+    traceback. Without this, a handler exception (e.g.
+    sqlite3.OperationalError: database is locked under WAL
+    contention) would be trapped on the un-awaited Future and
+    silently destroyed at GC, permanently dropping the fill from
+    fill_log with zero log signature.
     """
+    def _log_future_exception(future):
+        try:
+            exc = future.exception()
+        except Exception as cb_exc:
+            logger.warning(
+                "Fill handler done-callback failed to read Future: %s",
+                cb_exc,
+            )
+            return
+        if exc is not None:
+            logger.error(
+                "Fill handler %s raised in executor thread: %s",
+                sync_handler.__name__, exc,
+                exc_info=exc,
+            )
+
     def wrapper(trade, fill):
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                loop.run_in_executor(None, sync_handler, trade, fill)
+                future = loop.run_in_executor(None, sync_handler, trade, fill)
+                future.add_done_callback(_log_future_exception)
             else:
                 sync_handler(trade, fill)
         except Exception as exc:
