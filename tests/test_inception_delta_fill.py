@@ -39,16 +39,16 @@ def _init_test_db(db_path):
     conn.close()
 
 
-def _insert_pending_order(conn, ib_perm_id, payload_obj):
+def _insert_pending_order(conn, ib_perm_id, payload_obj, ib_order_id=None):
     """Insert a pending_orders row with given permId and payload."""
     if isinstance(payload_obj, str):
         payload_str = payload_obj  # allow raw string for malformed JSON test
     else:
         payload_str = json.dumps(payload_obj)
     conn.execute(
-        "INSERT INTO pending_orders (payload, status, created_at, ib_perm_id) "
-        "VALUES (?, 'staged', datetime('now'), ?)",
-        (payload_str, ib_perm_id),
+        "INSERT INTO pending_orders (payload, status, created_at, ib_perm_id, ib_order_id) "
+        "VALUES (?, 'staged', datetime('now'), ?, ?)",
+        (payload_str, ib_perm_id, ib_order_id),
     )
     conn.commit()
 
@@ -158,6 +158,32 @@ class TestLookupInceptionDelta(unittest.TestCase):
         """permId=0 → returns None without DB query."""
         from telegram_bot import _lookup_inception_delta_from_payload
         result = _lookup_inception_delta_from_payload(0)
+        self.assertIsNone(result)
+
+    def test_lookup_falls_back_to_client_id_when_perm_id_zero(self):
+        """Sprint-1.6: ib_perm_id=0 (race), ib_order_id=12345 → fallback finds row."""
+        from telegram_bot import _lookup_inception_delta_from_payload
+        _insert_pending_order(self.conn, 0, {
+            "inception_delta": 0.27, "ticker": "CRM",
+        }, ib_order_id=12345)
+        result = _lookup_inception_delta_from_payload(perm_id=0, client_id=12345)
+        self.assertAlmostEqual(result, 0.27)
+        self.assertIsInstance(result, float)
+
+    def test_lookup_falls_back_to_client_id_when_perm_id_misses(self):
+        """Sprint-1.6: real permId doesn't match stored ib_perm_id → fallback."""
+        from telegram_bot import _lookup_inception_delta_from_payload
+        _insert_pending_order(self.conn, 99999, {
+            "inception_delta": 0.27, "ticker": "CRM",
+        }, ib_order_id=12345)
+        # Real IBKR permId (1234567890) doesn't match stored ib_perm_id (99999)
+        result = _lookup_inception_delta_from_payload(perm_id=1234567890, client_id=12345)
+        self.assertAlmostEqual(result, 0.27)
+
+    def test_lookup_returns_none_when_both_ids_zero(self):
+        """Sprint-1.6: perm_id=0 and client_id=0 → short-circuits to None."""
+        from telegram_bot import _lookup_inception_delta_from_payload
+        result = _lookup_inception_delta_from_payload(perm_id=0, client_id=0)
         self.assertIsNone(result)
 
 

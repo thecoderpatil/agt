@@ -2161,34 +2161,50 @@ def _credit_premium(household: str, ticker: str, amount: float) -> bool:
         return False
 
 
-def _lookup_inception_delta_from_payload(perm_id: int) -> float | None:
-    """Look up inception_delta from pending_orders.payload via permId join.
+def _lookup_inception_delta_from_payload(perm_id: int, client_id: int = 0) -> float | None:
+    """Look up inception_delta from pending_orders.payload.
+
+    Joins on ib_perm_id first, falls back to ib_order_id if the permId
+    join misses. The fallback is required because _place_single_order
+    captures trade.order.permId synchronously immediately after
+    ib_async.placeOrder() returns, before IBKR has assigned the real
+    permId via the openOrder callback. As a result, pending_orders.ib_perm_id
+    is typically stored as 0 while trade.order.permId is later populated
+    with the real IBKR-assigned value. R5 handlers
+    (_r5_on_order_status, _r5_on_exec_details, _r5_on_commission_report)
+    rely on the same client_id (orderId) fallback to find their rows.
 
     Returns None on any failure mode (no match, malformed payload,
     missing key, non-float value, DB error). Never raises.
 
-    Mirrors the canonical permId join pattern from _r5_on_exec_details
-    (telegram_bot.py:1884-1893), adapted for read-only metadata extraction:
-      - No ib_order_id fallback (metadata enrichment only)
-      - No orphan_order_events write on miss
-      - Read-only DB pattern (closing() alone, no transaction)
+    Sprint-1.6 fix: added client_id fallback. The underlying permId race
+    in _place_single_order is a logged followup, not in scope here.
     """
-    if not perm_id:
+    if not perm_id and not client_id:
         return None
 
     try:
         with closing(_get_db_connection()) as conn:
-            row = conn.execute(
-                "SELECT payload FROM pending_orders "
-                "WHERE ib_perm_id = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (perm_id,),
-            ).fetchone()
+            row = None
+            if perm_id:
+                row = conn.execute(
+                    "SELECT payload FROM pending_orders "
+                    "WHERE ib_perm_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (perm_id,),
+                ).fetchone()
+            if row is None and client_id:
+                row = conn.execute(
+                    "SELECT payload FROM pending_orders "
+                    "WHERE ib_order_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (client_id,),
+                ).fetchone()
             if row is None:
                 logger.info(
-                    "no pending_orders match for permId=%s "
+                    "no pending_orders match for permId=%s client_id=%s "
                     "(manual order or pre-sprint-1.2 row)",
-                    perm_id,
+                    perm_id, client_id,
                 )
                 return None
 
@@ -2242,8 +2258,10 @@ def _on_cc_fill(trade, fill):
         total_premium = round(fill_price * 100 * fill_qty, 2)
 
         # Sprint-1.3: extract inception_delta from pending_orders payload
+        # Sprint-1.6: pass client_id for ib_order_id fallback (permId race)
         perm_id = getattr(order, 'permId', None) or 0
-        inception_delta = _lookup_inception_delta_from_payload(perm_id)
+        client_id = getattr(order, 'orderId', None) or 0
+        inception_delta = _lookup_inception_delta_from_payload(perm_id, client_id)
 
         if _apply_fill_atomically(execution.execId, ticker, "SELL_CALL",
                                   fill_qty, fill_price, total_premium,
