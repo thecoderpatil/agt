@@ -1,9 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
-**Last updated:** 2026-04-13
-**Status:** Sprint 1 (A-F) + Cleanup A + Sprints B/C/D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix + P3.2-alt Day 2 findings + V2 Smart Yield Walk-Down + Defensive Roll Engine + adaptive roll execution + ADR-005 V2 Router WARTIME whitelist/BAG/BTC cash-paid notional + ADR-006 ACB pipeline hardening + Followups #9/#10/#11 doc + Act 60 Fortress CSP Screener C1→C6.1 + C6.2-C7.3 + **Unified Roll Evaluator Sprint-1 (inception_delta pipeline) — sprint-1.1 through 1.4** — all COMPLETE.
-**Tests:** 958/964 passing, 5 skipped, 1 pre-existing failure (R7 earnings). Runtime: ~50s. (baseline 929 → 958 = +29 tests across sprint-1.1 through 1.3.)
-**Next:** C7.4 — V2 Router HARVEST classifier (on hold pending DeepThink review). C7.5 — earnings-window guard (on hold). **Sprint-2** of unified roll evaluator: `roll_engine.py` module decoupling with `PortfolioContext`.
+**Last updated:** 2026-04-14
+**Status:** Sprint 1 (A-F) + Cleanup A + Sprints B/C/D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix + P3.2-alt Day 2 findings + V2 Smart Yield Walk-Down + Defensive Roll Engine + adaptive roll execution + ADR-005 V2 Router WARTIME whitelist/BAG/BTC cash-paid notional + ADR-006 ACB pipeline hardening + Followups #9/#10/#11 doc + Act 60 Fortress CSP Screener C1→C6.1 + C6.2-C7.3 + Unified Roll Evaluator Sprint-1 (inception_delta pipeline) sprint-1.1→1.4 + **sprint-1.5 signed delta abs() fix + sprint-1.6 ib_order_id fallback + sprint-1.7 executor exception capture + scheduler timezone fix** — all COMPLETE.
+**Tests:** 965/971 passing, 5 skipped, 1 pre-existing failure (R7 earnings). Runtime: ~50s. (baseline 958 → 965 = +7 tests across sprint-1.5 through 1.7.)
+**Next:** C7.4 — V2 Router HARVEST classifier (on hold pending DeepThink review). C7.5 — earnings-window guard (on hold). **Sprint-2** of unified roll evaluator: `roll_engine.py` module decoupling with `PortfolioContext`. **Sprint-1.6 live verification** — next `/cc` fill on the restarted bot (af002ed) should populate `fill_log.inception_delta` via the ib_order_id fallback. Run `python scripts/verify_inception_delta.py` to confirm all 5 conditions pass.
 
 ---
 
@@ -127,12 +127,12 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 
 ## Current State
 
-- **Tests:** 958/964 passing, 5 skipped, 1 pre-existing failure (R7 earnings `test_fail_closed_no_data`) on `python -m pytest -q tests/` (~50s runtime)
-  - Full screener slice: 198/198 passing across 9 test files (isolation 3 + finnhub 17 + phase1 24 + phase2 18 + phase3 33 + correlation 22 + phase4 32 + phase5 29 + phase6 20)
-  - ib_chains slice: 18/18 passing (C6.2 NaN-safe helpers + C7.1 canonical strike validation + sprint-1.2 delta extraction)
-  - inception_delta slice: 5 schema tests (`test_fill_log_schema.py`) + 6 staging tests (`test_inception_delta_staging.py`) + 14 fill tests (`test_inception_delta_fill.py`) = 25 new tests
+- **Tests:** 965/971 passing, 5 skipped, 1 pre-existing failure (R7 earnings `test_fail_closed_no_data`) on `python -m pytest -q tests/` (~50s runtime)
+  - Full screener slice: 198/198 passing across 9 test files
+  - ib_chains slice: 20/20 passing (C6.2 NaN-safe + C7.1 canonical strikes + sprint-1.2 delta + sprint-1.5 abs() wrap)
+  - inception_delta slice: 5 schema + 6 staging + 17 fill + 2 offload = 30 new tests
   - AST guard at `tests/test_screener_isolation.py` enforces: no screener file imports telegram_bot, V2 router, walker, trade_repo, rule_engine, mode_engine, or `_pre_trade_gates`. `ib_async` is whitelisted ONLY for `chain_walker.py` and `vol_event_armor.py`.
-- **Mode:** PEACETIME
+- **Mode:** WARTIME (cold-start pin: Vikram leverage 2.27x, Yash leverage 1.71x — both above 1.50x threshold)
 - **Production DB:** CLEAN, backed up as `agt_desk.db.p3.2alt.bak`. mode_transitions seeded with 3 OVERWEIGHT rows (2026-04-01 backdate) for watchdog live test.
 - **Walker:** fully closed through W3.8 + special dividend fix (.net_cash). 14 active cycles (8 Yash + 6 Vikram).
 - **telegram_bot.py:** ~9,500 lines (down from 12,180 after Cleanup A purge)
@@ -143,9 +143,9 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 - **R9 compositor:** WIRED (Sprint B Unit 1). evaluate_all(ps, hh, conn=conn) passes conn for real R9. Reporting string now correctly shows 4-condition denominator.
 - **Gate 1:** DEDUPED (Sprint B Unit 3). Staging calls canonical evaluate_gate_1.
 - **DEX overlay:** FIXED (Sprint B Unit 2). _discover_positions reads STAGED/ATTESTED/TRANSMITTING encumbrance.
-- **Beta cache:** Daily 04:00 refresh job. Both top strip and rule engine use same cached betas.
+- **Beta cache:** Daily 04:00 ET refresh job (timezone fix `af002ed`). Both top strip and rule engine use same cached betas.
 - **EL snapshots:** 30s writer job. Top strip and PortfolioState read from el_snapshots table.
-- **R7 corporate intel:** Daily 05:00 refresh job. evaluate_rule_7 reads cache. Bug fixed: evaluate_all now forwards conn= to R7 (enables operator overrides). Provider handles yfinance 1.2.0 datetime.date return type.
+- **R7 corporate intel:** Daily 05:00 ET refresh job (timezone fix `af002ed`). evaluate_rule_7 reads cache. Bug fixed: evaluate_all now forwards conn= to R7 (enables operator overrides). Provider handles yfinance 1.2.0 datetime.date return type.
 - **PRAGMA tuning:** WAL + synchronous=FULL + wal_autocheckpoint=4000 + busy_timeout=5000.
 - **DeskSnapshot SSOT (Sprint C + #43):** `build_state()` returns frozen DeskSnapshot (NAV, cycles, betas, DEX encumbrance). 3-tier NAV: live_nlv param > el_snapshots (<120s) > Flex EOD. `nav_source_by_account` tracks provenance. `build_top_strip` now injects `live_nlv_dict` and consumes it.
 - **Cold-start wartime pin (Priority 4):** startup checks live `accountSummaryAsync()` NLV + live spots before watchdog/polling loops. If any household leverage is >= 1.50x, it logs WARTIME with reason `Cold-start pin: leverage >= 1.50x`.
@@ -352,25 +352,69 @@ Fill:  trade.order.permId → pending_orders.ib_perm_id join
 - `telegram_bot.py` — `_lookup_inception_delta_from_payload`, `_on_cc_fill`, `_apply_fill_atomically`
 - `scripts/verify_inception_delta.py` — verification harness
 
+## Completed Work — Sprint-1.5 through 1.7 + Scheduler Fix (2026-04-13)
+
+| Sprint | Commit | What | Tests |
+|--------|--------|------|-------|
+| 1.5 | `f46af86` | **Signed delta abs() fix:** `_build_chain_rows` wraps `modelGreeks.delta` in `abs()` before writing to row dict. Short call deltas (negative from IBKR) stored as positive magnitudes. Fixes sprint-1.4 harness condition 3 (`[0.15, 0.40]` rejects negatives) and sprint-3 evaluator trigger logic (`current_delta >= inception_delta + 0.10` evaluates wrong on signed values). | +2 |
+| 1.6 | `cc6f5a2` | **ib_order_id fallback:** `_lookup_inception_delta_from_payload` gains `client_id` param, queries `ib_perm_id` first then falls back to `ib_order_id`. Fixes permId race where `_place_single_order` captures `trade.order.permId` synchronously (typically 0) before IBKR assigns the real permId via openOrder callback. `_on_cc_fill` now passes both `permId` and `orderId`. Empirical: UBER fill `0002920b.69dd474f.01.01` had `pending_orders.ib_perm_id=0` but `ib_order_id=827`; real IBKR permId was `847054689`. | +3 |
+| 1.7 | `b5c04a3` | **Executor exception capture:** `_offload_fill_handler` attaches `Future.add_done_callback(_log_future_exception)` to the executor Future. Without this, handler exceptions (e.g. `sqlite3.OperationalError`) were trapped on the un-awaited Future and silently destroyed at GC. Now logs at ERROR level with full traceback and handler name. Covers all 6 wrapped handlers: `_on_cc_fill`, `_on_csp_premium_fill`, `_on_option_close`, `_on_shares_sold`, `_on_shares_bought`, `_r5_on_exec_details`. | +2 |
+| TZ fix | `af002ed` | **Scheduler timezone bind:** `beta_cache_refresh` and `corporate_intel_refresh` registration changed from `_dt_time(4, 0)` / `_dt_time(5, 0)` (naive = UTC) to `_dt_time(4, 0, tzinfo=ET)` / `_dt_time(5, 0, tzinfo=ET)`. Were firing at midnight/1am ET instead of intended 4am/5am ET. Other 5 daily/monthly jobs already correctly bound `tzinfo=ET`. | 0 |
+
+**Data flow (post sprint-1.5 + 1.6):**
+```
+Stage: ib.reqMktData → ticker_data.modelGreeks.delta
+         → _build_chain_rows abs(float(mg.delta))     ← sprint-1.5
+           → row["delta"] (positive magnitude)
+             → _walk_mode1_chain result["inception_delta"]
+               → {**ticket, **result} → pending_orders.payload JSON
+
+Fill:  trade.order.permId → pending_orders.ib_perm_id join
+       FALLBACK: trade.order.orderId → pending_orders.ib_order_id join  ← sprint-1.6
+         → payload["inception_delta"] → _apply_fill_atomically
+           → fill_log.inception_delta column
+```
+
+**Dispatch sequence (2026-04-13):**
+- D12: sprint-1.5 (abs fix)
+- D13: triage survey → root-caused permId race
+- D14: sprint-1.6 (ib_order_id fallback)
+- D14a: DT diagnostic survey (silent fill drops, T0 race, SQL bind)
+- D14b: commit verification
+- D14c: clean bot restart
+- D14d: CRM #241 IBKR reconciliation (orderId 488 not on IBKR)
+- D14e: payload inspection (inception_delta absent on pre-sprint-1.2 rows, present on post-1.2)
+- D14f: queue cleanup (4 stale rows → failed with audit notes)
+- D15: sprint-1.7 (executor exception capture)
+- D16: stray process triage
+- D17: holistic scheduler subsystem survey
+- D18: timezone audit + flex sync gap + walker vs IBKR truth
+- D19: manual flex sync recovery (1480 rows inserted, NAV/positions now current)
+- D20: scheduler timezone fix
+- D20a: leverage audit (Yash 1.71x, Vikram 2.27x — WARTIME confirmed correct)
+- D21: walker integrity audit (0 warnings, 0 NULL critical columns, 0 duplicate transaction_ids, perfect share count match across walker/Flex/IBKR live)
+
 ---
 
 ## In Flight
 
+**Sprint-1.6 live verification pending** — Bot must be restarted on `af002ed` before next `/cc` fill. The fill should populate `fill_log.inception_delta` via the ib_order_id fallback (sprint-1.6). Run `python scripts/verify_inception_delta.py` to confirm all 5 conditions pass. First UBER fill on 2026-04-13 confirmed capture-side worked (`payload.inception_delta = 0.138`) but fill-handler missed due to permId race (now fixed).
+
 **Unified Roll Evaluator Sprint-2** — `roll_engine.py` module decoupling with `PortfolioContext`. Awaiting Architect dispatch. Per DT review: single unified evaluator with constraint matrix, NOT two-engine split.
 
-**C7.4 — V2 Router HARVEST classifier** — kill `ray < 0.10` OR arm in `_scan_and_stage_defensive_rolls`. The RAY heuristic wrongly harvests 60% profit positions because deep OTM near-expiration calls naturally have low RAY. Pure `pnl_pct >= 0.85` rule only. On hold pending Architect review of DeepThink response.
+**C7.4 — V2 Router HARVEST classifier** — on hold pending Architect review of DeepThink response.
 
-**C7.5 — Earnings-window guard in `_walk_mode1_chain`** — check corporate intel earnings date before staging Mode 1 CCs. Skip strikes < 15% OTM when earnings falls in DTE window; flag strikes >= 15% OTM with `through_earnings=True` for operator warning. On hold pending Architect review of DeepThink response.
+**C7.5 — Earnings-window guard in `_walk_mode1_chain`** — on hold pending Architect review of DeepThink response.
 
-**Sprint-1.4 live verification pending** — Next real `/cc` fill should populate `fill_log.inception_delta`. Run `python scripts/verify_inception_delta.py` to confirm all 5 conditions pass.
-
-**P3.2-alt Read-Only Live** — Day 2 findings + V2 execution engine shipped. Kill-switch now enabled via `boot_desk.bat` (`AGT_EXECUTION_ENABLED=true`).
+**P3.2-alt Read-Only Live** — Day 2 findings + V2 execution engine + sprint-1.5→1.7 hardening shipped. Kill-switch ARMED.
 - Protocol: `protocols/P3_2alt_read_only_live_protocol.md`
 - Git tag: `p3.2alt-start` at `04c1d20`
 - DB backup: `agt_desk.db.p3.2alt.bak`
-- Kill-switch: triple-gate now ARMED (env ON via boot_desk.bat + DB disabled=1 + _HALTED=False)
-- mode_transitions: seeded 3 OVERWEIGHT rows (ADBE×2, PYPL×1) backdated to 2026-04-01 for watchdog staging test
+- Kill-switch: triple-gate ARMED (env ON via boot_desk.bat + DB disabled=0 + _HALTED=False)
+- Execution state: `/resume CONFIRM` ran 2026-04-13 12:32
 - V2 execution: Yield walkers use mid price, rolls staged as BAG combos in `pending_orders`, operator executes via `/approve`
+- Flex sync: recovered 2026-04-13 23:12 (sync_id=6, 1480 rows). NAV/positions current. Trade gap was non-issue (no trades April 7–13).
+- Walker: audited 2026-04-13 (Dispatch 21). 0 warnings, 0 NULL critical columns, perfect share match across walker/Flex/IBKR live. 14 active cycles (8 Yash + 6 Vikram).
 
 **Screener orchestrator (C8, separate sprint)** — wiring the 6-phase pipeline to `/scan` in `telegram_bot.py`. Output is Markdown table via `reply_text(parse_mode="Markdown")`. Scheduled daily refresh at 06:00 ET alongside existing R7 corporate intel refresh. Single-ticker mode `/screener TICKER` for interactive checks.
 
@@ -405,6 +449,10 @@ Fill:  trade.order.permId → pending_orders.ib_perm_id join
 | — | Screener log-level normalization (Phase 3 filter_fail warning→info, Phase 3.5 ALREADY_HELD warning→info, Phase 1 drop-path audit for remaining 4 paths) | C3.6 Delta 2 | Low, post-C6.2 |
 | — | Screener `cc_decision_log` integration for `/scan` decision audit trail (if structured queries become needed) | C3.6 planning | Low |
 | — | Screener Phase 1 heartbeat cache instrumentation parity review — ensure Phase 2/3/3.5/4/5/6 all surface cache hit rate in their final log lines | C2.1 pattern | Low, polish |
+| — | `_place_single_order` permId race: `ib_perm_id` written as 0 because permId not yet assigned by IBKR. Sprint-1.6 mitigates via `ib_order_id` fallback. Proper fix: await `trade.statusEvent` for permId or backfill from `openOrder` callback. | Sprint-1.6 triage | Post-roll-engine |
+| — | R5 terminal state transition: UBER #247 has `status=partially_filled` despite all 3 contracts filled. Final-fill → `filled` transition not firing. | Dispatch 14 triage | Low |
+| — | `pending_orders` stuck in `processing` when gate blocks before `placeOrder()`. Gate-failure path doesn't transition status to `failed`. | Dispatch 14d/14f | Low |
+| — | `pytest-asyncio` integration test for `_offload_fill_handler` done-callback wiring (unit test covers callback in isolation but not `add_done_callback` registration). | Sprint-1.7 | Low, if pytest-asyncio added |
 
 **Closed followups:** ~~#2~~ R7 cache (Sprint 1F), ~~#4~~ yf_tkr regression, ~~#8~~ Gate 1 dedup (Sprint B), ~~#9~~ Connection leak, ~~#13~~ Cross-await refactor, ~~#17~~ orderRef linking, ~~#20~~ Sub-account routing, ~~#23~~ Graceful shutdown
 
@@ -439,7 +487,7 @@ Fill:  trade.order.permId → pending_orders.ib_perm_id join
 25. **DeskSnapshot** (Sprint C1) — `build_state()` returns frozen `DeskSnapshot` (NAV, cycles, betas, DEX encumbrance, optional live_positions). IB-free, pure DB read path. `build_top_strip` is the first consumer (Sprint C2).
 26. **config.py centralized** (Sprint C pre-step + D) — HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, MARGIN_ELIGIBLE_ACCOUNTS, MARGIN_ACCOUNTS, PAPER_MODE all canonical in `agt_equities/config.py`. Paper-aware. All consumers import from config.
 27. **Rule 6 dynamic** (Sprint D) — Vikram account derived from `MARGIN_ELIGIBLE_ACCOUNTS["Vikram_Household"][0]`, not hardcoded. Returns GREEN if config empty.
-28. **inception_delta pipeline** (Roll Evaluator Sprint-1) — `fill_log.inception_delta` populated at CC fill time via permId join to `pending_orders.payload`. Only `_on_cc_fill` passes it; CSP/BTC callers write NULL (default kwarg). Pre-sprint-1.2 rows have NULL inception_delta. Mode is `str` constants (`"PEACETIME"`, `"AMBER"`, `"WARTIME"`), NOT enums — defined in `mode_engine.py:19-21`.
+28. **inception_delta pipeline** (Roll Evaluator Sprint-1 + 1.5 + 1.6) — `fill_log.inception_delta` populated at CC fill time. Sprint-1.5: `_build_chain_rows` wraps `modelGreeks.delta` in `abs()` — data layer stores positive magnitudes. Sprint-1.6: `_lookup_inception_delta_from_payload` joins on `ib_perm_id` first, falls back to `ib_order_id` (mirrors R5 canonical pattern). `_on_cc_fill` passes both `permId` and `orderId`. Only `_on_cc_fill` passes inception_delta; CSP/BTC callers write NULL (default kwarg). Pre-sprint-1.2 rows have NULL inception_delta. Mode is `str` constants (`"PEACETIME"`, `"AMBER"`, `"WARTIME"`), NOT enums — defined in `mode_engine.py:19-21`.
 28. **Underwater Positions** (G2) — present on BOTH command_deck and cure_console. Grouped by household, dedicated CC column, ▼ sort indicator. Shared `_build_underwater_rows()` helper.
 29. **Breathe animation** (G7) — `.breathe` class on `<header>`, cascades to `.num` children. `:not(.animate-pulse)` excludes WARTIME badges. Hover pauses, reduced-motion disables.
 30. **Execution kill-switch** — triple-gate OR logic: env `AGT_EXECUTION_ENABLED` (default OFF) + `_HALTED` in-process + `execution_state` DB row. All 3 `placeOrder` sites wrapped with `assert_execution_enabled()`. AST guard test enforces. `/halt` persists to DB (survives restart). `/resume CONFIRM` clears.
@@ -475,6 +523,10 @@ Fill:  trade.order.permId → pending_orders.ib_perm_id join
 60. **WARTIME whitelist** (`5d6662e`, C7.3) — `WARTIME_ALLOWED_SITES = ("dex", "v2_router", "legacy_approve")`. ADR-005 R4.1 amendment. legacy_approve added so Mode 1 CC writing can transmit during WARTIME. New CSP entries remain governed by separate WARTIME/AMBER blocks elsewhere. `test_adr007_legacy_approve_allowed_in_all_modes` parametrized across PEACETIME/AMBER/WARTIME.
 61. **`boot_desk.bat` execution gate** — `set AGT_EXECUTION_ENABLED=true` added before `python telegram_bot.py`. Process-scoped env var. Does NOT persist to System Properties — only affects the bot launched by this BAT file.
 62. **FOLLOWUP-001** — `TestV2ChainWalkers` class in `tests/test_v2_state_router.py` is testing `_walk_mode1_chain` (Mode 1 entry logic), not V2 Router rolling logic. Architectural coupling artifact from V2 Router sprint. Relocate to `tests/test_walk_mode1_chain.py` post-go-live.
+63. **`_offload_fill_handler` done-callback** (sprint-1.7, `b5c04a3`) — `_log_future_exception` callback attached to every executor Future via `add_done_callback`. Reads `future.exception()` in its own try/except (handles `CancelledError`). Logs at ERROR level with `sync_handler.__name__` for per-handler attribution. Callback is defined inside `_offload_fill_handler` (closes over `sync_handler`). 6 handlers wrapped: `_on_cc_fill`, `_on_csp_premium_fill`, `_on_option_close`, `_on_shares_sold`, `_on_shares_bought`, `_r5_on_exec_details`. The synchronous fallback path (`else: sync_handler(trade, fill)`) is unchanged — propagates exceptions naturally.
+64. **Scheduler timezone** (`af002ed`) — `beta_cache_refresh` and `corporate_intel_refresh` now bind `tzinfo=ET` in their `_dt_time(...)` constructors. Were firing at UTC (midnight/1am ET). All 7 daily/monthly jobs now correctly reference ET. The 4 repeating jobs (attested_poller, attested_sweeper, el_snapshot_writer, staged_alert_flush) use interval-in-seconds, timezone irrelevant.
+65. **Walker integrity** (audited Dispatch 21, 2026-04-13) — 0 walker warnings, 0 NULL critical columns in master_log_trades, 0 duplicate transaction_ids, perfect STK share match across walker / Flex open_positions / IBKR live reqPositions. 14 active cycles (8 Yash + 6 Vikram). Excluded from walker: TRAW.CVR (contingent value right), IBKR fractional ESPP (5.52 shares).
+66. **Flex sync** (recovered Dispatch 19, sync_id=6, 2026-04-13 23:12) — 1480 rows inserted across 10 master_log tables. NAV/positions current as of April 10. Trade gap April 7–13 confirmed non-issue (no trades occurred). `flex_sync_eod` fires at 17:00 ET Mon-Fri; April 9 failed (DNS), April 10–12 missed (bot not running at fire time). Sunday April 13 automated run returned 0 rows (Flex not yet published); manual re-run at 23:12 succeeded.
 
 ---
 
@@ -510,22 +562,18 @@ Always stop and report (do NOT auto-fix) on:
 
 1. Read this file end-to-end.
 2. Read `desk_state.md` at `C:\AGT_Telegram_Bridge\desk_state.md`.
-3. Run `git log --oneline -12` to confirm HEAD matches expected state. Expected top-of-tree (2026-04-11):
+3. Run `git log --oneline -12` to confirm HEAD matches expected state. Expected top-of-tree (2026-04-14):
    ```
-   b5885e4  screener C6.1: widen Phase 5 strike band ...        (origin/main)
-   040c939  screener C6:   Phase 6 (RAY filter - terminal)
-   9425b29  screener C5:   Phase 5 (IBKR option chain walker)
-   329d16f  screener C4:   Phase 4 (IVR + corporate calendar)
-   6f9744a  screener C3.7: Phase 3 semantic fixes
-   b1404df  screener C3.6: structural exclusions
-   570ce02  screener C3.5: correlation-fit portfolio gate
-   56487aa  screener C3:   fundamentals
-   0092b35  screener C2.1: cache instrumentation
-   81af518  screener C2:   Phase 1 + Phase 2
-   9e223f2  screener C1:   scaffolding
-   3bb8c81  followups #9 #10 #11
-   b874d81  ADR-006 ACB pipeline hardening
-   729c5ba  ADR-005 V2 router WARTIME whitelist + BAG + BTC cash-paid
+   af002ed  fix(scheduler): bind beta_cache_refresh and corporate_intel_refresh to ET timezone
+   b5c04a3  fix(fill_handler): capture executor-thread exceptions via done-callback (sprint-1.7)
+   cc6f5a2  fix(fill_handler): add ib_order_id fallback to inception_delta lookup (sprint-1.6)
+   f46af86  fix(ib_chains): wrap modelGreeks.delta in abs() for inception tracking (sprint-1.5)
+   932bb7f  docs: refresh HANDOFF_CODER_latest for unified roll evaluator sprint-1
+   3834a5b  tools(verify): inception_delta sprint-1.4 verification harness
+   23993cf  feat(fill_handler): thread inception_delta from pending_orders payload to fill_log
+   5cc91bc  feat(staging): persist inception_delta in pending_orders payload at CC stage time
+   542f277  feat(schema): add fill_log.inception_delta for roll engine inception tracking
+   4932984  docs(architecture): DeepThink roll engine review 2026-04-13
    ```
 4. Wait for Architect prompt. Do not start work autonomously.
 
