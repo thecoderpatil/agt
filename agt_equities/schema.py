@@ -747,9 +747,14 @@ def register_operational_tables(conn) -> None:
         CREATE TABLE IF NOT EXISTS fill_log (
             exec_id TEXT PRIMARY KEY, ticker TEXT NOT NULL, action TEXT NOT NULL,
             quantity REAL, price REAL, premium_delta REAL, account_id TEXT,
-            household_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            household_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            inception_delta REAL
         )
     """)
+
+    fl_cols = {row["name"] for row in conn.execute("PRAGMA table_info(fill_log)").fetchall()}
+    if "inception_delta" not in fl_cols:
+        conn.execute("ALTER TABLE fill_log ADD COLUMN inception_delta REAL")
 
     cc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(cc_cycle_log)").fetchall()}
     if "flag" not in cc_cols:
