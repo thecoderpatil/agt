@@ -10452,7 +10452,7 @@ def main() -> None:
         from datetime import time as _dt_time
         jq.run_daily(
             callback=_beta_cache_refresh_job,
-            time=_dt_time(4, 0),
+            time=_dt_time(4, 0, tzinfo=ET),
             name="beta_cache_refresh",
         )
         logger.info("Scheduled: beta_cache_refresh daily at 04:00")
@@ -10490,7 +10490,7 @@ def main() -> None:
 
         jq.run_daily(
             callback=_corporate_intel_refresh_job,
-            time=_dt_time(5, 0),
+            time=_dt_time(5, 0, tzinfo=ET),
             name="corporate_intel_refresh",
         )
         logger.info("Scheduled: corporate_intel_refresh daily at 05:00")
