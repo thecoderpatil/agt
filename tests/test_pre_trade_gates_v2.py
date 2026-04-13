@@ -6,7 +6,7 @@ Covers _pre_trade_gates in telegram_bot.py.
 
 Test matrix (8 core + 4 fail-closed regressions):
   1. v2_router + WARTIME               → allowed
-  2. legacy_approve + WARTIME          → blocked (regression canary)
+  2. legacy_approve + ALL modes         → allowed (ADR-007, was blocked per ADR-005)
   3. BAG under $25k notional           → allowed
   4. BAG over $25k notional            → blocked
   5. OPT BUY high strike low premium   → allowed (cash-paid semantics)
@@ -114,14 +114,30 @@ def test_1_v2_router_wartime_allowed(wartime):
     assert allowed, f"v2_router should be WARTIME-allowed; got: {reason}"
 
 
-def test_2_legacy_approve_wartime_blocked(wartime):
-    """legacy_approve must remain WARTIME-blocked (regression canary)."""
+@pytest.mark.parametrize("mode", ["PEACETIME", "AMBER", "WARTIME"])
+def test_adr007_legacy_approve_allowed_in_all_modes(mode, monkeypatch):
+    """ADR-007 (2026-04-13): Mode-based gating suspended for legacy_approve.
+
+    legacy_approve is allowed to transmit in PEACETIME, AMBER, and WARTIME.
+    The previous regression canary (test_2_legacy_approve_wartime_blocked)
+    protected the original ADR-005 contract that locked legacy_approve out
+    of WARTIME. ADR-007 supersedes that contract because the wartime lockout
+    created a deadlock: the desk could not generate the income needed to exit
+    WARTIME without writing Mode 1 CCs via legacy_approve.
+
+    Re-enabling the wartime gate is logged as the ADR-007 sunset criterion.
+    When the desk has been in PEACETIME for 10+ consecutive trading days
+    based on natural leverage, re-introduce the gate via a new ADR.
+    """
+    monkeypatch.setattr("telegram_bot._HALTED", False)
+    monkeypatch.setattr("telegram_bot._get_current_desk_mode", lambda: mode)
     contract = make_contract(secType="OPT", strike=100.0)
     order = make_order(action="SELL", totalQuantity=1, lmtPrice=2.0)
     allowed, reason = _run_gate(order, contract, make_context(site="legacy_approve"))
-    assert not allowed
-    assert "WARTIME" in reason
-    assert "legacy_approve" in reason
+    assert allowed, (
+        f"legacy_approve should be allowed in {mode} per ADR-007 — "
+        f"got blocked with reason: {reason}"
+    )
 
 
 def test_3_bag_under_ceiling_allowed(peacetime):

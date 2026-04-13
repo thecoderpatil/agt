@@ -27,17 +27,6 @@ class TestModeGate(unittest.TestCase):
     """Gate 1: WARTIME blocks non-DEX sites."""
 
     @patch("telegram_bot._get_current_desk_mode", return_value="WARTIME")
-    def test_wartime_blocks_legacy_approve(self, _mock):
-        from telegram_bot import _pre_trade_gates
-        ok, reason = _run(_pre_trade_gates(
-            _mock_order(), _mock_contract(),
-            {"site": "legacy_approve", "audit_id": None, "household": "Yash_Household"},
-        ))
-        self.assertFalse(ok)
-        self.assertIn("WARTIME", reason)
-        self.assertIn("legacy_approve", reason)
-
-    @patch("telegram_bot._get_current_desk_mode", return_value="WARTIME")
     def test_wartime_blocks_orders_match_mid(self, _mock):
         from telegram_bot import _pre_trade_gates
         ok, reason = _run(_pre_trade_gates(

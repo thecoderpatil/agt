@@ -6196,7 +6196,7 @@ async def _pre_trade_gates(
 
         # Gate 1: Mode gate — WARTIME whitelist (ADR-005 R4)
         mode = _get_current_desk_mode()
-        WARTIME_ALLOWED_SITES = ("dex", "v2_router")
+        WARTIME_ALLOWED_SITES = ("dex", "v2_router", "legacy_approve")
         if mode == "WARTIME" and site not in WARTIME_ALLOWED_SITES:
             return (False, f"WARTIME blocks {site}; allowed: {WARTIME_ALLOWED_SITES}")
 
