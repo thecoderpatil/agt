@@ -1,9 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
 **Last updated:** 2026-04-13
-**Status:** Sprint 1 (A-F) + Cleanup A + Sprints B/C/D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix + P3.2-alt Day 2 findings + V2 Smart Yield Walk-Down + Defensive Roll Engine + adaptive roll execution + ADR-005 V2 Router WARTIME whitelist/BAG/BTC cash-paid notional + ADR-006 ACB pipeline hardening + Followups #9/#10/#11 doc + Act 60 Fortress CSP Screener C1→C6.1 + **C6.2 NaN-safe coercion in ib_chains** + **C7.1 per-expiry strike validation** + **C7.2 Mode 1 strike range widening** + **C7.3 WARTIME whitelist legacy_approve + ADR-005 R4.1 amendment** — all COMPLETE.
-**Tests:** 929/935 passing, 5 skipped, 1 pre-existing failure (R7 earnings). Runtime: ~42s. (baseline 859 → 929 = +70 tests across C6.2 + M1-M2 + C7.1-C7.3.)
-**Next:** C7.4 — V2 Router HARVEST classifier: kill RAY arm, pure 85% pnl rule only. C7.5 — earnings-window guard in `_walk_mode1_chain`. Both on hold pending Architect review of DeepThink response.
+**Status:** Sprint 1 (A-F) + Cleanup A + Sprints B/C/D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix + P3.2-alt Day 2 findings + V2 Smart Yield Walk-Down + Defensive Roll Engine + adaptive roll execution + ADR-005 V2 Router WARTIME whitelist/BAG/BTC cash-paid notional + ADR-006 ACB pipeline hardening + Followups #9/#10/#11 doc + Act 60 Fortress CSP Screener C1→C6.1 + C6.2-C7.3 + **Unified Roll Evaluator Sprint-1 (inception_delta pipeline) — sprint-1.1 through 1.4** — all COMPLETE.
+**Tests:** 958/964 passing, 5 skipped, 1 pre-existing failure (R7 earnings). Runtime: ~50s. (baseline 929 → 958 = +29 tests across sprint-1.1 through 1.3.)
+**Next:** C7.4 — V2 Router HARVEST classifier (on hold pending DeepThink review). C7.5 — earnings-window guard (on hold). **Sprint-2** of unified roll evaluator: `roll_engine.py` module decoupling with `PortfolioContext`.
 
 ---
 
@@ -74,7 +74,8 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
   - `vol_event_armor.py` — Phase 4 (live IBKR reqHistoricalData IVR Option D + YFinanceCorporateIntelligenceProvider earnings/ex-div/corp-action gates)
   - `chain_walker.py` — Phase 5 (ib_chains-routed option chain walk with interval-based strike floor, C6.1 fix)
   - `ray_filter.py` — Phase 6 (sync terminal RAY band filter, NaN-safe)
-- `agt_equities/ib_chains.py` — low-level IBKR chain API (get_expirations, get_chain_for_expiry) — ONLY Phase 4/5 consumers are allowed to import ib_async
+- `agt_equities/ib_chains.py` — low-level IBKR chain API (get_expirations, get_chain_for_expiry) + `_build_chain_rows` with delta extraction (sprint-1.2) — ONLY Phase 4/5 consumers are allowed to import ib_async
+- `scripts/verify_inception_delta.py` — Sprint-1.4 read-only verification harness for inception_delta pipeline
 - `scripts/probe_ibkr_historical_iv.py` — throwaway diagnostic that confirmed Option D IVR subscription viability on 2026-04-11 (AAPL 249 bars, MSFT 250 IVR 95.7%, SPY 250 IVR 23.8%)
 
 ---
@@ -126,9 +127,10 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 
 ## Current State
 
-- **Tests:** 929/935 passing, 5 skipped, 1 pre-existing failure (R7 earnings `test_fail_closed_no_data`) on `python -m pytest -q tests` (~42s runtime)
+- **Tests:** 958/964 passing, 5 skipped, 1 pre-existing failure (R7 earnings `test_fail_closed_no_data`) on `python -m pytest -q tests/` (~50s runtime)
   - Full screener slice: 198/198 passing across 9 test files (isolation 3 + finnhub 17 + phase1 24 + phase2 18 + phase3 33 + correlation 22 + phase4 32 + phase5 29 + phase6 20)
-  - ib_chains slice: 14/14 passing (C6.2 NaN-safe helpers + C7.1 canonical strike validation)
+  - ib_chains slice: 18/18 passing (C6.2 NaN-safe helpers + C7.1 canonical strike validation + sprint-1.2 delta extraction)
+  - inception_delta slice: 5 schema tests (`test_fill_log_schema.py`) + 6 staging tests (`test_inception_delta_staging.py`) + 14 fill tests (`test_inception_delta_fill.py`) = 25 new tests
   - AST guard at `tests/test_screener_isolation.py` enforces: no screener file imports telegram_bot, V2 router, walker, trade_repo, rule_engine, mode_engine, or `_pre_trade_gates`. `ib_async` is whitelisted ONLY for `chain_walker.py` and `vol_event_armor.py`.
 - **Mode:** PEACETIME
 - **Production DB:** CLEAN, backed up as `agt_desk.db.p3.2alt.bak`. mode_transitions seeded with 3 OVERWEIGHT rows (2026-04-01 backdate) for watchdog live test.
@@ -321,13 +323,46 @@ Expected output shape: 5-30 `RAYCandidate` entries drawn from 2 nearest Friday e
 | `5d6662e` | **C7.3: WARTIME whitelist + ADR-005 R4.1 amendment.** Added `legacy_approve` to `WARTIME_ALLOWED_SITES` tuple in `_pre_trade_gates`. Mode 1 CC writing via `/approve` now transmits in WARTIME. Deleted 2 regression canaries asserting old blocked behavior, added 1 parametrized `test_adr007_legacy_approve_allowed_in_all_modes` (PEACETIME/AMBER/WARTIME). ADR-005 R4.1 amendment inline. ADR-005 tracked in git for the first time. | +1 (net) |
 | (config) | `boot_desk.bat`: added `set AGT_EXECUTION_ENABLED=true` + echo before `python telegram_bot.py`. Enables execution gate in bot's process scope. | — |
 
+## Completed Work — Unified Roll Evaluator Sprint-1 (inception_delta pipeline)
+
+Architecture document: `architecture/roll_engine_review_2026-04-13_deepthink.md` (commit `4932984`). DT review of V2 Router STATE_3 defensive roll path. Mandates single unified evaluator with constraint matrix, inception-delta-relative triggers, BAG-only atomic rolls, state-based cooldowns, and `roll_engine.py` decoupling with `PortfolioContext`.
+
+| Sprint | Commit | What | Tests |
+|--------|--------|------|-------|
+| 1.1 | `542f277` | **Schema:** `fill_log.inception_delta REAL` nullable column. CREATE TABLE updated for fresh DBs + idempotent ALTER TABLE migration for existing DBs. | +5 |
+| 1.2 | `5cc91bc` | **Staging:** `_build_chain_rows` (ib_chains.py) now extracts `modelGreeks.delta` into row dict as `"delta"` key (None-safe). `_walk_mode1_chain` and `_walk_harvest_chain` return dicts include `"inception_delta"` (renamed at staging boundary). Auto-propagates into `pending_orders.payload` JSON via `{**ticket, **result}` merge. | +10 |
+| 1.3 | `23993cf` | **Fill handler:** `_lookup_inception_delta_from_payload` helper extracts `inception_delta` from `pending_orders.payload` via permId join (mirrors `_r5_on_exec_details:1884-1893` canonical pattern). `_on_cc_fill` calls helper, passes value to `_apply_fill_atomically` as new `inception_delta` kwarg (default `None` for backward compat). `fill_log` INSERT writes 9th column. Defensive at every layer — fill never blocked by extraction failure. | +14 |
+| 1.4 | `3834a5b` | **Verification harness:** `scripts/verify_inception_delta.py` — standalone read-only script. Checks 5 conditions on latest CC fill: real fill, non-NULL, in [0.15, 0.40], payload match, cc_cycle_log match. Supports `--tail` follow mode and `--exec-id` targeting. | 0 (script only) |
+
+**Data flow (end-to-end):**
+```
+Stage: ib.reqMktData → ticker_data.modelGreeks.delta
+         → _build_chain_rows row["delta"]
+           → _walk_mode1_chain result["inception_delta"]
+             → {**ticket, **result} → pending_orders.payload JSON
+
+Fill:  trade.order.permId → pending_orders.ib_perm_id join
+         → payload["inception_delta"] → _apply_fill_atomically
+           → fill_log.inception_delta column
+```
+
+**Key files touched:**
+- `agt_equities/ib_chains.py` — `_build_chain_rows` delta extraction
+- `agt_equities/schema.py` — fill_log column + migration
+- `telegram_bot.py` — `_lookup_inception_delta_from_payload`, `_on_cc_fill`, `_apply_fill_atomically`
+- `scripts/verify_inception_delta.py` — verification harness
+
 ---
 
 ## In Flight
 
+**Unified Roll Evaluator Sprint-2** — `roll_engine.py` module decoupling with `PortfolioContext`. Awaiting Architect dispatch. Per DT review: single unified evaluator with constraint matrix, NOT two-engine split.
+
 **C7.4 — V2 Router HARVEST classifier** — kill `ray < 0.10` OR arm in `_scan_and_stage_defensive_rolls`. The RAY heuristic wrongly harvests 60% profit positions because deep OTM near-expiration calls naturally have low RAY. Pure `pnl_pct >= 0.85` rule only. On hold pending Architect review of DeepThink response.
 
 **C7.5 — Earnings-window guard in `_walk_mode1_chain`** — check corporate intel earnings date before staging Mode 1 CCs. Skip strikes < 15% OTM when earnings falls in DTE window; flag strikes >= 15% OTM with `through_earnings=True` for operator warning. On hold pending Architect review of DeepThink response.
+
+**Sprint-1.4 live verification pending** — Next real `/cc` fill should populate `fill_log.inception_delta`. Run `python scripts/verify_inception_delta.py` to confirm all 5 conditions pass.
 
 **P3.2-alt Read-Only Live** — Day 2 findings + V2 execution engine shipped. Kill-switch now enabled via `boot_desk.bat` (`AGT_EXECUTION_ENABLED=true`).
 - Protocol: `protocols/P3_2alt_read_only_live_protocol.md`
@@ -404,6 +439,7 @@ Expected output shape: 5-30 `RAYCandidate` entries drawn from 2 nearest Friday e
 25. **DeskSnapshot** (Sprint C1) — `build_state()` returns frozen `DeskSnapshot` (NAV, cycles, betas, DEX encumbrance, optional live_positions). IB-free, pure DB read path. `build_top_strip` is the first consumer (Sprint C2).
 26. **config.py centralized** (Sprint C pre-step + D) — HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, MARGIN_ELIGIBLE_ACCOUNTS, MARGIN_ACCOUNTS, PAPER_MODE all canonical in `agt_equities/config.py`. Paper-aware. All consumers import from config.
 27. **Rule 6 dynamic** (Sprint D) — Vikram account derived from `MARGIN_ELIGIBLE_ACCOUNTS["Vikram_Household"][0]`, not hardcoded. Returns GREEN if config empty.
+28. **inception_delta pipeline** (Roll Evaluator Sprint-1) — `fill_log.inception_delta` populated at CC fill time via permId join to `pending_orders.payload`. Only `_on_cc_fill` passes it; CSP/BTC callers write NULL (default kwarg). Pre-sprint-1.2 rows have NULL inception_delta. Mode is `str` constants (`"PEACETIME"`, `"AMBER"`, `"WARTIME"`), NOT enums — defined in `mode_engine.py:19-21`.
 28. **Underwater Positions** (G2) — present on BOTH command_deck and cure_console. Grouped by household, dedicated CC column, ▼ sort indicator. Shared `_build_underwater_rows()` helper.
 29. **Breathe animation** (G7) — `.breathe` class on `<header>`, cascades to `.num` children. `:not(.animate-pulse)` excludes WARTIME badges. Hover pauses, reduced-motion disables.
 30. **Execution kill-switch** — triple-gate OR logic: env `AGT_EXECUTION_ENABLED` (default OFF) + `_HALTED` in-process + `execution_state` DB row. All 3 `placeOrder` sites wrapped with `assert_execution_enabled()`. AST guard test enforces. `/halt` persists to DB (survives restart). `/resume CONFIRM` clears.
