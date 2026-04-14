@@ -46,8 +46,15 @@ DB_PATH = _BASE_DIR / "agt_desk.db"
 _BUSY_TIMEOUT_MS = 15000
 
 
-def get_db_connection() -> sqlite3.Connection:
+def get_db_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     """Open a read-write connection to agt_desk.db.
+
+    Args:
+        db_path: optional explicit path for tests/scripts. Default None
+            routes to the module-level DB_PATH (production). Banked in
+            FU-A-04 to enable test fixture DB injection without
+            monkeypatching the module attribute. See HANDOFF_ARCHITECT_v23
+            and DT ruling Q1 from 2026-04-14.
 
     Returns:
         sqlite3.Connection with row_factory=Row and busy_timeout set.
@@ -56,13 +63,14 @@ def get_db_connection() -> sqlite3.Connection:
     is closed. Write transactions must use tx_immediate(conn) — never
     rely on Python sqlite3's implicit DEFERRED 'with conn:' behavior.
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    target_path = db_path if db_path is not None else DB_PATH
+    conn = sqlite3.connect(str(target_path), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
     return conn
 
 
-def get_ro_connection() -> sqlite3.Connection:
+def get_ro_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     """Open a read-only connection to agt_desk.db.
 
     Used by the Cure Console FastAPI process for top-strip reads where
@@ -70,11 +78,19 @@ def get_ro_connection() -> sqlite3.Connection:
     read-only at the SQLite level — any attempted write raises
     sqlite3.OperationalError.
 
+    Args:
+        db_path: optional explicit path for tests/scripts. Default None
+            routes to the module-level DB_PATH (production). Banked in
+            FU-A-04 to enable test fixture DB injection without
+            monkeypatching the module attribute. See HANDOFF_ARCHITECT_v23
+            and DT ruling Q1 from 2026-04-14.
+
     Returns:
         sqlite3.Connection with row_factory=Row, query_only=ON, and
         busy_timeout set.
     """
-    uri = f"file:{DB_PATH}?mode=ro"
+    target_path = db_path if db_path is not None else DB_PATH
+    uri = f"file:{target_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON;")

@@ -1064,7 +1064,6 @@ async def _check_rule_11_leverage(household: str) -> tuple[bool, str]:
     try:
         from agt_equities.risk import gross_beta_leverage, LEVERAGE_LIMIT
         from agt_equities import trade_repo
-        trade_repo.DB_PATH = DB_PATH
         cycles = trade_repo.get_active_cycles()
 
         # Get spots and betas
@@ -1680,7 +1679,6 @@ def _load_premium_ledger_snapshot(
     if READ_FROM_MASTER_LOG:
         try:
             from agt_equities import trade_repo
-            trade_repo.DB_PATH = DB_PATH
             cycles = trade_repo.get_active_cycles_with_intraday_delta(
                 household=household_id, ticker=ticker.upper()
             )
@@ -7804,7 +7802,6 @@ async def _discover_positions(
     if READ_FROM_MASTER_LOG:
         try:
             from agt_equities import trade_repo
-            trade_repo.DB_PATH = DB_PATH
             for c in trade_repo.get_active_cycles():
                 if c.cycle_type != 'WHEEL':
                     continue
@@ -10024,7 +10021,6 @@ async def _pin_mode_on_startup(ib_conn=None) -> str | None:
         except Exception as exc:
             logger.warning("Cold-start wartime pin: accountSummary failed: %s", exc)
 
-        trade_repo.DB_PATH = DB_PATH
         snapshot = build_state(
             db_path=str(DB_PATH),
             live_nlv=live_nlv or None,
@@ -10442,7 +10438,6 @@ def main() -> None:
                 try:
                     from agt_equities import trade_repo
                     from pathlib import Path
-                    trade_repo.DB_PATH = str(Path(__file__).resolve().parent / "agt_desk.db")
                     cycles = trade_repo.get_active_cycles()
                     tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE'})
                 except Exception:
@@ -10475,7 +10470,6 @@ def main() -> None:
                 try:
                     from agt_equities import trade_repo
                     from pathlib import Path as _P
-                    trade_repo.DB_PATH = str(_P(__file__).resolve().parent / "agt_desk.db")
                     cycles = trade_repo.get_active_cycles()
                     tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE'})
                 except Exception:

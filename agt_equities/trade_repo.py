@@ -20,8 +20,6 @@ from .walker import Cycle, TradeEvent, walk_cycles, UnknownEventError
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
-
 # Tickers excluded from Walker (index options, not wheel candidates)
 EXCLUDED_TICKERS = frozenset({'SPX', 'VIX', 'NDX', 'RUT', 'XSP'})
 

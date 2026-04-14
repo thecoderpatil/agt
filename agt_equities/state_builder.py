@@ -239,7 +239,9 @@ def build_state(
     change yet.
 
     Args:
-        db_path: path to SQLite DB. Defaults to trade_repo.DB_PATH.
+        db_path: path to SQLite DB. Defaults to agt_equities.db.DB_PATH
+            (the canonical shared module constant). FU-A-03a migrated the
+            default away from the now-deleted trade_repo.DB_PATH.
         live_positions: optional pre-fetched IB snapshot. Caller
             (telegram_bot) fetches from IB and passes in. When None,
             DeskSnapshot.live_positions is an empty list and a warning
@@ -256,9 +258,10 @@ def build_state(
     from agt_equities import trade_repo  # deferred to avoid circular at import time
 
     if db_path is None:
-        # FU-A-03a: source from canonical shared module instead of
-        # trade_repo.DB_PATH. trade_repo.DB_PATH is deleted in FU-A-04;
-        # agt_equities.db.DB_PATH is the surviving SSOT.
+        # FU-A-03a + FU-A-04: default routes through the canonical
+        # shared module agt_equities.db.DB_PATH. The legacy
+        # trade_repo.DB_PATH module attribute was deleted in FU-A-04
+        # Phase E; this line is the post-sprint SSOT.
         from agt_equities.db import DB_PATH as _DEFAULT_DB_PATH
         db_path = str(_DEFAULT_DB_PATH)
 
