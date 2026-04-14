@@ -126,3 +126,108 @@ def test_a5a_attested_sweeper_trigger_interval_60s():
     assert interval.total_seconds() == 60, (
         f"attested_sweeper interval expected 60s, got {interval.total_seconds()}"
     )
+
+
+
+def _get_orphan_sweep_callable(monkeypatch):
+    """Build a scheduler + register_jobs, return the orphan_sweep job's
+    callable. Monkeypatching on agt_equities.health.sweep_orphan_staged_orders
+    *before* register_jobs runs lets us intercept the call from inside the
+    closure (register_jobs does the import locally)."""
+    import agt_scheduler
+    from agt_equities.ib_conn import IBConnector, IBConnConfig
+    sched = agt_scheduler.build_scheduler()
+    conn = IBConnector(config=IBConnConfig(client_id=2))
+    agt_scheduler.register_jobs(sched, conn)
+    job = sched.get_job("orphan_sweep")
+    assert job is not None, "orphan_sweep not registered"
+    return job.func
+
+
+def test_a5c_orphan_sweep_enqueues_alert_when_swept(monkeypatch):
+    """A5c: orphan_sweep callback enqueues an ORPHAN_SWEEP warn alert via the
+    cross_daemon_alerts bus when the sweep returns swept_count > 0."""
+    captured: list[dict] = []
+
+    def fake_sweep(*, ttl_hours, **_kw):  # noqa: ARG001 — signature-compatible
+        return 7
+
+    def fake_enqueue(kind, payload, *, severity="info", db_path=None):
+        captured.append(
+            {"kind": kind, "payload": payload, "severity": severity, "db_path": db_path}
+        )
+        return 1
+
+    # Patch BEFORE register_jobs runs so the closure captures the fake.
+    monkeypatch.setattr(
+        "agt_equities.health.sweep_orphan_staged_orders", fake_sweep
+    )
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+    job_callable = _get_orphan_sweep_callable(monkeypatch)
+    job_callable()
+
+    assert len(captured) == 1, f"expected exactly 1 alert, got {captured}"
+    rec = captured[0]
+    assert rec["kind"] == "ORPHAN_SWEEP"
+    assert rec["severity"] == "warn"
+    assert rec["payload"]["swept_count"] == 7
+    assert rec["payload"]["ttl_hours"] > 0
+
+
+def test_a5c_orphan_sweep_silent_when_zero_swept(monkeypatch):
+    """A5c: zero-swept runs must not enqueue an alert (no spam)."""
+    captured: list[dict] = []
+
+    monkeypatch.setattr(
+        "agt_equities.health.sweep_orphan_staged_orders",
+        lambda *, ttl_hours, **_kw: 0,
+    )
+    monkeypatch.setattr(
+        "agt_equities.alerts.enqueue_alert",
+        lambda *a, **kw: captured.append((a, kw)),
+    )
+
+    job_callable = _get_orphan_sweep_callable(monkeypatch)
+    job_callable()
+
+    assert captured == [], f"expected no alerts on zero-swept, got {captured}"
+
+
+def test_a5c_orphan_sweep_swallows_alert_failures(monkeypatch):
+    """A5c: an exception inside enqueue_alert must NOT propagate out of the
+    job callback. The sweep already committed; alert-bus issues are
+    best-effort and should be logged, not crash the scheduler."""
+    monkeypatch.setattr(
+        "agt_equities.health.sweep_orphan_staged_orders",
+        lambda *, ttl_hours, **_kw: 3,
+    )
+
+    def boom(*a, **kw):
+        raise RuntimeError("simulated alert-bus down")
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", boom)
+
+    job_callable = _get_orphan_sweep_callable(monkeypatch)
+    # Must not raise
+    job_callable()
+
+
+def test_a5c_orphan_sweep_swallows_sweep_failures(monkeypatch):
+    """A5c: if the sweep itself raises, the job must log + return without
+    attempting to enqueue an alert."""
+    captured: list = []
+
+    def boom(*, ttl_hours, **_kw):  # noqa: ARG001
+        raise RuntimeError("DB exploded")
+
+    monkeypatch.setattr("agt_equities.health.sweep_orphan_staged_orders", boom)
+    monkeypatch.setattr(
+        "agt_equities.alerts.enqueue_alert",
+        lambda *a, **kw: captured.append((a, kw)),
+    )
+
+    job_callable = _get_orphan_sweep_callable(monkeypatch)
+    job_callable()  # must not raise
+
+    assert captured == [], "must not enqueue when sweep itself failed"
