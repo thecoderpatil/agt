@@ -27,10 +27,9 @@ _STALE_DAYS = 14  # warn if beta older than this
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 15000;")
-    return conn
+    """FU-B: delegate to shared db module (get_db_connection)."""
+    from agt_equities.db import get_db_connection
+    return get_db_connection()
 
 
 def ensure_table(conn: sqlite3.Connection) -> None:

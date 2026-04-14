@@ -309,9 +309,11 @@ def main():
     print(f"DB: {DB_PATH}")
     print()
 
-    conn = sqlite3.connect(str(DB_PATH), timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 15000")
+    # FU-B: converge onto shared db module. Script is read-only per
+    # module docstring ("No mutations. No IB calls.") — query_only=ON
+    # enforces that at the SQLite level.
+    from agt_equities.db import get_ro_connection
+    conn = get_ro_connection(DB_PATH)
 
     # 1. NAV
     print("── NAV (per-account MAX(report_date)) ──")

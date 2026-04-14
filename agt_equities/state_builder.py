@@ -220,11 +220,16 @@ class DeskSnapshot:
 
 
 def _open_readonly(db_path: str) -> sqlite3.Connection:
-    """Open a read-only DB connection with Sprint B Unit 6 PRAGMA tuning."""
-    conn = sqlite3.connect(db_path, timeout=5)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 15000")
-    return conn
+    """Open a read-only DB connection via the shared db module.
+
+    FU-B: delegates to agt_equities.db.get_ro_connection, which enforces
+    readonly at the SQLite level (URI mode=ro + PRAGMA query_only=ON).
+    The old inline implementation advertised 'readonly' in the name but
+    returned a RW-capable connection — this converges onto the shared
+    module and makes the promise real.
+    """
+    from agt_equities.db import get_ro_connection
+    return get_ro_connection(db_path)
 
 
 def build_state(
