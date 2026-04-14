@@ -14,8 +14,8 @@
 #     - tests/test_flex_sync_atomic.py (A3)
 #
 # Why not the full 975 baseline yet:
-#   The full suite has 5 known pre-existing failures (4× test_margin_logic
-#   async config, 1× test_phase3a R7) that block CI green. We'll broaden
+#   The full suite has 5 known pre-existing failures (4x test_margin_logic
+#   async config, 1x test_phase3a R7) that block CI green. We'll broaden
 #   to the full baseline in a follow-up after FU-ASYNCIO-CONFIG lands.
 
 stages:
@@ -50,4 +50,6 @@ sprint_a_unit_tests:
   rules:
     - if: $CI_PIPELINE_SOURCE == "push"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "api"
+    - if: $CI_PIPELINE_SOURCE == "web"
     - if: $CI_COMMIT_BRANCH == "main"
