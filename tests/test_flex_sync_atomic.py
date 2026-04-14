@@ -59,19 +59,19 @@ def _three_synthetic_sections() -> list[dict]:
     return [
         {
             "table": "master_log_trades",
-            "rows": [{"transaction_id": "T1", "symbol": "AAPL"}],
+            "rows": [{"transaction_id": "T1", "symbol": "AAPL", "account_id": "U_TEST_1"}],
             "pk_cols": ["transaction_id"],
             "account_id": "U_TEST_1",
         },
         {
             "table": "master_log_corp_actions",
-            "rows": [{"transaction_id": "C1"}],
+            "rows": [{"transaction_id": "C1", "account_id": "U_TEST_1"}],
             "pk_cols": ["transaction_id"],
             "account_id": "U_TEST_1",
         },
         {
             "table": "master_log_transfers",
-            "rows": [{"transaction_id": "X1"}],
+            "rows": [{"transaction_id": "X1", "account_id": "U_TEST_1"}],
             "pk_cols": ["transaction_id"],
             "account_id": "U_TEST_1",
         },
