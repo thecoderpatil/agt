@@ -20,6 +20,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Sprint A / A3: single atomic transaction for run_sync.
+from agt_equities.db import tx_immediate
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -38,6 +41,9 @@ def _get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
+    # FU-A / A3: 15s busy_timeout to survive scheduler/bot contention under
+    # the new single-atomic-transaction window.
+    conn.execute("PRAGMA busy_timeout = 15000;")
     return conn
 
 
@@ -637,8 +643,8 @@ def _persist_walker_warnings(conn: sqlite3.Connection, sync_id: str) -> None:
     from agt_equities import trade_repo as _tr
     from agt_equities.walker import walk_cycles, get_walker_warnings, UnknownEventError
 
-    _tr.DB_PATH = str(conn.execute("PRAGMA database_list").fetchone()[2])
-
+    # NOTE (A3): trade_repo.DB_PATH was deleted in FU-A; this assignment is dead.
+    # Connection is passed explicitly via the loaders below.
     all_ev = _tr._load_trade_events(conn)
     ci_ev = _tr._load_carryin_events(conn)
     combined = ci_ev + all_ev
@@ -663,7 +669,7 @@ def _persist_walker_warnings(conn: sqlite3.Connection, sync_id: str) -> None:
             (sync_id, w.code, w.severity, w.ticker, w.household, w.account,
              w.message, json.dumps(w.context) if w.context else None),
         )
-    conn.commit()
+    # A3: caller (run_sync) owns the surrounding tx_immediate; do not commit here.
     logger.info("Walker warnings persisted: %d warnings for sync_id=%s", len(all_warnings), sync_id)
 
 
@@ -674,6 +680,24 @@ def _persist_walker_warnings(conn: sqlite3.Connection, sync_id: str) -> None:
 def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
     """Execute a Flex sync.
 
+    Sprint A / A3: single atomic transaction.
+        Per DT Q2 ruling (2026-04-14): the data side of a sync is one
+        ``BEGIN IMMEDIATE`` ... ``COMMIT`` block covering all section
+        upserts, the master_log_sync success update, and the walker
+        warnings persist. Per-section commits are rejected — a partial
+        section pile would corrupt the master_log invariant that any
+        sync_id present in master_log_sync with status='success' has the
+        full row set committed.
+
+        The sync_id allocation row (status='running') is its own small
+        txn at entry — this guarantees that even a hard failure of the
+        data block leaves an auditable master_log_sync row, which the
+        error path then updates to status='error' in a second small txn.
+
+        Side effects (desk_state regen, friday handoff archive, git
+        auto-push) stay outside the txn — they are wall-clock effects,
+        not DB state.
+
     Args:
         mode: INCEPTION, INCREMENTAL, or ONESHOT.
         xml_bytes: Pre-fetched XML (for testing). If None, pulls from IBKR.
@@ -681,13 +705,14 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
     now = datetime.utcnow().isoformat()
     conn = _get_db()
 
-    cursor = conn.execute(
-        "INSERT INTO master_log_sync (started_at, flex_query_id, status) "
-        "VALUES (?, ?, 'running')",
-        (now, FLEX_QUERY_ID),
-    )
-    sync_id = cursor.lastrowid
-    conn.commit()
+    # --- Audit row allocation (own small txn) ---
+    with tx_immediate(conn):
+        cursor = conn.execute(
+            "INSERT INTO master_log_sync (started_at, flex_query_id, status) "
+            "VALUES (?, ?, 'running')",
+            (now, FLEX_QUERY_ID),
+        )
+        sync_id = cursor.lastrowid
 
     result = SyncResult(sync_id=sync_id, status='running')
 
@@ -698,46 +723,50 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
         section_data = parse_flex_xml(xml_bytes)
         result.sections_processed = len(section_data)
 
-        total_rows = 0
-        total_inserted = 0
-        for sd in section_data:
-            rows = sd['rows']
-            total_rows += len(rows)
-            ins, upd = _upsert_rows(conn, sd['table'], rows, sd['pk_cols'], now)
-            total_inserted += ins
-            logger.info("  %s (%s): %d rows, %d upserted",
-                        sd['table'], sd['account_id'], len(rows), ins)
+        # --- Single atomic data txn (A3) ---
+        with tx_immediate(conn):
+            total_rows = 0
+            total_inserted = 0
+            for sd in section_data:
+                rows = sd['rows']
+                total_rows += len(rows)
+                ins, upd = _upsert_rows(conn, sd['table'], rows, sd['pk_cols'], now)
+                total_inserted += ins
+                logger.info("  %s (%s): %d rows, %d upserted",
+                            sd['table'], sd['account_id'], len(rows), ins)
 
-        conn.commit()
+            result.rows_received = total_rows
+            result.rows_inserted = total_inserted
 
-        result.rows_received = total_rows
-        result.rows_inserted = total_inserted
+            conn.execute(
+                "UPDATE master_log_sync SET finished_at=?, sections_processed=?, "
+                "rows_received=?, rows_inserted=?, rows_updated=?, status='success' "
+                "WHERE sync_id=?",
+                (datetime.utcnow().isoformat(), result.sections_processed,
+                 result.rows_received, result.rows_inserted, result.rows_updated,
+                 sync_id),
+            )
+
+            # W3.6: walker warnings inside the same txn so success+warnings are
+            # all-or-nothing. _persist_walker_warnings no longer commits.
+            try:
+                _persist_walker_warnings(conn, str(sync_id))
+            except Exception as warn_exc:
+                # Walker warning failure must NOT roll the entire sync back.
+                # Log + swallow so the success commit stands.
+                logger.error("Walker warnings persist failed (non-fatal): %s", warn_exc)
+
+        # If we got here, the atomic txn committed.
         result.status = 'success'
 
-        conn.execute(
-            "UPDATE master_log_sync SET finished_at=?, sections_processed=?, "
-            "rows_received=?, rows_inserted=?, rows_updated=?, status='success' "
-            "WHERE sync_id=?",
-            (datetime.utcnow().isoformat(), result.sections_processed,
-             result.rows_received, result.rows_inserted, result.rows_updated,
-             sync_id),
-        )
-        conn.commit()
-
-        # W3.6: Post-sync walker warnings pass — persist to walker_warnings_log
-        try:
-            _persist_walker_warnings(conn, str(sync_id))
-        except Exception as warn_exc:
-            logger.error("Walker warnings persist failed (non-fatal): %s", warn_exc)
-
+        # --- Side effects (outside DB txn) ---
         # Phase 3A: Regenerate desk_state.md after successful sync
         try:
             from agt_deck.desk_state_writer import write_desk_state_atomic, generate_desk_state
             from agt_equities.mode_engine import get_current_mode
-            # Minimal desk_state with available data — full version runs on 5-min scheduler
-            mode = get_current_mode(conn)
+            mode_now = get_current_mode(conn)
             content = generate_desk_state(
-                mode=mode, household_data={}, rule_evaluations=[],
+                mode=mode_now, household_data={}, rule_evaluations=[],
                 glide_paths=[], walker_warning_count=0,
                 walker_worst_severity=None, recent_transitions=[],
                 report_date=datetime.utcnow().strftime("%Y-%m-%d"),
@@ -779,12 +808,16 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
         result.status = 'error'
         result.error_message = str(exc)
         logger.exception("Flex sync failed: %s", exc)
-        conn.execute(
-            "UPDATE master_log_sync SET finished_at=?, status='error', error_message=? "
-            "WHERE sync_id=?",
-            (datetime.utcnow().isoformat(), str(exc), sync_id),
-        )
-        conn.commit()
+        # --- Error audit (own small txn so it survives data rollback) ---
+        try:
+            with tx_immediate(conn):
+                conn.execute(
+                    "UPDATE master_log_sync SET finished_at=?, status='error', error_message=? "
+                    "WHERE sync_id=?",
+                    (datetime.utcnow().isoformat(), str(exc), sync_id),
+                )
+        except Exception as audit_exc:
+            logger.exception("master_log_sync error-audit write failed: %s", audit_exc)
 
     finally:
         conn.close()

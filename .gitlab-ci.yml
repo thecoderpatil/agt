@@ -1,0 +1,53 @@
+# GitLab CI for AGT Equities — Decoupling Sprint A targeted runner.
+#
+# Why this exists:
+#   The Linux sandbox we use for Cowork Architect work has Windows-mount
+#   permission quirks (chmod 700 .pyc files we can't unlink, intermittent
+#   .git/*.lock issues). Running pytest in a clean container sidesteps the
+#   whole class of issue and gives us reproducible green/red signal.
+#
+# Scope today (A3):
+#   Targeted run of the Sprint A unit tests only:
+#     - tests/test_ib_conn.py        (A1)
+#     - tests/test_agt_scheduler.py  (A1, A2)
+#     - tests/test_health.py         (A2)
+#     - tests/test_flex_sync_atomic.py (A3)
+#
+# Why not the full 975 baseline yet:
+#   The full suite has 5 known pre-existing failures (4× test_margin_logic
+#   async config, 1× test_phase3a R7) that block CI green. We'll broaden
+#   to the full baseline in a follow-up after FU-ASYNCIO-CONFIG lands.
+
+stages:
+  - test
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+
+.python_setup: &python_setup
+  image: python:3.10-slim
+  before_script:
+    - python -V
+    - pip install --no-cache-dir
+        pytest==9.0.3
+        pytest-asyncio==1.3.0
+        hypothesis
+        apscheduler
+        pytz
+        ib_async
+
+sprint_a_unit_tests:
+  <<: *python_setup
+  stage: test
+  script:
+    - pytest -v --tb=short
+        tests/test_ib_conn.py
+        tests/test_agt_scheduler.py
+        tests/test_health.py
+        tests/test_flex_sync_atomic.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
