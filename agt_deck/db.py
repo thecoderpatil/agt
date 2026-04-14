@@ -1,29 +1,16 @@
-"""Read-only SQLite connection for the Command Deck."""
-from __future__ import annotations
+"""
+agt_deck/db.py — backward-compat shim.
 
-import logging
-import sqlite3
-from pathlib import Path
+The canonical connection module is now agt_equities/db.py. This shim
+preserves the get_ro_conn / get_rw_conn names used by existing callers
+in the Cure Console FastAPI process. New code should import directly
+from agt_equities.db.
 
-logger = logging.getLogger(__name__)
+This shim will be removed once all agt_deck/* callers have migrated
+to the new names.
+"""
 
-DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
-
-
-def get_ro_conn() -> sqlite3.Connection:
-    """Open a read-only SQLite connection with WAL mode."""
-    uri = f"file:{DB_PATH}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only = ON;")
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    return conn
-
-
-def get_rw_conn() -> sqlite3.Connection:
-    """Open a read-write SQLite connection. Caller owns commit/rollback/close."""
-    uri = f"file:{DB_PATH}"
-    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    return conn
+from agt_equities.db import (  # noqa: F401
+    get_db_connection as get_rw_conn,
+    get_ro_connection as get_ro_conn,
+)

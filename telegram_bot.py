@@ -245,11 +245,15 @@ def _parse_sqlite_utc(ts: str) -> _datetime:
 # SQLite bridge helpers
 # ---------------------------------------------------------------------------
 
-def _get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    return conn
+# Sprint A Phase C1: shared connection module from agt_equities/db.py.
+# The local name _get_db_connection is preserved as an alias to keep
+# all 75 existing call sites in this file unchanged. New code should
+# import get_db_connection directly from agt_equities.db.
+from agt_equities.db import (
+    get_db_connection as _get_db_connection,
+    tx_immediate,
+    init_pragmas,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -306,18 +310,21 @@ async def _push_mode_transition(app, old_mode: str, new_mode: str,
 
 def init_db() -> None:
     with closing(_get_db_connection()) as conn:
-        with conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=FULL;")
-            conn.execute("PRAGMA wal_autocheckpoint=4000;")
-            conn.execute("PRAGMA busy_timeout=5000;")
+        # Sprint A Phase C1: PRAGMAs must run outside any transaction.
+        # PRAGMA journal_mode=WAL specifically requires no active
+        # transaction to persist the mode change. init_pragmas()
+        # handles journal_mode, synchronous, wal_autocheckpoint.
+        # busy_timeout is set per-connection by get_db_connection().
+        init_pragmas(conn)
 
-            # Cleanup Sprint A Purge 5: operational DDL moved to schema.py
-            from agt_equities.schema import register_operational_tables
-            register_operational_tables(conn)
-            # ── Master Log Refactor v3: Bucket 2 + Bucket 3 new tables ──
-            from agt_equities.schema import register_master_log_tables
-            register_master_log_tables(conn)
+        # DDL registration. CREATE TABLE IF NOT EXISTS auto-commits
+        # in SQLite when run outside an explicit transaction.
+        # Cleanup Sprint A Purge 5: operational DDL moved to schema.py
+        from agt_equities.schema import register_operational_tables
+        register_operational_tables(conn)
+        # ── Master Log Refactor v3: Bucket 2 + Bucket 3 new tables ──
+        from agt_equities.schema import register_master_log_tables
+        register_master_log_tables(conn)
 
     _cleanup_test_orders()
     _load_todays_usage()
@@ -327,7 +334,7 @@ def _cleanup_test_orders():
     """Mark all stale staged orders as superseded on boot."""
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 result = conn.execute(
                     """
                     UPDATE pending_orders
@@ -376,7 +383,7 @@ def append_pending_tickets(tickets: list[dict]) -> None:
         ))
 
     with closing(_get_db_connection()) as conn:
-        with conn:
+        with tx_immediate(conn):
             conn.executemany(
                 """
                 INSERT INTO pending_orders (payload, status, created_at)
@@ -393,7 +400,7 @@ def _revert_pending_order_claims(order_ids: list[int]) -> int:
 
     placeholders = ",".join("?" for _ in order_ids)
     with closing(_get_db_connection()) as conn:
-        with conn:
+        with tx_immediate(conn):
             result = conn.execute(
                 f"""
                 UPDATE pending_orders
@@ -428,7 +435,7 @@ def _log_cc_cycle(entries: list[dict]) -> None:
                 e.get("flag", "NORMAL"),
             ))
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 conn.executemany(
                     """
                     INSERT INTO cc_cycle_log
@@ -490,7 +497,7 @@ def _check_and_track_tokens(input_tokens: int, output_tokens: int, model: str = 
 
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 conn.execute(
                     """
                     INSERT INTO api_usage (date, input_tokens, output_tokens, api_calls)
@@ -5313,7 +5320,7 @@ def _refresh_ticker_universe_sync() -> dict:
         updated = 0
 
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 existing = {
                     row["ticker"]
                     for row in conn.execute("SELECT ticker FROM ticker_universe").fetchall()
@@ -7046,7 +7053,7 @@ def _persist_conviction(ticker: str, conviction: dict) -> None:
     try:
         inputs = conviction.get("inputs", {})
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 conn.execute(
                     """
                     UPDATE ticker_universe
@@ -8563,7 +8570,7 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
     if all_staged:
         try:
             with closing(_get_db_connection()) as conn:
-                with conn:
+                with tx_immediate(conn):
                     conn.execute(
                         "UPDATE pending_orders SET status = 'superseded' WHERE status = 'staged'"
                     )
@@ -8729,7 +8736,7 @@ async def cmd_declare_peacetime(update: Update, context: ContextTypes.DEFAULT_TY
         from agt_equities.mode_engine import get_current_mode, log_mode_transition, MODE_PEACETIME
         memo = " ".join(context.args) if context.args else ""
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 old_mode = get_current_mode(conn)
                 if old_mode == MODE_PEACETIME:
                     await update.message.reply_text(f"Already in PEACETIME mode.")
@@ -9282,7 +9289,7 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
                 # Auto-resolve expired entries
                 if dte < 0:
                     with closing(_get_db_connection()) as conn:
-                        with conn:
+                        with tx_immediate(conn):
                             conn.execute(
                                 "UPDATE roll_watchlist SET status = 'expired', resolved_at = datetime('now') WHERE id = ?",
                                 (r["id"],),
@@ -9354,7 +9361,7 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
                         if position_pct <= DYNAMIC_EXIT_RULE1_LIMIT * 100:
                             # Position is no longer overweight — clear marker
                             with closing(_get_db_connection()) as conn:
-                                with conn:
+                                with tx_immediate(conn):
                                     conn.execute(
                                         """
                                         UPDATE mode_transitions
@@ -9651,9 +9658,7 @@ async def cmd_recover_transmitting(
 
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
-                conn.execute("BEGIN IMMEDIATE")  # D11: lock before SELECT
-
+            with tx_immediate(conn):
                 row = conn.execute(
                     "SELECT final_status FROM bucket3_dynamic_exit_log "
                     "WHERE audit_id = ?",
@@ -9757,7 +9762,7 @@ async def cmd_halt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Persist to DB (survives restart)
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 conn.execute(
                     "INSERT OR REPLACE INTO execution_state "
                     "(id, disabled, set_by, set_at, reason) "
@@ -9802,7 +9807,7 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Clear DB disable
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 conn.execute(
                     "INSERT OR REPLACE INTO execution_state "
                     "(id, disabled, set_by, set_at, reason) "
