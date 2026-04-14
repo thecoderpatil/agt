@@ -14,7 +14,7 @@ variables:
 
 compliance:ast_guard:
   stage: compliance
-  image: python:3.10-slim
+  image: python:3.12-slim
   script:
     - python scripts/ast_guard.py
   rules:
@@ -23,4 +23,5 @@ compliance:ast_guard:
     - if: $CI_COMMIT_BRANCH == "main"
 
 include:
+  - local: .gitlab-ci.yml
   - template: Security/Secret-Detection.gitlab-ci.yml
