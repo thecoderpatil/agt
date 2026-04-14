@@ -176,3 +176,69 @@ def test_table_indexed_for_drain(alerts_db: Path) -> None:
         ).fetchall()
     names = {r[0] for r in rows}
     assert "idx_cross_daemon_alerts_status_created" in names
+
+
+
+# ---------------------------------------------------------------------------
+# A5d — format_alert_text rendering tests
+# ---------------------------------------------------------------------------
+
+def test_format_orphan_sweep_alert_text() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text(
+        {
+            "id": 1,
+            "kind": "ORPHAN_SWEEP",
+            "severity": "warn",
+            "payload": {"swept_count": 7, "ttl_hours": 24.0},
+        }
+    )
+    assert "[WARN]" in text
+    assert "orphan_sweep" in text
+    assert "7" in text
+    assert "ttl=24.0h" in text
+
+
+def test_format_unknown_kind_falls_back_to_generic() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text(
+        {
+            "id": 9,
+            "kind": "FUTURE_KIND",
+            "severity": "info",
+            "payload": {"a": 1, "b": "x"},
+        }
+    )
+    assert text.startswith("[INFO] FUTURE_KIND:")
+    assert '"a": 1' in text
+    assert '"b": "x"' in text
+
+
+def test_format_handles_missing_severity() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text({"kind": "ORPHAN_SWEEP", "payload": {"swept_count": 1}})
+    assert text.startswith("[INFO]")  # default severity
+
+
+def test_format_handles_non_dict_payload() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text({"kind": "X", "severity": "crit", "payload": None})
+    assert text.startswith("[CRIT] X:")
+    assert "_raw" in text
+
+
+def test_format_handles_empty_kind() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text({"kind": "", "severity": "info", "payload": {}})
+    assert "UNKNOWN" in text
+
+
+def test_format_round_trips_drained_record(alerts_db) -> None:
+    """Make sure format_alert_text accepts the dict shape returned by
+    drain_pending_alerts() without a separate adapter."""
+    from agt_equities.alerts import format_alert_text
+    enqueue_alert("ORPHAN_SWEEP", {"swept_count": 3, "ttl_hours": 12}, severity="warn", db_path=alerts_db)
+    drained = drain_pending_alerts(db_path=alerts_db)
+    assert len(drained) == 1
+    text = format_alert_text(drained[0])
+    assert "[WARN]" in text and "orphan_sweep" in text and "3" in text

@@ -230,6 +230,39 @@ def get_alert(alert_id: int, *, db_path: str | Path | None = None) -> dict[str, 
     }
 
 
+def format_alert_text(alert: dict[str, Any]) -> str:
+    """A5d: render a drained cross_daemon_alerts row to a Telegram-ready
+    string. Pure function — kept here so the bot consumer can import it
+    without pulling Telegram-specific deps and so we can unit-test the
+    rendering in CI without booting the bot.
+
+    Renders by `kind`. Unknown kinds fall through to a generic format
+    so a producer landing in a future MR doesn't silently swallow alerts.
+    """
+    kind = (alert.get("kind") or "UNKNOWN").strip() or "UNKNOWN"
+    severity = ((alert.get("severity") or "info").strip() or "info").upper()
+    payload = alert.get("payload")
+    if not isinstance(payload, dict):
+        payload = {"_raw": payload}
+
+    if kind == "ORPHAN_SWEEP":
+        n = payload.get("swept_count", "?")
+        ttl = payload.get("ttl_hours", "?")
+        return (
+            f"[{severity}] orphan_sweep swept {n} staged pending_orders "
+            f"(ttl={ttl}h)"
+        )
+
+    # Generic fallback for unknown kinds (forward-compat for A5d.b/c/d
+    # producers landing later — they will still surface via Telegram even
+    # before this function gets a dedicated branch for their `kind`).
+    try:
+        payload_str = json.dumps(payload, default=str, sort_keys=True)
+    except Exception:
+        payload_str = repr(payload)
+    return f"[{severity}] {kind}: {payload_str}"
+
+
 __all__: Iterable[str] = (
     "MAX_ATTEMPTS",
     "enqueue_alert",
@@ -237,4 +270,5 @@ __all__: Iterable[str] = (
     "mark_alert_sent",
     "mark_alert_failed",
     "get_alert",
+    "format_alert_text",
 )
