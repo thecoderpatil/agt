@@ -5581,7 +5581,7 @@ async def handle_approve_callback(
         if action == "reject_all":
             # ── WRITE phase (no await inside) ──
             with closing(_get_db_connection()) as conn:
-                with conn:
+                with tx_immediate(conn):
                     result = conn.execute(
                         "UPDATE pending_orders SET status = 'rejected' WHERE status = 'staged'"
                     )
@@ -5609,7 +5609,7 @@ async def handle_approve_callback(
             # ── WRITE phase: CAS claim staged → processing ──
             placeholders = ",".join("?" * len(staged_ids))
             with closing(_get_db_connection()) as conn:
-                with conn:
+                with tx_immediate(conn):
                     claimed = conn.execute(
                         f"UPDATE pending_orders SET status = 'processing' "
                         f"WHERE id IN ({placeholders}) AND status = 'staged'",
@@ -5693,7 +5693,7 @@ async def handle_approve_callback(
 
         # ── WRITE phase: CAS claim single row ──
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 result = conn.execute(
                     "UPDATE pending_orders SET status = 'processing' "
                     "WHERE id = ? AND status = 'staged'",
@@ -5791,7 +5791,7 @@ def _revert_transmitting_to_cancelled(audit_id: str, reason: str) -> int:
     """
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 result = conn.execute(
                     "UPDATE bucket3_dynamic_exit_log "
                     "SET final_status = 'CANCELLED', "
@@ -5849,7 +5849,7 @@ async def handle_dex_callback(
     # ── CANCEL branch ──────────────────────────────────────────────────
     if action == "cancel":
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 result = conn.execute(
                     "UPDATE bucket3_dynamic_exit_log "
                     "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
@@ -5927,7 +5927,7 @@ async def handle_dex_callback(
     if not is_wartime and row["re_validation_count"] >= 3:
         # Transition to DRIFT_BLOCKED terminal
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 conn.execute(
                     "UPDATE bucket3_dynamic_exit_log "
                     "SET final_status = 'DRIFT_BLOCKED', last_updated = CURRENT_TIMESTAMP "
@@ -6105,7 +6105,7 @@ async def handle_dex_callback(
     # Step 6: Atomic ATTESTED → TRANSMITTING lock
     now_ts = _time_mod.time()
     with closing(_get_db_connection()) as conn:
-        with conn:
+        with tx_immediate(conn):
             lock_result = conn.execute(
                 "UPDATE bucket3_dynamic_exit_log "
                 "SET final_status = 'TRANSMITTING', last_updated = CURRENT_TIMESTAMP "
@@ -6210,7 +6210,7 @@ async def handle_dex_callback(
     # Step 8: TRANSMITTING → TRANSMITTED (Followup #17: recovery wrapper per D7)
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 result = conn.execute(
                     "UPDATE bucket3_dynamic_exit_log "
                     "SET final_status = 'TRANSMITTED', transmitted = 1, "
@@ -6366,7 +6366,7 @@ async def _pre_trade_gates(
                         (audit_id,),
                     ).fetchone()
                     if row and not row["originating_account_id"]:
-                        with conn:
+                        with tx_immediate(conn):
                             conn.execute(
                                 "UPDATE bucket3_dynamic_exit_log "
                                 "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
@@ -6503,7 +6503,7 @@ async def _place_single_order(
                             and pos.position < 0):
                         # Already have this exact short call
                         with closing(_get_db_connection()) as conn:
-                            with conn:
+                            with tx_immediate(conn):
                                 conn.execute(
                                     "UPDATE pending_orders SET status = 'duplicate_skipped' WHERE id = ?",
                                     (db_id,),
@@ -6532,7 +6532,7 @@ async def _place_single_order(
                 acct_uncovered = (acct_long_shares - acct_short_contracts * 100) // 100
                 if qty > acct_uncovered:
                     with closing(_get_db_connection()) as conn:
-                        with conn:
+                        with tx_immediate(conn):
                             conn.execute(
                                 "UPDATE pending_orders SET status = 'rejected_naked' WHERE id = ?",
                                 (db_id,),
@@ -6620,7 +6620,7 @@ async def _place_single_order(
 
         # R5: Update status to SENT and store IBKR IDs for event matching
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 from agt_equities.order_state import append_status
                 conn.execute(
                     "UPDATE pending_orders SET ib_order_id = ?, ib_perm_id = ? WHERE id = ?",
@@ -6638,7 +6638,7 @@ async def _place_single_order(
         if mode == "MODE_1_DEFENSIVE":
             try:
                 with closing(_get_db_connection()) as conn:
-                    with conn:
+                    with tx_immediate(conn):
                         conn.execute(
                             """
                             INSERT INTO roll_watchlist
@@ -6676,7 +6676,7 @@ async def _place_single_order(
         # R5: Mark as failed via state machine
         try:
             with closing(_get_db_connection()) as conn:
-                with conn:
+                with tx_immediate(conn):
                     from agt_equities.order_state import append_status
                     append_status(conn, db_id, 'failed', 'placeOrder_exception', {
                         'error': str(exc)[:200],
@@ -6696,7 +6696,7 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 result = conn.execute(
                     "UPDATE pending_orders SET status = 'rejected' WHERE status = 'staged'"
                 )
@@ -7451,7 +7451,7 @@ async def _stage_dynamic_exit_candidate(
         staged_audit_ids = []
         try:
             with closing(_get_db_connection()) as conn:
-                with conn:
+                with tx_immediate(conn):
                     for account_id, acct_contracts in allocation.items():
                         row_audit_id = str(uuid.uuid4())
                         scale = acct_contracts / excess_contracts
