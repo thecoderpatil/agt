@@ -1,0 +1,22 @@
+# AGT Compliance Pipeline (injected by Compliance Framework "AGT-Required").
+# Runs on every pipeline regardless of project .gitlab-ci.yml contents.
+# Expand as Sprint B / CSP Allocator work lands.
+
+stages:
+  - compliance
+
+variables:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+compliance:ast_guard:
+  stage: compliance
+  image: python:3.10-slim
+  script:
+    - python scripts/ast_guard.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
