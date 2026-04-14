@@ -1,9 +1,13 @@
 # AGT Compliance Pipeline (injected by Compliance Framework "AGT-Required").
 # Runs on every pipeline regardless of project .gitlab-ci.yml contents.
-# Expand as Sprint B / CSP Allocator work lands.
 
 stages:
+  - .pre
+  - build
+  - test
+  - deploy
   - compliance
+  - .post
 
 variables:
   PYTHONDONTWRITEBYTECODE: "1"
