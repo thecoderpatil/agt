@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.sprint_a
+
 from agt_equities import health
 from agt_equities.db import get_db_connection
 from agt_equities.schema import register_operational_tables
