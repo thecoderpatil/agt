@@ -23,6 +23,28 @@ from agt_equities.schema import register_master_log_tables, register_operational
 # Test DB fixture — isolated, never touches prod.
 # ---------------------------------------------------------------------------
 
+# Three trivial test-only tables. Keeps the A3 atomic-transaction invariant
+# decoupled from production schema — the target-table choice is incidental;
+# what matters is that three upserts land atomically and roll back together.
+_A3_TEST_TABLES = [
+    """CREATE TABLE IF NOT EXISTS a3_test_section_one (
+        transaction_id TEXT PRIMARY KEY,
+        payload TEXT,
+        last_synced_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS a3_test_section_two (
+        transaction_id TEXT PRIMARY KEY,
+        payload TEXT,
+        last_synced_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS a3_test_section_three (
+        transaction_id TEXT PRIMARY KEY,
+        payload TEXT,
+        last_synced_at TEXT NOT NULL
+    )""",
+]
+
+
 @pytest.fixture
 def flex_db(tmp_path: Path, monkeypatch) -> Path:
     db = tmp_path / "agt_flex_test.db"
@@ -30,8 +52,12 @@ def flex_db(tmp_path: Path, monkeypatch) -> Path:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 15000;")
     try:
+        # master_log_sync + walker_warnings_log come from the real schema so
+        # run_sync's audit-row writes hit valid tables.
         register_master_log_tables(conn)
         register_operational_tables(conn)
+        for ddl in _A3_TEST_TABLES:
+            conn.execute(ddl)
         conn.commit()
     finally:
         conn.close()
@@ -55,41 +81,28 @@ def flex_db(tmp_path: Path, monkeypatch) -> Path:
 # ---------------------------------------------------------------------------
 
 def _three_synthetic_sections() -> list[dict]:
-    """Three sections matching real flex_sync SECTIONS table/pk shape.
+    """Three sections targeting A3 test-only tables.
 
-    master_log_trades has 10 NOT NULL cols beyond PK and last_synced_at
-    (which _upsert_rows auto-injects). All are populated here with minimal
-    legal values so the synthetic rows can INSERT without a NOT NULL trip.
+    Decouples the atomic-transaction assertion from production schema —
+    what's under test is rollback semantics across three upserts, not the
+    contents of any particular master_log_* table.
     """
-    trade_row = {
-        "transaction_id": "T1",
-        "account_id": "U_TEST_1",
-        "currency": "USD",
-        "asset_category": "STK",
-        "symbol": "AAPL",
-        "conid": 265598,
-        "date_time": "2026-04-14 10:00:00",
-        "trade_date": "2026-04-14",
-        "transaction_type": "ExchTrade",
-        "buy_sell": "BUY",
-        "quantity": 100.0,
-    }
     return [
         {
-            "table": "master_log_trades",
-            "rows": [trade_row],
+            "table": "a3_test_section_one",
+            "rows": [{"transaction_id": "T1", "payload": "one"}],
             "pk_cols": ["transaction_id"],
             "account_id": "U_TEST_1",
         },
         {
-            "table": "master_log_corp_actions",
-            "rows": [{"transaction_id": "C1", "account_id": "U_TEST_1"}],
+            "table": "a3_test_section_two",
+            "rows": [{"transaction_id": "T2", "payload": "two"}],
             "pk_cols": ["transaction_id"],
             "account_id": "U_TEST_1",
         },
         {
-            "table": "master_log_transfers",
-            "rows": [{"transaction_id": "X1", "account_id": "U_TEST_1"}],
+            "table": "a3_test_section_three",
+            "rows": [{"transaction_id": "T3", "payload": "three"}],
             "pk_cols": ["transaction_id"],
             "account_id": "U_TEST_1",
         },
@@ -124,9 +137,9 @@ def test_run_sync_happy_path_commits_all(flex_db: Path, monkeypatch):
 
     conn = sqlite3.connect(flex_db)
     try:
-        n_trades = conn.execute("SELECT COUNT(*) FROM master_log_trades").fetchone()[0]
-        n_corp = conn.execute("SELECT COUNT(*) FROM master_log_corp_actions").fetchone()[0]
-        n_xfer = conn.execute("SELECT COUNT(*) FROM master_log_transfers").fetchone()[0]
+        n_trades = conn.execute("SELECT COUNT(*) FROM a3_test_section_one").fetchone()[0]
+        n_corp = conn.execute("SELECT COUNT(*) FROM a3_test_section_two").fetchone()[0]
+        n_xfer = conn.execute("SELECT COUNT(*) FROM a3_test_section_three").fetchone()[0]
         assert (n_trades, n_corp, n_xfer) == (1, 1, 1)
         n_sync = conn.execute(
             "SELECT COUNT(*) FROM master_log_sync WHERE status='success'"
@@ -165,9 +178,9 @@ def test_run_sync_atomic_rollback_on_mid_section_failure(flex_db: Path, monkeypa
     conn = sqlite3.connect(flex_db)
     try:
         # ATOMIC ROLLBACK — sections 1 and 2 must NOT have persisted.
-        n_trades = conn.execute("SELECT COUNT(*) FROM master_log_trades").fetchone()[0]
-        n_corp = conn.execute("SELECT COUNT(*) FROM master_log_corp_actions").fetchone()[0]
-        n_xfer = conn.execute("SELECT COUNT(*) FROM master_log_transfers").fetchone()[0]
+        n_trades = conn.execute("SELECT COUNT(*) FROM a3_test_section_one").fetchone()[0]
+        n_corp = conn.execute("SELECT COUNT(*) FROM a3_test_section_two").fetchone()[0]
+        n_xfer = conn.execute("SELECT COUNT(*) FROM a3_test_section_three").fetchone()[0]
         assert (n_trades, n_corp, n_xfer) == (0, 0, 0), \
             "A3 invariant violated: partial-section data persisted across rollback"
 
@@ -208,7 +221,7 @@ def test_walker_warning_failure_is_non_fatal(flex_db: Path, monkeypatch):
 
     conn = sqlite3.connect(flex_db)
     try:
-        n_trades = conn.execute("SELECT COUNT(*) FROM master_log_trades").fetchone()[0]
+        n_trades = conn.execute("SELECT COUNT(*) FROM a3_test_section_one").fetchone()[0]
         assert n_trades == 1
         n_success = conn.execute(
             "SELECT COUNT(*) FROM master_log_sync WHERE status='success'"
