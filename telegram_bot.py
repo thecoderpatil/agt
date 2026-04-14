@@ -10141,6 +10141,53 @@ async def _sweep_attested_ttl_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("attested_sweeper error: %s", exc)
 
 
+async def _drain_cross_daemon_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A5d: bot-side consumer for the cross_daemon_alerts bus.
+
+    Runs every 2s via jq.run_repeating. Drains pending alerts emitted by
+    agt_scheduler producers (A5c onward) and dispatches each by `kind` to
+    the operator's Telegram via context.bot.send_message. Marks each row
+    'sent' on successful delivery, 'failed' on delivery exception (the
+    alerts module retries on subsequent drain up to MAX_ATTEMPTS=3 then
+    transitions terminal 'failed' for operator triage).
+
+    Safe no-op when the table is empty. Safe under USE_SCHEDULER_DAEMON=0:
+    no producers are running on the scheduler side, so the bus stays empty.
+    """
+    if _HALTED:
+        return
+    try:
+        from agt_equities.alerts import (
+            drain_pending_alerts,
+            mark_alert_sent,
+            mark_alert_failed,
+            format_alert_text,
+        )
+    except Exception as exc:
+        logger.error("alerts module import failed: %s", exc)
+        return
+    try:
+        alerts = drain_pending_alerts(limit=20)
+    except Exception as exc:
+        logger.error("drain_pending_alerts failed: %s", exc)
+        return
+    for a in alerts:
+        aid = a.get("id")
+        try:
+            text = format_alert_text(a)
+            await context.bot.send_message(chat_id=AUTHORIZED_USER_ID, text=text)
+            try:
+                mark_alert_sent(aid)
+            except Exception as exc:
+                logger.error("mark_alert_sent(%s) failed: %s", aid, exc)
+        except Exception as exc:
+            logger.error("cross_daemon_alerts dispatch %s failed: %s", aid, exc)
+            try:
+                mark_alert_failed(aid, str(exc))
+            except Exception as exc2:
+                logger.error("mark_alert_failed(%s) failed: %s", aid, exc2)
+
+
 async def _poll_attested_rows(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Poll for ATTESTED rows and push TRANSMIT/CANCEL keyboards to operator.
 
@@ -10429,6 +10476,13 @@ def main() -> None:
             name="staged_alert_flush",
         )
         logger.info("Scheduled: staged_alert_flush every 15s")
+        jq.run_repeating(
+            callback=_drain_cross_daemon_alerts_job,
+            interval=2,
+            first=5,
+            name="cross_daemon_alerts_drain",
+        )
+        logger.info("Scheduled: cross_daemon_alerts_drain every 2s")
 
         # Sprint 1F Fix 2: daily beta cache refresh (04:00 local, pre-market)
         async def _beta_cache_refresh_job(context):
