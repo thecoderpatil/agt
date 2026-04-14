@@ -94,13 +94,35 @@ def test_build_scheduler_timezone_pinned():
     assert "New_York" in tz_name
 
 
-def test_register_jobs_a2_baseline():
-    """A2 ships heartbeat_writer + orphan_sweep. A5 adds the 13 production jobs."""
+def test_register_jobs_a5a_set():
+    """A2 + A5a: heartbeat_writer, orphan_sweep, attested_sweeper.
+
+    Order is the registration order — preserved here as a regression guard
+    so future units appending jobs do not accidentally reorder the existing
+    set (which would break dependent code that introspects `registered[0]`).
+    """
     import agt_scheduler
     from agt_equities.ib_conn import IBConnector, IBConnConfig
     sched = agt_scheduler.build_scheduler()
     conn = IBConnector(config=IBConnConfig(client_id=2))
     registered = agt_scheduler.register_jobs(sched, conn)
-    assert registered == ["heartbeat_writer", "orphan_sweep"]
+    assert registered == ["heartbeat_writer", "orphan_sweep", "attested_sweeper"]
     job_ids = {j.id for j in sched.get_jobs()}
-    assert {"heartbeat_writer", "orphan_sweep"}.issubset(job_ids)
+    assert {"heartbeat_writer", "orphan_sweep", "attested_sweeper"}.issubset(job_ids)
+
+
+def test_a5a_attested_sweeper_trigger_interval_60s():
+    """A5a: attested_sweeper must fire every 60s (matches bot-side cadence)."""
+    import agt_scheduler
+    from agt_equities.ib_conn import IBConnector, IBConnConfig
+    sched = agt_scheduler.build_scheduler()
+    conn = IBConnector(config=IBConnConfig(client_id=2))
+    agt_scheduler.register_jobs(sched, conn)
+    job = sched.get_job("attested_sweeper")
+    assert job is not None, "attested_sweeper not registered"
+    # APScheduler IntervalTrigger exposes the interval as a timedelta.
+    interval = getattr(job.trigger, "interval", None)
+    assert interval is not None, f"unexpected trigger type: {type(job.trigger)}"
+    assert interval.total_seconds() == 60, (
+        f"attested_sweeper interval expected 60s, got {interval.total_seconds()}"
+    )
