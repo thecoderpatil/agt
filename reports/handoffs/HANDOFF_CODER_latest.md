@@ -1,9 +1,9 @@
 # AGT Equities — Coder (Claude Code) Handoff
 
 **Last updated:** 2026-04-14
-**Status:** Sprint 1 (A-F) + Cleanup A + Sprints B/C/D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix + P3.2-alt Day 2 findings + V2 Smart Yield Walk-Down + Defensive Roll Engine + adaptive roll execution + ADR-005 V2 Router WARTIME whitelist/BAG/BTC cash-paid notional + ADR-006 ACB pipeline hardening + Followups #9/#10/#11 doc + Act 60 Fortress CSP Screener C1→C6.1 + C6.2-C7.3 + Unified Roll Evaluator Sprint-1 (inception_delta pipeline) sprint-1.1→1.4 + **sprint-1.5 signed delta abs() fix + sprint-1.6 ib_order_id fallback + sprint-1.7 executor exception capture + scheduler timezone fix** — all COMPLETE.
-**Tests:** 965/971 passing, 5 skipped, 1 pre-existing failure (R7 earnings). Runtime: ~50s. (baseline 958 → 965 = +7 tests across sprint-1.5 through 1.7.)
-**Next:** C7.4 — V2 Router HARVEST classifier (on hold pending DeepThink review). C7.5 — earnings-window guard (on hold). **Sprint-2** of unified roll evaluator: `roll_engine.py` module decoupling with `PortfolioContext`. **Sprint-1.6 live verification** — next `/cc` fill on the restarted bot (af002ed) should populate `fill_log.inception_delta` via the ib_order_id fallback. Run `python scripts/verify_inception_delta.py` to confirm all 5 conditions pass.
+**Status:** Sprint 1 (A-F) + Cleanup A + Sprints B/C/D + Cure Polish + Execution Kill-Switch + PTB 22.7 Fix + P3.2-alt Day 2 findings + V2 Smart Yield Walk-Down + Defensive Roll Engine + adaptive roll execution + ADR-005 V2 Router WARTIME whitelist/BAG/BTC cash-paid notional + ADR-006 ACB pipeline hardening + Followups #9/#10/#11 doc + Act 60 Fortress CSP Screener C1→C6.1 + C6.2-C7.3 + Unified Roll Evaluator Sprint-1 (inception_delta pipeline) sprint-1.1→1.7 + scheduler timezone fix + **Sprint A DB connection hardening (Phases B/C1/C2/C3/D)** — all COMPLETE.
+**Tests:** 965/971 passing, 5 skipped, 1 pre-existing failure (R7 earnings). Runtime: ~50s.
+**Next:** C7.4 — V2 Router HARVEST classifier (on hold pending DeepThink review). C7.5 — earnings-window guard (on hold). **Sprint-2** of unified roll evaluator: `roll_engine.py` module decoupling with `PortfolioContext`. **Sprint-1.6 live verification** — next `/cc` fill on the restarted bot (9f58d66) should populate `fill_log.inception_delta` via the ib_order_id fallback. Run `python scripts/verify_inception_delta.py` to confirm all 5 conditions pass. **Decoupling Sprint A** — flex_sync.py restructure + scheduler process extraction (deferred from Sprint A Phase D).
 
 ---
 
@@ -74,6 +74,7 @@ You take prompts from Architect (Claude chat in the AGT Equities project). Yash 
   - `vol_event_armor.py` — Phase 4 (live IBKR reqHistoricalData IVR Option D + YFinanceCorporateIntelligenceProvider earnings/ex-div/corp-action gates)
   - `chain_walker.py` — Phase 5 (ib_chains-routed option chain walk with interval-based strike floor, C6.1 fix)
   - `ray_filter.py` — Phase 6 (sync terminal RAY band filter, NaN-safe)
+- `agt_equities/db.py` — canonical shared SQLite connection module (Sprint A). get_db_connection(), get_ro_connection(), tx_immediate(conn), init_pragmas(conn). busy_timeout=10000ms.
 - `agt_equities/ib_chains.py` — low-level IBKR chain API (get_expirations, get_chain_for_expiry) + `_build_chain_rows` with delta extraction (sprint-1.2) — ONLY Phase 4/5 consumers are allowed to import ib_async
 - `scripts/verify_inception_delta.py` — Sprint-1.4 read-only verification harness for inception_delta pipeline
 - `scripts/probe_ibkr_historical_iv.py` — throwaway diagnostic that confirmed Option D IVR subscription viability on 2026-04-11 (AAPL 249 bars, MSFT 250 IVR 95.7%, SPY 250 IVR 23.8%)
@@ -146,7 +147,8 @@ Staging → Cure Console attestation → [10s trust-tier cooldown] → JIT 9-ste
 - **Beta cache:** Daily 04:00 ET refresh job (timezone fix `af002ed`). Both top strip and rule engine use same cached betas.
 - **EL snapshots:** 30s writer job. Top strip and PortfolioState read from el_snapshots table.
 - **R7 corporate intel:** Daily 05:00 ET refresh job (timezone fix `af002ed`). evaluate_rule_7 reads cache. Bug fixed: evaluate_all now forwards conn= to R7 (enables operator overrides). Provider handles yfinance 1.2.0 datetime.date return type.
-- **PRAGMA tuning:** WAL + synchronous=FULL + wal_autocheckpoint=4000 + busy_timeout=5000.
+- **PRAGMA tuning:** WAL + synchronous=FULL + wal_autocheckpoint=4000 + busy_timeout=10000 (hardened from 5000 in Sprint A).
+- **DB connection module (Sprint A):** `agt_equities/db.py` is the canonical connection module for all production callers. Exports `get_db_connection()` (read-write, busy_timeout=10000ms), `get_ro_connection()` (read-only, PRAGMA query_only=ON), `tx_immediate(conn)` (BEGIN IMMEDIATE context manager replacing implicit DEFERRED `with conn:`), and `init_pragmas(conn)` (one-time WAL/synchronous/autocheckpoint setup). `agt_deck/db.py` is a backward-compat shim re-exporting `get_rw_conn`/`get_ro_conn`. telegram_bot.py aliases `get_db_connection as _get_db_connection` to preserve 75 existing call sites. All 42 write sites in telegram_bot.py use `tx_immediate(conn)` — zero implicit DEFERRED transactions, zero manual `BEGIN IMMEDIATE` lines remain. trade_repo.py migrated with override-aware `_get_db()` preserving 16 legacy `DB_PATH` override sites across 10 test/script files.
 - **DeskSnapshot SSOT (Sprint C + #43):** `build_state()` returns frozen DeskSnapshot (NAV, cycles, betas, DEX encumbrance). 3-tier NAV: live_nlv param > el_snapshots (<120s) > Flex EOD. `nav_source_by_account` tracks provenance. `build_top_strip` now injects `live_nlv_dict` and consumes it.
 - **Cold-start wartime pin (Priority 4):** startup checks live `accountSummaryAsync()` NLV + live spots before watchdog/polling loops. If any household leverage is >= 1.50x, it logs WARTIME with reason `Cold-start pin: leverage >= 1.50x`.
 - **Dynamic Exit engine:** V1 Emergency Kill-Switch logic archived to `agt_equities/archive_wartime_v1.py`. Active candidate selection in `rule_engine.py` is V2 Smart Yield Walk-Down. `evaluate_defensive_rolls()` appended for 0.40 delta / Friday Trap defense.
@@ -394,11 +396,36 @@ Fill:  trade.order.permId → pending_orders.ib_perm_id join
 - D20a: leverage audit (Yash 1.71x, Vikram 2.27x — WARTIME confirmed correct)
 - D21: walker integrity audit (0 warnings, 0 NULL critical columns, 0 duplicate transaction_ids, perfect share count match across walker/Flex/IBKR live)
 
+## Completed Work — Sprint A: DB Connection Hardening (2026-04-13/14)
+
+Architecture document: Dispatches 23–43 across one session. Promotes `agt_deck/db.py` to `agt_equities/db.py` as the canonical SQLite connection module. Hardens busy_timeout from 5000ms to 10000ms. Introduces `tx_immediate(conn)` context manager replacing all implicit DEFERRED `with conn:` write transactions with explicit BEGIN IMMEDIATE.
+
+| Phase | Commit | What | Sites |
+|-------|--------|------|-------|
+| B + C1 | `13dc565` | Shared `agt_equities/db.py` module + import alias + init_db restructure + 14 housekeeping write site conversions | 14 |
+| C2 | `9eb946c` | Staging path conversions (pending_orders state machine, bucket3_dynamic_exit_log transitions, placeOrder success/failure) | 16 |
+| C3 | `068b793` | Fill handler conversions (R5 event handlers, fill_log/premium_ledger writers, stock ledger writers, orphan scan, EL snapshot writer) | 12 |
+| D | `9f58d66` | trade_repo.py migration to shared module with override-aware `_get_db()` preserving 16 legacy DB_PATH override sites across 10 test/script files | 0 (read-only) |
+
+**Latent bugs fixed as side effects (4 total):**
+1. `init_db()` wrapped `PRAGMA journal_mode=WAL` inside implicit DEFERRED transaction — WAL mode requires no active transaction to persist. Fixed by calling `init_pragmas(conn)` outside any transaction.
+2. `/dex_status` (recover_transmitting) had manual `conn.execute("BEGIN IMMEDIATE")` inside `with conn:` — implicit DEFERRED was already open, making manual BEGIN a no-op or nested-transaction error. Replaced with `tx_immediate`.
+3. `_on_shares_sold` had same manual BEGIN inside `with conn:` pattern. Fixed.
+4. `_on_shares_bought` had same pattern. Fixed.
+
+**Key files:**
+- `agt_equities/db.py` — new, +133 lines. Exports: `get_db_connection()`, `get_ro_connection()`, `tx_immediate(conn)`, `init_pragmas(conn)`, `DB_PATH`.
+- `agt_deck/db.py` — backward-compat shim (4 lines), re-exports `get_rw_conn`/`get_ro_conn`.
+- `telegram_bot.py` — `_get_db_connection` aliased from shared module. 42/42 write sites on `tx_immediate`. Zero `with conn:` writes remaining. Zero manual `BEGIN IMMEDIATE` remaining.
+- `agt_equities/trade_repo.py` — `_get_db()` override-aware: checks `DB_PATH != agt_equities.db.DB_PATH` for backward-compat with test fixtures.
+
+**Out of scope (deferred to Decoupling Sprint A):** `flex_sync.py` restructure + process extraction.
+
 ---
 
 ## In Flight
 
-**Sprint-1.6 live verification pending** — Bot must be restarted on `af002ed` before next `/cc` fill. The fill should populate `fill_log.inception_delta` via the ib_order_id fallback (sprint-1.6). Run `python scripts/verify_inception_delta.py` to confirm all 5 conditions pass. First UBER fill on 2026-04-13 confirmed capture-side worked (`payload.inception_delta = 0.138`) but fill-handler missed due to permId race (now fixed).
+**Sprint-1.6 live verification pending** — Bot must be restarted on `9f58d66` before next `/cc` fill. The fill should populate `fill_log.inception_delta` via the ib_order_id fallback (sprint-1.6). Run `python scripts/verify_inception_delta.py` to confirm all 5 conditions pass. First UBER fill on 2026-04-13 confirmed capture-side worked (`payload.inception_delta = 0.138`) but fill-handler missed due to permId race (now fixed).
 
 **Unified Roll Evaluator Sprint-2** — `roll_engine.py` module decoupling with `PortfolioContext`. Awaiting Architect dispatch. Per DT review: single unified evaluator with constraint matrix, NOT two-engine split.
 
@@ -406,7 +433,9 @@ Fill:  trade.order.permId → pending_orders.ib_perm_id join
 
 **C7.5 — Earnings-window guard in `_walk_mode1_chain`** — on hold pending Architect review of DeepThink response.
 
-**P3.2-alt Read-Only Live** — Day 2 findings + V2 execution engine + sprint-1.5→1.7 hardening shipped. Kill-switch ARMED.
+**Decoupling Sprint A** — flex_sync.py restructure + scheduler process extraction. Deferred from Sprint A Phase D.
+
+**P3.2-alt Read-Only Live** — Day 2 findings + V2 execution engine + sprint-1.5→1.7 hardening + Sprint A DB hardening shipped. Kill-switch ARMED.
 - Protocol: `protocols/P3_2alt_read_only_live_protocol.md`
 - Git tag: `p3.2alt-start` at `04c1d20`
 - DB backup: `agt_desk.db.p3.2alt.bak`
@@ -440,6 +469,7 @@ Fill:  trade.order.permId → pending_orders.ib_perm_id join
 | 36 | Dead helper sweep post-Sprint C (get_portfolio_nav, load_active_cycles, get_betas) | Sprint C2 | Post-paper |
 | 39 | Dedupe Underwater Positions rendering into shared Jinja macro | G2 | Post-paper |
 | 9 | Intraday delta watermark reconciliation gap (per-row reconciliation flag on fill_log long-term fix) | ADR-006 STEP 0 | Low now, Medium-High before multi-tenant |
+| 40 | trade_repo.DB_PATH override cleanup: migrate 16 test/script sites to canonical pattern (monkeypatch or explicit db_path param) and delete backward-compat branch from `_get_db()` | Sprint A Phase D | Pre-scheduler extraction |
 | 10 | `cc_decision_log` V2 router audit wiring (structured per-decision audit trail) | ADR-006 Blocker C | Low (`v2_rationale` text field is fallback) |
 | 11 | Empirical verification of `EXPIRE_WORTHLESS` `ev.net_cash` values (H1 dead code vs H2 load-bearing) | ADR-006 DIFF 1 triage | Low (hygiene) |
 | — | R4 pair mapping (glide_paths needs ticker_a/ticker_b ALTER) | Sprint 1F | Post-paper |
