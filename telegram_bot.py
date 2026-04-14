@@ -450,8 +450,9 @@ def _log_cc_cycle(entries: list[dict]) -> None:
         logger.warning("_log_cc_cycle failed: %s", exc)
 
 
-
-init_db()
+# A4 (Decoupling Sprint A): init_db() moved from module scope into main()
+# so importing telegram_bot does not touch the on-disk DB. Daemon callers
+# unaffected — main() invokes init_db() before any handler runs.
 
 # Sprint 1C: loud paper mode startup log
 if PAPER_MODE:
@@ -10319,6 +10320,7 @@ async def _el_snapshot_writer_job(
 
 
 def main() -> None:
+    init_db()  # A4: lazy DB init at daemon boot, not import
     logger.info(
         "Starting AGT Equities Bridge — Hybrid Architecture "
         "(default: Haiku 4.5 | /think: Sonnet 4.6 | /deep: Opus 4.6 | "

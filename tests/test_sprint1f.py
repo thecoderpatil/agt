@@ -935,7 +935,8 @@ class TestBuildCureDataWithNonEmptyCycles(unittest.TestCase):
 
 class TestAGTFormattedBotIsExtBot(unittest.TestCase):
     """Bot subclass must inherit from ExtBot."""
-    pytestmark = pytest.mark.agt_tripwire_exempt
+    # A4 (Decoupling Sprint A): tripwire exemption removed.
+    # init_db() no longer fires at telegram_bot import.
 
     def test_isinstance(self):
         from telegram.ext import ExtBot

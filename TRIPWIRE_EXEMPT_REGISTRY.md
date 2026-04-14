@@ -7,33 +7,6 @@ target: every exemption should be deleted before its fix-by sprint closes.
 
 ## Active Exemptions
 
-### Category 1: telegram_bot.py:454 init_db() at import time
-
-Root cause: `telegram_bot.py:454` calls `init_db()` at module level.
-`init_db()` → `get_db_connection()` → `sqlite3.connect(DB_PATH)` fires
-before any test-level patch() can intercept. Pre-FU-A-02 this silently
-mutated production `agt_desk.db` on every test run.
-
-Fix-by sprint: Decoupling Sprint A. When bot becomes a daemon with
-explicit startup order, `init_db()` moves from module-level to daemon
-boot sequence. All exemptions in this category are deleted then.
-
-#### tests/test_inception_delta_fill.py
-- **Surfaced:** FU-A-02 Phase C, 2026-04-14
-- **Scope:** 19 tests in the file (module-level `pytestmark`).
-- **Delete marker when fixed:** remove `pytestmark = pytest.mark.agt_tripwire_exempt`
-  from test_inception_delta_fill.py and delete this registry entry.
-
-#### tests/test_sprint1f.py — TestAGTFormattedBotIsExtBot
-- **Surfaced:** FU-A-03c Phase B, 2026-04-14
-- **Scope:** 1 test class (TestAGTFormattedBotIsExtBot) inside an
-  otherwise-clean test file. 30+ other tests in test_sprint1f.py are
-  unaffected and remain under tripwire enforcement.
-- **Delete marker when fixed:** remove
-  `pytestmark = pytest.mark.agt_tripwire_exempt` from the
-  TestAGTFormattedBotIsExtBot class definition and delete this
-  registry entry.
-
 ### Category 2: agt_deck test fixtures call get_ro_conn() directly
 
 Root cause: Test setUp methods in agt_deck test files construct DB
@@ -113,4 +86,24 @@ sprints don't need to re-enter `agt_equities/db.py` to do the same change.
 
 ## Historical Exemptions (resolved)
 
-None yet.
+### Category 1: telegram_bot.py module-level init_db() — CLOSED by A4
+
+**Root cause:** `telegram_bot.py:454` called `init_db()` at module scope.
+`init_db()` → `get_db_connection()` → `sqlite3.connect(DB_PATH)` fired
+before any test-level patch could intercept.
+
+**Resolution:** Decoupling Sprint A unit A4 (2026-04-14). The bare
+`init_db()` call at module scope was deleted; an `init_db()` invocation
+was added as the first statement of `def main()` so the daemon boot
+path remains identical while `import telegram_bot` becomes
+side-effect-free for the on-disk database.
+
+**Tests un-exempted:**
+- `tests/test_inception_delta_fill.py` — module-level `pytestmark` removed.
+- `tests/test_sprint1f.py::TestAGTFormattedBotIsExtBot` — class-level
+  `pytestmark` removed.
+
+**Regression guard:** `tests/test_a4_init_db_lazy.py` (sprint_a marker)
+asserts via AST that `telegram_bot.py` contains zero module-level
+`init_db()` calls and that `def main` still calls `init_db()` in its
+body.

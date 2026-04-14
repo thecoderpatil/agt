@@ -21,13 +21,8 @@ from unittest.mock import patch
 import pytest
 import sys
 
-# FU-A-02: This test file imports telegram_bot which calls init_db() at
-# module level (telegram_bot.py:454). init_db() hits agt_equities.db.DB_PATH
-# at import time, before any test-level patch() can intercept. This predates
-# Sprint A and was silently hitting production DB until FU-A-02's tripwire
-# surfaced it. Fix deferred to Decoupling Sprint A (refactor init_db() into
-# daemon startup). See TRIPWIRE_EXEMPT_REGISTRY.md.
-pytestmark = pytest.mark.agt_tripwire_exempt
+# A4 (Decoupling Sprint A): tripwire exemption removed.
+# init_db() is no longer called at telegram_bot import time.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agt_equities.schema import register_operational_tables, register_master_log_tables
