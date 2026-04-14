@@ -55,11 +55,29 @@ def flex_db(tmp_path: Path, monkeypatch) -> Path:
 # ---------------------------------------------------------------------------
 
 def _three_synthetic_sections() -> list[dict]:
-    """Three sections matching real flex_sync SECTIONS table/pk shape."""
+    """Three sections matching real flex_sync SECTIONS table/pk shape.
+
+    master_log_trades has 10 NOT NULL cols beyond PK and last_synced_at
+    (which _upsert_rows auto-injects). All are populated here with minimal
+    legal values so the synthetic rows can INSERT without a NOT NULL trip.
+    """
+    trade_row = {
+        "transaction_id": "T1",
+        "account_id": "U_TEST_1",
+        "currency": "USD",
+        "asset_category": "STK",
+        "symbol": "AAPL",
+        "conid": 265598,
+        "date_time": "2026-04-14 10:00:00",
+        "trade_date": "2026-04-14",
+        "transaction_type": "ExchTrade",
+        "buy_sell": "BUY",
+        "quantity": 100.0,
+    }
     return [
         {
             "table": "master_log_trades",
-            "rows": [{"transaction_id": "T1", "symbol": "AAPL", "account_id": "U_TEST_1"}],
+            "rows": [trade_row],
             "pk_cols": ["transaction_id"],
             "account_id": "U_TEST_1",
         },
