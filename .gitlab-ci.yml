@@ -14,6 +14,7 @@
 #     - tests/test_flex_sync_atomic.py    (A3)
 #     - tests/test_a4_init_db_lazy.py     (A4)
 #     - tests/test_alerts.py              (A5b)
+#     - tests/test_a5d_consumer_wired.py  (A5d)
 #
 # Why not the full 975 baseline yet:
 #   The full suite has 5 known pre-existing failures (4x test_margin_logic
@@ -68,6 +69,7 @@ sprint_a_unit_tests:
         tests/test_flex_sync_atomic.py
         tests/test_a4_init_db_lazy.py
         tests/test_alerts.py
+        tests/test_a5d_consumer_wired.py
   rules:
     - if: $CI_PIPELINE_SOURCE == "push"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
