@@ -1872,7 +1872,7 @@ def _r5_on_order_status(trade):
                         (order_ref,),
                     ).fetchone()
                     if dex_row:
-                        with conn:
+                        with tx_immediate(conn):
                             conn.execute(
                                 "UPDATE bucket3_dynamic_exit_log "
                                 "SET ib_perm_id = ? WHERE audit_id = ? AND ib_perm_id IS NULL",
@@ -1911,7 +1911,7 @@ def _r5_on_exec_details(trade, fill):
         new_status = OrderStatus.FILLED if (not remaining or float(remaining) == 0) else OrderStatus.PARTIALLY_FILLED
 
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 row = None
                 if perm_id:
                     row = conn.execute(
@@ -2017,7 +2017,7 @@ def _r5_on_commission_report(trade, fill, report):
                         (order_ref,),
                     ).fetchone()
                     if dex_row:
-                        with conn:
+                        with tx_immediate(conn):
                             conn.execute(
                                 "UPDATE bucket3_dynamic_exit_log "
                                 "SET commission = ? "
@@ -2059,7 +2059,7 @@ def _record_fill(exec_id: str, ticker: str, action: str,
     """Log a processed fill for deduplication."""
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO fill_log
@@ -2088,7 +2088,7 @@ def _apply_fill_atomically(
     """Atomic: dedup via INSERT OR IGNORE + ledger UPSERT. Single transaction."""
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 # Step 1: Attempt dedup insert — if exec_id exists, rowcount = 0
                 cur = conn.execute(
                     """
@@ -2159,7 +2159,7 @@ def _credit_premium(household: str, ticker: str, amount: float) -> bool:
     """Add premium to total_premium_collected. Returns True if updated."""
     try:
         with closing(_get_db_connection()) as conn:
-            with conn:
+            with tx_immediate(conn):
                 existing = conn.execute(
                     "SELECT total_premium_collected FROM premium_ledger "
                     "WHERE household_id = ? AND ticker = ?",
@@ -2416,8 +2416,7 @@ def _on_shares_sold(trade, fill):
         shares_sold = abs(int(execution.shares))
 
         with closing(_get_db_connection()) as conn:
-            with conn:
-                conn.execute("BEGIN IMMEDIATE")  # CLEANUP-6: acquire RESERVED lock before SELECT
+            with tx_immediate(conn):
                 # Atomic dedup inside transaction
                 dup = conn.execute(
                     "SELECT 1 FROM fill_log WHERE exec_id = ?", (exec_id,)
@@ -2512,8 +2511,7 @@ def _on_shares_bought(trade, fill):
         cost_per_share = execution.price
 
         with closing(_get_db_connection()) as conn:
-            with conn:
-                conn.execute("BEGIN IMMEDIATE")  # CLEANUP-6: acquire RESERVED lock before SELECT
+            with tx_immediate(conn):
                 # Atomic dedup inside transaction
                 dup = conn.execute(
                     "SELECT 1 FROM fill_log WHERE exec_id = ?", (exec_id,)
@@ -9915,7 +9913,7 @@ async def _scan_orphaned_transmitting_rows(ib_conn, app_bot):
             status = open_match.orderStatus.status
             if status in _OPEN_FILLED_STATES:
                 with closing(_get_db_connection()) as conn:
-                    with conn:
+                    with tx_immediate(conn):
                         r = conn.execute(
                             "UPDATE bucket3_dynamic_exit_log "
                             "SET final_status = 'TRANSMITTED', "
@@ -9928,7 +9926,7 @@ async def _scan_orphaned_transmitting_rows(ib_conn, app_bot):
                             logger.info("orphan_scan: %s -> TRANSMITTED (filled)", audit_id)
             elif status in _OPEN_DEAD_STATES:
                 with closing(_get_db_connection()) as conn:
-                    with conn:
+                    with tx_immediate(conn):
                         r = conn.execute(
                             "UPDATE bucket3_dynamic_exit_log "
                             "SET final_status = 'ABANDONED', "
@@ -9952,7 +9950,7 @@ async def _scan_orphaned_transmitting_rows(ib_conn, app_bot):
                 needs_manual.append((audit_id, ticker, f"unknown-status ({status})"))
         elif exec_match:
             with closing(_get_db_connection()) as conn:
-                with conn:
+                with tx_immediate(conn):
                     r = conn.execute(
                         "UPDATE bucket3_dynamic_exit_log "
                         "SET final_status = 'TRANSMITTED', "
@@ -10302,7 +10300,7 @@ async def _el_snapshot_writer_job(
             hh = ACCOUNT_TO_HOUSEHOLD.get(acct_id, "Unknown")
             try:
                 with closing(_get_db_connection()) as conn:
-                    with conn:
+                    with tx_immediate(conn):
                         conn.execute(
                             "INSERT INTO el_snapshots "
                             "(account_id, household, excess_liquidity, nlv, buying_power, source) "
