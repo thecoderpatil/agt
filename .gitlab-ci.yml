@@ -24,9 +24,14 @@
 #   * pip downloads are cached under $CI_PROJECT_DIR/.cache/pip keyed on
 #     the requirements-ci.txt hash. First run on a branch = Cache miss,
 #     subsequent pushes = Cache restored + pip install in seconds.
-#   * Test collection uses the `sprint_a` pytest marker instead of an
-#     enumerated file list, so adding a Sprint A test is one @mark line
-#     rather than a CI-yaml edit.
+#   * Test collection pairs the `sprint_a` pytest marker with an explicit
+#     file list. The marker is the semantic gate (adding a new test inside
+#     these files takes the decorator and nothing else); the file list
+#     scopes collection so unrelated tests/*.py files — which pull heavy
+#     deps (telegram, fastapi, full project stack) that are NOT in
+#     requirements-ci.txt — don't bomb import-time collection. Adding a
+#     new Sprint A *file* = one-line CI edit; adding a new Sprint A
+#     *test* inside an existing file = zero CI edits.
 
 stages:
   - test
@@ -54,7 +59,11 @@ sprint_a_unit_tests:
   <<: *python_setup
   stage: test
   script:
-    - pytest -v --tb=short -m sprint_a tests/
+    - pytest -v --tb=short -m sprint_a
+        tests/test_ib_conn.py
+        tests/test_agt_scheduler.py
+        tests/test_health.py
+        tests/test_flex_sync_atomic.py
   rules:
     - if: $CI_PIPELINE_SOURCE == "push"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
