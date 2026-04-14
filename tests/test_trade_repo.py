@@ -49,15 +49,13 @@ class TestTradeRepo(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        trade_repo.DB_PATH = cls.db_path
-
     @classmethod
     def tearDownClass(cls):
         os.unlink(cls.db_path)
 
     def test_get_active_cycles_returns_cycles(self):
         """get_active_cycles returns at least some active cycles."""
-        cycles = trade_repo.get_active_cycles()
+        cycles = trade_repo.get_active_cycles(db_path=self.db_path)
         self.assertGreater(len(cycles), 0)
         for c in cycles:
             self.assertEqual(c.status, 'ACTIVE')
@@ -66,13 +64,13 @@ class TestTradeRepo(unittest.TestCase):
         """Ticker filter returns only matching cycles. SLS has clean YTD
         history in U21971297 (first event is CSP_OPEN)."""
         cycles = trade_repo.get_active_cycles(
-            household='Yash_Household', ticker='SLS')
+            household='Yash_Household', ticker='SLS', db_path=self.db_path)
         for c in cycles:
             self.assertEqual(c.ticker, 'SLS')
 
     def test_get_active_cycles_household_filter(self):
         """Household filter returns only matching households."""
-        yash = trade_repo.get_active_cycles(household='Yash_Household')
+        yash = trade_repo.get_active_cycles(household='Yash_Household', db_path=self.db_path)
         for c in yash:
             self.assertEqual(c.household_id, 'Yash_Household')
 
@@ -84,21 +82,21 @@ class TestTradeRepo(unittest.TestCase):
         # long options stay ACTIVE instead of closing prematurely.
         # This may prevent orphan events that previously froze the ticker.
         cycles = trade_repo.get_active_cycles(
-            household='Yash_Household', ticker='UBER')
+            household='Yash_Household', ticker='UBER', db_path=self.db_path)
         # Either empty (frozen) or has active cycles — but no exception
         # Result depends on YTD fixture event ordering
         self.assertIsInstance(cycles, list)
 
     def test_get_closed_cycles_clean_ticker(self):
         """CRM in Vikram_Household has clean YTD history with closed cycles."""
-        cycles = trade_repo.get_closed_cycles('Vikram_Household', 'CRM')
+        cycles = trade_repo.get_closed_cycles('Vikram_Household', 'CRM', db_path=self.db_path)
         for c in cycles:
             self.assertEqual(c.status, 'CLOSED')
 
     def test_trade_repo_loads_from_db(self):
         """Verify trade_repo reads from DB. Count < 444 because
         _load_trade_events filters EXCLUDED_TICKERS (SPX, VIX, etc.)."""
-        conn = trade_repo._get_db()
+        conn = trade_repo._get_db(self.db_path)
         try:
             events = trade_repo._load_trade_events(conn)
             # 444 total trades minus ~48 excluded-ticker trades

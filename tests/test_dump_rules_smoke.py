@@ -99,9 +99,7 @@ class TestDumpRulesSmoke(unittest.TestCase):
 
         # Monkeypatch DB path + trade_repo
         orig_db = dump_rules.DB_PATH
-        orig_tr_db = trade_repo.DB_PATH
         dump_rules.DB_PATH = Path(self.db_path)
-        trade_repo.DB_PATH = Path(self.db_path)
         dump_rules._gaps.clear()
 
         captured = StringIO()
@@ -112,7 +110,6 @@ class TestDumpRulesSmoke(unittest.TestCase):
                 dump_rules.main()
         finally:
             dump_rules.DB_PATH = orig_db
-            trade_repo.DB_PATH = orig_tr_db
 
         output = captured.getvalue()
         # Validate key sections present

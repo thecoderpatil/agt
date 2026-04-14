@@ -38,7 +38,6 @@ with open(os.path.join(os.path.dirname(__file__), '..', 'data', 'inception_carry
              row['quantity'], row.get('basis_price'), row['as_of_date'],
              row.get('source_broker'), row.get('reason'), row.get('notes')))
 conn.commit()
-trade_repo.DB_PATH = db_path
 
 ACCT_TO_HH = trade_repo.ACCOUNT_TO_HOUSEHOLD
 

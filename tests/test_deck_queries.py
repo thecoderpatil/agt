@@ -1,5 +1,8 @@
 """Test deck queries run against live DB and return expected shapes."""
 import sys, os, unittest
+
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from agt_deck.db import get_ro_conn
@@ -7,6 +10,7 @@ from agt_deck import queries
 
 
 class TestDeckQueries(unittest.TestCase):
+    pytestmark = pytest.mark.agt_tripwire_exempt
 
     def setUp(self):
         self.conn = get_ro_conn()

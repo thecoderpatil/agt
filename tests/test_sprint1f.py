@@ -2,6 +2,8 @@
 import json
 import sqlite3
 import unittest
+
+import pytest
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
@@ -590,36 +592,28 @@ class TestBuildTopStripConsumesDeskSnapshot(_TopStripDBMixin, unittest.TestCase)
 
     def test_build_top_strip_has_expected_keys(self):
         from unittest.mock import patch
-        from agt_equities import trade_repo
-        from pathlib import Path
 
-        # Monkeypatch trade_repo.DB_PATH for build_state() internal connection
-        orig_db_path = trade_repo.DB_PATH
-        trade_repo.DB_PATH = Path(self.db_path)
-        try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
 
-            with patch("agt_deck.main.get_vix", return_value=18.5), \
-                 patch("agt_deck.main.get_spots", return_value={}):
-                from agt_deck.main import build_top_strip
-                result = build_top_strip(conn)
+        with patch("agt_deck.main.get_vix", return_value=18.5), \
+             patch("agt_deck.main.get_spots", return_value={}):
+            from agt_deck.main import build_top_strip
+            result = build_top_strip(conn, db_path=self.db_path)
 
-            conn.close()
+        conn.close()
 
-            expected_keys = {
-                "vix", "el_retain_pct", "total_nav", "inception_pnl",
-                "inception_pnl_pct", "net_inflows", "el_current", "el_required",
-                "vikram_el_pct", "conc_ticker", "conc_pct", "conc_hh",
-                "sector_violations", "leverage", "last_sync", "nav_by_acct",
-                "change_nav", "walker_warning_count", "walker_worst_severity",
-                "desk_mode",
-            }
-            self.assertEqual(set(result.keys()), expected_keys)
-            self.assertAlmostEqual(result["total_nav"], 300000.0)
-            self.assertIn("U21971297", result["nav_by_acct"])
-        finally:
-            trade_repo.DB_PATH = orig_db_path
+        expected_keys = {
+            "vix", "el_retain_pct", "total_nav", "inception_pnl",
+            "inception_pnl_pct", "net_inflows", "el_current", "el_required",
+            "vikram_el_pct", "conc_ticker", "conc_pct", "conc_hh",
+            "sector_violations", "leverage", "last_sync", "nav_by_acct",
+            "change_nav", "walker_warning_count", "walker_worst_severity",
+            "desk_mode",
+        }
+        self.assertEqual(set(result.keys()), expected_keys)
+        self.assertAlmostEqual(result["total_nav"], 300000.0)
+        self.assertIn("U21971297", result["nav_by_acct"])
 
 
 class TestBuildTopStripNavMatchesBuildState(_TopStripDBMixin, unittest.TestCase):
@@ -645,31 +639,24 @@ class TestBuildTopStripNavMatchesBuildState(_TopStripDBMixin, unittest.TestCase)
 
     def test_nav_matches_build_state(self):
         from unittest.mock import patch
-        from agt_equities import trade_repo
         from agt_equities.state_builder import build_state
-        from pathlib import Path
 
-        orig_db_path = trade_repo.DB_PATH
-        trade_repo.DB_PATH = Path(self.db_path)
-        try:
-            snapshot = build_state(db_path=self.db_path, live_positions=[])
+        snapshot = build_state(db_path=self.db_path, live_positions=[])
 
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
 
-            with patch("agt_deck.main.get_vix", return_value=None), \
-                 patch("agt_deck.main.get_spots", return_value={}):
-                from agt_deck.main import build_top_strip
-                result = build_top_strip(conn)
+        with patch("agt_deck.main.get_vix", return_value=None), \
+             patch("agt_deck.main.get_spots", return_value={}):
+            from agt_deck.main import build_top_strip
+            result = build_top_strip(conn, db_path=self.db_path)
 
-            conn.close()
+        conn.close()
 
-            self.assertAlmostEqual(
-                result["total_nav"], snapshot.nav_total,
-                msg="build_top_strip total_nav must equal build_state().nav_total",
-            )
-        finally:
-            trade_repo.DB_PATH = orig_db_path
+        self.assertAlmostEqual(
+            result["total_nav"], snapshot.nav_total,
+            msg="build_top_strip total_nav must equal build_state().nav_total",
+        )
 
 
 # ── Polish G2: Underwater Positions tests ────────────────────────────
@@ -721,8 +708,6 @@ class TestBuildCureDataIncludesUnderwater(unittest.TestCase):
 
     def test_underwater_key_present(self):
         from unittest.mock import patch, MagicMock
-        from agt_equities import trade_repo
-        from pathlib import Path
         import tempfile
 
         # Create minimal temp DB for build_state + _build_cure_data
@@ -741,22 +726,19 @@ class TestBuildCureDataIncludesUnderwater(unittest.TestCase):
         conn.execute("CREATE TABLE mode_history (id INTEGER PRIMARY KEY, timestamp TEXT, old_mode TEXT, new_mode TEXT, trigger_rule TEXT, trigger_household TEXT, trigger_value REAL, notes TEXT)")
         conn.commit()
 
-        orig_db_path = trade_repo.DB_PATH
-        trade_repo.DB_PATH = Path(db_path)
         try:
             with patch("agt_deck.main.get_vix", return_value=18.0), \
                  patch("agt_deck.main.get_spots", return_value={}), \
                  patch("agt_deck.main.load_active_cycles", return_value=[]), \
                  patch("agt_deck.main.build_cycles_table", return_value=[]):
                 from agt_deck.main import _build_cure_data
-                result = _build_cure_data(conn)
+                result = _build_cure_data(conn, db_path=db_path)
 
             self.assertIn("underwater", result)
             self.assertIn("underwater_grouped", result)
             self.assertIsInstance(result["underwater"], list)
             self.assertIsInstance(result["underwater_grouped"], list)
         finally:
-            trade_repo.DB_PATH = orig_db_path
             conn.close()
             try:
                 import os
@@ -902,8 +884,6 @@ class TestBuildCureDataWithNonEmptyCycles(unittest.TestCase):
 
     def test_get_betas_called_when_spots_exist(self):
         from unittest.mock import patch, MagicMock
-        from agt_equities import trade_repo
-        from pathlib import Path
         import tempfile
 
         # Minimal DB for build_state + _build_cure_data
@@ -932,8 +912,6 @@ class TestBuildCureDataWithNonEmptyCycles(unittest.TestCase):
         mock_cycle.open_short_calls = 1
         mock_cycle.open_short_puts = 0
 
-        orig_db_path = trade_repo.DB_PATH
-        trade_repo.DB_PATH = Path(db_path)
         try:
             with patch("agt_deck.main.get_vix", return_value=18.0), \
                  patch("agt_deck.main.get_spots", return_value={"SPY": 520.0}), \
@@ -941,13 +919,13 @@ class TestBuildCureDataWithNonEmptyCycles(unittest.TestCase):
                  patch("agt_deck.main.build_cycles_table", return_value=[]):
                 from agt_deck.main import _build_cure_data
                 # This call triggers get_betas(["SPY"]) at line 513
-                result = _build_cure_data(conn)
+                result = _build_cure_data(conn, db_path=db_path)
 
             self.assertIn("households", result)
         finally:
-            trade_repo.DB_PATH = orig_db_path
             conn.close()
             try:
+                import os
                 os.unlink(db_path)
             except OSError:
                 pass
@@ -957,6 +935,7 @@ class TestBuildCureDataWithNonEmptyCycles(unittest.TestCase):
 
 class TestAGTFormattedBotIsExtBot(unittest.TestCase):
     """Bot subclass must inherit from ExtBot."""
+    pytestmark = pytest.mark.agt_tripwire_exempt
 
     def test_isinstance(self):
         from telegram.ext import ExtBot

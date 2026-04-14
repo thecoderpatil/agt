@@ -23,7 +23,6 @@ conn.commit()
 for sd in parse_flex_xml(load_flex_xml_from_file(INCEPTION)):
     _upsert_rows(conn, sd['table'], sd['rows'], sd['pk_cols'], 'now')
 conn.commit()
-trade_repo.DB_PATH = db_path
 
 # ── SECTION 1: ACATS sells ──
 print("=" * 80)

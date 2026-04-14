@@ -29,32 +29,29 @@ EXCLUDED_TICKERS = frozenset({'SPX', 'VIX', 'NDX', 'RUT', 'XSP'})
 _cycle_cache: dict[str, list[Cycle]] = {}
 
 
-def _get_db() -> sqlite3.Connection:
+def _get_db(db_path: "str | Path | None" = None) -> sqlite3.Connection:
     """Open a read connection to agt_desk.db.
 
-    Normal path: delegates to the shared agt_equities.db module's
-    get_db_connection(), which sets row_factory=Row and
-    busy_timeout=10000ms.
+    Default path (db_path=None): delegates to the shared agt_equities.db
+    module's get_db_connection(), which sets row_factory=Row and
+    busy_timeout=15000ms. This is the production path.
 
-    Backward-compat path: if the module-level DB_PATH has been
-    overridden at runtime (test fixtures in test_trade_repo.py,
-    test_sprint1f.py, test_dump_rules_smoke.py; runtime scripts
-    run_task3*.py, run_crosschecks.py), opens a direct sqlite3
-    connection to the override path with the same pragmas
-    get_db_connection() would have set. Preserves 15 override
-    sites across 8 files without requiring per-file test fixture
-    updates. Tracked for post-Sprint cleanup: migrate all 15
-    sites to a canonical pattern (monkeypatch-based fixture or
-    explicit db_path parameter) and delete the fallback branch.
+    Explicit path (db_path=<path>): opens a direct sqlite3.connect() to
+    the override with identical pragmas. Used exclusively by test
+    fixtures and ad-hoc scripts that need to target a non-production DB.
+
+    The FU-A cleanup sprint (2026-04) replaced the v22 module-attribute
+    override mechanism (trade_repo.DB_PATH = ...) with explicit kwarg
+    threading. All 4 public read functions accept db_path and pass it
+    through to this helper. See HANDOFF_ARCHITECT_v22 FU-A and DT ruling
+    Q1 for the decision rationale.
     """
-    from . import db as _shared
-    if DB_PATH != _shared.DB_PATH:
-        # Divergent path — honor the module-local override
-        conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 10000;")
-        return conn
-    return get_db_connection()
+    if db_path is None:
+        return get_db_connection()
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 15000;")
+    return conn
 
 
 def invalidate_cache() -> None:
@@ -345,9 +342,15 @@ def get_active_cycles(
     household: Optional[str] = None,
     ticker: Optional[str] = None,
     as_of_report_date: Optional[str] = None,
+    *,
+    db_path: "str | Path | None" = None,
 ) -> list[Cycle]:
-    """Returns ACTIVE cycles. Settled-state read path. No intraday overlay."""
-    conn = _get_db()
+    """Returns ACTIVE cycles. Settled-state read path. No intraday overlay.
+
+    db_path: optional explicit database path for test fixtures. Default
+    (None) routes to production via get_db_connection().
+    """
+    conn = _get_db(db_path)
     try:
         all_cycles = _run_walker_for_all(conn, household, ticker)
         return [c for c in all_cycles if c.status == 'ACTIVE']
@@ -359,9 +362,15 @@ def get_closed_cycles(
     household: str,
     ticker: str,
     limit: int = 20,
+    *,
+    db_path: "str | Path | None" = None,
 ) -> list[Cycle]:
-    """Returns closed cycles for one (household, ticker) in reverse chron."""
-    conn = _get_db()
+    """Returns closed cycles for one (household, ticker) in reverse chron.
+
+    db_path: optional explicit database path for test fixtures. Default
+    (None) routes to production via get_db_connection().
+    """
+    conn = _get_db(db_path)
     try:
         all_cycles = _run_walker_for_all(conn, household, ticker)
         closed = [c for c in all_cycles if c.status == 'CLOSED']
@@ -371,9 +380,18 @@ def get_closed_cycles(
         conn.close()
 
 
-def get_cycles_for_ticker(household: str, ticker: str) -> list[Cycle]:
-    """All cycles (active + closed) for one ticker."""
-    conn = _get_db()
+def get_cycles_for_ticker(
+    household: str,
+    ticker: str,
+    *,
+    db_path: "str | Path | None" = None,
+) -> list[Cycle]:
+    """All cycles (active + closed) for one ticker.
+
+    db_path: optional explicit database path for test fixtures. Default
+    (None) routes to production via get_db_connection().
+    """
+    conn = _get_db(db_path)
     try:
         return _run_walker_for_all(conn, household, ticker)
     finally:
@@ -392,6 +410,8 @@ def get_active_cycles_with_intraday_delta(
     household: Optional[str] = None,
     ticker: Optional[str] = None,
     as_of_datetime: "datetime | None" = None,  # noqa: F821
+    *,
+    db_path: "str | Path | None" = None,
 ) -> list[Cycle]:
     """Walker-derived cycles + same-day fill overlay (ADR-006).
 
@@ -412,6 +432,8 @@ def get_active_cycles_with_intraday_delta(
         household: optional household filter
         ticker: optional ticker filter
         as_of_datetime: optional override for "now" (testing)
+        db_path: optional explicit database path for test fixtures.
+            Default (None) routes to production via get_db_connection().
 
     Returns:
         list[Cycle] with master_log state plus same-day fills applied.
@@ -419,11 +441,13 @@ def get_active_cycles_with_intraday_delta(
     from contextlib import closing
 
     # Step 1: get baseline walker cycles from master_log only
-    baseline_cycles = get_active_cycles(household=household, ticker=ticker)
+    baseline_cycles = get_active_cycles(
+        household=household, ticker=ticker, db_path=db_path,
+    )
 
     # Step 2: find the master_log_trades watermark (ADR-006 addendum)
     try:
-        with closing(_get_db()) as conn:
+        with closing(_get_db(db_path)) as conn:
             row = conn.execute(
                 "SELECT MAX(last_synced_at) as watermark FROM master_log_trades"
             ).fetchone()
@@ -440,7 +464,7 @@ def get_active_cycles_with_intraday_delta(
 
     # Step 3: read fill_log delta since watermark
     try:
-        with closing(_get_db()) as conn:
+        with closing(_get_db(db_path)) as conn:
             delta_rows = conn.execute(
                 "SELECT * FROM fill_log WHERE created_at > ? "
                 "ORDER BY created_at ASC, exec_id ASC",

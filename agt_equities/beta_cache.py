@@ -29,7 +29,7 @@ _STALE_DAYS = 14  # warn if beta older than this
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA busy_timeout = 15000;")
     return conn
 
 

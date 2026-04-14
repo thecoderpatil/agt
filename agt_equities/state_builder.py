@@ -223,7 +223,7 @@ def _open_readonly(db_path: str) -> sqlite3.Connection:
     """Open a read-only DB connection with Sprint B Unit 6 PRAGMA tuning."""
     conn = sqlite3.connect(db_path, timeout=5)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA busy_timeout = 15000")
     return conn
 
 
@@ -256,7 +256,11 @@ def build_state(
     from agt_equities import trade_repo  # deferred to avoid circular at import time
 
     if db_path is None:
-        db_path = str(trade_repo.DB_PATH)
+        # FU-A-03a: source from canonical shared module instead of
+        # trade_repo.DB_PATH. trade_repo.DB_PATH is deleted in FU-A-04;
+        # agt_equities.db.DB_PATH is the surviving SSOT.
+        from agt_equities.db import DB_PATH as _DEFAULT_DB_PATH
+        db_path = str(_DEFAULT_DB_PATH)
 
     warnings: List[str] = []
     now = datetime.utcnow()
@@ -333,7 +337,7 @@ def build_state(
     # ── 2. Active cycles (settled, from Walker) ──
     active_cycles: List = []
     try:
-        active_cycles = trade_repo.get_active_cycles()
+        active_cycles = trade_repo.get_active_cycles(db_path=db_path)
     except Exception as exc:
         warnings.append(f"active_cycles query failed: {exc}")
 

@@ -9,6 +9,8 @@ import sys
 import os
 import xml.etree.ElementTree as ET
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from agt_equities.walker import (
@@ -18,6 +20,11 @@ from agt_equities.walker import (
 
 FIXTURE_PATH = os.path.join(os.path.dirname(__file__), 'fixtures', 'master_log_sample.xml')
 INCEPTION_FIXTURE_PATH = os.path.join(os.path.dirname(__file__), 'fixtures', 'master_log_inception.xml')
+
+# FU-A-03c: Production DB path for integration tests that require live
+# data. Tests using this constant must be marked @pytest.mark.skipif so
+# they skip cleanly on machines without the production DB.
+_PROD_DB_PATH = r'C:\AGT_Telegram_Bridge\agt_desk.db'
 
 # Account → household mapping
 HOUSEHOLD_MAP = {
@@ -776,14 +783,17 @@ class TestWalker(unittest.TestCase):
         self.assertEqual(c.open_short_puts, 0)
         self.assertAlmostEqual(c.premium_total, 150.0, delta=1.0)
 
+    @pytest.mark.skipif(
+        not os.path.exists(_PROD_DB_PATH),
+        reason="Integration test requires production DB at " + _PROD_DB_PATH,
+    )
     def test_cash_only_transfer_ignored(self):
         """Cash-only transfer (qty=0) should not crash or create events."""
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agt_equities import trade_repo
-        trade_repo.DB_PATH = r'C:\AGT_Telegram_Bridge\agt_desk.db'
         import sqlite3
-        conn = sqlite3.connect(trade_repo.DB_PATH)
+        conn = sqlite3.connect(_PROD_DB_PATH)
         conn.row_factory = sqlite3.Row
         events = trade_repo._load_transfer_events(conn)
         conn.close()

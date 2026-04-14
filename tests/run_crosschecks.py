@@ -96,7 +96,6 @@ def setup_db():
 
 
 def run_walker(conn):
-    trade_repo.DB_PATH = conn  # we'll pass conn directly below
     all_events = trade_repo._load_trade_events(conn)
     carryin_events = trade_repo._load_carryin_events(conn)
     transfer_events = trade_repo._load_transfer_events(conn)
@@ -343,9 +342,6 @@ def crosscheck_c(conn, all_cycles):
 
 def main():
     conn, db_path = setup_db()
-
-    # Point trade_repo at test DB
-    trade_repo.DB_PATH = db_path
 
     all_cycles, frozen = run_walker(conn)
     active = [c for c in all_cycles if c.status == 'ACTIVE']

@@ -10,7 +10,7 @@ Used by:
   - agt_scheduler.py (the future APScheduler daemon, Sprint B)
 
 Connection discipline:
-  - busy_timeout=10000ms (10s) on every connection — survives the
+  - busy_timeout=15000ms (15s) on every connection — survives the
     contention window when flex_sync holds the writer lock during EOD.
   - row_factory=sqlite3.Row everywhere — callers expect dict-like access.
   - Read-write connections via get_db_connection().
@@ -41,9 +41,9 @@ from typing import Iterator
 _BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = _BASE_DIR / "agt_desk.db"
 
-# Connection-level lock wait. 10 seconds covers the worst-case Flex sync
-# contention window observed in production.
-_BUSY_TIMEOUT_MS = 10000
+# Connection-level lock wait. 15 seconds covers the worst-case Flex sync
+# contention window observed in production (two-daemon WAL contention).
+_BUSY_TIMEOUT_MS = 15000
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -91,7 +91,7 @@ def tx_immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     reserved on first write).
 
     BEGIN IMMEDIATE acquires the reserved lock upfront. Under
-    contention, the connection waits up to busy_timeout (10s) for the
+    contention, the connection waits up to busy_timeout (15s) for the
     lock rather than failing immediately. On exception, the transaction
     rolls back. On clean exit, it commits.
 

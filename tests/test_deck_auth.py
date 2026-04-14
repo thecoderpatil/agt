@@ -1,5 +1,8 @@
 """Test deck auth middleware."""
 import sys, os, unittest
+
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 os.environ["AGT_DECK_TOKEN"] = "test_token_12345"
@@ -9,6 +12,7 @@ from agt_deck.main import app
 
 
 class TestDeckAuth(unittest.TestCase):
+    pytestmark = pytest.mark.agt_tripwire_exempt
 
     def setUp(self):
         self.client = TestClient(app)

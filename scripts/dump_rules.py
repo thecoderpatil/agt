@@ -79,10 +79,16 @@ def _derive_household_nlv(nav_by_acct: dict[str, float]) -> dict[str, float]:
 
 
 def _load_active_cycles() -> list:
+    """Load Walker active cycles via trade_repo.
+
+    Threads the module-level DB_PATH (which the test monkeypatches) through
+    to trade_repo.get_active_cycles(db_path=...) per FU-A-03a (DT ruling Q1).
+    The vestigial trade_repo.DB_PATH module-attribute assignment was
+    deleted as part of this refactor.
+    """
     try:
         from agt_equities import trade_repo
-        trade_repo.DB_PATH = DB_PATH
-        return trade_repo.get_active_cycles()
+        return trade_repo.get_active_cycles(db_path=str(DB_PATH))
     except Exception as exc:
         print(f"[WARN] Active cycles load failed: {exc}", file=sys.stderr)
         _gaps.append(f"Active cycles: load failed ({exc})")
@@ -305,7 +311,7 @@ def main():
 
     conn = sqlite3.connect(str(DB_PATH), timeout=5.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA busy_timeout = 15000")
 
     # 1. NAV
     print("── NAV (per-account MAX(report_date)) ──")

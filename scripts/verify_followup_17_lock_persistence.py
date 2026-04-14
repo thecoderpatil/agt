@@ -90,6 +90,10 @@ def _child_process(db_path: str):
     try:
         conn = sqlite3.connect(db_path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL;")
+        # NOTE: intentionally held at 5000 to probe lock-persistence timing under
+        # contention. Production busy_timeout is 15000 (see agt_equities/db.py).
+        # FU-A-02 Phase B.0 explicitly preserved this value. See DT ruling
+        # 2026-04-14 + HANDOFF_ARCHITECT_v23.
         conn.execute("PRAGMA busy_timeout = 5000;")
 
         # Canonical pattern: closing() + with conn: for write

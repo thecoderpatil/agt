@@ -138,12 +138,18 @@ def get_spots(tickers: list[str]) -> dict[str, float]:
 
 # ── Active cycles loader ─────────────────────────────────────────
 
-def load_active_cycles() -> list:
-    """Load Walker active cycles from trade_repo."""
+def load_active_cycles(db_path: "str | None" = None) -> list:
+    """Load Walker active cycles from trade_repo.
+
+    db_path: optional explicit path for tests/scripts. Default None routes
+    through agt_equities.db.get_db_connection() (production path). Threaded
+    through trade_repo.get_active_cycles() per FU-A-03a (DT ruling Q1).
+    The vestigial trade_repo.DB_PATH module-attribute assignment was
+    deleted as part of this refactor.
+    """
     try:
         from agt_equities import trade_repo
-        trade_repo.DB_PATH = str(Path(__file__).resolve().parent.parent / "agt_desk.db")
-        return trade_repo.get_active_cycles()
+        return trade_repo.get_active_cycles(db_path=db_path)
     except Exception as exc:
         logger.warning("load_active_cycles failed: %s", exc)
         return []
@@ -151,10 +157,9 @@ def load_active_cycles() -> list:
 
 # ── Build top strip data ─────────────────────────────────────────
 
-def build_top_strip(conn) -> dict:
+def build_top_strip(conn, db_path: "str | None" = None) -> dict:
     # ── Sprint C2: SSOT reads from DeskSnapshot (NAV, cycles, betas) ──
     from agt_equities.state_builder import build_state
-    from agt_equities import trade_repo
 
     _el_data = queries.get_health_strip_data(conn)
     live_nlv_dict = {
@@ -166,7 +171,7 @@ def build_top_strip(conn) -> dict:
     }
 
     snapshot = build_state(
-        db_path=str(trade_repo.DB_PATH),
+        db_path=db_path,
         live_nlv=live_nlv_dict or None,
     )
 
@@ -486,7 +491,7 @@ def _build_household_el(top: dict, hh_nlv: dict) -> dict:
     return result
 
 
-def _build_cure_data(conn) -> dict:
+def _build_cure_data(conn, db_path: "str | None" = None) -> dict:
     """Assemble Cure Console data from rule engine + glide paths."""
     from agt_equities.rule_engine import PortfolioState, evaluate_all, compute_leverage_pure
     from agt_equities.mode_engine import (
@@ -495,8 +500,8 @@ def _build_cure_data(conn) -> dict:
     )
     from datetime import date as _date
 
-    top = build_top_strip(conn)
-    cycles_raw = load_active_cycles()
+    top = build_top_strip(conn, db_path=db_path)
+    cycles_raw = load_active_cycles(db_path=db_path)
 
     # Build PortfolioState
     hh_nlv = {}
