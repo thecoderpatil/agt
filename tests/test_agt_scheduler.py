@@ -12,6 +12,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.sprint_a
+
 
 def test_import_no_side_effects(monkeypatch):
     """Importing agt_scheduler must not start a scheduler, open IB, or touch DB."""

@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.sprint_a
+
 from agt_equities import flex_sync
 from agt_equities.db import get_db_connection
 from agt_equities.schema import register_master_log_tables, register_operational_tables

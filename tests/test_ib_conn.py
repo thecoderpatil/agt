@@ -11,6 +11,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.sprint_a
+
 from agt_equities.ib_conn import IBConnConfig, IBConnector
 
 
