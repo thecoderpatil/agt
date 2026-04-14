@@ -191,7 +191,31 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     registered.append("heartbeat_writer")
 
     def _orphan_sweep_job() -> None:
-        sweep_orphan_staged_orders(ttl_hours=DEFAULT_ORPHAN_TTL_HOURS)
+        # A5c: when the sweep finds orphan staged rows, surface a warn-severity
+        # ORPHAN_SWEEP event onto the cross_daemon_alerts bus for bot-side
+        # delivery (consumer wires up in A5d). Zero-swept runs stay silent.
+        try:
+            swept = sweep_orphan_staged_orders(ttl_hours=DEFAULT_ORPHAN_TTL_HOURS)
+        except Exception as exc:
+            logger.error("orphan_sweep call failed: %s", exc)
+            return
+        if swept and swept > 0:
+            try:
+                # Lazy import — keeps agt_scheduler module-import cost minimal
+                # and matches the pattern used by _attested_sweep_job.
+                from agt_equities.alerts import enqueue_alert
+                enqueue_alert(
+                    "ORPHAN_SWEEP",
+                    {
+                        "swept_count": int(swept),
+                        "ttl_hours": float(DEFAULT_ORPHAN_TTL_HOURS),
+                    },
+                    severity="warn",
+                )
+            except Exception as exc:
+                # Alert enqueue is best-effort. Sweep already committed; an
+                # alert-bus failure must not crash the scheduler job loop.
+                logger.error("orphan_sweep alert enqueue failed: %s", exc)
 
     scheduler.add_job(
         _orphan_sweep_job,
