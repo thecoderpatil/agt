@@ -203,12 +203,52 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("orphan_sweep")
 
-    # Unit A5 will append: cc_daily, watchdog_daily, universe_monthly,
-    #   conviction_weekly, flex_sync_eod, attested_poller (10s),
-    #   attested_sweeper (60s), el_snapshot_writer (30s),
+    # ── A5a — attested_sweeper (60s) ────────────────────────────────────────
+    # Continuous sweeper for stale STAGED + ATTESTED rows in
+    # bucket3_dynamic_exit_log (R7 — 10min ATTESTED TTL, 15min STAGED TTL).
+    # Pure DB op; identical semantics to telegram_bot._sweep_attested_ttl_job
+    # but addressed via the shared get_db_connection helper rather than the
+    # bot-local _get_db_connection alias. Bot-side registration in
+    # telegram_bot.main() is intentionally left in place — the jq.run_repeating
+    # call there is harmless when USE_SCHEDULER_DAEMON=0 (default) because
+    # the scheduler daemon is not running. Bot-side gating lands in A5d
+    # alongside NSSM cutover prep.
+    def _attested_sweep_job() -> None:
+        # Lazy imports to keep agt_scheduler module-import cost minimal and
+        # avoid pulling rule_engine + agt_equities.db into slim CI containers
+        # that don't need them at import time.
+        from contextlib import closing
+        from agt_equities.db import get_db_connection
+        from agt_equities.rule_engine import sweep_stale_dynamic_exit_stages
+        try:
+            with closing(get_db_connection()) as conn:
+                result = sweep_stale_dynamic_exit_stages(conn)
+                swept = result.get("swept", 0)
+                att_swept = result.get("attested_swept", 0)
+                if swept > 0 or att_swept > 0:
+                    logger.info(
+                        "attested_sweeper: staged=%d attested=%d swept",
+                        swept, att_swept,
+                    )
+        except Exception as exc:
+            logger.error("attested_sweeper error: %s", exc)
+
+    scheduler.add_job(
+        _attested_sweep_job,
+        trigger="interval",
+        seconds=60,
+        id="attested_sweeper",
+        name="attested_sweeper",
+        replace_existing=True,
+    )
+    registered.append("attested_sweeper")
+
+    # Unit A5b/c will append the remaining production jobs:
+    #   cc_daily, watchdog_daily, universe_monthly, conviction_weekly,
+    #   flex_sync_eod, attested_poller (10s), el_snapshot_writer (30s),
     #   staged_alert_flush (15s), beta_cache_refresh (daily 04:00),
     #   beta_startup, corporate_intel_refresh (daily 05:00),
-    #   corporate_intel_startup. = 13 jobs total.
+    #   corporate_intel_startup.
     return registered
 
 
