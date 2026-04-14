@@ -4,36 +4,36 @@
 # When/if additional engineers join, split sections by domain expertise.
 
 # â”€â”€â”€ DEFAULT OWNER â”€â”€â”€
-* @yashpatil
+* @yashpatil1
 
 # â”€â”€â”€ MONEY PATH (CRITICAL) â”€â”€â”€
 # Pure-function SSOT for cycle reconstruction. Never mutate.
-/agt_equities/walker.py @yashpatil
+/agt_equities/walker.py @yashpatil1
 
 # Sole writer to immutable master_log_* tables. Atomic-txn invariant per DT Q2.
-/agt_equities/flex_sync.py @yashpatil
+/agt_equities/flex_sync.py @yashpatil1
 
 # Trade repo â€” operational state DML. db_path threading per FU-A.
-/agt_equities/trade_repo.py @yashpatil
+/agt_equities/trade_repo.py @yashpatil1
 
 # Shared DB connection module â€” busy_timeout, tx_immediate. Sprint A foundation.
-/agt_equities/db.py @yashpatil
+/agt_equities/db.py @yashpatil1
 
 # Schema definitions â€” master_log_* and operational tables.
-/agt_equities/schema.py @yashpatil
+/agt_equities/schema.py @yashpatil1
 
 # â”€â”€â”€ DAEMON LAYER (Sprint A) â”€â”€â”€
-/agt_equities/ib_conn.py @yashpatil
-/agt_equities/health.py @yashpatil
-/agt_scheduler.py @yashpatil
+/agt_equities/ib_conn.py @yashpatil1
+/agt_equities/health.py @yashpatil1
+/agt_scheduler.py @yashpatil1
 
 # â”€â”€â”€ COMPLIANCE / CI INFRA â”€â”€â”€
-/.gitlab-ci.yml @yashpatil
-/.gitlab/ @yashpatil
-/CODEOWNERS @yashpatil
-/scripts/api_commit.py @yashpatil
+/.gitlab-ci.yml @yashpatil1
+/.gitlab/ @yashpatil1
+/CODEOWNERS @yashpatil1
+/scripts/api_commit.py @yashpatil1
 
 # â”€â”€â”€ FUTURE (Sprint B + CSP Allocator) â”€â”€â”€
 # Pre-claim ownership now so approval rules apply on first commit.
-/agt_equities/acb_pipeline.py @yashpatil
-/agt_equities/csp_allocator.py @yashpatil
+/agt_equities/acb_pipeline.py @yashpatil1
+/agt_equities/csp_allocator.py @yashpatil1
