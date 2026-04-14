@@ -912,6 +912,28 @@ def register_operational_tables(conn) -> None:
             notes       TEXT
         )
     """)
+    # Cross-daemon alert bus (Sprint A unit A5b). Producers (typically
+    # agt_scheduler jobs without a Telegram bot token) enqueue user-facing
+    # events here; the bot process polls drain_pending_alerts() to render
+    # them. Status state machine: pending -> in_flight -> sent | failed,
+    # with retry-via-pending up to MAX_ATTEMPTS (see agt_equities/alerts.py).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cross_daemon_alerts (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_ts    REAL NOT NULL,
+            kind          TEXT NOT NULL,
+            severity      TEXT NOT NULL,
+            payload_json  TEXT NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            sent_ts       REAL,
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            last_error    TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cross_daemon_alerts_status_created "
+        "ON cross_daemon_alerts(status, created_ts, id)"
+    )
 
 
 def register_master_log_tables(conn) -> None:
