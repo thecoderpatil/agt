@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD
+from .db import get_db_connection
 from .walker import Cycle, TradeEvent, walk_cycles, UnknownEventError
 
 logger = logging.getLogger(__name__)
@@ -29,9 +30,31 @@ _cycle_cache: dict[str, list[Cycle]] = {}
 
 
 def _get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Open a read connection to agt_desk.db.
+
+    Normal path: delegates to the shared agt_equities.db module's
+    get_db_connection(), which sets row_factory=Row and
+    busy_timeout=10000ms.
+
+    Backward-compat path: if the module-level DB_PATH has been
+    overridden at runtime (test fixtures in test_trade_repo.py,
+    test_sprint1f.py, test_dump_rules_smoke.py; runtime scripts
+    run_task3*.py, run_crosschecks.py), opens a direct sqlite3
+    connection to the override path with the same pragmas
+    get_db_connection() would have set. Preserves 15 override
+    sites across 8 files without requiring per-file test fixture
+    updates. Tracked for post-Sprint cleanup: migrate all 15
+    sites to a canonical pattern (monkeypatch-based fixture or
+    explicit db_path parameter) and delete the fallback branch.
+    """
+    from . import db as _shared
+    if DB_PATH != _shared.DB_PATH:
+        # Divergent path — honor the module-local override
+        conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 10000;")
+        return conn
+    return get_db_connection()
 
 
 def invalidate_cache() -> None:
@@ -400,8 +423,7 @@ def get_active_cycles_with_intraday_delta(
 
     # Step 2: find the master_log_trades watermark (ADR-006 addendum)
     try:
-        with closing(sqlite3.connect(DB_PATH, timeout=30.0)) as conn:
-            conn.row_factory = sqlite3.Row
+        with closing(_get_db()) as conn:
             row = conn.execute(
                 "SELECT MAX(last_synced_at) as watermark FROM master_log_trades"
             ).fetchone()
@@ -418,8 +440,7 @@ def get_active_cycles_with_intraday_delta(
 
     # Step 3: read fill_log delta since watermark
     try:
-        with closing(sqlite3.connect(DB_PATH, timeout=30.0)) as conn:
-            conn.row_factory = sqlite3.Row
+        with closing(_get_db()) as conn:
             delta_rows = conn.execute(
                 "SELECT * FROM fill_log WHERE created_at > ? "
                 "ORDER BY created_at ASC, exec_id ASC",
