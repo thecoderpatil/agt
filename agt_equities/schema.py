@@ -888,6 +888,31 @@ def register_operational_tables(conn) -> None:
         VALUES (1, 1, 'schema_init', datetime('now'), 'default disabled')
     """)
 
+    # ── Decoupling Sprint A Unit A2: daemon heartbeat + orphan sweep ──
+    # Per DT Q3 ruling. 90s stale TTL is set in agt_equities/health.py
+    # (consumer-side), not as a DB constraint, to allow per-caller override
+    # for tests and operator diagnostics.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daemon_heartbeat (
+            daemon_name   TEXT PRIMARY KEY,
+            last_beat_utc TEXT NOT NULL,
+            pid           INTEGER NOT NULL,
+            client_id     INTEGER,
+            notes         TEXT
+        )
+    """)
+    # Audit trail for orphan-sweep job runs. Separate from mode_history
+    # because sweeps are operational events, not mode transitions.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orphan_sweep_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at_utc  TEXT NOT NULL,
+            swept_count INTEGER NOT NULL,
+            ttl_hours   REAL NOT NULL,
+            notes       TEXT
+        )
+    """)
+
 
 def register_master_log_tables(conn) -> None:
     """Execute all DDL for Master Log Refactor v3. Safe to call on every startup.

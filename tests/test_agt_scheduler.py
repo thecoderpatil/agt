@@ -92,11 +92,13 @@ def test_build_scheduler_timezone_pinned():
     assert "New_York" in tz_name
 
 
-def test_register_jobs_empty_in_skeleton():
-    """A1 ships with zero jobs registered. The 13 jobs migrate in A5."""
+def test_register_jobs_a2_baseline():
+    """A2 ships heartbeat_writer + orphan_sweep. A5 adds the 13 production jobs."""
     import agt_scheduler
     from agt_equities.ib_conn import IBConnector, IBConnConfig
     sched = agt_scheduler.build_scheduler()
     conn = IBConnector(config=IBConnConfig(client_id=2))
     registered = agt_scheduler.register_jobs(sched, conn)
-    assert registered == []
+    assert registered == ["heartbeat_writer", "orphan_sweep"]
+    job_ids = {j.id for j in sched.get_jobs()}
+    assert {"heartbeat_writer", "orphan_sweep"}.issubset(job_ids)

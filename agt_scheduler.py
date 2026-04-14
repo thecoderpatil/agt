@@ -159,12 +159,51 @@ def build_scheduler() -> "AsyncIOScheduler":
 def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> list[str]:
     """Register all scheduler-owned jobs. Returns list of registered job names.
 
-    Empty in the A1 skeleton. The 13 jobs migrate from telegram_bot.py in
-    Unit A5 (atomic cutover, no phased moves per Q1a-g).
+    A2 adds: heartbeat_writer (60s), orphan_sweep (5 min).
+    A5 will add the 13 production jobs migrated from telegram_bot.py
+    (atomic cutover, no phased moves per Q1a-g).
     """
+    from agt_equities.health import (
+        write_heartbeat,
+        sweep_orphan_staged_orders,
+        DEFAULT_ORPHAN_TTL_HOURS,
+    )
+
     registered: list[str] = []
-    # Unit A2 will add: heartbeat_writer (60s), orphan_sweep (5min).
-    # Unit A5 will add: cc_daily, watchdog_daily, universe_monthly,
+
+    client_id = ib_connector.config.client_id
+
+    def _heartbeat_job() -> None:
+        write_heartbeat(
+            DAEMON_NAME,
+            client_id=client_id,
+            notes="ok",
+        )
+
+    scheduler.add_job(
+        _heartbeat_job,
+        trigger="interval",
+        seconds=60,
+        id="heartbeat_writer",
+        name="heartbeat_writer",
+        replace_existing=True,
+    )
+    registered.append("heartbeat_writer")
+
+    def _orphan_sweep_job() -> None:
+        sweep_orphan_staged_orders(ttl_hours=DEFAULT_ORPHAN_TTL_HOURS)
+
+    scheduler.add_job(
+        _orphan_sweep_job,
+        trigger="interval",
+        minutes=5,
+        id="orphan_sweep",
+        name="orphan_sweep",
+        replace_existing=True,
+    )
+    registered.append("orphan_sweep")
+
+    # Unit A5 will append: cc_daily, watchdog_daily, universe_monthly,
     #   conviction_weekly, flex_sync_eod, attested_poller (10s),
     #   attested_sweeper (60s), el_snapshot_writer (30s),
     #   staged_alert_flush (15s), beta_cache_refresh (daily 04:00),
