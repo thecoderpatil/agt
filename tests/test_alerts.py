@@ -275,3 +275,68 @@ def test_format_flex_sync_digest_handles_missing_payload_keys() -> None:
         {"kind": "FLEX_SYNC_DIGEST", "severity": "info", "payload": {}}
     )
     assert "sync_id=?" in text and "mode=?" in text and "? sections" in text
+
+
+# ---------------------------------------------------------------------------
+# A5d.d — APEX_SURVIVAL format_alert_text tests
+# ---------------------------------------------------------------------------
+
+
+def test_format_apex_survival_full_payload() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text(
+        {
+            "kind": "APEX_SURVIVAL",
+            "severity": "critical",
+            "payload": {
+                "account_id": "U21971297",
+                "household": "Yash_Household",
+                "el_pct": 0.055,
+                "nlv": 480_000.0,
+                "excess_liquidity": 26_400.0,
+            },
+        }
+    )
+    assert "[CRITICAL]" in text
+    # Unicode siren U+1F6A8
+    assert "🚨" in text
+    assert "APEX SURVIVAL" in text
+    assert "U21971297" in text
+    assert "Yash_Household" in text
+    assert "$26,400" in text
+    assert "5.5%" in text
+    assert "$480,000" in text
+    assert "Tied-unwinds required" in text
+
+
+def test_format_apex_survival_missing_fields_falls_back_to_placeholders() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text(
+        {"kind": "APEX_SURVIVAL", "severity": "critical", "payload": {}}
+    )
+    assert "APEX SURVIVAL" in text
+    assert "[?/?]" in text
+    # Missing numerics render as "?"
+    assert text.count("?") >= 4
+
+
+def test_format_apex_survival_handles_non_numeric_values() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text(
+        {
+            "kind": "APEX_SURVIVAL",
+            "severity": "critical",
+            "payload": {
+                "account_id": "U22388499",
+                "household": "Vikram_Household",
+                "el_pct": "nope",
+                "nlv": None,
+                "excess_liquidity": "bad",
+            },
+        }
+    )
+    # Must not raise; values fall back to string/placeholder
+    assert "U22388499" in text
+    assert "Vikram_Household" in text
+    assert "APEX SURVIVAL" in text
+
