@@ -29,7 +29,7 @@ import time
 from collections import defaultdict
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
-from datetime import date, date as _date, datetime as _datetime, time as _time, timedelta as _timedelta, timezone as _timezone
+from datetime import date, date as _date, datetime as _datetime, time as _time, timedelta, timedelta as _timedelta, timezone as _timezone
 from zoneinfo import ZoneInfo as _ZoneInfo
 from pathlib import Path
 
@@ -9194,6 +9194,59 @@ def _build_position_for_evaluator(
     )
 
 
+# ---------------------------------------------------------------------------
+# Finnhub ex-dividend lookup (WHEEL roll_engine R4)
+# ---------------------------------------------------------------------------
+
+_EXDIV_CACHE: dict[tuple[str, str], tuple[date | None, float | None]] = {}
+
+
+def _finnhub_next_ex_div(
+    ticker: str,
+    today: date,
+    horizon_days: int = 60,
+) -> tuple[date | None, float | None]:
+    """Return (next_ex_div_date, amount) within [today, today+horizon_days].
+
+    Day-cached per (ticker, today) to avoid hammering Finnhub on every roll
+    scan. Returns (None, None) on any failure â€” caller treats as "no known
+    upcoming ex-div" and the R4 gate is skipped. Never raises.
+    """
+    cache_key = (ticker.upper(), today.isoformat())
+    if cache_key in _EXDIV_CACHE:
+        return _EXDIV_CACHE[cache_key]
+
+    result: tuple[date | None, float | None] = (None, None)
+    try:
+        horizon = today + timedelta(days=horizon_days)
+        rows = finnhub_client.stock_dividends(
+            ticker.upper(),
+            _from=today.isoformat(),
+            to=horizon.isoformat(),
+        ) or []
+        upcoming: list[tuple[date, float]] = []
+        for r in rows:
+            try:
+                ex_str = r.get("date") or r.get("exDate") or r.get("ex_date")
+                amt = r.get("amount")
+                if ex_str is None or amt is None:
+                    continue
+                ex_d = date.fromisoformat(str(ex_str)[:10])
+                if ex_d >= today:
+                    upcoming.append((ex_d, float(amt)))
+            except (TypeError, ValueError):
+                continue
+        if upcoming:
+            upcoming.sort(key=lambda x: x[0])
+            result = upcoming[0]
+    except Exception as exc:
+        logger.warning("WHEEL-R4: finnhub ex-div fetch failed for %s: %s", ticker, exc)
+        result = (None, None)
+
+    _EXDIV_CACHE[cache_key] = result
+    return result
+
+
 async def _build_market_snapshot_for_evaluator(
     ib_conn,
     ticker: str,
@@ -9274,6 +9327,11 @@ async def _build_market_snapshot_for_evaluator(
                 iv=float(row.get("impliedVol") or 0.0),
             ))
 
+    # R4: preemptive ex-dividend lookup. Failure returns (None, None) and the
+    # evaluator's ex-div gate becomes a no-op â€” fail-open, never block a roll
+    # on a Finnhub outage.
+    ex_div_date, ex_div_amount = _finnhub_next_ex_div(ticker, today, horizon_days=60)
+
     return MarketSnapshot(
         ticker=ticker,
         spot=float(spot),
@@ -9281,6 +9339,8 @@ async def _build_market_snapshot_for_evaluator(
         chain=tuple(chain_quotes),
         current_call=current_call_quote,
         asof=today,
+        next_ex_div_date=ex_div_date,
+        next_div_amount=ex_div_amount,
     )
 
 
