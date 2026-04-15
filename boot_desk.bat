@@ -1,4 +1,5 @@
 @echo off
+setlocal EnableDelayedExpansion
 title AGT Desk Oracle - Telegram Bridge
 echo ============================================
 echo   AGT Equities - Desk Oracle Boot Sequence
@@ -7,27 +8,29 @@ echo.
 
 cd /d "C:\AGT_Telegram_Bridge"
 
-if exist ".venv\Scripts\activate.bat" (
-    echo [OK] Activating virtual environment...
-    call .venv\Scripts\activate.bat
-) else (
-    echo [SKIP] No .venv found - using system Python.
+REM ============================================================
+REM  Git guardrail: prod runs origin/main, clean tree, no drift.
+REM  Refuses to boot on uncommitted mods or non-fast-forward state.
+REM ============================================================
+echo [CHECK] Verifying git state...
+
+git rev-parse --is-inside-work-tree >nul 2>&1
+if !ERRORLEVEL! NEQ 0 (
+    echo [FAIL] Not a git repo. Refusing to boot.
+    goto :halt
 )
 
-echo [OK] Checking dependencies...
-pip install --quiet --upgrade "python-telegram-bot[job-queue]" >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    echo [OK] python-telegram-bot[job-queue] verified.
-) else (
-    echo [WARN] pip install failed - JobQueue may not work.
+git diff --quiet
+set _DIRTY_UNSTAGED=!ERRORLEVEL!
+git diff --cached --quiet
+set _DIRTY_STAGED=!ERRORLEVEL!
+if !_DIRTY_UNSTAGED! NEQ 0 goto :dirty_tree
+if !_DIRTY_STAGED! NEQ 0 goto :dirty_tree
+
+git fetch origin main --quiet
+if !ERRORLEVEL! NEQ 0 (
+    echo [FAIL] git fetch origin main failed. Check network/credentials.
+    goto :halt
 )
 
-echo [OK] Launching telegram_bot.py...
-echo.
-python telegram_bot.py
-
-echo.
-echo ============================================
-echo   Process exited. Press any key to close.
-echo ============================================
-pause >nul
+for /f "
