@@ -8895,6 +8895,84 @@ _scheduled_mode1 = _scheduled_cc
 # WHEEL-4 glue helpers
 # ---------------------------------------------------------------------------
 
+def _lookup_inception_from_flex(
+    conid: int,
+    account_id: str,
+    expiry_iso: str,
+) -> tuple["date", float, int] | None:
+    """Look up authoritative inception metadata for an open short option contract.
+
+    Preferred source: master_log_open_positions (flex-populated EOD snapshot)
+    carries open_date_time + open_price per (account_id, conid). Fallback:
+    most-recent Sell-to-Open row in master_log_trades for the same conid.
+
+    Returns (opened_at, initial_credit_per_contract, initial_dte) on hit,
+    None on miss. Caller falls back to V_r=0 graceful degradation.
+
+    Safe: read-only queries under _get_db_connection(); any exception → None.
+    """
+    if not conid or not account_id:
+        return None
+    try:
+        with closing(_get_db_connection()) as conn:
+            row = conn.execute(
+                """
+                SELECT open_date_time, open_price
+                FROM master_log_open_positions
+                WHERE conid = ? AND account_id = ? AND open_date_time IS NOT NULL
+                ORDER BY report_date DESC
+                LIMIT 1
+                """,
+                (int(conid), str(account_id)),
+            ).fetchone()
+            if row is None or row["open_date_time"] is None or row["open_price"] is None:
+                row = conn.execute(
+                    """
+                    SELECT date_time AS open_date_time, trade_price AS open_price
+                    FROM master_log_trades
+                    WHERE conid = ? AND account_id = ?
+                      AND buy_sell = 'SELL' AND open_close = 'O'
+                    ORDER BY date_time DESC
+                    LIMIT 1
+                    """,
+                    (int(conid), str(account_id)),
+                ).fetchone()
+            if row is None or row["open_date_time"] is None or row["open_price"] is None:
+                return None
+
+            raw_dt = str(row["open_date_time"])
+            try:
+                if ";" in raw_dt:
+                    datepart = raw_dt.split(";", 1)[0]
+                else:
+                    datepart = raw_dt[:10].replace("-", "")
+                opened_at = date(int(datepart[0:4]), int(datepart[4:6]), int(datepart[6:8]))
+            except (ValueError, IndexError):
+                return None
+
+            try:
+                initial_credit = abs(float(row["open_price"])) * 100.0
+            except (TypeError, ValueError):
+                return None
+
+            try:
+                if "-" in expiry_iso:
+                    exp_d = date.fromisoformat(expiry_iso)
+                else:
+                    exp_d = date(int(expiry_iso[0:4]), int(expiry_iso[4:6]), int(expiry_iso[6:8]))
+            except (ValueError, IndexError):
+                return None
+
+            initial_dte = max(0, (exp_d - opened_at).days)
+            return (opened_at, initial_credit, initial_dte)
+    except Exception as exc:
+        logger.debug(
+            "_lookup_inception_from_flex conid=%s account=%s failed: %s",
+            conid, account_id, exc,
+        )
+        return None
+
+
 def _build_position_for_evaluator(
     pos,  # ib_async.Position
     ledger_snapshot: dict | None,
@@ -8923,16 +9001,29 @@ def _build_position_for_evaluator(
         if raw_adjusted is not None:
             adjusted_basis = float(raw_adjusted)
 
-    # Initial credit: avgCost / 100 (matches existing inline heuristic at
-    # legacy line 9024). When unavailable, velocity-ratio gate returns 0.
-    initial_credit = abs(float(getattr(pos, "avgCost", 0.0) or 0.0)) / 100.0
+    # WHEEL-4b: prefer authoritative inception from flex-populated tables
+    # (master_log_open_positions with master_log_trades fallback). Enables
+    # real velocity-ratio routing on positions flex has captured (all open
+    # shorts older than the current trading session).
+    inception = None
+    try:
+        conid_val = int(getattr(pos.contract, "conId", 0) or 0)
+        expiry_iso = str(getattr(pos.contract, "lastTradeDateOrContractMonth", "") or "")
+        if conid_val and expiry_iso:
+            inception = _lookup_inception_from_flex(conid_val, acct_id, expiry_iso)
+    except Exception:
+        inception = None
 
-    # opened_at / initial_dte: not tracked at fill-log granularity today.
-    # Use today as opened_at and current dte as initial_dte — makes V_r ~0
-    # (t_pct ~0) which falls through to extrinsic-based routing. This is
-    # the intended graceful degradation per WHEEL-3 research brief.
     today = date.today()
-    initial_dte = max(0, (exp_date - today).days)
+    if inception is not None:
+        opened_at, initial_credit, initial_dte = inception
+    else:
+        # Graceful degradation: flex has not captured this position yet
+        # (same-session open) — fall back to avgCost for premium anchor and
+        # V_r=0 (opened_at=today → t_pct=0) for routing.
+        initial_credit = abs(float(getattr(pos, "avgCost", 0.0) or 0.0)) / 100.0
+        opened_at = today
+        initial_dte = max(0, (exp_date - today).days)
 
     return Position(
         ticker=ticker,
@@ -8943,7 +9034,7 @@ def _build_position_for_evaluator(
         quantity=qty,
         cost_basis=assigned_basis,
         inception_delta=None,  # vestigial in WHEEL-3 evaluator
-        opened_at=today,
+        opened_at=opened_at,
         avg_premium_collected=initial_credit,
         assigned_basis=assigned_basis,
         adjusted_basis=adjusted_basis,
