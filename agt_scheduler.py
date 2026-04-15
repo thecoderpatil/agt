@@ -403,11 +403,116 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("el_snapshot_writer")
 
+    # -- A5e -- beta_cache_refresh (daily 04:00 ET) + startup ----------------
+    # Pure data refresh -- calls agt_equities.beta_cache.refresh_beta_cache
+    # on all active tickers.  No IB dependency, no Telegram output.
+    # Errors swallowed + logged per scheduler-job resilience pattern.
+
+    def _beta_cache_refresh_job() -> None:
+        try:
+            from agt_equities.beta_cache import refresh_beta_cache
+            from agt_equities import trade_repo
+
+            tickers: list[str] = []
+            try:
+                cycles = trade_repo.get_active_cycles()
+                tickers = list(
+                    {c.ticker for c in cycles if c.status == "ACTIVE"}
+                )
+            except Exception:
+                pass
+            if tickers:
+                refresh_beta_cache(tickers)
+                logger.info(
+                    "beta_cache_refresh: refreshed %d tickers", len(tickers),
+                )
+        except Exception as exc:
+            logger.warning("beta_cache_refresh_job failed: %s", exc)
+
+    scheduler.add_job(
+        _beta_cache_refresh_job,
+        trigger="cron",
+        hour=4,
+        minute=0,
+        id="beta_cache_refresh",
+        name="beta_cache_refresh",
+        replace_existing=True,
+    )
+    registered.append("beta_cache_refresh")
+
+    from datetime import datetime, timedelta
+
+    scheduler.add_job(
+        _beta_cache_refresh_job,
+        trigger="date",
+        run_date=datetime.now(tz=scheduler.timezone) + timedelta(seconds=10),
+        id="beta_startup",
+        name="beta_startup",
+        replace_existing=True,
+    )
+    registered.append("beta_startup")
+
+    # -- A5e -- corporate_intel_refresh (daily 05:00 ET) + startup -----------
+    # yfinance corporate calendar refresh on active tickers.
+    # No IB dependency, no Telegram output.
+
+    def _corporate_intel_refresh_job() -> None:
+        try:
+            from agt_equities.providers.yfinance_corporate_intelligence import (
+                YFinanceCorporateIntelligenceProvider,
+            )
+            from agt_equities import trade_repo
+
+            tickers: list[str] = []
+            try:
+                cycles = trade_repo.get_active_cycles()
+                tickers = list(
+                    {c.ticker for c in cycles if c.status == "ACTIVE"}
+                )
+            except Exception:
+                pass
+            if tickers:
+                provider = YFinanceCorporateIntelligenceProvider()
+                for tk in tickers:
+                    try:
+                        provider.get_corporate_calendar(tk)
+                    except Exception as tk_exc:
+                        logger.warning(
+                            "corporate_intel refresh failed for %s: %s",
+                            tk,
+                            tk_exc,
+                        )
+                logger.info(
+                    "corporate_intel: refreshed %d tickers", len(tickers),
+                )
+        except Exception as exc:
+            logger.warning("corporate_intel_refresh_job failed: %s", exc)
+
+    scheduler.add_job(
+        _corporate_intel_refresh_job,
+        trigger="cron",
+        hour=5,
+        minute=0,
+        id="corporate_intel_refresh",
+        name="corporate_intel_refresh",
+        replace_existing=True,
+    )
+    registered.append("corporate_intel_refresh")
+
+    scheduler.add_job(
+        _corporate_intel_refresh_job,
+        trigger="date",
+        run_date=datetime.now(tz=scheduler.timezone) + timedelta(seconds=15),
+        id="corporate_intel_startup",
+        name="corporate_intel_startup",
+        replace_existing=True,
+    )
+    registered.append("corporate_intel_startup")
+
     # Unit A5 remaining: cc_daily, watchdog_daily, universe_monthly,
-    #   conviction_weekly, flex_sync_eod, attested_poller (10s),
-    #   beta_cache_refresh (daily 04:00), beta_startup,
-    #   corporate_intel_refresh (daily 05:00), corporate_intel_startup.
+    #   conviction_weekly, flex_sync_eod, attested_poller (10s).
     #   el_snapshot_writer shipped in A5d.d.
+    #   beta_cache_refresh + corporate_intel_refresh shipped in A5e.
     return registered
 
 

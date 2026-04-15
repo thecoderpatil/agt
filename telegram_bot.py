@@ -8568,12 +8568,13 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
         logger.warning("CC discovery warning: %s", disco["error"])
 
     # Flatten all uncovered positions into a single target list — no mode split.
-    # NOTE: initial_basis check removed here — per-account basis is checked
-    # below when building per-account targets (WHEEL-5 fix, 2026-04-15).
     cc_targets: list[dict] = []
     for hh_data in disco["households"].values():
         for p in hh_data["positions"]:
             if p["available_contracts"] < 1:
+                continue
+            # Need a paper basis to anchor. If missing, skip loudly.
+            if p.get("initial_basis", 0) <= 0:
                 continue
             cc_targets.append(p)
 
@@ -8645,41 +8646,74 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                     logger.warning("Dynamic exit staging failed for %s: %s",
                                    p["ticker"], de_exc)
 
-    # ── WHEEL-5 fix: per-account basis-anchored chain walks (parallel) ──
-    # Build flat list of per-account targets. Each account within a position
-    # gets its own paper_basis from the ADR-006 per-account walker path,
-    # so Roth@$73 and Individual@$86 get independent chain walks + strikes.
-    _acct_targets: list[dict] = []
-    for p in cc_targets:
+    # ── Unified basis-anchored chain walks (parallel) ──
+    async def _walk_target(p):
+        """Walk chain for one target. Returns (p, result, skip_reason)."""
         ticker = p["ticker"]
-        hh = p["household"]
         spot = p["spot_price"]
+        paper_basis = p["initial_basis"]
 
         if spot <= 0:
+            return p, None, "No spot price"
+
+        result = await _walk_chain_limited(
+            _walk_cc_chain, ticker, spot, paper_basis, CC_TARGET_DTE
+        )
+        if result is None:
+            return p, None, "No viable strike"
+        if result.get("below_floor"):
+            reason = (
+                f"STAND DOWN \u2014 best {result['best_strike']:.2f}C "
+                f"@ {result['best_annualized']:.1f}% ann "
+                f"(< {result['floor_pct']:.0f}% floor, "
+                f"DTE {result['dte']})"
+            )
+            return p, None, reason
+
+        return p, result, None
+
+    results = await asyncio.gather(
+        *[_walk_target(p) for p in cc_targets],
+        return_exceptions=True,
+    )
+
+    for item in results:
+        if isinstance(item, Exception):
+            logger.warning("CC chain walk failed: %s", item)
+            continue
+
+        p, result, skip_reason = item
+
+        if skip_reason:
             skipped.append({
-                "ticker": ticker, "reason": "No spot price",
-                "household": hh, "mode": p.get("mode", ""),
-                "spot": spot, "adjusted_basis": p.get("adjusted_basis", 0),
+                "ticker": p["ticker"],
+                "reason": skip_reason,
+                "household": p["household"],
+                "mode": p.get("mode", ""),
+                "spot": p["spot_price"],
+                "adjusted_basis": p.get("adjusted_basis", 0),
                 "initial_basis": p.get("initial_basis", 0),
             })
             continue
 
-        # Dynamic exit carve-out check (household-level, unchanged)
         remaining_available = p["available_contracts"]
-        carve_key = f"{hh}|{ticker}"
+        carve_key = f"{p['household']}|{p['ticker']}"
         carved = excess_carveout.get(carve_key, 0)
         if carved > 0:
             remaining_available = max(0, remaining_available - carved)
             if remaining_available == 0:
                 skipped.append({
-                    "ticker": ticker,
+                    "ticker": p["ticker"],
                     "reason": f"All contracts reserved for Dynamic Exit ({carved}c)",
-                    "household": hh, "mode": p.get("mode", ""),
-                    "spot": spot, "adjusted_basis": p.get("adjusted_basis", 0),
+                    "household": p["household"],
+                    "mode": p.get("mode", ""),
+                    "spot": p["spot_price"],
+                    "adjusted_basis": p.get("adjusted_basis", 0),
                     "initial_basis": p.get("initial_basis", 0),
                 })
                 continue
 
+        ticker = p["ticker"]
         working_pa = p.get("working_per_account", {})
         staged_pa = p.get("staged_per_account", {})
 
@@ -8703,128 +8737,26 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                 continue
             remaining_available -= acct_contracts
 
-            # Per-account basis via ADR-006 walker path
-            try:
-                acct_ledger = await asyncio.to_thread(
-                    _load_premium_ledger_snapshot, hh, ticker, acct_id,
-                )
-            except Exception as ledger_exc:
-                logger.warning(
-                    "WHEEL-5: per-account ledger failed for %s/%s/%s: %s",
-                    hh, ticker, acct_id, ledger_exc,
-                )
-                acct_ledger = None
-
-            acct_basis = (
-                acct_ledger.get("initial_basis", 0) if acct_ledger else 0
-            )
-            if acct_basis <= 0:
-                # Fallback: use household-aggregated basis (pre-WHEEL-5 behavior)
-                # so we don't silently drop accounts that lack per-account data.
-                acct_basis = p.get("initial_basis", 0)
-                if acct_basis <= 0:
-                    skipped.append({
-                        "ticker": ticker,
-                        "reason": f"No paper basis for account {acct_id}",
-                        "household": hh, "mode": p.get("mode", ""),
-                        "spot": spot, "adjusted_basis": 0,
-                        "initial_basis": 0,
-                    })
-                    continue
-                logger.info(
-                    "WHEEL-5: falling back to household basis %.2f for %s/%s/%s",
-                    acct_basis, hh, ticker, acct_id,
-                )
-
-            _acct_targets.append({
-                "position": p,
-                "acct_id": acct_id,
-                "acct_contracts": acct_contracts,
-                "paper_basis": acct_basis,
-            })
-
-    async def _walk_acct_target(t):
-        """Walk chain for one per-account target."""
-        p = t["position"]
-        ticker = p["ticker"]
-        spot = p["spot_price"]
-        basis = t["paper_basis"]
-        acct_id = t["acct_id"]
-
-        try:
-            result = await _walk_chain_limited(
-                _walk_cc_chain, ticker, spot, basis, CC_TARGET_DTE
-            )
-        except Exception as exc:
-            logger.warning(
-                "WHEEL-5: chain walk failed for %s/%s (basis=%.2f): %s",
-                ticker, acct_id, basis, exc,
-            )
-            return t, None, f"Chain walk error: {exc}"
-
-        if result is None:
-            return t, None, "No viable strike"
-        if result.get("below_floor"):
-            reason = (
-                f"STAND DOWN \u2014 best {result['best_strike']:.2f}C "
-                f"@ {result['best_annualized']:.1f}% ann "
-                f"(< {result['floor_pct']:.0f}% floor, "
-                f"DTE {result['dte']}, "
-                f"acct={acct_id} basis=${basis:.2f})"
-            )
-            return t, None, reason
-
-        return t, result, None
-
-    walk_results = await asyncio.gather(
-        *[_walk_acct_target(t) for t in _acct_targets],
-        return_exceptions=True,
-    )
-
-    for item in walk_results:
-        if isinstance(item, Exception):
-            logger.warning("CC per-account chain walk failed: %s", item)
-            continue
-
-        t, result, skip_reason = item
-        p = t["position"]
-        acct_id = t["acct_id"]
-        ticker = p["ticker"]
-
-        if skip_reason:
-            skipped.append({
-                "ticker": ticker,
-                "reason": skip_reason,
-                "household": p["household"],
-                "mode": p.get("mode", ""),
-                "spot": p["spot_price"],
-                "adjusted_basis": p.get("adjusted_basis", 0),
-                "initial_basis": t["paper_basis"],
+            ticket = {
                 "account_id": acct_id,
-            })
-            continue
-
-        ticket = {
-            "account_id": acct_id,
-            "household": p["household"],
-            "ticker": ticker,
-            "action": "SELL",
-            "sec_type": "OPT",
-            "right": "C",
-            "strike": result["strike"],
-            "expiry": result["expiry"],
-            "quantity": t["acct_contracts"],
-            "limit_price": result["bid"],
-            "annualized_yield": result["annualized"],
-            # All unified-walker tickets log as MODE_2_HARVEST for DB
-            # compatibility (roll_watchlist / cc_cycle_log readers).
-            # Branch ("BASIS_ANCHOR" vs "BASIS_STEP_UP") rides in the
-            # merged result dict for the digest.
-            "mode": "MODE_2_HARVEST",
-            "status": "staged",
-            "per_account_basis": t["paper_basis"],  # WHEEL-5: audit trail
-        }
-        staged.append({**ticket, **result})
+                "household": p["household"],
+                "ticker": ticker,
+                "action": "SELL",
+                "sec_type": "OPT",
+                "right": "C",
+                "strike": result["strike"],
+                "expiry": result["expiry"],
+                "quantity": acct_contracts,
+                "limit_price": result["bid"],
+                "annualized_yield": result["annualized"],
+                # All unified-walker tickets log as MODE_2_HARVEST for DB
+                # compatibility (roll_watchlist / cc_cycle_log readers).
+                # Branch ("BASIS_ANCHOR" vs "BASIS_STEP_UP") rides in the
+                # merged result dict for the digest.
+                "mode": "MODE_2_HARVEST",
+                "status": "staged",
+            }
+            staged.append({**ticket, **result})
 
     # Write all staged tickets to SQLite
     if staged:
@@ -11296,72 +11228,79 @@ def main() -> None:
         )
         logger.info("Scheduled: cross_daemon_alerts_drain every 2s")
 
-        # Sprint 1F Fix 2: daily beta cache refresh (04:00 local, pre-market)
-        async def _beta_cache_refresh_job(context):
-            if _HALTED:
-                return
-            try:
-                from agt_equities.beta_cache import refresh_beta_cache
-                tickers = []
+        # A5e: beta_cache_refresh + corporate_intel_refresh -- scheduler daemon
+        # owns these when USE_SCHEDULER_DAEMON=1.  Bot retains them as
+        # fallback for the 4-week cutover window (flag=0 default).
+        if not _use_scheduler_daemon():
+            async def _beta_cache_refresh_job(context):
+                if _HALTED:
+                    return
                 try:
-                    from agt_equities import trade_repo
-                    from pathlib import Path
-                    cycles = trade_repo.get_active_cycles()
-                    tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE'})
-                except Exception:
-                    pass
-                if tickers:
-                    await asyncio.to_thread(refresh_beta_cache, tickers)
-            except Exception as exc:
-                logger.warning("beta_cache_refresh_job failed: %s", exc)
+                    from agt_equities.beta_cache import refresh_beta_cache
+                    tickers = []
+                    try:
+                        from agt_equities import trade_repo
+                        from pathlib import Path
+                        cycles = trade_repo.get_active_cycles()
+                        tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE'})
+                    except Exception:
+                        pass
+                    if tickers:
+                        await asyncio.to_thread(refresh_beta_cache, tickers)
+                except Exception as exc:
+                    logger.warning("beta_cache_refresh_job failed: %s", exc)
 
-        from datetime import time as _dt_time
-        jq.run_daily(
-            callback=_beta_cache_refresh_job,
-            time=_dt_time(4, 0, tzinfo=ET),
-            name="beta_cache_refresh",
-        )
-        logger.info("Scheduled: beta_cache_refresh daily at 04:00")
-        async def _beta_startup_check(context):
-            await _beta_cache_refresh_job(context)
-        jq.run_once(_beta_startup_check, when=10, name="beta_startup")
+            from datetime import time as _dt_time
+            jq.run_daily(
+                callback=_beta_cache_refresh_job,
+                time=_dt_time(4, 0, tzinfo=ET),
+                name="beta_cache_refresh",
+            )
+            logger.info("Scheduled: beta_cache_refresh daily at 04:00")
+            async def _beta_startup_check(context):
+                await _beta_cache_refresh_job(context)
+            jq.run_once(_beta_startup_check, when=10, name="beta_startup")
 
-        # Sprint 1F Fix 6: daily R7 corporate intel refresh (05:00 local)
-        async def _corporate_intel_refresh_job(context):
-            if _HALTED:
-                return
-            try:
-                from agt_equities.providers.yfinance_corporate_intelligence import (
-                    YFinanceCorporateIntelligenceProvider,
-                )
-                tickers = []
+            async def _corporate_intel_refresh_job(context):
+                if _HALTED:
+                    return
                 try:
-                    from agt_equities import trade_repo
-                    from pathlib import Path as _P
-                    cycles = trade_repo.get_active_cycles()
-                    tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE'})
-                except Exception:
-                    pass
-                if tickers:
-                    provider = YFinanceCorporateIntelligenceProvider()
-                    for tk in tickers:
-                        try:
-                            await asyncio.to_thread(provider.get_corporate_calendar, tk)
-                        except Exception as tk_exc:
-                            logger.warning("corporate_intel refresh failed for %s: %s", tk, tk_exc)
-                    logger.info("corporate_intel: refreshed %d tickers", len(tickers))
-            except Exception as exc:
-                logger.warning("corporate_intel_refresh_job failed: %s", exc)
+                    from agt_equities.providers.yfinance_corporate_intelligence import (
+                        YFinanceCorporateIntelligenceProvider,
+                    )
+                    tickers = []
+                    try:
+                        from agt_equities import trade_repo
+                        from pathlib import Path as _P
+                        cycles = trade_repo.get_active_cycles()
+                        tickers = list({c.ticker for c in cycles if c.status == 'ACTIVE'})
+                    except Exception:
+                        pass
+                    if tickers:
+                        provider = YFinanceCorporateIntelligenceProvider()
+                        for tk in tickers:
+                            try:
+                                await asyncio.to_thread(provider.get_corporate_calendar, tk)
+                            except Exception as tk_exc:
+                                logger.warning("corporate_intel refresh failed for %s: %s", tk, tk_exc)
+                        logger.info("corporate_intel: refreshed %d tickers", len(tickers))
+                except Exception as exc:
+                    logger.warning("corporate_intel_refresh_job failed: %s", exc)
 
-        jq.run_daily(
-            callback=_corporate_intel_refresh_job,
-            time=_dt_time(5, 0, tzinfo=ET),
-            name="corporate_intel_refresh",
-        )
-        logger.info("Scheduled: corporate_intel_refresh daily at 05:00")
-        async def _corporate_intel_startup(context):
-            await _corporate_intel_refresh_job(context)
-        jq.run_once(_corporate_intel_startup, when=15, name="corporate_intel_startup")
+            jq.run_daily(
+                callback=_corporate_intel_refresh_job,
+                time=_dt_time(5, 0, tzinfo=ET),
+                name="corporate_intel_refresh",
+            )
+            logger.info("Scheduled: corporate_intel_refresh daily at 05:00")
+            async def _corporate_intel_startup(context):
+                await _corporate_intel_refresh_job(context)
+            jq.run_once(_corporate_intel_startup, when=15, name="corporate_intel_startup")
+        else:
+            logger.info(
+                "Skipped beta_cache_refresh + corporate_intel_refresh registration: "
+                "USE_SCHEDULER_DAEMON=1 (owned by agt_scheduler daemon)"
+            )
     else:
         logger.warning("JobQueue not available — scheduled jobs not registered")
 

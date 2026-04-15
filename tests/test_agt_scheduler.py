@@ -94,9 +94,8 @@ def test_build_scheduler_timezone_pinned():
     assert "New_York" in tz_name
 
 
-def test_register_jobs_a5dd_set():
-    """A2 + A5a + A5d.d: heartbeat_writer, orphan_sweep, attested_sweeper,
-    el_snapshot_writer.
+def test_register_jobs_a5e_set():
+    """A2 + A5a + A5d.d + A5e: full job set including beta + corporate_intel.
 
     Order is the registration order — preserved here as a regression guard
     so future units appending jobs do not accidentally reorder the existing
@@ -112,11 +111,17 @@ def test_register_jobs_a5dd_set():
         "orphan_sweep",
         "attested_sweeper",
         "el_snapshot_writer",
+        "beta_cache_refresh",
+        "beta_startup",
+        "corporate_intel_refresh",
+        "corporate_intel_startup",
     ]
     job_ids = {j.id for j in sched.get_jobs()}
     assert {
         "heartbeat_writer", "orphan_sweep",
         "attested_sweeper", "el_snapshot_writer",
+        "beta_cache_refresh", "beta_startup",
+        "corporate_intel_refresh", "corporate_intel_startup",
     }.issubset(job_ids)
 
 
@@ -635,4 +640,194 @@ def test_a5dd_apex_enqueue_failure_does_not_crash_job(monkeypatch, tmp_path):
     ]
     job = _get_el_writer_callable(_FakeIBConn(summary))
     _run_sync(job())  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# A5e — beta_cache_refresh + corporate_intel_refresh migration tests
+# ---------------------------------------------------------------------------
+
+
+def _build_scheduler_with_jobs():
+    """Helper: build scheduler + register all jobs with a fake IBConnector."""
+    import agt_scheduler
+    from agt_equities.ib_conn import IBConnector, IBConnConfig
+    sched = agt_scheduler.build_scheduler()
+    conn = IBConnector(config=IBConnConfig(client_id=2))
+    agt_scheduler.register_jobs(sched, conn)
+    return sched
+
+
+def test_a5e_beta_cache_refresh_cron_trigger():
+    """beta_cache_refresh must use CronTrigger at 04:00."""
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("beta_cache_refresh")
+    assert job is not None, "beta_cache_refresh not registered"
+    from apscheduler.triggers.cron import CronTrigger
+    assert isinstance(job.trigger, CronTrigger)
+    # Verify hour=4, minute=0 in the trigger fields.
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert fields["hour"] == "4"
+    assert fields["minute"] == "0"
+
+
+def test_a5e_beta_startup_date_trigger():
+    """beta_startup must use DateTrigger (one-shot at startup + 10s)."""
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("beta_startup")
+    assert job is not None, "beta_startup not registered"
+    from apscheduler.triggers.date import DateTrigger
+    assert isinstance(job.trigger, DateTrigger)
+
+
+def test_a5e_corporate_intel_refresh_cron_trigger():
+    """corporate_intel_refresh must use CronTrigger at 05:00."""
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("corporate_intel_refresh")
+    assert job is not None, "corporate_intel_refresh not registered"
+    from apscheduler.triggers.cron import CronTrigger
+    assert isinstance(job.trigger, CronTrigger)
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert fields["hour"] == "5"
+    assert fields["minute"] == "0"
+
+
+def test_a5e_corporate_intel_startup_date_trigger():
+    """corporate_intel_startup must use DateTrigger (one-shot at startup + 15s)."""
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("corporate_intel_startup")
+    assert job is not None, "corporate_intel_startup not registered"
+    from apscheduler.triggers.date import DateTrigger
+    assert isinstance(job.trigger, DateTrigger)
+
+
+def test_a5e_beta_cache_refresh_calls_library(monkeypatch):
+    """beta_cache_refresh job must call refresh_beta_cache with active tickers."""
+    import types
+
+    captured: list[list[str]] = []
+
+    def fake_refresh(tickers):
+        captured.append(list(tickers))
+
+    monkeypatch.setattr("agt_equities.beta_cache.refresh_beta_cache", fake_refresh)
+
+    # Fake trade_repo.get_active_cycles returning one active cycle.
+    fake_cycle = types.SimpleNamespace(ticker="AAPL", status="ACTIVE")
+    monkeypatch.setattr(
+        "agt_equities.trade_repo.get_active_cycles",
+        lambda **kw: [fake_cycle],
+    )
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("beta_cache_refresh")
+    job.func()
+
+    assert len(captured) == 1
+    assert "AAPL" in captured[0]
+
+
+def test_a5e_beta_cache_refresh_swallows_exceptions(monkeypatch):
+    """beta_cache_refresh must not propagate exceptions."""
+    def boom(tickers):
+        raise RuntimeError("beta cache exploded")
+
+    monkeypatch.setattr("agt_equities.beta_cache.refresh_beta_cache", boom)
+
+    import types
+    fake_cycle = types.SimpleNamespace(ticker="AAPL", status="ACTIVE")
+    monkeypatch.setattr(
+        "agt_equities.trade_repo.get_active_cycles",
+        lambda **kw: [fake_cycle],
+    )
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("beta_cache_refresh")
+    job.func()  # must not raise
+
+
+def test_a5e_beta_cache_refresh_no_tickers_noop(monkeypatch):
+    """With no active cycles, refresh_beta_cache must not be called."""
+    captured: list = []
+
+    monkeypatch.setattr(
+        "agt_equities.beta_cache.refresh_beta_cache",
+        lambda tickers: captured.append(tickers),
+    )
+    monkeypatch.setattr(
+        "agt_equities.trade_repo.get_active_cycles",
+        lambda **kw: [],
+    )
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("beta_cache_refresh")
+    job.func()
+
+    assert captured == [], "must not call refresh_beta_cache with empty tickers"
+
+
+def test_a5e_corporate_intel_refresh_calls_provider(monkeypatch):
+    """corporate_intel_refresh must call get_corporate_calendar per ticker."""
+    import types
+
+    called_tickers: list[str] = []
+
+    class FakeProvider:
+        def get_corporate_calendar(self, ticker):
+            called_tickers.append(ticker)
+
+    monkeypatch.setattr(
+        "agt_equities.providers.yfinance_corporate_intelligence."
+        "YFinanceCorporateIntelligenceProvider",
+        FakeProvider,
+    )
+
+    fake_cycles = [
+        types.SimpleNamespace(ticker="AAPL", status="ACTIVE"),
+        types.SimpleNamespace(ticker="MSFT", status="ACTIVE"),
+        types.SimpleNamespace(ticker="GOOG", status="CLOSED"),
+    ]
+    monkeypatch.setattr(
+        "agt_equities.trade_repo.get_active_cycles",
+        lambda **kw: fake_cycles,
+    )
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("corporate_intel_refresh")
+    job.func()
+
+    assert set(called_tickers) == {"AAPL", "MSFT"}
+
+
+def test_a5e_corporate_intel_refresh_swallows_per_ticker_errors(monkeypatch):
+    """A single ticker failure must not stop remaining tickers."""
+    import types
+
+    called_tickers: list[str] = []
+
+    class FlakyProvider:
+        def get_corporate_calendar(self, ticker):
+            if ticker == "AAPL":
+                raise RuntimeError("yfinance down for AAPL")
+            called_tickers.append(ticker)
+
+    monkeypatch.setattr(
+        "agt_equities.providers.yfinance_corporate_intelligence."
+        "YFinanceCorporateIntelligenceProvider",
+        FlakyProvider,
+    )
+
+    fake_cycles = [
+        types.SimpleNamespace(ticker="AAPL", status="ACTIVE"),
+        types.SimpleNamespace(ticker="MSFT", status="ACTIVE"),
+    ]
+    monkeypatch.setattr(
+        "agt_equities.trade_repo.get_active_cycles",
+        lambda **kw: fake_cycles,
+    )
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("corporate_intel_refresh")
+    job.func()  # must not raise
+
+    assert "MSFT" in called_tickers
 
