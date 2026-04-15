@@ -19,7 +19,7 @@ Key design departures from the WHEEL-2 scaffold:
       DEFENSE (sub-basis): never assign, grind premium via short rolls,
               accept low RAY (2%), use velocity-ratio harvest, 4-tier
               upward-strike cascade on defensive rolls.
-      OFFENSE (at/above-basis): welcome assignment, demand RAY â‰¥ 10%,
+      OFFENSE (at/above-basis): welcome assignment, demand RAY ≥ 10%,
               check Opportunity Cost Breakeven for legacy deep-ITM
               positions where liquidation is mathematically dominant.
   - LiquidateResult is a new variant emitted ONLY in offense regime when
@@ -320,7 +320,7 @@ def _try_cascade(
             )
     return AlertResult(
         severity="CRITICAL",
-        reason=f"{reason_prefix}; cascade exhausted (no tier yielded net credit â‰¥ {constraints.min_credit_per_contract})",
+        reason=f"{reason_prefix}; cascade exhausted (no tier yielded net credit ≥ {constraints.min_credit_per_contract})",
         context={
             "ticker": pos.ticker,
             "account_id": pos.account_id,
@@ -357,7 +357,7 @@ def _evaluate_defense(
             btc_limit=round(call.ask, 4),
             pnl_pct=round(p_pct, 4),
             velocity_ratio=round(v_r, 4) if v_r != float("inf") else v_r,
-            reason=f"V_r={v_r:.2f}â‰¥{constraints.harvest_velocity_ratio} AND P_pct={p_pct:.2f}â‰¥{constraints.harvest_min_pnl_pct}",
+            reason=f"V_r={v_r:.2f}≥{constraints.harvest_velocity_ratio} AND P_pct={p_pct:.2f}≥{constraints.harvest_min_pnl_pct}",
         )
 
     # 2. Gamma cutoff: defense regime can't let assign â€” must roll if triggered
@@ -368,7 +368,7 @@ def _evaluate_defense(
     ):
         return _try_cascade(
             pos, market, constraints,
-            reason_prefix=f"GAMMA_CUTOFF dte={dte}â‰¤{constraints.gamma_cutoff_dte} ext={extrinsic:.2f}â‰¤{constraints.gamma_cutoff_extrinsic} delta={delta_abs:.2f}â‰¥{constraints.gamma_cutoff_delta}",
+            reason_prefix=f"GAMMA_CUTOFF dte={dte}â‰¤{constraints.gamma_cutoff_dte} ext={extrinsic:.2f}â‰¤{constraints.gamma_cutoff_extrinsic} delta={delta_abs:.2f}≥{constraints.gamma_cutoff_delta}",
         )
 
     # 3. Defensive roll trigger: ITM with extrinsic depleted
@@ -426,7 +426,7 @@ def _evaluate_offense(
         and delta_abs >= constraints.gamma_cutoff_delta
     ):
         return AssignResult(
-            reason=f"OFFENSE_LET_IT_CALL dte={dte}â‰¤{constraints.gamma_cutoff_dte} ext={extrinsic:.2f}â‰¤{constraints.gamma_cutoff_extrinsic} delta={delta_abs:.2f}â‰¥{constraints.gamma_cutoff_delta}",
+            reason=f"OFFENSE_LET_IT_CALL dte={dte}â‰¤{constraints.gamma_cutoff_dte} ext={extrinsic:.2f}â‰¤{constraints.gamma_cutoff_extrinsic} delta={delta_abs:.2f}≥{constraints.gamma_cutoff_delta}",
         )
 
     # 3. 90% profit harvest
@@ -436,7 +436,7 @@ def _evaluate_offense(
             btc_limit=round(call.ask, 4),
             pnl_pct=round(p_pct, 4),
             velocity_ratio=0.0,              # not used in offense
-            reason=f"OFFENSE_HARVEST P_pct={p_pct:.2f}â‰¥{constraints.offense_harvest_pnl}",
+            reason=f"OFFENSE_HARVEST P_pct={p_pct:.2f}≥{constraints.offense_harvest_pnl}",
         )
 
     # 4. Hold
