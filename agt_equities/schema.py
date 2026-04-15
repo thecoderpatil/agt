@@ -1356,6 +1356,38 @@ def register_master_log_tables(conn) -> None:
         )
     """)
 
+    # Sprint B5: CSP Allocator pre-stage view — available_nlv per account.
+    # Per DT Q4: NLV from el_snapshots; available_nlv = IBKR's excess_liquidity
+    # (NOT a re-derivation from master_log_open_positions collateral math —
+    # IBKR's portfolio-margin engine already nets box spreads, credit spreads,
+    # CC assigned-share coverage, and all cross-position margin offsets).
+    # encumbered_capital = nlv - excess_liquidity is a display-only derived
+    # column; the allocator gates on available_nlv directly.
+    conn.execute("""
+        CREATE VIEW IF NOT EXISTS v_available_nlv AS
+        SELECT
+            account_id,
+            household,
+            nlv,
+            excess_liquidity,
+            (nlv - excess_liquidity) AS encumbered_capital,
+            excess_liquidity          AS available_nlv,
+            timestamp                 AS nlv_timestamp
+        FROM (
+            SELECT
+                account_id, household, nlv, excess_liquidity, timestamp,
+                ROW_NUMBER() OVER (
+                    PARTITION BY account_id
+                    ORDER BY timestamp DESC
+                ) AS rn
+            FROM el_snapshots
+            WHERE account_id      IS NOT NULL
+              AND nlv              IS NOT NULL
+              AND excess_liquidity IS NOT NULL
+        )
+        WHERE rn = 1
+    """)
+
 
 def _extend_pending_orders(conn) -> None:
     """Add R5 order lifecycle columns to pending_orders if missing.
