@@ -509,10 +509,70 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("corporate_intel_startup")
 
+    # -- A5e -- flex_sync_eod (Mon-Fri 17:00 ET) ----------------------------
+    # IBKR Flex Web Service sync into master_log_* tables.  No IB API
+    # dependency (uses HTTPS Flex endpoint).  On success, enqueue
+    # FLEX_SYNC_DIGEST alert for bot-side Telegram delivery.  On failure,
+    # enqueue FLEX_SYNC_FAILURE alert (crit severity).
+    #
+    # DT Q2: flex_sync itself uses a single atomic transaction internally.
+    # The scheduler job is a thin wrapper that calls run_sync() and surfaces
+    # the result onto the cross_daemon_alerts bus.
+
+    def _flex_sync_eod_job() -> None:
+        try:
+            from agt_equities.flex_sync import run_sync, SyncMode
+            result = run_sync(SyncMode.INCREMENTAL)
+        except Exception as exc:
+            logger.exception("flex_sync_eod: run_sync raised: %s", exc)
+            try:
+                from agt_equities.alerts import enqueue_alert
+                enqueue_alert(
+                    "FLEX_SYNC_FAILURE",
+                    {"error": str(exc)[:500]},
+                    severity="crit",
+                )
+            except Exception as alert_exc:
+                logger.error(
+                    "flex_sync_eod: alert enqueue failed: %s", alert_exc,
+                )
+            return
+
+        try:
+            from agt_equities.alerts import enqueue_alert
+            payload = {
+                "sync_id": getattr(result, "sync_id", None),
+                "mode": "INCREMENTAL",
+                "sections_processed": getattr(result, "sections_processed", 0),
+                "rows_received": getattr(result, "rows_received", 0),
+                "rows_inserted": getattr(result, "rows_inserted", 0),
+            }
+            sev = "info"
+            if getattr(result, "error_message", None):
+                payload["error"] = str(result.error_message)[:500]
+                sev = "warn"
+            enqueue_alert("FLEX_SYNC_DIGEST", payload, severity=sev)
+        except Exception as alert_exc:
+            # Sync already committed; alert-bus failure is best-effort.
+            logger.error("flex_sync_eod: alert enqueue failed: %s", alert_exc)
+
+    scheduler.add_job(
+        _flex_sync_eod_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=17,
+        minute=0,
+        id="flex_sync_eod",
+        name="flex_sync_eod",
+        replace_existing=True,
+    )
+    registered.append("flex_sync_eod")
+
     # Unit A5 remaining: cc_daily, watchdog_daily, universe_monthly,
-    #   conviction_weekly, flex_sync_eod, attested_poller (10s).
+    #   conviction_weekly, attested_poller (10s).
     #   el_snapshot_writer shipped in A5d.d.
     #   beta_cache_refresh + corporate_intel_refresh shipped in A5e.
+    #   flex_sync_eod shipped in A5e.
     return registered
 
 

@@ -264,6 +264,10 @@ def format_alert_text(alert: dict[str, Any]) -> str:
             f"{secs} sections, {rcv} rows received, {ins} upserted"
         )
 
+    if kind == "FLEX_SYNC_FAILURE":
+        err = payload.get("error", "unknown")
+        return f"[{severity}] flex_sync FAILED: {err}"
+
     if kind == "INCEPTION_DELTA_MISS":
         # Sprint B4: fill callback could not resolve inception_delta from
         # the FA-block reader or legacy flat path after 3 retries.
