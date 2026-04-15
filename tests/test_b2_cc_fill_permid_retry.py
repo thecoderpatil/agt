@@ -108,9 +108,13 @@ def test_persistent_miss_exhausts_retries(bot_module, monkeypatch, caplog):
         return True
     monkeypatch.setattr(bot_module, "_apply_fill_atomically", _fake_apply)
 
+    # agt_bridge logger is propagate=False + has own handler; flip propagate
+    # so caplog (root-attached) captures records.
+    logging.getLogger("agt_bridge").propagate = True
+    caplog.set_level(logging.WARNING)
+
     trade, fill = _make_trade_fill()
-    with caplog.at_level(logging.WARNING, logger=bot_module.logger.name):
-        bot_module._on_cc_fill(trade, fill)
+    bot_module._on_cc_fill(trade, fill)
 
     assert attempts[0] == 3, f"expected 3 retry attempts, got {attempts[0]}"
     assert sleeps == [0.5, 0.5], f"expected 2 sleeps (between 3 attempts), got {sleeps}"
@@ -118,7 +122,7 @@ def test_persistent_miss_exhausts_retries(bot_module, monkeypatch, caplog):
     assert "inception_delta" in applied_kwargs
     assert applied_kwargs["inception_delta"] is None
     # Warning logged.
-    assert any("inception_delta lookup miss after 3 retries" in rec.message
+    assert any("inception_delta lookup miss after 3 retries" in rec.getMessage()
                for rec in caplog.records), "expected retry-exhaustion warning"
 
 
