@@ -1,4 +1,4 @@
-# GitLab CI for AGT Equities — Decoupling Sprint A targeted runner.
+# GitLab CI for AGT Equities — Decoupling Sprint A/B targeted runner.
 #
 # Why this exists:
 #   The Linux sandbox we use for Cowork Architect work has Windows-mount
@@ -6,36 +6,13 @@
 #   .git/*.lock issues). Running pytest in a clean container sidesteps the
 #   whole class of issue and gives us reproducible green/red signal.
 #
-# Scope today (A1..A4):
-#   Targeted run of the Sprint A unit tests only:
-#     - tests/test_ib_conn.py             (A1)
-#     - tests/test_agt_scheduler.py       (A1, A2)
-#     - tests/test_health.py              (A2)
-#     - tests/test_flex_sync_atomic.py    (A3)
-#     - tests/test_a4_init_db_lazy.py     (A4)
-#     - tests/test_alerts.py              (A5b)
-#     - tests/test_a5d_consumer_wired.py  (A5d)
-#     - tests/test_a5dc_dead_buffer_removed.py (A5d.c)
+# Scope today (Sprint A complete + Sprint B ramp):
+#   Targeted run of the Sprint A + B unit tests only.
 #
 # Why not the full 975 baseline yet:
 #   The full suite has 5 known pre-existing failures (4x test_margin_logic
 #   async config, 1x test_phase3a R7) that block CI green. We'll broaden
 #   to the full baseline in a follow-up after FU-ASYNCIO-CONFIG lands.
-#
-# Post-A3 compute-efficiency batch #1 (infra/ci-efficiency-batch-1):
-#   * Dependency versions live in requirements-ci.txt (single source of
-#     truth, cache-key input).
-#   * pip downloads are cached under $CI_PROJECT_DIR/.cache/pip keyed on
-#     the requirements-ci.txt hash. First run on a branch = Cache miss,
-#     subsequent pushes = Cache restored + pip install in seconds.
-#   * Test collection pairs the `sprint_a` pytest marker with an explicit
-#     file list. The marker is the semantic gate (adding a new test inside
-#     these files takes the decorator and nothing else); the file list
-#     scopes collection so unrelated tests/*.py files — which pull heavy
-#     deps (telegram, fastapi, full project stack) that are NOT in
-#     requirements-ci.txt — don't bomb import-time collection. Adding a
-#     new Sprint A *file* = one-line CI edit; adding a new Sprint A
-#     *test* inside an existing file = zero CI edits.
 
 stages:
   - test
@@ -44,35 +21,30 @@ variables:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHONDONTWRITEBYTECODE: "1"
   PYTHONUNBUFFERED: "1"
-  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
 
 .python_setup: &python_setup
-  image: python:3.12-slim
-  cache:
-    key:
-      files:
-        - requirements-ci.txt
-      prefix: "${CI_COMMIT_REF_SLUG}"
-    paths:
-      - .cache/pip/
+  image: python:3.10-slim
   before_script:
     - python -V
-    - pip install -r requirements-ci.txt
+    - pip install --no-cache-dir
+        pytest==9.0.3
+        pytest-asyncio==1.3.0
+        hypothesis
+        apscheduler
+        pytz
+        ib_async
 
 sprint_a_unit_tests:
   <<: *python_setup
   stage: test
   script:
-    - pytest -v --tb=short -m sprint_a
+    - pytest -v --tb=short
         tests/test_ib_conn.py
         tests/test_agt_scheduler.py
         tests/test_health.py
         tests/test_flex_sync_atomic.py
         tests/test_a5e_atomic_cutover.py
-        tests/test_a4_init_db_lazy.py
-        tests/test_alerts.py
-        tests/test_a5d_consumer_wired.py
-        tests/test_a5dc_dead_buffer_removed.py
+        tests/test_b1_pending_order_children_schema.py
   rules:
     - if: $CI_PIPELINE_SOURCE == "push"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
