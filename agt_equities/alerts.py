@@ -264,6 +264,16 @@ def format_alert_text(alert: dict[str, Any]) -> str:
             f"{secs} sections, {rcv} rows received, {ins} upserted"
         )
 
+    if kind == "UNIVERSE_REFRESH":
+        added = payload.get("added", "?")
+        updated = payload.get("updated", "?")
+        total = payload.get("total", "?")
+        err = payload.get("error")
+        msg = f"[{severity}] Universe refresh: added={added} updated={updated} total={total}"
+        if err:
+            msg += f" error={err}"
+        return msg
+
     if kind == "FLEX_SYNC_FAILURE":
         err = payload.get("error", "unknown")
         return f"[{severity}] flex_sync FAILED: {err}"
