@@ -71,6 +71,7 @@ sprint_a_unit_tests:
         tests/test_a5e_atomic_cutover.py
         tests/test_b1_pending_order_children_schema.py
         tests/test_b2_cc_fill_permid_retry.py
+        tests/test_b3_children_writer.py
         tests/test_inception_delta_fill.py
         tests/test_a4_init_db_lazy.py
         tests/test_alerts.py

@@ -1037,7 +1037,9 @@ async def ensure_ib_connected() -> ib_async.IB:
                     candidate.orderStatusEvent += _r5_on_order_status
                     candidate.execDetailsEvent += _offload_fill_handler(_r5_on_exec_details)
                     candidate.commissionReportEvent += _r5_on_commission_report
-                    logger.info("Fill + R5 order state event listeners registered (8 handlers)")
+                    # Sprint B3: pending_order_children writer.
+                    candidate.openOrderEvent += _on_open_order_write_child
+                    logger.info("Fill + R5 + B3 order state event listeners registered (9 handlers)")
                 except Exception as evt_exc:
                     logger.warning("Failed to register fill events: %s", evt_exc)
 
@@ -1826,6 +1828,71 @@ def _offload_fill_handler(sync_handler):
 # ---------------------------------------------------------------------------
 # R5: Order state machine event handlers
 # ---------------------------------------------------------------------------
+
+def _on_open_order_write_child(trade):
+    """openOrderEvent handler -- Sprint B3 writer for pending_order_children.
+
+    IBKR assigns the real orderId/permId asynchronously after placeOrder
+    returns. _place_single_order seeds the child row with whatever ids were
+    available synchronously; this handler runs once IBKR dispatches the
+    openOrder callback and fills in any NULL id columns via COALESCE.
+
+    For FA blocks, IBKR fires openOrder once per allocated child account,
+    each with a distinct orderId/permId and the child account on
+    trade.order.account. This handler finds the parent pending_order via
+    trade.order.orderId (our seeded value on placement) and then updates
+    the single child row matching (parent_order_id, trade.order.account).
+
+    Writer-only. Reads untouched. Kill switch: AGT_B3_CHILDREN_WRITER=0.
+    Never raises -- any failure logs a warning and returns.
+    """
+    try:
+        from agt_equities.order_state import (
+            children_writer_enabled,
+            update_child_ib_ids,
+        )
+        if not children_writer_enabled():
+            return
+        order = getattr(trade, "order", None)
+        if order is None:
+            return
+        perm_id = int(getattr(order, "permId", 0) or 0)
+        order_id = int(getattr(order, "orderId", 0) or 0)
+        account = str(getattr(order, "account", "") or "")
+        if not account or (not perm_id and not order_id):
+            return
+        with closing(_get_db_connection()) as conn:
+            # Resolve parent pending_order. We match on the ids we stored at
+            # placement time (ib_order_id captured synchronously, ib_perm_id
+            # usually 0 until this event fires) -- so orderId is the reliable
+            # join key here.
+            row = None
+            if order_id:
+                row = conn.execute(
+                    "SELECT id FROM pending_orders WHERE ib_order_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (order_id,),
+                ).fetchone()
+            if row is None and perm_id:
+                row = conn.execute(
+                    "SELECT id FROM pending_orders WHERE ib_perm_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (perm_id,),
+                ).fetchone()
+            if row is None:
+                return  # orphan openOrder (manual entry or pre-B3 row)
+            parent_id = int(row[0])
+            with tx_immediate(conn):
+                update_child_ib_ids(
+                    conn,
+                    parent_order_id=parent_id,
+                    account_id=account,
+                    child_ib_order_id=order_id or None,
+                    child_ib_perm_id=perm_id or None,
+                )
+    except Exception as exc:
+        logger.warning("B3 openOrderEvent handler error: %s", exc)
+
 
 def _r5_on_order_status(trade):
     """orderStatusEvent handler — updates pending_orders status via R5 state machine."""
@@ -6653,6 +6720,29 @@ async def _place_single_order(
                     'ib_order_id': str(ib_order_id),
                     'ib_perm_id': str(ib_perm_id),
                 })
+                # Sprint B3: force-clear cutover -- seed pending_order_children
+                # with the single child row this 1:1 placement represents.
+                # Kill switch: AGT_B3_CHILDREN_WRITER=0. Writer-only; nothing
+                # reads this table yet (CSP Allocator B5 is the first reader).
+                try:
+                    from agt_equities.order_state import (
+                        children_writer_enabled,
+                        insert_pending_order_child,
+                    )
+                    if children_writer_enabled() and acct_id:
+                        insert_pending_order_child(
+                            conn,
+                            parent_order_id=db_id,
+                            account_id=acct_id,
+                            status='sent',
+                            child_ib_order_id=ib_order_id,
+                            child_ib_perm_id=ib_perm_id,
+                        )
+                except Exception as b3_exc:
+                    logger.warning(
+                        "B3 child-row insert failed for #%d: %s (non-fatal)",
+                        db_id, b3_exc,
+                    )
 
         # Add to roll watchlist ONLY for Mode 1 defensive CCs.
         # Mode 2 (welcome assignment, tax-exempt gain) and Dynamic Exit
