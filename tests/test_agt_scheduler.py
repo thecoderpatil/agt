@@ -116,6 +116,7 @@ def test_register_jobs_a5e_set():
         "corporate_intel_refresh",
         "corporate_intel_startup",
         "flex_sync_eod",
+        "universe_monthly",
     ]
     job_ids = {j.id for j in sched.get_jobs()}
     assert {
@@ -123,7 +124,7 @@ def test_register_jobs_a5e_set():
         "attested_sweeper", "el_snapshot_writer",
         "beta_cache_refresh", "beta_startup",
         "corporate_intel_refresh", "corporate_intel_startup",
-        "flex_sync_eod",
+        "flex_sync_eod", "universe_monthly",
     }.issubset(job_ids)
 
 
@@ -1001,3 +1002,115 @@ def test_a5e_flex_sync_eod_warns_on_error_message(monkeypatch):
     assert len(captured) == 1
     assert captured[0]["severity"] == "warn"
     assert "parse errors" in captured[0]["payload"]["error"]
+
+# ---------------------------------------------------------------------------
+# A5e -- universe_monthly migration tests
+# ---------------------------------------------------------------------------
+
+
+def test_a5e_universe_monthly_cron_trigger():
+    """universe_monthly must use CronTrigger on day=1 at 06:00."""
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("universe_monthly")
+    assert job is not None, "universe_monthly not registered"
+    from apscheduler.triggers.cron import CronTrigger
+    assert isinstance(job.trigger, CronTrigger)
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert fields["hour"] == "6"
+    assert fields["minute"] == "0"
+    assert fields["day"] == "1"
+
+
+def test_a5e_universe_monthly_enqueues_alert_on_success(monkeypatch):
+    """On successful refresh, must enqueue UNIVERSE_REFRESH alert."""
+    captured: list[dict] = []
+
+    monkeypatch.setattr(
+        "agt_equities.universe_refresh.refresh_ticker_universe",
+        lambda **kw: {"added": 5, "updated": 100, "total": 105, "error": None},
+    )
+
+    def fake_enqueue(kind, payload, *, severity="info", db_path=None):
+        captured.append({"kind": kind, "payload": payload, "severity": severity})
+        return 1
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("universe_monthly")
+    job.func()
+
+    assert len(captured) == 1
+    rec = captured[0]
+    assert rec["kind"] == "UNIVERSE_REFRESH"
+    assert rec["severity"] == "info"
+    assert rec["payload"]["added"] == 5
+    assert rec["payload"]["total"] == 105
+
+
+def test_a5e_universe_monthly_warns_on_error(monkeypatch):
+    """If refresh returns with error, severity must be warn."""
+    captured: list[dict] = []
+
+    monkeypatch.setattr(
+        "agt_equities.universe_refresh.refresh_ticker_universe",
+        lambda **kw: {"added": 0, "updated": 0, "total": 0,
+                      "error": "Both Wikipedia scrapes failed"},
+    )
+
+    def fake_enqueue(kind, payload, *, severity="info", db_path=None):
+        captured.append({"kind": kind, "payload": payload, "severity": severity})
+        return 1
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("universe_monthly")
+    job.func()
+
+    assert len(captured) == 1
+    assert captured[0]["severity"] == "warn"
+    assert "Wikipedia" in captured[0]["payload"]["error"]
+
+
+def test_a5e_universe_monthly_enqueues_crit_on_exception(monkeypatch):
+    """If refresh raises, must enqueue UNIVERSE_REFRESH with crit severity."""
+    captured: list[dict] = []
+
+    def boom(**kw):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(
+        "agt_equities.universe_refresh.refresh_ticker_universe", boom,
+    )
+
+    def fake_enqueue(kind, payload, *, severity="info", db_path=None):
+        captured.append({"kind": kind, "payload": payload, "severity": severity})
+        return 1
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("universe_monthly")
+    job.func()  # must not raise
+
+    assert len(captured) == 1
+    assert captured[0]["kind"] == "UNIVERSE_REFRESH"
+    assert captured[0]["severity"] == "crit"
+
+
+def test_a5e_universe_monthly_swallows_alert_failure(monkeypatch):
+    """Alert enqueue failure after successful refresh must not propagate."""
+    monkeypatch.setattr(
+        "agt_equities.universe_refresh.refresh_ticker_universe",
+        lambda **kw: {"added": 1, "updated": 2, "total": 3, "error": None},
+    )
+
+    def boom(*a, **kw):
+        raise RuntimeError("bus down")
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", boom)
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("universe_monthly")
+    job.func()  # must not raise

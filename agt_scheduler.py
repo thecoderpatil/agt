@@ -568,11 +568,64 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("flex_sync_eod")
 
-    # Unit A5 remaining: cc_daily, watchdog_daily, universe_monthly,
-    #   conviction_weekly, attested_poller (10s).
+    # -- A5e -- universe_monthly (1st of month, 06:00 ET) ---------------------
+    # Refreshes ticker_universe table from Wikipedia + yfinance.  No IB
+    # dependency.  Enqueues UNIVERSE_REFRESH alert for bot-side delivery.
+    # Long-running (~minutes due to yfinance enrichment) — runs in the
+    # APScheduler threadpool, which is why max_workers=10 matters.
+
+    def _universe_monthly_job() -> None:
+        try:
+            from agt_equities.universe_refresh import refresh_ticker_universe
+            result = refresh_ticker_universe()
+        except Exception as exc:
+            logger.exception("universe_monthly: refresh raised: %s", exc)
+            try:
+                from agt_equities.alerts import enqueue_alert
+                enqueue_alert(
+                    "UNIVERSE_REFRESH",
+                    {"error": str(exc)[:500]},
+                    severity="crit",
+                )
+            except Exception as alert_exc:
+                logger.error(
+                    "universe_monthly: alert enqueue failed: %s", alert_exc,
+                )
+            return
+
+        try:
+            from agt_equities.alerts import enqueue_alert
+            payload = {
+                "added": result.get("added", 0),
+                "updated": result.get("updated", 0),
+                "total": result.get("total", 0),
+            }
+            sev = "info"
+            err = result.get("error")
+            if err:
+                payload["error"] = str(err)[:500]
+                sev = "warn"
+            enqueue_alert("UNIVERSE_REFRESH", payload, severity=sev)
+        except Exception as alert_exc:
+            logger.error("universe_monthly: alert enqueue failed: %s", alert_exc)
+
+    scheduler.add_job(
+        _universe_monthly_job,
+        trigger="cron",
+        day=1,
+        hour=6,
+        minute=0,
+        id="universe_monthly",
+        name="universe_monthly",
+        replace_existing=True,
+    )
+    registered.append("universe_monthly")
+
+    # Unit A5 remaining: cc_daily, watchdog_daily, conviction_weekly,
+    #   attested_poller (10s).
     #   el_snapshot_writer shipped in A5d.d.
-    #   beta_cache_refresh + corporate_intel_refresh shipped in A5e.
-    #   flex_sync_eod shipped in A5e.
+    #   beta_cache_refresh + corporate_intel_refresh + flex_sync_eod
+    #   + universe_monthly shipped in A5e.
     return registered
 
 
