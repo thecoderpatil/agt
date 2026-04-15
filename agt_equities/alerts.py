@@ -264,6 +264,18 @@ def format_alert_text(alert: dict[str, Any]) -> str:
             f"{secs} sections, {rcv} rows received, {ins} upserted"
         )
 
+    if kind == "CONVICTION_REFRESH":
+        upd = payload.get("updated", "?")
+        fail = payload.get("failed", "?")
+        total = payload.get("total", "?")
+        err = payload.get("error")
+        msg = f"[{severity}] Conviction refresh: {upd}/{total} updated"
+        if fail and str(fail) != "0":
+            msg += f" ({fail} failed)"
+        if err:
+            msg += f" error={err}"
+        return msg
+
     if kind == "UNIVERSE_REFRESH":
         added = payload.get("added", "?")
         updated = payload.get("updated", "?")
