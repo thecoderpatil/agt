@@ -100,6 +100,10 @@ class MarketSnapshot:
     # Populated by caller from Finnhub (see telegram_bot._build_market_snapshot_for_evaluator).
     next_ex_div_date: Optional[date] = None
     next_div_amount: Optional[float] = None
+    # Earnings-week gate. If set, offense cascades are skipped during the
+    # ISO calendar week containing this date. None = gate disabled.
+    # Populated by caller from YFinanceCorporateIntelligenceProvider.
+    next_earnings_date: Optional[date] = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +152,12 @@ class ConstraintMatrix:
     # R1: Offense regime roll floor â€” above basis we have optionality; demand a
     # real $0.20/contract credit before preferring roll over assignment.
     offense_roll_min_credit: float = 0.20
+    # Earnings-week gate: when True (default), offensive cascades (R1/R8)
+    # are suppressed during the ISO calendar week containing next_earnings_date.
+    # R4 ex-div cascade is NOT gated (early-assignment risk is mechanical).
+    # Defense regime is NEVER gated (loss prevention overrides).
+    # Harvest and opp-cost close are unaffected (pure close, no new exposure).
+    earnings_week_block_offense: bool = True
     # Legacy compatibility â€” kept for the gamma cutoff delta floor
     static_delta_fallback: float = 0.40
 
@@ -223,6 +233,17 @@ EvalResult = Union[
 # ---------------------------------------------------------------------------
 # Helper functions (pure, no logging in hot path)
 # ---------------------------------------------------------------------------
+
+def _in_earnings_week(asof: date, next_earnings: Optional[date]) -> bool:
+    """True iff asof and next_earnings fall in the same ISO calendar week.
+
+    ISO weeks run Mon-Sun; matches US earnings week convention. Returns
+    False when next_earnings is None (fail-open on missing data).
+    """
+    if next_earnings is None:
+        return False
+    return asof.isocalendar()[:2] == next_earnings.isocalendar()[:2]
+
 
 def _extrinsic_value(call: OptionQuote, spot: float) -> float:
     """Time value remaining on a call: ask âˆ’ max(0, spot âˆ’ strike)."""
@@ -505,6 +526,25 @@ def _evaluate_offense(
     # offense_roll_min_credit ($0.20) before defaulting to ASSIGN. This lets
     # offense capture a final short-cycle credit if the chain cooperates
     # while still preferring assignment over a marginal/unprofitable roll.
+    #
+    # EARNINGS-WEEK GATE: during the ISO week containing earnings, skip the
+    # R1+R8 offensive cascade. Harvest-and-reopen-after-earnings dominates
+    # writing a fresh short into an IV-crush event where a whipsaw through
+    # the new strike manufactures a defensive emergency. Defense regime,
+    # R4 ex-div gate, and harvest are NOT affected.
+    if (
+        is_itm and dte <= constraints.gamma_cutoff_dte
+        and constraints.earnings_week_block_offense
+        and _in_earnings_week(market.asof, market.next_earnings_date)
+    ):
+        return HoldResult(
+            reason=(
+                f"OFFENSE_EARNINGS_WEEK_SKIP_CASCADE "
+                f"earnings={market.next_earnings_date.isoformat()} "
+                f"dte={dte} spot={market.spot:.2f} strike={pos.strike:.2f} "
+                f"\u2014 harvest and re-enter after earnings week"
+            ),
+        )
     if is_itm and dte <= constraints.gamma_cutoff_dte:
         cascade = _try_cascade(
             pos, market, constraints,
@@ -590,8 +630,22 @@ def evaluate(
 
         # Default to defense if basis is unknown (safer)
         if basis_for_regime is None or market.spot < basis_for_regime:
-            return _evaluate_defense(pos, market, constraints)
-        return _evaluate_offense(pos, market, constraints)
+            _regime = "defense"
+            _result = _evaluate_defense(pos, market, constraints)
+        else:
+            _regime = "offense"
+            _result = _evaluate_offense(pos, market, constraints)
+        try:
+            logger.info(
+                "WHEEL-4-DECISION ticker=%s account=%s regime=%s strike=%.2f "
+                "expiry=%s spot=%.2f result=%s reason=%s",
+                pos.ticker, pos.account_id, _regime, float(pos.strike),
+                pos.expiry.isoformat(), float(market.spot),
+                _result.kind, (getattr(_result, 'reason', '') or '')[:160],
+            )
+        except Exception:
+            pass
+        return _result
 
     except Exception as exc:
         logger.exception(

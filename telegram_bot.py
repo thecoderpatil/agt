@@ -8586,6 +8586,31 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
     staged: list[dict] = []
     skipped: list[dict] = []
 
+    # ── Earnings-week entry block (WHEEL-4 gate) ──
+    # Don't sell NEW CCs during the ISO calendar week of upcoming earnings.
+    # Defensive rolls are unaffected — roll_engine handles the defense regime
+    # regardless of earnings. Missing/stale cache (next_earnings=None) fails open.
+    _ew_today = date.today()
+    _ew_filtered: list[dict] = []
+    for _ewp in cc_targets:
+        try:
+            _ew_ex, _ew_amt, _ew_earn = _read_corp_calendar_cache(_ewp["ticker"])
+        except Exception:
+            _ew_earn = None
+        if _ew_earn is not None and _ew_today.isocalendar()[:2] == _ew_earn.isocalendar()[:2]:
+            skipped.append({
+                "ticker": _ewp["ticker"],
+                "reason": f"EARNINGS_WEEK blocked: earnings={_ew_earn.isoformat()}",
+                "household": _ewp["household"],
+                "mode": _ewp.get("mode", ""),
+                "spot": _ewp["spot_price"],
+                "adjusted_basis": _ewp.get("adjusted_basis", 0),
+                "initial_basis": _ewp.get("initial_basis", 0),
+            })
+        else:
+            _ew_filtered.append(_ewp)
+    cc_targets = _ew_filtered
+
     # ── Dynamic Exit carve-out (unchanged from prior implementation) ──
     dynamic_exit_staged: list[dict] = []
     excess_carveout: dict[str, int] = {}
@@ -9195,56 +9220,49 @@ def _build_position_for_evaluator(
 
 
 # ---------------------------------------------------------------------------
-# Finnhub ex-dividend lookup (WHEEL roll_engine R4)
+# Corporate calendar cache reader (WHEEL roll_engine R4 ex-div + earnings gate)
 # ---------------------------------------------------------------------------
+#
+# HOT-PATH RULE: never fetch from yfinance/Finnhub here. The daily
+# corporate_intel_refresh scheduler job populates
+# agt_desk_cache/corporate_intel/{TICKER}_calendar.json via
+# YFinanceCorporateIntelligenceProvider. This helper is a pure cache read.
+# Stale / missing cache returns (None, None, None) and gates fail open.
 
-_EXDIV_CACHE: dict[tuple[str, str], tuple[date | None, float | None]] = {}
+_CORP_CALENDAR_CACHE_DIR = Path("agt_desk_cache/corporate_intel")
 
 
-def _finnhub_next_ex_div(
+def _read_corp_calendar_cache(
     ticker: str,
-    today: date,
-    horizon_days: int = 60,
-) -> tuple[date | None, float | None]:
-    """Return (next_ex_div_date, amount) within [today, today+horizon_days].
+) -> tuple[date | None, float | None, date | None]:
+    """Return (next_ex_div_date, ex_div_amount, next_earnings_date).
 
-    Day-cached per (ticker, today) to avoid hammering Finnhub on every roll
-    scan. Returns (None, None) on any failure â€” caller treats as "no known
-    upcoming ex-div" and the R4 gate is skipped. Never raises.
+    Reads the JSON blob written by YFinanceCorporateIntelligenceProvider.
+    Never raises; returns all-None on any failure.
     """
-    cache_key = (ticker.upper(), today.isoformat())
-    if cache_key in _EXDIV_CACHE:
-        return _EXDIV_CACHE[cache_key]
-
-    result: tuple[date | None, float | None] = (None, None)
     try:
-        horizon = today + timedelta(days=horizon_days)
-        rows = finnhub_client.stock_dividends(
-            ticker.upper(),
-            _from=today.isoformat(),
-            to=horizon.isoformat(),
-        ) or []
-        upcoming: list[tuple[date, float]] = []
-        for r in rows:
-            try:
-                ex_str = r.get("date") or r.get("exDate") or r.get("ex_date")
-                amt = r.get("amount")
-                if ex_str is None or amt is None:
-                    continue
-                ex_d = date.fromisoformat(str(ex_str)[:10])
-                if ex_d >= today:
-                    upcoming.append((ex_d, float(amt)))
-            except (TypeError, ValueError):
-                continue
-        if upcoming:
-            upcoming.sort(key=lambda x: x[0])
-            result = upcoming[0]
+        path = _CORP_CALENDAR_CACHE_DIR / f"{ticker.upper()}_calendar.json"
+        if not path.exists():
+            return (None, None, None)
+        data = json.loads(path.read_text())
+        ex_div = (
+            date.fromisoformat(data["ex_dividend_date"])
+            if data.get("ex_dividend_date") else None
+        )
+        amt_raw = data.get("dividend_amount")
+        amt = float(amt_raw) if amt_raw not in (None, 0, 0.0) else None
+        earnings = (
+            date.fromisoformat(data["next_earnings"])
+            if data.get("next_earnings") else None
+        )
+        return (ex_div, amt, earnings)
     except Exception as exc:
-        logger.warning("WHEEL-R4: finnhub ex-div fetch failed for %s: %s", ticker, exc)
-        result = (None, None)
+        logger.warning(
+            "WHEEL-4: corporate calendar cache read failed for %s: %s",
+            ticker, exc,
+        )
+        return (None, None, None)
 
-    _EXDIV_CACHE[cache_key] = result
-    return result
 
 
 async def _build_market_snapshot_for_evaluator(
@@ -9327,10 +9345,9 @@ async def _build_market_snapshot_for_evaluator(
                 iv=float(row.get("impliedVol") or 0.0),
             ))
 
-    # R4: preemptive ex-dividend lookup. Failure returns (None, None) and the
-    # evaluator's ex-div gate becomes a no-op â€” fail-open, never block a roll
-    # on a Finnhub outage.
-    ex_div_date, ex_div_amount = _finnhub_next_ex_div(ticker, today, horizon_days=60)
+    # R4 + earnings-week gate: read from nightly corporate calendar cache.
+    # Cache-miss returns all-None â€” both gates fail open. Never fetches.
+    ex_div_date, ex_div_amount, next_earnings_date = _read_corp_calendar_cache(ticker)
 
     return MarketSnapshot(
         ticker=ticker,
@@ -9341,6 +9358,7 @@ async def _build_market_snapshot_for_evaluator(
         asof=today,
         next_ex_div_date=ex_div_date,
         next_div_amount=ex_div_amount,
+        next_earnings_date=next_earnings_date,
     )
 
 
