@@ -21,6 +21,8 @@ from unittest.mock import patch
 import pytest
 import sys
 
+pytestmark = pytest.mark.sprint_a
+
 # A4 (Decoupling Sprint A): tripwire exemption removed.
 # init_db() is no longer called at telegram_bot import time.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -419,8 +421,4 @@ def test_offload_fill_handler_done_callback_handles_cancelled_future():
     # Cancelled future — callback must handle gracefully, no crash
     cancelled_future = concurrent.futures.Future()
     cancelled_future.cancel()
-    log_future_exc_cb(cancelled_future)  # must not raise
-
-
-if __name__ == "__main__":
-    unittest.main()
+    log_future_exc_cb(cancelled_future)  # 
