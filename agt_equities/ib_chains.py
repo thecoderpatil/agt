@@ -14,12 +14,10 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
 
 
 # ── C6.2: NaN-safe numeric coercion helpers ─────────────────────
@@ -209,8 +207,9 @@ def _log_fetch(ticker: str, source: str, latency_ms: float,
     """Write to market_data_log table."""
     try:
         from contextlib import closing
-        with closing(sqlite3.connect(DB_PATH, timeout=5.0)) as conn:
-            with conn:
+        from agt_equities.db import get_db_connection, tx_immediate
+        with closing(get_db_connection()) as conn:
+            with tx_immediate(conn):
                 conn.execute(
                     "INSERT INTO market_data_log "
                     "(timestamp, ticker, source, latency_ms, success, error_class) "

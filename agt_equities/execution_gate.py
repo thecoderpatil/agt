@@ -12,12 +12,11 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
-from pathlib import Path
+from contextlib import closing
 
 logger = logging.getLogger(__name__)
 
-# Same DB path resolution as trade_repo.py:22
-_DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
+from agt_equities.db import get_ro_connection
 
 
 class ExecutionDisabledError(RuntimeError):
@@ -33,15 +32,15 @@ def _env_enabled() -> bool:
 def _db_enabled() -> bool:
     """Check execution_state DB row. No row or disabled=0 means enabled."""
     try:
-        with sqlite3.connect(str(_DB_PATH), timeout=2.0) as conn:
+        with closing(get_ro_connection()) as conn:
             row = conn.execute(
                 "SELECT disabled FROM execution_state WHERE id=1"
             ).fetchone()
             if row is None:
                 return True  # no row = not disabled (fresh install pre-schema)
             return row[0] == 0
-    except sqlite3.OperationalError:
-        return True  # table missing = not disabled (fresh install)
+    except (sqlite3.OperationalError, Exception):
+        return True  # table missing or DB unavailable = not disabled
 
 
 def assert_execution_enabled(in_process_halted: bool = False) -> None:
