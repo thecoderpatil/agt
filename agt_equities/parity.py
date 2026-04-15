@@ -8,17 +8,10 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
-
-
-def _get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    return conn
+from agt_equities.db import get_ro_connection
 
 
 def verify_option_eae_parity(
@@ -35,7 +28,7 @@ def verify_option_eae_parity(
     """
     close_conn = False
     if conn is None:
-        conn = _get_db()
+        conn = get_ro_connection()
         close_conn = True
 
     try:
