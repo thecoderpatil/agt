@@ -33,6 +33,7 @@ def conn():
     from agt_equities.schema import register_operational_tables
 
     register_operational_tables(c)
+    c.commit()  # close any implicit transaction so PRAGMA foreign_keys=ON sticks
     yield c
     c.close()
 
@@ -242,6 +243,7 @@ def test_register_operational_tables_idempotent():
     from agt_equities.schema import register_operational_tables
 
     c = sqlite3.connect(":memory:")
+    c.row_factory = sqlite3.Row  # schema.py PRAGMA table_info readers use row["name"]
     try:
         register_operational_tables(c)
         register_operational_tables(c)  # must not raise
