@@ -164,15 +164,12 @@ class TestCSPHarvestVsCanonical:
         # Canonical says NO — not day-1, and 80% < 90% threshold for day 2+
         assert not should
 
-    @pytest.mark.xfail(
-        reason="E7: CSP harvests on expiry day (0DTE) — should let it ride",
-        strict=True,
-    )
     def test_expiry_day_should_not_harvest(self):
-        """DTE=0, 95% profit. Canonical: let it ride."""
+        """DTE=0, 95% profit. Canonical: let it ride. (E7 FIXED 2026-04-15)"""
         from agt_equities.csp_harvest import _should_harvest_csp
-        should, _ = _should_harvest_csp(1.00, 0.05, dte=0)
+        should, reason = _should_harvest_csp(1.00, 0.05, dte=0)
         assert not should
+        assert "expiry_day" in reason
 
     def test_day1_position_80pct_should_harvest(self):
         """A day-1 position at 80% profit should harvest.

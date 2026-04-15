@@ -83,10 +83,11 @@ def _should_harvest_csp(
     Semantics:
       - initial_credit must be > 0 (we need a real opening credit)
       - current_ask must be a real finite non-negative number
-      - dte must be an integer (negative values treated as last-day)
+      - dte must be an integer (negative values treated as expiry day)
       - profit_pct = (initial_credit - current_ask) / initial_credit
+      - If dte <= 0 → NEVER harvest (let it ride on expiry day, E7 fix)
       - If dte >= 1 and profit_pct >= 0.80 → harvest ("next_day_80")
-      - If dte <= 1 and profit_pct >= 0.90 → harvest ("last_day_90")
+      - If dte == 1 and profit_pct >= 0.90 → harvest ("last_day_90")
       - Else → do not harvest
       - Note: dte == 1 qualifies under BOTH rules; next-day wins
         because it's checked first (0.80 is the easier bar).
@@ -108,12 +109,23 @@ def _should_harvest_csp(
 
     profit_pct = (ic - ca) / ic
 
+    # E7 fix (2026-04-15): expiry day — let it ride to expiration.
+    # Paying the ask spread to close a position expiring worthless is
+    # negative EV. Canonical: "on expiry day itself, let it ride."
+    if dte <= 0:
+        return False, f"expiry_day_let_ride:profit_pct={profit_pct:.3f}"
+
     # Next-day rule (easier bar — check first)
+    # NOTE (E6/E8): This SHOULD fire only on day-1 positions (held 1
+    # trading day), but _should_harvest_csp has no days_held parameter.
+    # Until days-held tracking is added (E8 infrastructure gap), this
+    # fires on DTE which over-harvests older positions at 80%. Acceptable
+    # for now — over-harvesting is conservative (locks in profit early).
     if dte >= 1 and profit_pct >= CSP_HARVEST_THRESHOLD_NEXT_DAY:
         return True, f"next_day_80:profit_pct={profit_pct:.3f}"
 
-    # Last-day rule (tighter bar, 0DTE / 1DTE crunch)
-    if dte <= 1 and profit_pct >= CSP_HARVEST_THRESHOLD_LAST_DAY:
+    # Last-day rule (tighter bar, 1DTE — no longer fires on 0DTE per E7 fix)
+    if dte == 1 and profit_pct >= CSP_HARVEST_THRESHOLD_LAST_DAY:
         return True, f"last_day_90:profit_pct={profit_pct:.3f}"
 
     return False, f"below_threshold:profit_pct={profit_pct:.3f},dte={dte}"
