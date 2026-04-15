@@ -5882,15 +5882,16 @@ def _increment_revalidation_count(audit_id: str) -> None:
     counter measures failure pressure, not attempt volume. Must survive
     downstream rollback so the 3-strike budget is accurate.
     """
-    iso_conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    from agt_equities.db import get_db_connection, tx_immediate
+    iso_conn = get_db_connection()
     try:
-        iso_conn.execute(
-            "UPDATE bucket3_dynamic_exit_log "
-            "SET re_validation_count = re_validation_count + 1 "
-            "WHERE audit_id = ?",
-            (audit_id,),
-        )
-        iso_conn.commit()
+        with tx_immediate(iso_conn):
+            iso_conn.execute(
+                "UPDATE bucket3_dynamic_exit_log "
+                "SET re_validation_count = re_validation_count + 1 "
+                "WHERE audit_id = ?",
+                (audit_id,),
+            )
     finally:
         iso_conn.close()
 

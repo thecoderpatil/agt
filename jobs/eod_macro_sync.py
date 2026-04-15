@@ -38,8 +38,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("eod_macro_sync")
 
-DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
-
 
 def load_active_tickers(conn: sqlite3.Connection) -> list[str]:
     """Load tickers with active Walker cycles from master_log_open_positions."""
@@ -61,8 +59,9 @@ def main():
     # Ensure logs directory exists
     (Path(__file__).resolve().parent.parent / "logs").mkdir(exist_ok=True)
 
-    conn = sqlite3.connect(str(DB_PATH), isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
+    from agt_equities.db import get_db_connection
+    conn = get_db_connection()
+    conn.isolation_level = None  # autocommit mode for batch inserts
 
     tickers = load_active_tickers(conn)
     if not tickers:
