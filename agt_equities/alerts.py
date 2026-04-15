@@ -264,6 +264,30 @@ def format_alert_text(alert: dict[str, Any]) -> str:
             f"{secs} sections, {rcv} rows received, {ins} upserted"
         )
 
+    if kind == "APEX_SURVIVAL":
+        # A5d.d: critical leverage-safety alert produced by scheduler-side
+        # el_snapshot_writer when excess_liquidity / NLV <= 0.08 on a
+        # margin-eligible account. Payload keys: account_id, household,
+        # el_pct, nlv, excess_liquidity.
+        acct = payload.get("account_id", "?")
+        hh = payload.get("household", "?")
+        def _money(x):
+            try:
+                return f"${float(x):,.0f}"
+            except (TypeError, ValueError):
+                return "?" if x is None else str(x)
+        def _pct(x):
+            try:
+                return f"{float(x):.1%}"
+            except (TypeError, ValueError):
+                return "?" if x is None else str(x)
+        return (
+            f"[{severity}] \U0001F6A8 APEX SURVIVAL [{acct}/{hh}]: "
+            f"Excess Liquidity {_money(payload.get('excess_liquidity'))} "
+            f"({_pct(payload.get('el_pct'))} of NLV {_money(payload.get('nlv'))}). "
+            f"Tied-unwinds required."
+        )
+
     # Generic fallback for unknown kinds (forward-compat for A5d.b/c/d
     # producers landing later — they will still surface via Telegram even
     # before this function gets a dedicated branch for their `kind`).

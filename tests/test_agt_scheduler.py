@@ -94,8 +94,9 @@ def test_build_scheduler_timezone_pinned():
     assert "New_York" in tz_name
 
 
-def test_register_jobs_a5a_set():
-    """A2 + A5a: heartbeat_writer, orphan_sweep, attested_sweeper.
+def test_register_jobs_a5dd_set():
+    """A2 + A5a + A5d.d: heartbeat_writer, orphan_sweep, attested_sweeper,
+    el_snapshot_writer.
 
     Order is the registration order — preserved here as a regression guard
     so future units appending jobs do not accidentally reorder the existing
@@ -106,9 +107,17 @@ def test_register_jobs_a5a_set():
     sched = agt_scheduler.build_scheduler()
     conn = IBConnector(config=IBConnConfig(client_id=2))
     registered = agt_scheduler.register_jobs(sched, conn)
-    assert registered == ["heartbeat_writer", "orphan_sweep", "attested_sweeper"]
+    assert registered == [
+        "heartbeat_writer",
+        "orphan_sweep",
+        "attested_sweeper",
+        "el_snapshot_writer",
+    ]
     job_ids = {j.id for j in sched.get_jobs()}
-    assert {"heartbeat_writer", "orphan_sweep", "attested_sweeper"}.issubset(job_ids)
+    assert {
+        "heartbeat_writer", "orphan_sweep",
+        "attested_sweeper", "el_snapshot_writer",
+    }.issubset(job_ids)
 
 
 def test_a5a_attested_sweeper_trigger_interval_60s():
@@ -231,3 +240,399 @@ def test_a5c_orphan_sweep_swallows_sweep_failures(monkeypatch):
     job_callable()  # must not raise
 
     assert captured == [], "must not enqueue when sweep itself failed"
+
+
+# ---------------------------------------------------------------------------
+# A5d.d — el_snapshot_writer (scheduler-side) tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeAccountItem:
+    """Duck-type replacement for ib_async.AccountValue."""
+    __slots__ = ("account", "tag", "value")
+
+    def __init__(self, account: str, tag: str, value):
+        self.account = account
+        self.tag = tag
+        self.value = value
+
+
+class _FakeIB:
+    def __init__(self, summary):
+        self._summary = summary
+
+    async def accountSummaryAsync(self):
+        return self._summary
+
+
+class _FakeIBConn:
+    """Duck-type IBConnector with config.client_id + ensure_connected()."""
+
+    def __init__(self, summary, *, connect_fail: bool = False):
+        self._summary = summary
+        self._connect_fail = connect_fail
+        import types as _types
+        self.config = _types.SimpleNamespace(client_id=2)
+
+    async def ensure_connected(self):
+        if self._connect_fail:
+            raise RuntimeError("simulated IB down")
+        return _FakeIB(self._summary)
+
+
+def _get_el_writer_callable(ib_conn):
+    """Register jobs with the given fake IBConnector and return the
+    el_snapshot_writer async callable."""
+    import agt_scheduler
+    sched = agt_scheduler.build_scheduler()
+    agt_scheduler.register_jobs(sched, ib_conn)
+    job = sched.get_job("el_snapshot_writer")
+    assert job is not None, "el_snapshot_writer not registered"
+    return job.func
+
+
+def _run_sync(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
+def _sqlite_with_el_snapshots(tmp_path):
+    """Open a sqlite file and create just the el_snapshots table we write to."""
+    import sqlite3
+    db = tmp_path / "a5dd_el.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS el_snapshots (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id       TEXT,
+            household        TEXT NOT NULL,
+            timestamp        TEXT NOT NULL DEFAULT (datetime('now')),
+            excess_liquidity REAL,
+            nlv              REAL,
+            buying_power     REAL,
+            source           TEXT NOT NULL DEFAULT 'ibkr_live'
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+    return str(db)
+
+
+def test_a5dd_writer_registered_with_30s_interval():
+    """el_snapshot_writer must appear in register_jobs output and run
+    every 30 seconds."""
+    import agt_scheduler
+    from agt_equities.ib_conn import IBConnector, IBConnConfig
+    sched = agt_scheduler.build_scheduler()
+    conn = IBConnector(config=IBConnConfig(client_id=2))
+    registered = agt_scheduler.register_jobs(sched, conn)
+    assert "el_snapshot_writer" in registered
+    job = sched.get_job("el_snapshot_writer")
+    assert job is not None
+    # Trigger should be an IntervalTrigger with 30s period.
+    from apscheduler.triggers.interval import IntervalTrigger
+    assert isinstance(job.trigger, IntervalTrigger)
+    assert job.trigger.interval.total_seconds() == 30.0
+
+
+def test_a5dd_non_margin_account_writes_snapshot_no_apex(monkeypatch, tmp_path):
+    """Non-margin account with healthy EL must INSERT one row and NOT
+    enqueue an APEX alert."""
+    acct = "U_IRA_ACCT"
+    # Stand up a config where acct is active, not margin.
+    monkeypatch.setattr("agt_equities.config.ACTIVE_ACCOUNTS", [acct])
+    monkeypatch.setattr("agt_equities.config.MARGIN_ACCOUNTS", frozenset())
+    monkeypatch.setattr(
+        "agt_equities.config.ACCOUNT_TO_HOUSEHOLD", {acct: "Yash_Household"},
+    )
+
+    db_path = _sqlite_with_el_snapshots(tmp_path)
+    import sqlite3
+    from contextlib import closing
+    def fake_get_conn(*a, **kw):
+        return sqlite3.connect(db_path)
+    monkeypatch.setattr("agt_equities.db.get_db_connection", fake_get_conn)
+
+    captured_alerts: list = []
+    monkeypatch.setattr(
+        "agt_equities.alerts.enqueue_alert",
+        lambda *a, **kw: captured_alerts.append((a, kw)),
+    )
+
+    summary = [
+        _FakeAccountItem(acct, "NetLiquidation", "500000"),
+        _FakeAccountItem(acct, "ExcessLiquidity", "100000"),
+        _FakeAccountItem(acct, "BuyingPower", "250000"),
+    ]
+    ib_conn = _FakeIBConn(summary)
+    job = _get_el_writer_callable(ib_conn)
+    _run_sync(job())
+
+    with closing(sqlite3.connect(db_path)) as c:
+        rows = c.execute(
+            "SELECT account_id, household, excess_liquidity, nlv, buying_power, source "
+            "FROM el_snapshots"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == acct
+    assert rows[0][1] == "Yash_Household"
+    assert rows[0][2] == 100000.0
+    assert rows[0][3] == 500000.0
+    assert rows[0][4] == 250000.0
+    assert rows[0][5] == "ibkr_live"
+    assert captured_alerts == [], "non-margin account must not emit APEX"
+
+
+def test_a5dd_margin_account_healthy_el_writes_snapshot_no_apex(
+    monkeypatch, tmp_path,
+):
+    """Margin account with el_pct > 0.08 must write snapshot, no APEX alert."""
+    acct = "U21971297"
+    monkeypatch.setattr("agt_equities.config.ACTIVE_ACCOUNTS", [acct])
+    monkeypatch.setattr("agt_equities.config.MARGIN_ACCOUNTS", frozenset([acct]))
+    monkeypatch.setattr(
+        "agt_equities.config.ACCOUNT_TO_HOUSEHOLD", {acct: "Yash_Household"},
+    )
+
+    db_path = _sqlite_with_el_snapshots(tmp_path)
+    import sqlite3
+    from contextlib import closing
+    monkeypatch.setattr(
+        "agt_equities.db.get_db_connection",
+        lambda *a, **kw: sqlite3.connect(db_path),
+    )
+    captured: list = []
+    monkeypatch.setattr(
+        "agt_equities.alerts.enqueue_alert",
+        lambda *a, **kw: captured.append((a, kw)),
+    )
+
+    # el_pct = 100000 / 500000 = 0.20 → above 0.08 threshold
+    summary = [
+        _FakeAccountItem(acct, "NetLiquidation", "500000"),
+        _FakeAccountItem(acct, "ExcessLiquidity", "100000"),
+        _FakeAccountItem(acct, "BuyingPower", "250000"),
+    ]
+    job = _get_el_writer_callable(_FakeIBConn(summary))
+    _run_sync(job())
+
+    with closing(sqlite3.connect(db_path)) as c:
+        count = c.execute("SELECT COUNT(*) FROM el_snapshots").fetchone()[0]
+    assert count == 1
+    assert captured == [], "healthy EL must not emit APEX"
+
+
+def test_a5dd_margin_account_apex_enqueues_alert_and_skips_snapshot(
+    monkeypatch, tmp_path,
+):
+    """el_pct <= 0.08 must enqueue APEX_SURVIVAL and SKIP the DB write
+    (matches bot-side behavior — no snapshot during critical condition)."""
+    acct = "U21971297"
+    monkeypatch.setattr("agt_equities.config.ACTIVE_ACCOUNTS", [acct])
+    monkeypatch.setattr("agt_equities.config.MARGIN_ACCOUNTS", frozenset([acct]))
+    monkeypatch.setattr(
+        "agt_equities.config.ACCOUNT_TO_HOUSEHOLD", {acct: "Yash_Household"},
+    )
+
+    db_path = _sqlite_with_el_snapshots(tmp_path)
+    import sqlite3
+    from contextlib import closing
+    monkeypatch.setattr(
+        "agt_equities.db.get_db_connection",
+        lambda *a, **kw: sqlite3.connect(db_path),
+    )
+    captured: list = []
+    def fake_enqueue(kind, payload, *, severity="info", db_path=None):
+        captured.append(
+            {"kind": kind, "payload": payload, "severity": severity}
+        )
+        return 1
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+    # el_pct = 30000 / 500000 = 0.06 → below 0.08 threshold
+    summary = [
+        _FakeAccountItem(acct, "NetLiquidation", "500000"),
+        _FakeAccountItem(acct, "ExcessLiquidity", "30000"),
+        _FakeAccountItem(acct, "BuyingPower", "150000"),
+    ]
+    job = _get_el_writer_callable(_FakeIBConn(summary))
+    _run_sync(job())
+
+    # APEX alert emitted with correct shape
+    assert len(captured) == 1
+    rec = captured[0]
+    assert rec["kind"] == "APEX_SURVIVAL"
+    assert rec["severity"] == "critical"
+    assert rec["payload"]["account_id"] == acct
+    assert rec["payload"]["household"] == "Yash_Household"
+    assert abs(rec["payload"]["el_pct"] - 0.06) < 1e-6
+    assert rec["payload"]["nlv"] == 500000.0
+    assert rec["payload"]["excess_liquidity"] == 30000.0
+
+    # And NO snapshot row was written for this account during APEX.
+    with closing(sqlite3.connect(db_path)) as c:
+        count = c.execute(
+            "SELECT COUNT(*) FROM el_snapshots WHERE account_id = ?", (acct,),
+        ).fetchone()[0]
+    assert count == 0
+
+
+def test_a5dd_apex_debounces_repeat_alerts_within_15min(monkeypatch, tmp_path):
+    """Two ticks back-to-back on the same APEX condition must yield ONE
+    alert (in-process 15-min per-account debounce)."""
+    acct = "U21971297"
+    monkeypatch.setattr("agt_equities.config.ACTIVE_ACCOUNTS", [acct])
+    monkeypatch.setattr("agt_equities.config.MARGIN_ACCOUNTS", frozenset([acct]))
+    monkeypatch.setattr(
+        "agt_equities.config.ACCOUNT_TO_HOUSEHOLD", {acct: "Yash_Household"},
+    )
+
+    db_path = _sqlite_with_el_snapshots(tmp_path)
+    import sqlite3
+    monkeypatch.setattr(
+        "agt_equities.db.get_db_connection",
+        lambda *a, **kw: sqlite3.connect(db_path),
+    )
+    captured: list = []
+    monkeypatch.setattr(
+        "agt_equities.alerts.enqueue_alert",
+        lambda kind, payload, *, severity="info", db_path=None:
+            captured.append({"kind": kind, "severity": severity}),
+    )
+
+    summary = [
+        _FakeAccountItem(acct, "NetLiquidation", "500000"),
+        _FakeAccountItem(acct, "ExcessLiquidity", "20000"),  # el_pct 0.04
+        _FakeAccountItem(acct, "BuyingPower", "100000"),
+    ]
+    ib_conn = _FakeIBConn(summary)
+    job = _get_el_writer_callable(ib_conn)
+    _run_sync(job())
+    _run_sync(job())
+    _run_sync(job())
+    # Exactly one alert despite three ticks
+    assert len(captured) == 1
+
+
+def test_a5dd_swallows_ib_connect_failure(monkeypatch, tmp_path):
+    """If ensure_connected raises, the job must return silently — no DB
+    writes, no alerts, no propagation."""
+    monkeypatch.setattr("agt_equities.config.ACTIVE_ACCOUNTS", ["U_X"])
+    monkeypatch.setattr("agt_equities.config.MARGIN_ACCOUNTS", frozenset())
+    monkeypatch.setattr(
+        "agt_equities.config.ACCOUNT_TO_HOUSEHOLD", {"U_X": "X"},
+    )
+    db_path = _sqlite_with_el_snapshots(tmp_path)
+    import sqlite3
+    monkeypatch.setattr(
+        "agt_equities.db.get_db_connection",
+        lambda *a, **kw: sqlite3.connect(db_path),
+    )
+    captured: list = []
+    monkeypatch.setattr(
+        "agt_equities.alerts.enqueue_alert",
+        lambda *a, **kw: captured.append((a, kw)),
+    )
+
+    job = _get_el_writer_callable(_FakeIBConn([], connect_fail=True))
+    _run_sync(job())  # must not raise
+
+    import sqlite3 as _s
+    from contextlib import closing
+    with closing(_s.connect(db_path)) as c:
+        assert c.execute("SELECT COUNT(*) FROM el_snapshots").fetchone()[0] == 0
+    assert captured == []
+
+
+def test_a5dd_swallows_db_write_failure(monkeypatch, tmp_path):
+    """DB-write exception on a single account must not kill the job or
+    propagate. Alert path must also be untouched."""
+    acct = "U_IRA"
+    monkeypatch.setattr("agt_equities.config.ACTIVE_ACCOUNTS", [acct])
+    monkeypatch.setattr("agt_equities.config.MARGIN_ACCOUNTS", frozenset())
+    monkeypatch.setattr(
+        "agt_equities.config.ACCOUNT_TO_HOUSEHOLD", {acct: "Yash_Household"},
+    )
+    def boom(*a, **kw):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr("agt_equities.db.get_db_connection", boom)
+    captured: list = []
+    monkeypatch.setattr(
+        "agt_equities.alerts.enqueue_alert",
+        lambda *a, **kw: captured.append((a, kw)),
+    )
+
+    summary = [
+        _FakeAccountItem(acct, "NetLiquidation", "500000"),
+        _FakeAccountItem(acct, "ExcessLiquidity", "100000"),
+        _FakeAccountItem(acct, "BuyingPower", "250000"),
+    ]
+    job = _get_el_writer_callable(_FakeIBConn(summary))
+    _run_sync(job())  # must not raise
+
+    assert captured == [], "DB failure must not trigger alerts"
+
+
+def test_a5dd_ignores_inactive_accounts(monkeypatch, tmp_path):
+    """Summary rows for accounts outside ACTIVE_ACCOUNTS must be dropped."""
+    active = "U_ACTIVE"
+    stranger = "U_STRANGER"
+    monkeypatch.setattr("agt_equities.config.ACTIVE_ACCOUNTS", [active])
+    monkeypatch.setattr("agt_equities.config.MARGIN_ACCOUNTS", frozenset())
+    monkeypatch.setattr(
+        "agt_equities.config.ACCOUNT_TO_HOUSEHOLD", {active: "Yash_Household"},
+    )
+
+    db_path = _sqlite_with_el_snapshots(tmp_path)
+    import sqlite3
+    from contextlib import closing
+    monkeypatch.setattr(
+        "agt_equities.db.get_db_connection",
+        lambda *a, **kw: sqlite3.connect(db_path),
+    )
+
+    summary = [
+        _FakeAccountItem(active, "NetLiquidation", "500000"),
+        _FakeAccountItem(active, "ExcessLiquidity", "100000"),
+        _FakeAccountItem(active, "BuyingPower", "250000"),
+        _FakeAccountItem(stranger, "NetLiquidation", "999999"),
+        _FakeAccountItem(stranger, "ExcessLiquidity", "1"),
+        _FakeAccountItem(stranger, "BuyingPower", "0"),
+    ]
+    job = _get_el_writer_callable(_FakeIBConn(summary))
+    _run_sync(job())
+
+    with closing(sqlite3.connect(db_path)) as c:
+        rows = c.execute("SELECT account_id FROM el_snapshots").fetchall()
+    assert [r[0] for r in rows] == [active]
+
+
+def test_a5dd_apex_enqueue_failure_does_not_crash_job(monkeypatch, tmp_path):
+    """enqueue_alert raising inside the APEX branch must not propagate."""
+    acct = "U21971297"
+    monkeypatch.setattr("agt_equities.config.ACTIVE_ACCOUNTS", [acct])
+    monkeypatch.setattr("agt_equities.config.MARGIN_ACCOUNTS", frozenset([acct]))
+    monkeypatch.setattr(
+        "agt_equities.config.ACCOUNT_TO_HOUSEHOLD", {acct: "Yash_Household"},
+    )
+    db_path = _sqlite_with_el_snapshots(tmp_path)
+    import sqlite3
+    monkeypatch.setattr(
+        "agt_equities.db.get_db_connection",
+        lambda *a, **kw: sqlite3.connect(db_path),
+    )
+
+    def boom(*a, **kw):
+        raise RuntimeError("bus down")
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", boom)
+
+    summary = [
+        _FakeAccountItem(acct, "NetLiquidation", "500000"),
+        _FakeAccountItem(acct, "ExcessLiquidity", "10000"),  # el_pct 0.02
+        _FakeAccountItem(acct, "BuyingPower", "50000"),
+    ]
+    job = _get_el_writer_callable(_FakeIBConn(summary))
+    _run_sync(job())  # must not raise
+
