@@ -454,7 +454,9 @@ async def _run() -> int:
     finally:
         logger.info("Scheduler stopping…")
         try:
-            scheduler.shutdown(wait=False)
+            # A5e: wait=True so in-flight jobs can finish cleanly before
+            # the loop tears down. Matches DT Q1a-g clean-shutdown spec.
+            scheduler.shutdown(wait=True)
         except Exception:
             logger.exception("scheduler.shutdown raised")
         try:
