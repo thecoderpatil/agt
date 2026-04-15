@@ -626,6 +626,87 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     #   el_snapshot_writer shipped in A5d.d.
     #   beta_cache_refresh + corporate_intel_refresh + flex_sync_eod
     #   + universe_monthly shipped in A5e.
+
+    # ── A5e: conviction_weekly (Sunday 20:00 ET) ──────────────────────────
+    async def _conviction_weekly_job() -> None:
+        try:
+            ib = await ib_connector.ensure_connected()
+        except Exception as exc:
+            logger.warning("conviction_weekly: IB not available: %s", exc)
+            try:
+                from agt_equities.alerts import enqueue_alert
+                enqueue_alert(
+                    "CONVICTION_REFRESH",
+                    {"error": f"IB connect failed: {exc}"[:500]},
+                    severity="warn",
+                )
+            except Exception as alert_exc:
+                logger.error("conviction_weekly: alert enqueue failed: %s", alert_exc)
+            return
+        try:
+            positions = await ib.reqPositionsAsync()
+        except Exception as exc:
+            logger.warning("conviction_weekly: reqPositionsAsync failed: %s", exc)
+            try:
+                from agt_equities.alerts import enqueue_alert
+                enqueue_alert(
+                    "CONVICTION_REFRESH",
+                    {"error": f"reqPositions failed: {exc}"[:500]},
+                    severity="warn",
+                )
+            except Exception as alert_exc:
+                logger.error("conviction_weekly: alert enqueue failed: %s", alert_exc)
+            return
+        try:
+            from agt_equities.conviction import (
+                refresh_conviction_data,
+                EXCLUDED_TICKERS,
+            )
+            held = set()
+            for pos in positions:
+                if pos.position != 0 and pos.contract.secType == "STK":
+                    tkr = pos.contract.symbol.upper()
+                    if tkr not in EXCLUDED_TICKERS:
+                        held.add(tkr)
+            result = refresh_conviction_data(held)
+        except Exception as exc:
+            logger.exception("conviction_weekly: refresh raised: %s", exc)
+            try:
+                from agt_equities.alerts import enqueue_alert
+                enqueue_alert(
+                    "CONVICTION_REFRESH",
+                    {"error": str(exc)[:500]},
+                    severity="crit",
+                )
+            except Exception as alert_exc:
+                logger.error("conviction_weekly: alert enqueue failed: %s", alert_exc)
+            return
+        try:
+            from agt_equities.alerts import enqueue_alert
+            payload = {
+                "updated": result.get("updated", 0),
+                "failed": result.get("failed", 0),
+                "total": result.get("total", 0),
+            }
+            sev = "info"
+            if result.get("failed", 0) > 0:
+                sev = "warn"
+            if result.get("error"):
+                payload["error"] = str(result["error"])[:500]
+                sev = "warn"
+            enqueue_alert("CONVICTION_REFRESH", payload, severity=sev)
+        except Exception as alert_exc:
+            logger.error("conviction_weekly: alert enqueue failed: %s", alert_exc)
+
+    scheduler.add_job(
+        _conviction_weekly_job,
+        CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=ET),
+        id="conviction_weekly",
+        name="conviction_weekly",
+        replace_existing=True,
+    )
+    registered.append("conviction_weekly")
+
     return registered
 
 

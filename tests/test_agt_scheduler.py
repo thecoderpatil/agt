@@ -117,6 +117,7 @@ def test_register_jobs_a5e_set():
         "corporate_intel_startup",
         "flex_sync_eod",
         "universe_monthly",
+        "conviction_weekly",
     ]
     job_ids = {j.id for j in sched.get_jobs()}
     assert {
@@ -125,6 +126,7 @@ def test_register_jobs_a5e_set():
         "beta_cache_refresh", "beta_startup",
         "corporate_intel_refresh", "corporate_intel_startup",
         "flex_sync_eod", "universe_monthly",
+        "conviction_weekly",
     }.issubset(job_ids)
 
 
@@ -1114,3 +1116,137 @@ def test_a5e_universe_monthly_swallows_alert_failure(monkeypatch):
     sched = _build_scheduler_with_jobs()
     job = sched.get_job("universe_monthly")
     job.func()  # must not raise
+
+
+# ── A5e: conviction_weekly tests ───────────────────────────────────────
+
+class TestConvictionWeeklyJob:
+    """Tests for the conviction_weekly scheduler job."""
+
+    def test_conviction_weekly_trigger(self, _build_scheduler_with_jobs):
+        scheduler, _ = _build_scheduler_with_jobs
+        job = scheduler.get_job("conviction_weekly")
+        assert job is not None
+        trigger = job.trigger
+        from apscheduler.triggers.cron import CronTrigger
+        assert isinstance(trigger, CronTrigger)
+
+    @pytest.mark.asyncio
+    async def test_conviction_weekly_calls_refresh(self, _build_scheduler_with_jobs, monkeypatch):
+        """Job fetches IB positions, filters STK, calls refresh_conviction_data."""
+        scheduler, ib_connector = _build_scheduler_with_jobs
+        job = scheduler.get_job("conviction_weekly")
+        assert job is not None
+
+        # Mock IB connection
+        class FakeContract:
+            def __init__(self, symbol, sec_type="STK"):
+                self.symbol = symbol
+                self.secType = sec_type
+
+        class FakePosition:
+            def __init__(self, symbol, position, sec_type="STK"):
+                self.contract = FakeContract(symbol, sec_type)
+                self.position = position
+
+        positions = [
+            FakePosition("AAPL", 100),
+            FakePosition("MSFT", 200),
+            FakePosition("SPX", 50, "IND"),   # excluded: not STK
+            FakePosition("IBKR", 100),         # excluded: EXCLUDED_TICKERS
+            FakePosition("TSLA", 0),            # excluded: zero position
+        ]
+
+        class FakeIB:
+            async def reqPositionsAsync(self):
+                return positions
+
+        async def fake_ensure():
+            return FakeIB()
+
+        ib_connector.ensure_connected = fake_ensure
+
+        refresh_calls = []
+        def fake_refresh(held, **kwargs):
+            refresh_calls.append(held)
+            return {"updated": len(held), "failed": 0, "total": len(held), "error": None}
+
+        monkeypatch.setattr(
+            "agt_equities.conviction.refresh_conviction_data",
+            fake_refresh,
+        )
+
+        enqueued = []
+        def fake_enqueue(kind, payload, **kwargs):
+            enqueued.append((kind, payload))
+
+        monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+        func = job.func
+        await func()
+
+        assert len(refresh_calls) == 1
+        assert refresh_calls[0] == {"AAPL", "MSFT"}
+        assert len(enqueued) == 1
+        assert enqueued[0][0] == "CONVICTION_REFRESH"
+        assert enqueued[0][1]["updated"] == 2
+
+    @pytest.mark.asyncio
+    async def test_conviction_weekly_ib_failure_enqueues_alert(self, _build_scheduler_with_jobs, monkeypatch):
+        """When IB connect fails, job enqueues a warn-level alert."""
+        scheduler, ib_connector = _build_scheduler_with_jobs
+        job = scheduler.get_job("conviction_weekly")
+        assert job is not None
+
+        async def fail_connect():
+            raise ConnectionError("Gateway down")
+
+        ib_connector.ensure_connected = fail_connect
+
+        enqueued = []
+        def fake_enqueue(kind, payload, **kwargs):
+            enqueued.append((kind, payload, kwargs))
+
+        monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+        await job.func()  # must not raise
+
+        assert len(enqueued) == 1
+        assert enqueued[0][0] == "CONVICTION_REFRESH"
+        assert "Gateway down" in enqueued[0][1]["error"]
+        assert enqueued[0][2].get("severity") == "warn"
+
+    @pytest.mark.asyncio
+    async def test_conviction_weekly_refresh_exception_enqueues_crit(self, _build_scheduler_with_jobs, monkeypatch):
+        """When refresh_conviction_data raises, job enqueues a crit-level alert."""
+        scheduler, ib_connector = _build_scheduler_with_jobs
+        job = scheduler.get_job("conviction_weekly")
+
+        class FakeIB:
+            async def reqPositionsAsync(self):
+                return []
+
+        async def fake_ensure():
+            return FakeIB()
+
+        ib_connector.ensure_connected = fake_ensure
+
+        def boom(held, **kwargs):
+            raise RuntimeError("yfinance exploded")
+
+        monkeypatch.setattr(
+            "agt_equities.conviction.refresh_conviction_data",
+            boom,
+        )
+
+        enqueued = []
+        def fake_enqueue(kind, payload, **kwargs):
+            enqueued.append((kind, payload, kwargs))
+
+        monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+        await job.func()  # must not raise
+
+        assert len(enqueued) == 1
+        assert enqueued[0][0] == "CONVICTION_REFRESH"
+        assert enqueued[0][2].get("severity") == "crit"
