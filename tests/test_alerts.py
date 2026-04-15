@@ -242,3 +242,36 @@ def test_format_round_trips_drained_record(alerts_db) -> None:
     assert len(drained) == 1
     text = format_alert_text(drained[0])
     assert "[WARN]" in text and "orphan_sweep" in text and "3" in text
+
+
+
+def test_format_flex_sync_digest_alert_text() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text(
+        {
+            "id": 11,
+            "kind": "FLEX_SYNC_DIGEST",
+            "severity": "info",
+            "payload": {
+                "sync_id": 4242,
+                "mode": "oneshot",
+                "sections_processed": 5,
+                "rows_received": 1234,
+                "rows_inserted": 56,
+            },
+        }
+    )
+    assert text.startswith("[INFO] flex_sync ok")
+    assert "sync_id=4242" in text
+    assert "mode=oneshot" in text
+    assert "5 sections" in text
+    assert "1234 rows received" in text
+    assert "56 upserted" in text
+
+
+def test_format_flex_sync_digest_handles_missing_payload_keys() -> None:
+    from agt_equities.alerts import format_alert_text
+    text = format_alert_text(
+        {"kind": "FLEX_SYNC_DIGEST", "severity": "info", "payload": {}}
+    )
+    assert "sync_id=?" in text and "mode=?" in text and "? sections" in text
