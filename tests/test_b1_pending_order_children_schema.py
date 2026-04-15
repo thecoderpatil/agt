@@ -19,6 +19,8 @@ import sqlite3
 
 import pytest
 
+pytestmark = pytest.mark.sprint_a
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
