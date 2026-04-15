@@ -1,5 +1,5 @@
 """
-agt_equities.fa_block_margin — Sprint B5 FA-block margin pre-stage library.
+agt_equities.fa_block_margin — Sprint B5 CSP Allocator pre-stage library.
 
 Purpose
 -------
@@ -8,35 +8,40 @@ margin (Blind Spot #1 — FA Block Margin Contagion). This module performs
 local margin math BEFORE the parent block is staged so that underfunded
 accounts are dropped ahead of `placeOrder`, preserving the survivors.
 
+B5.b integration
+----------------
+Replaces M1.x `_csp_route_to_accounts` as the canonical per-account router.
+Two-phase allocation:
+
+  Phase 1 — cash (IRA) accounts: greedy fill by cash_available desc.
+    IRA-first invariant from M1.x. No margin-view lookup (IRA accounts
+    don't have IBKR excess_liquidity semantics). No FA-block contagion
+    risk (cash collateral is always isolated per-account).
+
+  Phase 2 — margin accounts: pro-rata on residual contracts, NLV-desc.
+    DT Q4 invariant: each margin account gets contracts_requested / n
+    base share, remainder to NLV-largest. Per-account WARTIME mode gate
+    inline (Act 60 principal vs advisory nuance). Partial allocation
+    when affordable < pro_rata (no peer forfeit).
+
 DT Q4 ruling invariants encoded here:
-  * NLV source = `el_snapshots` (latest row per account).
-  * Available capital = IBKR `excess_liquidity` (exposed via the
-    `v_available_nlv` view). NOT a re-derived CSP-collateral sum — IBKR's
-    portfolio-margin engine already nets box spreads, credit spreads, CC
-    assigned-share coverage, and cross-position offsets. Re-deriving in
-    SQL double-counts everything (e.g. synthetic financing boxes that
-    show up as 13× short SPX puts but are margin-flat in IBKR's view).
-  * Traversal = NLV-descending (largest accounts first — maximizes
-    coverage when aggregate capital is tight).
-  * Partial allocation — if an account only covers N of its pro-rata share,
-    allocate N and keep going rather than dropping it entirely.
+  * NLV source for margin accounts = `el_snapshots` via `v_available_nlv`.
+  * Available capital = IBKR `excess_liquidity` (netted by portfolio
+    margin — do NOT re-derive in SQL, box spreads double-count).
+  * Traversal: cash-first greedy (M1.x), margin pro-rata NLV-desc (DT Q4).
+  * Partial allocation — allocate what fits, surface residual in digest.
   * Per-household mode gate evaluated INSIDE the loop, not at entry.
-    Act 60 principal accounts can be WARTIME while advisory clients are
-    PEACETIME; one WARTIME account must not veto the whole block.
-  * Aggregate digest failure surfacing — single structured digest
-    per allocation summarizing approved + dropped accounts with reasons
-    (caller renders + delivers; this module only returns the digest).
+  * Aggregate digest failure surfacing — fold-together approved/dropped.
+  * Mode-blocked / no-snapshot accounts do NOT forfeit their share to
+    peers (DT Q4 non-redistribution invariant).
 
-Scope (this MR)
+Scope (B5.b MR)
 ---------------
-Pure library + tests. No wiring into `_place_single_order` /
-`_stage_csp_fa_block` yet; that's the follow-on MR (B5.b) after paper-run
-review. No writes to `pending_order_children.margin_check_*` columns yet
-(B5.b territory).
+Pure library + tests. No live `accountSummaryAsync` refresh (deferred
+to B5.c). No writes to `pending_order_children.margin_check_*` (B5.c).
 
-This module does ZERO I/O at import (no telegram/ib_async imports). The
-only runtime dependency is `agt_equities.db.get_ro_connection` for the
-view query.
+ZERO I/O at import. Only runtime dep: `agt_equities.db.get_ro_connection`
+(lazy-imported inside `_fetch_available_nlv`).
 """
 from __future__ import annotations
 
@@ -49,10 +54,11 @@ MODE_PEACETIME = "PEACETIME"
 MODE_AMBER = "AMBER"
 MODE_WARTIME = "WARTIME"
 
-# Margin-check outcome codes persisted to pending_order_children by B5.b
+# Margin-check outcome codes persisted to pending_order_children by B5.c
 # and rendered by format_allocation_digest today.
 STATUS_APPROVED = "approved"
 STATUS_INSUFFICIENT_NLV = "insufficient_nlv"
+STATUS_INSUFFICIENT_CASH = "insufficient_cash"
 STATUS_MODE_BLOCKED = "mode_blocked"
 STATUS_NO_SNAPSHOT = "no_snapshot"
 
@@ -69,20 +75,22 @@ class CSPProposal:
     Fields
     ------
     household_id : str
-        Logical household the proposal belongs to (display only — real
-        mode gating lives in mode_gate_accounts per-account).
     ticker : str
     strike : float
     contracts_requested : int
-        Total contracts across all accounts; per-account share is
-        `contracts_requested // len(mode_gate_accounts)` rounded down,
-        with remainder distributed to the NLV-largest account.
+        Total contracts across all accounts in the household.
     expiry : str
-        ISO date or YYYYMMDD. Display only at this layer.
+        ISO date or YYYYMMDD. Display + ticket construction.
     mode_gate_accounts : Mapping[str, str]
-        account_id -> mode (one of MODE_*). Per-account mode lookup is
-        the caller's responsibility — allocator treats this dict as
-        ground truth.
+        account_id -> mode (one of MODE_*). Per-account mode lookup.
+    margin_eligible : Mapping[str, bool]
+        account_id -> True for margin account, False for cash/IRA.
+        Absent or empty dict → treat all accounts as margin
+        (preserves pre-B5.b behavior for tests and callers).
+    limit_price : float
+        Option mid for ticket construction downstream (M1.x tickets).
+    annualized_yield : float
+        For digest rendering context; not used in allocation math.
     """
 
     household_id: str
@@ -91,6 +99,9 @@ class CSPProposal:
     contracts_requested: int
     expiry: str
     mode_gate_accounts: Mapping[str, str]
+    margin_eligible: Mapping[str, bool] = field(default_factory=dict)
+    limit_price: float = 0.0
+    annualized_yield: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -101,7 +112,7 @@ class AccountAllocation:
     contracts_allocated: int
     margin_check_status: str  # one of STATUS_*
     margin_check_reason: str
-    available_nlv: float | None  # None if no v_available_nlv row
+    available_nlv: float | None  # None for cash accts or no-snapshot
 
 
 @dataclass(frozen=True)
@@ -117,24 +128,23 @@ class AllocationDigest:
 
 
 # ---------------------------------------------------------------------------
-# Core allocator
+# Core allocator helpers
 # ---------------------------------------------------------------------------
 
 
-def _contracts_affordable(available_nlv: float, strike: float) -> int:
+def _contracts_affordable(available: float, strike: float) -> int:
     """Floor(available / (strike * 100)). Non-negative.
 
-    Strike * 100 is the cash-collateral requirement per contract for
-    an equity CSP. Non-standard multipliers (index options, futures)
-    are out of scope for v1 — the Wheel strategy runs on equity
-    underliers only.
+    Strike * 100 is cash-collateral / margin requirement per contract
+    for an equity CSP. Non-standard multipliers (index options, futures)
+    are out of scope — Wheel runs on equity underliers only.
     """
     if strike <= 0:
         return 0
     per_contract = strike * 100.0
-    if available_nlv <= 0:
+    if available <= 0:
         return 0
-    return int(available_nlv // per_contract)
+    return int(available // per_contract)
 
 
 def _fetch_available_nlv(
@@ -142,21 +152,18 @@ def _fetch_available_nlv(
     *,
     db_path: str | Path | None = None,
 ) -> dict[str, float]:
-    """Query v_available_nlv for the given account_ids.
+    """Query v_available_nlv for the given margin account_ids.
 
     Returns {account_id: available_nlv}. Accounts with no matching row
-    (no recent el_snapshot) are absent from the result — the allocator
+    (no recent el_snapshot) are absent from the result — allocator
     treats absence as STATUS_NO_SNAPSHOT.
 
-    Defensive against: view not yet created (OperationalError), empty
-    account_ids list (returns {} without hitting DB), connection failure
-    (re-raises — caller decides halt vs proceed-with-zero).
+    Empty account_ids → returns {} without hitting DB.
+    Connection failure re-raises — caller decides halt vs proceed.
     """
     if not account_ids:
         return {}
 
-    # Late import so this module is safe to import in test contexts
-    # that don't have a DB stack wired up yet.
     from agt_equities.db import get_ro_connection
 
     placeholders = ",".join("?" for _ in account_ids)
@@ -176,7 +183,6 @@ def _fetch_available_nlv(
 
     out: dict[str, float] = {}
     for row in rows:
-        # Support both sqlite3.Row and plain tuples.
         try:
             acct = row["account_id"]
             nlv = row["available_nlv"]
@@ -187,65 +193,54 @@ def _fetch_available_nlv(
     return out
 
 
+def _is_margin(proposal: CSPProposal, acct: str) -> bool:
+    """Account is margin-eligible unless explicitly flagged False.
+
+    Empty margin_eligible map → all-margin (pre-B5.b behavior).
+    """
+    if not proposal.margin_eligible:
+        return True
+    return bool(proposal.margin_eligible.get(acct, True))
+
+
 def allocate_csp(
     proposal: CSPProposal,
     *,
     db_path: str | Path | None = None,
     available_nlv_override: Mapping[str, float] | None = None,
+    cash_snapshot: Mapping[str, float] | None = None,
 ) -> AllocationDigest:
-    """Allocate a CSP proposal across the accounts in its mode-gate map.
+    """Allocate a CSP proposal across cash + margin accounts.
+
+    Phase 1 (cash accounts, greedy):
+        Sort by cash_available desc. Mode gate inline. Fill greedily.
+        WARTIME → STATUS_MODE_BLOCKED. Zero cash → STATUS_INSUFFICIENT_CASH.
+
+    Phase 2 (margin accounts, pro-rata):
+        Residual = contracts_requested - cash_allocated.
+        base_share, remainder = divmod(residual, n_margin_accounts).
+        Sort margin accts NLV-desc (no-snapshot sorts last).
+        idx=0 gets base+remainder; others get base.
+        Per-account WARTIME → blocked. No view row → no_snapshot.
+        affordable >= pro_rata → approved. affordable > 0 → partial
+        (STATUS_INSUFFICIENT_NLV, take affordable). affordable == 0 →
+        insufficient, take 0.
+
+    Neither phase redistributes a dropped account's share — DT Q4
+    non-forfeit invariant (WARTIME/missing peer doesn't enlarge survivors).
 
     Parameters
     ----------
     proposal : CSPProposal
-    db_path : optional, passed to shared RO connection.
-    available_nlv_override : optional, bypasses the v_available_nlv query
-        entirely. Used in tests and by B5.b when the caller already has
-        NLV in hand from a prior lookup.
-
-    Returns
-    -------
-    AllocationDigest
-
-    Behavior
-    --------
-    1. Fetch available_nlv per account (view lookup unless override).
-    2. Sort accounts NLV-descending. Accounts with no v_available_nlv
-       row sort last (treated as 0.0 for ordering, flagged NO_SNAPSHOT).
-    3. Compute per-account pro-rata share. Remainder (from integer
-       division) goes to the NLV-largest account.
-    4. Per-account loop:
-         a. If mode == WARTIME → 0 contracts, STATUS_MODE_BLOCKED.
-         b. Else if no NLV snapshot → 0 contracts, STATUS_NO_SNAPSHOT.
-         c. Else compute affordable contracts at strike. If affordable
-            >= pro-rata share → STATUS_APPROVED, allocate pro-rata.
-            If affordable > 0 but < pro-rata → STATUS_INSUFFICIENT_NLV
-            with partial allocation. If affordable == 0 →
-            STATUS_INSUFFICIENT_NLV with 0 contracts.
-    5. Build digest; `dropped_accounts` = every non-APPROVED account.
+    db_path : optional, shared RO connection path.
+    available_nlv_override : optional, bypasses v_available_nlv lookup.
+        Tests and B5.c pre-fetched paths use this.
+    cash_snapshot : optional, account_id -> cash_available for cash
+        accounts. Absent account → 0 cash. Unused for margin accounts.
     """
     accounts = list(proposal.mode_gate_accounts.keys())
 
-    if available_nlv_override is not None:
-        nlv_map = {a: float(v) for a, v in available_nlv_override.items()}
-    else:
-        try:
-            nlv_map = _fetch_available_nlv(accounts, db_path=db_path)
-        except Exception:
-            # If the view lookup itself fails, we cannot make margin
-            # decisions. Fail loud — better to halt than to stage a
-            # block against stale/empty data.
-            raise
-
-    # NLV-descending sort; no-snapshot accounts sort last with NLV = -inf
-    # sentinel so they're traversed after every funded account.
-    def _sort_key(acct: str) -> float:
-        return nlv_map.get(acct, float("-inf"))
-
-    sorted_accounts = sorted(accounts, key=_sort_key, reverse=True)
-
-    n = len(sorted_accounts)
-    if n == 0:
+    if not accounts or proposal.contracts_requested <= 0:
         return AllocationDigest(
             proposal=proposal,
             allocations=(),
@@ -254,40 +249,56 @@ def allocate_csp(
             dropped_accounts=(),
         )
 
-    base_share, remainder = divmod(proposal.contracts_requested, n)
+    cash_map = dict(cash_snapshot) if cash_snapshot else {}
+    cash_accounts = [a for a in accounts if not _is_margin(proposal, a)]
+    margin_accounts = [a for a in accounts if _is_margin(proposal, a)]
 
+    strike = proposal.strike
+    per_contract = strike * 100.0
     allocations: list[AccountAllocation] = []
     dropped: list[tuple[str, str]] = []
     total_allocated = 0
+    remaining = proposal.contracts_requested
 
-    for idx, acct in enumerate(sorted_accounts):
+    # ---------- Phase 1: cash accounts, greedy desc ----------
+    cash_accounts.sort(key=lambda a: cash_map.get(a, 0.0), reverse=True)
+    for acct in cash_accounts:
         mode = proposal.mode_gate_accounts[acct]
-        # Remainder goes to NLV-largest account (index 0 after sort desc).
-        pro_rata = base_share + (remainder if idx == 0 else 0)
-
-        # Mode gate — evaluated per-account.
         if mode == MODE_WARTIME:
             alloc = AccountAllocation(
                 account_id=acct,
                 contracts_allocated=0,
                 margin_check_status=STATUS_MODE_BLOCKED,
-                margin_check_reason=(
-                    f"WARTIME — LLM CSP entry blocked per 3-mode state machine"
-                ),
-                available_nlv=nlv_map.get(acct),
+                margin_check_reason="WARTIME — LLM CSP entry blocked per 3-mode state machine",
+                available_nlv=None,
             )
             allocations.append(alloc)
             dropped.append((acct, alloc.margin_check_reason))
             continue
 
-        # No-snapshot gate.
-        if acct not in nlv_map:
+        cash = cash_map.get(acct, 0.0)
+        affordable = _contracts_affordable(cash, strike)
+        if remaining <= 0:
+            # No residual demand — show as dropped-insufficient w/ zero.
             alloc = AccountAllocation(
                 account_id=acct,
                 contracts_allocated=0,
-                margin_check_status=STATUS_NO_SNAPSHOT,
+                margin_check_status=STATUS_INSUFFICIENT_CASH,
+                margin_check_reason="no remaining contracts to allocate",
+                available_nlv=None,
+            )
+            allocations.append(alloc)
+            # Not "dropped" in the failure sense — don't append to dropped.
+            continue
+
+        if affordable <= 0:
+            alloc = AccountAllocation(
+                account_id=acct,
+                contracts_allocated=0,
+                margin_check_status=STATUS_INSUFFICIENT_CASH,
                 margin_check_reason=(
-                    "no recent el_snapshot in v_available_nlv"
+                    f"cash: available=${cash:,.0f} "
+                    f"covers 0 of {remaining} remaining at strike ${strike:,.2f}"
                 ),
                 available_nlv=None,
             )
@@ -295,51 +306,125 @@ def allocate_csp(
             dropped.append((acct, alloc.margin_check_reason))
             continue
 
-        available = nlv_map[acct]
-        affordable = _contracts_affordable(available, proposal.strike)
+        take = min(remaining, affordable)
+        alloc = AccountAllocation(
+            account_id=acct,
+            contracts_allocated=take,
+            margin_check_status=STATUS_APPROVED,
+            margin_check_reason=(
+                f"cash: available=${cash:,.0f} "
+                f"covers {take}x (required=${take * per_contract:,.0f})"
+            ),
+            available_nlv=None,
+        )
+        allocations.append(alloc)
+        total_allocated += take
+        remaining -= take
 
-        if affordable >= pro_rata and pro_rata > 0:
-            alloc = AccountAllocation(
-                account_id=acct,
-                contracts_allocated=pro_rata,
-                margin_check_status=STATUS_APPROVED,
-                margin_check_reason=(
-                    f"available=${available:,.0f} "
-                    f"required=${pro_rata * proposal.strike * 100:,.0f}"
-                ),
-                available_nlv=available,
-            )
-            allocations.append(alloc)
-            total_allocated += pro_rata
-        elif affordable > 0:
-            # Partial allocation — take what the account can cover.
-            alloc = AccountAllocation(
-                account_id=acct,
-                contracts_allocated=affordable,
-                margin_check_status=STATUS_INSUFFICIENT_NLV,
-                margin_check_reason=(
-                    f"partial: available=${available:,.0f} "
-                    f"covers {affordable} of {pro_rata} requested "
-                    f"(required=${pro_rata * proposal.strike * 100:,.0f})"
-                ),
-                available_nlv=available,
-            )
-            allocations.append(alloc)
-            total_allocated += affordable
-            dropped.append((acct, alloc.margin_check_reason))
+    # ---------- Phase 2: margin accounts, pro-rata on residual ----------
+    if margin_accounts and remaining > 0:
+        if available_nlv_override is not None:
+            nlv_map = {a: float(v) for a, v in available_nlv_override.items()}
         else:
-            alloc = AccountAllocation(
-                account_id=acct,
-                contracts_allocated=0,
-                margin_check_status=STATUS_INSUFFICIENT_NLV,
-                margin_check_reason=(
-                    f"available=${available:,.0f} "
-                    f"covers 0 of {pro_rata} requested at strike ${proposal.strike:,.2f}"
-                ),
-                available_nlv=available,
-            )
-            allocations.append(alloc)
-            dropped.append((acct, alloc.margin_check_reason))
+            nlv_map = _fetch_available_nlv(margin_accounts, db_path=db_path)
+
+        def _nlv_key(acct: str) -> float:
+            return nlv_map.get(acct, float("-inf"))
+
+        margin_accounts.sort(key=_nlv_key, reverse=True)
+
+        n_margin = len(margin_accounts)
+        base_share, remainder = divmod(remaining, n_margin)
+
+        for idx, acct in enumerate(margin_accounts):
+            mode = proposal.mode_gate_accounts[acct]
+            pro_rata = base_share + (remainder if idx == 0 else 0)
+
+            if mode == MODE_WARTIME:
+                alloc = AccountAllocation(
+                    account_id=acct,
+                    contracts_allocated=0,
+                    margin_check_status=STATUS_MODE_BLOCKED,
+                    margin_check_reason="WARTIME — LLM CSP entry blocked per 3-mode state machine",
+                    available_nlv=nlv_map.get(acct),
+                )
+                allocations.append(alloc)
+                dropped.append((acct, alloc.margin_check_reason))
+                continue
+
+            if acct not in nlv_map:
+                alloc = AccountAllocation(
+                    account_id=acct,
+                    contracts_allocated=0,
+                    margin_check_status=STATUS_NO_SNAPSHOT,
+                    margin_check_reason="no recent el_snapshot in v_available_nlv",
+                    available_nlv=None,
+                )
+                allocations.append(alloc)
+                dropped.append((acct, alloc.margin_check_reason))
+                continue
+
+            available = nlv_map[acct]
+            affordable = _contracts_affordable(available, strike)
+
+            if pro_rata <= 0:
+                # Residual insufficient for integer share — mark zero.
+                alloc = AccountAllocation(
+                    account_id=acct,
+                    contracts_allocated=0,
+                    margin_check_status=STATUS_INSUFFICIENT_NLV,
+                    margin_check_reason=(
+                        f"margin: available=${available:,.0f} "
+                        f"pro_rata share is 0 (residual {remaining} < n_margin {n_margin})"
+                    ),
+                    available_nlv=available,
+                )
+                allocations.append(alloc)
+                dropped.append((acct, alloc.margin_check_reason))
+                continue
+
+            if affordable >= pro_rata:
+                alloc = AccountAllocation(
+                    account_id=acct,
+                    contracts_allocated=pro_rata,
+                    margin_check_status=STATUS_APPROVED,
+                    margin_check_reason=(
+                        f"margin: available=${available:,.0f} "
+                        f"required=${pro_rata * per_contract:,.0f}"
+                    ),
+                    available_nlv=available,
+                )
+                allocations.append(alloc)
+                total_allocated += pro_rata
+            elif affordable > 0:
+                # Partial — take what fits.
+                alloc = AccountAllocation(
+                    account_id=acct,
+                    contracts_allocated=affordable,
+                    margin_check_status=STATUS_INSUFFICIENT_NLV,
+                    margin_check_reason=(
+                        f"margin partial: available=${available:,.0f} "
+                        f"covers {affordable} of {pro_rata} pro_rata "
+                        f"(required=${pro_rata * per_contract:,.0f})"
+                    ),
+                    available_nlv=available,
+                )
+                allocations.append(alloc)
+                total_allocated += affordable
+                dropped.append((acct, alloc.margin_check_reason))
+            else:
+                alloc = AccountAllocation(
+                    account_id=acct,
+                    contracts_allocated=0,
+                    margin_check_status=STATUS_INSUFFICIENT_NLV,
+                    margin_check_reason=(
+                        f"margin: available=${available:,.0f} "
+                        f"covers 0 of {pro_rata} pro_rata at strike ${strike:,.2f}"
+                    ),
+                    available_nlv=available,
+                )
+                allocations.append(alloc)
+                dropped.append((acct, alloc.margin_check_reason))
 
     return AllocationDigest(
         proposal=proposal,
@@ -358,19 +443,20 @@ def allocate_csp(
 def format_allocation_digest(digest: AllocationDigest) -> str:
     """Render a single human-readable digest string.
 
-    Shape (one Telegram message per allocation, not N per account):
+    Fold-together format — one Approved block (cash + margin mixed,
+    per-account reason text distinguishes), one Dropped block.
 
         CSP Allocator — {household_id}/{ticker} {contracts}x@${strike} {expiry}
         Requested: {requested} | Allocated: {allocated} | Dropped: {dropped_count}
         Approved:
-          - {acct}: {contracts}x (available=${nlv})
+          - {acct}: {contracts}x ({reason})
           ...
         Dropped:
           - {acct}: {reason}
           ...
 
-    Tolerant of: empty allocations, zero approved, zero dropped,
-    None available_nlv. Never raises on well-formed digest input.
+    Tolerant of empty allocations, zero approved, zero dropped.
+    Never raises on well-formed digest input.
     """
     p = digest.proposal
     lines: list[str] = []
@@ -388,13 +474,8 @@ def format_allocation_digest(digest: AllocationDigest) -> str:
     if approved:
         lines.append("Approved:")
         for a in approved:
-            nlv_str = (
-                f"available=${a.available_nlv:,.0f}"
-                if a.available_nlv is not None
-                else "available=n/a"
-            )
             lines.append(
-                f"  - {a.account_id}: {a.contracts_allocated}x ({nlv_str})"
+                f"  - {a.account_id}: {a.contracts_allocated}x ({a.margin_check_reason})"
             )
 
     non_approved = [

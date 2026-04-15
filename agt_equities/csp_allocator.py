@@ -45,6 +45,13 @@ from agt_equities.config import (
     HOUSEHOLD_MAP,
     MARGIN_ACCOUNTS,
 )
+from agt_equities.fa_block_margin import (
+    AllocationDigest,
+    CSPProposal,
+    STATUS_APPROVED,
+    allocate_csp,
+    format_allocation_digest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -426,74 +433,23 @@ def _csp_route_to_accounts(
     hh_snapshot: dict,
     candidate,
 ) -> list[dict]:
-    """Route n_contracts across accounts in a household, IRA-first.
+    """Route n_contracts across household accounts via fa_block_margin.
 
-    Ordering: non-margin (IRA) accounts first sorted by cash_available
-    desc, then margin-eligible accounts sorted by buying_power desc.
-    Greedy fill. Partial allocation allowed — returns whatever fit,
-    possibly less than n_contracts. Empty list if nothing fits.
+    DEPRECATED shim as of Sprint B5.b — delegates to
+    `agt_equities.fa_block_margin.allocate_csp`, the canonical per-account
+    router. Preserves the original ticket-dict return shape so callers that
+    haven't migrated to AllocationDigest consumption keep working.
 
-    Each returned ticket is a dict matching the pending_orders payload
-    shape used by append_pending_tickets.
-
-    Pure function — no IB, no DB, no side effects.
+    Use `allocate_csp` directly for new call sites. This shim will be
+    removed in M1.5 when cmd_scan wiring collapses the indirection.
     """
     if n_contracts < 1:
         return []
-
-    collateral = candidate.strike * 100
-    if collateral <= 0:
+    if candidate.strike * 100 <= 0:
         return []
 
-    # IRA first (margin_eligible=False), margin last.
-    # Within each group, largest capacity first for efficient packing.
-    # The sort key returns a (group, neg_capacity) tuple:
-    #   group=0 for IRA, group=1 for margin
-    #   capacity is cash_available for IRA, buying_power for margin
-    ordered = sorted(
-        hh_snapshot["accounts"].values(),
-        key=lambda a: (
-            0 if not a["margin_eligible"] else 1,
-            -(
-                a["cash_available"]
-                if not a["margin_eligible"]
-                else a["buying_power"]
-            ),
-        ),
-    )
-
-    remaining = n_contracts
-    tickets: list[dict] = []
-    for acct in ordered:
-        if remaining == 0:
-            break
-        capacity = (
-            acct["cash_available"]
-            if not acct["margin_eligible"]
-            else acct["buying_power"]
-        )
-        max_fit = int(capacity // collateral)
-        take = min(remaining, max_fit)
-        if take < 1:
-            continue
-        tickets.append({
-            "account_id": acct["account_id"],
-            "household": hh_snapshot["household"],
-            "ticker": candidate.ticker.upper(),
-            "action": "SELL",
-            "sec_type": "OPT",
-            "right": "P",
-            "strike": float(candidate.strike),
-            "expiry": candidate.expiry.replace("-", ""),  # YYYYMMDD
-            "quantity": take,
-            "limit_price": float(candidate.mid),
-            "annualized_yield": float(candidate.annualized_yield),
-            "mode": "CSP_ENTRY",
-            "status": "staged",
-        })
-        remaining -= take
-
-    return tickets
+    digest = _build_and_allocate(n_contracts, hh_snapshot, candidate)
+    return _tickets_from_digest(digest, hh_snapshot, candidate)
 
 
 
@@ -820,6 +776,99 @@ def run_csp_allocator(
     return result
 
 
+
+# ---------------------------------------------------------------------------
+# B5.b helpers: bridge M1.x snapshot dicts to fa_block_margin.CSPProposal
+# ---------------------------------------------------------------------------
+
+
+def _build_csp_proposal(
+    n_contracts: int,
+    hh_snapshot: dict,
+    candidate,
+) -> CSPProposal:
+    """Construct a CSPProposal from M1.x snapshot + candidate.
+
+    Inherits mode from each account's snapshot (caller-populated).
+    margin_eligible flag comes straight from hh_snapshot.accounts.
+    """
+    accounts = hh_snapshot.get("accounts", {})
+    mode_gate = {
+        acct_id: acct.get("mode", "PEACETIME")
+        for acct_id, acct in accounts.items()
+    }
+    margin_eligible = {
+        acct_id: bool(acct.get("margin_eligible", True))
+        for acct_id, acct in accounts.items()
+    }
+    return CSPProposal(
+        household_id=hh_snapshot.get("household", "?"),
+        ticker=candidate.ticker.upper(),
+        strike=float(candidate.strike),
+        contracts_requested=n_contracts,
+        expiry=candidate.expiry.replace("-", ""),  # YYYYMMDD
+        mode_gate_accounts=mode_gate,
+        margin_eligible=margin_eligible,
+        limit_price=float(getattr(candidate, "mid", 0.0)),
+        annualized_yield=float(getattr(candidate, "annualized_yield", 0.0)),
+    )
+
+
+def _build_and_allocate(
+    n_contracts: int,
+    hh_snapshot: dict,
+    candidate,
+    *,
+    db_path=None,
+) -> AllocationDigest:
+    """Build CSPProposal + call allocate_csp with cash_snapshot from M1.x.
+
+    Cash accounts get their cash_available from the M1.x snapshot.
+    Margin accounts use v_available_nlv view (DT Q4 invariant).
+    """
+    proposal = _build_csp_proposal(n_contracts, hh_snapshot, candidate)
+    cash_snapshot = {
+        acct_id: float(acct.get("cash_available", 0.0))
+        for acct_id, acct in hh_snapshot.get("accounts", {}).items()
+        if not acct.get("margin_eligible", True)
+    }
+    return allocate_csp(
+        proposal,
+        db_path=db_path,
+        cash_snapshot=cash_snapshot,
+    )
+
+
+def _tickets_from_digest(
+    digest: AllocationDigest,
+    hh_snapshot: dict,
+    candidate,
+) -> list[dict]:
+    """Convert approved AccountAllocations to M1.x ticket dicts."""
+    tickets: list[dict] = []
+    for alloc in digest.allocations:
+        if alloc.margin_check_status != STATUS_APPROVED:
+            continue
+        if alloc.contracts_allocated < 1:
+            continue
+        tickets.append({
+            "account_id": alloc.account_id,
+            "household": hh_snapshot.get("household", "?"),
+            "ticker": candidate.ticker.upper(),
+            "action": "SELL",
+            "sec_type": "OPT",
+            "right": "P",
+            "strike": float(candidate.strike),
+            "expiry": candidate.expiry.replace("-", ""),
+            "quantity": alloc.contracts_allocated,
+            "limit_price": float(candidate.mid),
+            "annualized_yield": float(candidate.annualized_yield),
+            "mode": "CSP_ENTRY",
+            "status": "staged",
+        })
+    return tickets
+
+
 def _process_one(
     hh: dict,
     hh_name: str,
@@ -860,13 +909,27 @@ def _process_one(
         })
         return
 
-    # Step 4: route across accounts (partial allowed)
-    tickets = _csp_route_to_accounts(n_contracts, hh, candidate)
+    # Step 4: route via fa_block_margin allocator (B5.b).
+    # allocate_csp handles cash/margin split, per-account mode gate,
+    # view-backed margin veto. Returns AllocationDigest — ground truth
+    # for staging + mutation. Dropped accounts surface in digest, not
+    # here (result.skipped is for household-level candidate rejection).
+    alloc_digest = _build_and_allocate(n_contracts, hh, candidate)
+    tickets = _tickets_from_digest(alloc_digest, hh, candidate)
     if not tickets:
+        # All accounts vetoed (mode-blocked, no-snapshot, insufficient).
+        # Surface the digest in result.skipped so the outer digest has
+        # full context without burying per-account reasons.
+        reason = (
+            f"allocator vetoed all {len(alloc_digest.allocations)} accounts"
+            if alloc_digest.allocations
+            else "no accounts in household"
+        )
         result.skipped.append({
             "household": hh_name,
             "ticker": candidate.ticker,
-            "reason": "no account has capacity for any integer contract",
+            "reason": reason,
+            "allocation_digest": alloc_digest,
         })
         return
 
@@ -886,6 +949,9 @@ def _process_one(
             })
             return
 
+    # Attach the allocator digest to each ticket for _format_digest.
+    for t in tickets:
+        t["_allocation_digest"] = alloc_digest
     result.staged.extend(tickets)
 
     # Step 6: mutate snapshot to prevent double-booking
@@ -949,6 +1015,16 @@ def _format_digest(result: AllocatorResult) -> list[str]:
             f"\nTotal: {result.total_staged_contracts} contracts, "
             f"${result.total_staged_notional:,.0f} notional"
         )
+        # B5.b: per-candidate allocator detail (deduped by digest identity)
+        seen_digests: set[int] = set()
+        for t in result.staged:
+            d = t.get("_allocation_digest")
+            if d is None or id(d) in seen_digests:
+                continue
+            seen_digests.add(id(d))
+            if d.dropped_accounts:
+                lines.append("")
+                lines.append(format_allocation_digest(d))
     if result.skipped:
         lines.append(f"\nSkipped: {len(result.skipped)}")
         # Show first 5 skip reasons, collapse the rest
