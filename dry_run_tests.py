@@ -247,20 +247,20 @@ test("5.3 LOW modifier", CONVICTION_TIERS["LOW"] == 0.40,
 print("\n-- TEST GROUP 6: Constants --")
 
 from telegram_bot import (
-    MODE1_MIN_ANNUALIZED_PCT, MODE1_MIN_OTM_PCT,
-    HARVEST_MIN_ANNUALIZED_PCT, HARVEST_MAX_ANNUALIZED_PCT,
+    CC_MIN_ANN, CC_MAX_ANN, CC_BID_FLOOR, CC_TARGET_DTE,
     DYNAMIC_EXIT_TARGET_PCT, DYNAMIC_EXIT_RULE1_LIMIT,
     EXCLUDED_TICKERS,
 )
 
-test("6.1 Mode1 annualized floor", MODE1_MIN_ANNUALIZED_PCT == 5.0,
-     f"got {MODE1_MIN_ANNUALIZED_PCT}")
-test("6.2 Mode1 OTM floor", MODE1_MIN_OTM_PCT == 5.0,
-     f"got {MODE1_MIN_OTM_PCT} (Rulebook says 3%, code uses 5%)")
-test("6.3 Harvest min", HARVEST_MIN_ANNUALIZED_PCT == 30.0,
-     f"got {HARVEST_MIN_ANNUALIZED_PCT}")
-test("6.4 Harvest max", HARVEST_MAX_ANNUALIZED_PCT == 130.0,
-     f"got {HARVEST_MAX_ANNUALIZED_PCT}")
+# Unified CC engine (2026-04-15): single basis-anchored walker, 30-130 band.
+test("6.1 CC min annualized", CC_MIN_ANN == 30.0,
+     f"got {CC_MIN_ANN}")
+test("6.2 CC max annualized", CC_MAX_ANN == 130.0,
+     f"got {CC_MAX_ANN}")
+test("6.3 CC bid floor", CC_BID_FLOOR == 0.03,
+     f"got {CC_BID_FLOOR}")
+test("6.4 CC target DTE", CC_TARGET_DTE == (14, 30),
+     f"got {CC_TARGET_DTE}")
 test("6.5 Exit target", DYNAMIC_EXIT_TARGET_PCT == 0.15,
      f"got {DYNAMIC_EXIT_TARGET_PCT}")
 test("6.6 Rule 1 limit", DYNAMIC_EXIT_RULE1_LIMIT == 0.20,
