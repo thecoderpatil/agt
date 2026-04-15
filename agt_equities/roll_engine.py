@@ -391,8 +391,42 @@ def _evaluate_defense(
 
     is_itm = market.spot > pos.strike
 
-    # 1. Velocity-ratio harvest gate (rapid IV crush / fast move)
+    # --- E3/E4 fix: Expiry-day let-ride (canonical 80/90 harvest rule) ---
+    # On expiry day itself, let the position ride to expiration. Paying the
+    # ask spread to close a position expiring worthless is negative EV.
+    if dte <= 0:
+        return HoldResult(
+            reason=f"DEFENSE_EXPIRY_LET_RIDE dte={dte} spot={market.spot:.2f} strike={pos.strike:.2f}",
+        )
+
+    # --- Canonical 80/90 harvest (E2/E5 fix) ---
+    # Compute P_pct once for canonical checks + velocity-ratio below.
     v_r, p_pct = _velocity_ratio(pos, market)
+    days_held = (market.asof - pos.opened_at).days
+
+    # E2 fix: Day-1 positions at >= 80% profit → harvest immediately.
+    # Rapid IV crush on day of sale; lock in the win before theta flattens.
+    if days_held <= 1 and p_pct >= 0.80 and dte >= 1:
+        return HarvestResult(
+            btc_limit=round(call.ask, 4),
+            pnl_pct=round(p_pct, 4),
+            velocity_ratio=round(v_r, 4) if v_r != float("inf") else v_r,
+            reason=f"DEFENSE_DAY1_80 days_held={days_held} P_pct={p_pct:.2f}>=0.80 dte={dte}",
+        )
+
+    # E5 fix: Day 2+ through day before expiry at >= 90% profit → harvest.
+    # The velocity-ratio gate (below) misses slow grinders where V_r < 1.5
+    # but profit is banked at 90%+. Canonical rule: 90% = done, take it.
+    if days_held >= 2 and p_pct >= 0.90 and dte >= 1:
+        return HarvestResult(
+            btc_limit=round(call.ask, 4),
+            pnl_pct=round(p_pct, 4),
+            velocity_ratio=round(v_r, 4) if v_r != float("inf") else v_r,
+            reason=f"DEFENSE_CANONICAL_90 days_held={days_held} P_pct={p_pct:.2f}>=0.90 dte={dte}",
+        )
+
+    # 1. Velocity-ratio harvest gate (rapid IV crush / fast move)
+    # Still fires for sub-90% fast decay (V_r >= 1.5 AND P_pct >= 0.50).
     if (
         v_r >= constraints.harvest_velocity_ratio
         and p_pct >= constraints.harvest_min_pnl_pct
@@ -563,17 +597,35 @@ def _evaluate_offense(
             ),
         )
 
-    # 4. 90% profit harvest (see R3 note on offense_harvest_pnl).
+    # --- E3/E4 fix: Expiry-day let-ride (canonical 80/90 harvest rule) ---
+    if dte <= 0:
+        return HoldResult(
+            reason=f"OFFENSE_EXPIRY_LET_RIDE dte={dte} spot={market.spot:.2f} strike={pos.strike:.2f}",
+        )
+
+    # 4. Canonical 80/90 harvest (replaces flat 90% gate).
     _v_r, p_pct = _velocity_ratio(pos, market)
-    if p_pct >= constraints.offense_harvest_pnl:
+    days_held = (market.asof - pos.opened_at).days
+
+    # E2 fix: Day-1 positions at >= 80% profit → harvest.
+    if days_held <= 1 and p_pct >= 0.80 and dte >= 1:
         return HarvestResult(
             btc_limit=round(call.ask, 4),
             pnl_pct=round(p_pct, 4),
-            velocity_ratio=0.0,              # not used in offense
-            reason=f"OFFENSE_HARVEST P_pct={p_pct:.2f}≥{constraints.offense_harvest_pnl}",
+            velocity_ratio=0.0,
+            reason=f"OFFENSE_DAY1_80 days_held={days_held} P_pct={p_pct:.2f}>=0.80 dte={dte}",
         )
 
-    # 4. Hold
+    # Standard 90% harvest (day 2+ through day before expiry).
+    if days_held >= 2 and p_pct >= constraints.offense_harvest_pnl and dte >= 1:
+        return HarvestResult(
+            btc_limit=round(call.ask, 4),
+            pnl_pct=round(p_pct, 4),
+            velocity_ratio=0.0,
+            reason=f"OFFENSE_HARVEST P_pct={p_pct:.2f}≥{constraints.offense_harvest_pnl} days_held={days_held} dte={dte}",
+        )
+
+    # 5. Hold
     return HoldResult(
         reason=f"OFFENSE_HOLD spot={market.spot:.2f} basis={basis} ext={extrinsic:.2f} dte={dte} P_pct={p_pct:.2f}",
     )

@@ -138,7 +138,7 @@ class TestPerAccountBasisScenario:
     def test_uber_roth_73_should_write(self):
         """Roth at $73 basis, spot $80. Chain has strikes $75-$95.
 
-        $75C with mid=$2.50: ann = (2.50/75)*(365/21)*100 = 57.9% → WRITE
+        $75C with mid=$2.50: ann = (2.50/75)*(365/21)*100 = 57.9% -> WRITE
         """
         chain = [
             (75.0, 2.50),   # ITM but above basis — valid anchor
@@ -157,12 +157,12 @@ class TestPerAccountBasisScenario:
         assert result["strike"] == 75.0
 
     def test_uber_individual_86_stand_down(self):
-        """Individual at $86 basis, spot $80. Spot < basis → no strikes above basis
+        """Individual at $86 basis, spot $80. Spot < basis -> no strikes above basis
         that are also above spot. $87.5C has tiny premium.
 
-        $87.5C with mid=$0.15: ann = (0.15/87.5)*(365/21)*100 = 2.98% → below 30%
+        $87.5C with mid=$0.15: ann = (0.15/87.5)*(365/21)*100 = 2.98% -> below 30%
         $90C with mid=$0.05: garbage quote (< $0.03 floor after rounding)
-        → STAND DOWN
+        -> STAND DOWN
         """
         chain = [
             (75.0, 2.50),
@@ -183,8 +183,8 @@ class TestPerAccountBasisScenario:
     def test_blended_82_incorrectly_stands_down(self):
         """Household-aggregated $82 basis. Shows why blending is wrong.
 
-        $82.5C with mid=$0.70: ann = (0.70/82.5)*(365/21)*100 = 14.7% → below 30%
-        → STAND DOWN. But Roth@$73 SHOULD write at $75C.
+        $82.5C with mid=$0.70: ann = (0.70/82.5)*(365/21)*100 = 14.7% -> below 30%
+        -> STAND DOWN. But Roth@$73 SHOULD write at $75C.
         """
         chain = [
             (75.0, 2.50),
@@ -198,7 +198,7 @@ class TestPerAccountBasisScenario:
         result = self.canonical_should_write(
             paper_basis=82.0, spot=80.0, available_strikes=chain, dte=21
         )
-        # Blended basis anchors at $82.5 → 14.7% → STAND DOWN
+        # Blended basis anchors at $82.5 -> 14.7% -> STAND DOWN
         assert result["action"] == "STAND_DOWN", (
             f"Blended@$82 should STAND DOWN (demonstrating the bug), got {result}"
         )
@@ -235,7 +235,7 @@ class TestPerAccountBasisScenario:
         """When both accounts CAN write, they may pick different strikes
         because different anchors land in different parts of the chain."""
         # High-IV scenario where premiums are fat enough at all strikes.
-        # $87.5C at $2.00: ann = (2.00/87.5)*(365/21)*100 = 39.7% → in band.
+        # $87.5C at $2.00: ann = (2.00/87.5)*(365/21)*100 = 39.7% -> in band.
         chain = [
             (72.5, 4.00),
             (75.0, 3.50),
@@ -255,7 +255,10 @@ class TestPerAccountBasisScenario:
 
         assert roth["action"] == "WRITE"
         assert individual["action"] == "WRITE"
-        # Different anchors → different strikes
+        # Different anchors -> different strikes
         # Roth anchors at $75 ($75 >= $73), Individual anchors at $87.5 ($87.5 >= $86)
         assert roth["strike"] <= individual["strike"], (
-            f"Roth st
+            "Roth strike {} should be <= Individual {}".format(
+                roth["strike"], individual["strike"]
+            )
+        )
