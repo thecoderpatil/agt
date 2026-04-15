@@ -10295,6 +10295,122 @@ _OPEN_LIVE_STATES = frozenset({
 })
 
 
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/scan — dry-run CSP entry scan. Posts allocator digest, stages nothing."""
+    if not is_authorized(update):
+        return
+
+    status_msg = await update.message.reply_text("\U0001f50d Running CSP scan…")
+
+    try:
+        # ── 1. Load watchlist + run scanner (sync, yfinance) in a thread ──
+        from pxo_scanner import (
+            _load_scan_universe,
+            scan_csp_candidates,
+            MIN_DTE, MAX_DTE, MIN_ANNUALIZED_ROI,
+        )
+        watchlist = await asyncio.to_thread(_load_scan_universe)
+        rows = await asyncio.to_thread(
+            scan_csp_candidates, watchlist, 10, 50,
+        )
+
+        if not rows:
+            await status_msg.edit_text(
+                "\u2139\ufe0f No CSP candidates meet Heitkoetter criteria "
+                f"(DTE {MIN_DTE}-{MAX_DTE}, yield \u2265 {MIN_ANNUALIZED_ROI}%)."
+            )
+            return
+
+        # ── 2. Adapt dicts -> ScanCandidate objects ──
+        from agt_equities.scan_bridge import (
+            adapt_scanner_candidates,
+            build_watchlist_sector_map,
+            make_minimal_extras_provider,
+        )
+        candidates = adapt_scanner_candidates(rows)
+        if not candidates:
+            await status_msg.edit_text(
+                "\u26a0\ufe0f Scanner produced rows but none survived adapter "
+                "validation (missing ticker/strike/expiry/premium/ann_roi)."
+            )
+            return
+
+        # ── 3. Fetch VIX (yfinance, 20.0 fallback) ──
+        def _fetch_vix() -> float:
+            try:
+                hist = yf.Ticker("^VIX").history(period="1d")
+                if len(hist) and "Close" in hist.columns:
+                    return float(hist["Close"].iloc[-1])
+            except Exception as exc:
+                logger.warning("cmd_scan: VIX fetch failed: %s", exc)
+            return 20.0
+        vix = await asyncio.to_thread(_fetch_vix)
+
+        # ── 4. Discover positions + build per-household snapshots ──
+        disco = await _discover_positions(None)
+        if disco.get("error"):
+            logger.warning("cmd_scan: _discover_positions warning: %s", disco["error"])
+
+        ib_conn = await ensure_ib_connected()
+        from agt_equities.csp_allocator import (
+            _fetch_household_buying_power_snapshot,
+            run_csp_allocator,
+        )
+        snapshots = await _fetch_household_buying_power_snapshot(ib_conn, disco)
+        if not snapshots:
+            await status_msg.edit_text(
+                "\u26a0\ufe0f Could not build household buying-power snapshots "
+                "(accountSummaryAsync failed or no accounts in HOUSEHOLD_MAP)."
+            )
+            return
+
+        # ── 5. Build extras_provider + run allocator in dry-run ──
+        sector_map = build_watchlist_sector_map(watchlist)
+        extras_provider = make_minimal_extras_provider(sector_map)
+
+        result = run_csp_allocator(
+            ray_candidates=candidates,
+            snapshots=snapshots,
+            vix=vix,
+            extras_provider=extras_provider,
+            staging_callback=None,  # DRY-RUN — bridge-2 flips this on.
+        )
+
+        # ── 6. Post digest ──
+        header = [
+            f"\u2501\u2501 /scan (dry-run) \u2501\u2501",
+            f"Candidates scanned: {len(candidates)}  \u00b7  VIX: {vix:.1f}",
+            "",
+        ]
+        digest = "\n".join(header + (result.digest_lines or ["(no allocator output)"]))
+        await status_msg.delete()
+        await send_text(
+            update,
+            f"<pre>{html.escape(digest)}</pre>",
+        )
+
+    except Exception as exc:
+        logger.exception("cmd_scan failed")
+        try:
+            await status_msg.edit_text(f"\u274c /scan failed: {exc}")
+        except Exception:
+            try:
+                await update.message.reply_text(f"\u274c /scan failed: {exc}")
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Shared LLM dispatcher — parameterized by model
+# ---------------------------------------------------------------------------
+_MODEL_LABELS = {
+    CLAUDE_MODEL_HAIKU:  ("H", "\U0001f504 Thinking\u2026"),
+    CLAUDE_MODEL_SONNET: ("S", "\U0001f504 Thinking (Sonnet)\u2026"),
+    CLAUDE_MODEL_OPUS:   ("O", "\U0001f504 Deep thinking (Opus)\u2026"),
+}
+
+
 async def _scan_orphaned_transmitting_rows(ib_conn, app_bot):
     """Resolve orphaned TRANSMITTING rows after restart.
 
