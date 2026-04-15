@@ -326,3 +326,77 @@ def test_constraints_defaults_reflect_hardening():
     assert cm.min_credit_per_contract == 0.01, "R2"
     assert cm.offense_roll_min_credit == 0.20, "R1"
     assert cm.offense_harvest_pnl == 0.90, "R3 override (deliberate)"
+
+
+# ---------------------------------------------------------------------------
+# Earnings-week gate — offense regime skips cascade (harvest-and-re-enter
+# handled outside roll_engine). Defense regime is unaffected.
+# ---------------------------------------------------------------------------
+
+def _offense_pos(**overrides) -> Position:
+    """Offense = spot > adjusted_basis. Also override to 10 DTE so R8 doesn't
+    fire instead of the earnings gate."""
+    return _pos(
+        expiry=TODAY + timedelta(days=10),
+        cost_basis=48.0,
+        assigned_basis=48.0,
+        adjusted_basis=48.0,
+        **overrides,
+    )
+
+
+def test_earnings_week_offense_skips_cascade():
+    """Offense regime + earnings THIS ISO week → HoldResult with
+    OFFENSE_EARNINGS_WEEK_SKIP_CASCADE. No roll staged."""
+    pos = _offense_pos()
+    chain = (_quote(52.0, TODAY + timedelta(days=14), bid=0.80, ask=0.85),)
+    m = _market(
+        pos, spot=52.0, current_ask=0.20, chain=chain,
+        next_earnings_date=TODAY + timedelta(days=2),   # same ISO week
+    )
+    result = evaluate(pos, m, CTX)
+    assert isinstance(result, HoldResult), f"got {type(result).__name__}: {result}"
+    assert "OFFENSE_EARNINGS_WEEK_SKIP_CASCADE" in result.reason
+
+
+def test_earnings_week_offense_different_week_cascades_normally():
+    """Offense regime + earnings in a LATER ISO week → cascade proceeds."""
+    pos = _offense_pos()
+    chain = (_quote(52.0, TODAY + timedelta(days=14), bid=0.80, ask=0.85),)
+    m = _market(
+        pos, spot=52.0, current_ask=0.20, chain=chain,
+        next_earnings_date=TODAY + timedelta(days=21),  # 3 weeks out
+    )
+    result = evaluate(pos, m, CTX)
+    assert not isinstance(result, HoldResult) or "EARNINGS_WEEK" not in result.reason, \
+        f"should cascade, got {type(result).__name__}: {result}"
+
+
+def test_earnings_week_none_fails_open():
+    """next_earnings_date=None (missing / stale cache) → cascade proceeds."""
+    pos = _offense_pos()
+    chain = (_quote(52.0, TODAY + timedelta(days=14), bid=0.80, ask=0.85),)
+    m = _market(
+        pos, spot=52.0, current_ask=0.20, chain=chain,
+        next_earnings_date=None,
+    )
+    result = evaluate(pos, m, CTX)
+    # Either RollResult, HarvestResult, or anything else — just not the
+    # earnings-week HoldResult.
+    assert not (isinstance(result, HoldResult) and "EARNINGS_WEEK" in result.reason)
+
+
+def test_earnings_week_defense_regime_unaffected():
+    """Defense regime (sub-basis ITM) → earnings-week gate does NOT fire; roll proceeds."""
+    pos = _pos()  # 2 DTE ITM, adjusted_basis=55, spot=52 → defense
+    tier1_exp = TODAY + timedelta(days=10)
+    chain = (_quote(51.0, tier1_exp, bid=0.50, ask=0.55, delta=0.30),)
+    m = _market(
+        pos, spot=52.0, current_ask=0.25, chain=chain,
+        next_earnings_date=TODAY + timedelta(days=2),  # same ISO week
+    )
+    result = evaluate(pos, m, CTX)
+    # Defense must still roll — CCs may roll through earnings to avoid
+    # assignment at a loss.
+    assert isinstance(result, RollResult), \
+        f"defense must roll through earnings; got {type(result).__name__}: {result}"
