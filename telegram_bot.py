@@ -11177,13 +11177,19 @@ def main() -> None:
             name="conviction_weekly",
         )
         logger.info("Scheduled: conviction_weekly at 8:00 PM ET (Sunday)")
-        jq.run_daily(
-            callback=_scheduled_flex_sync,
-            time=_time(hour=17, minute=0, tzinfo=ET),
-            days=(1, 2, 3, 4, 5),
-            name="flex_sync_eod",
-        )
-        logger.info("Scheduled: flex_sync_eod at 5:00 PM ET (Mon-Fri)")
+        if not _use_scheduler_daemon():
+            jq.run_daily(
+                callback=_scheduled_flex_sync,
+                time=_time(hour=17, minute=0, tzinfo=ET),
+                days=(1, 2, 3, 4, 5),
+                name="flex_sync_eod",
+            )
+            logger.info("Scheduled: flex_sync_eod at 5:00 PM ET (Mon-Fri)")
+        else:
+            logger.info(
+                "Skipped flex_sync_eod registration: "
+                "USE_SCHEDULER_DAEMON=1 (owned by agt_scheduler daemon)"
+            )
         jq.run_repeating(
             callback=_poll_attested_rows,
             interval=10,

@@ -115,6 +115,7 @@ def test_register_jobs_a5e_set():
         "beta_startup",
         "corporate_intel_refresh",
         "corporate_intel_startup",
+        "flex_sync_eod",
     ]
     job_ids = {j.id for j in sched.get_jobs()}
     assert {
@@ -122,6 +123,7 @@ def test_register_jobs_a5e_set():
         "attested_sweeper", "el_snapshot_writer",
         "beta_cache_refresh", "beta_startup",
         "corporate_intel_refresh", "corporate_intel_startup",
+        "flex_sync_eod",
     }.issubset(job_ids)
 
 
@@ -831,3 +833,171 @@ def test_a5e_corporate_intel_refresh_swallows_per_ticker_errors(monkeypatch):
 
     assert "MSFT" in called_tickers
 
+# ---------------------------------------------------------------------------
+# A5e — flex_sync_eod migration tests
+# ---------------------------------------------------------------------------
+
+
+def test_a5e_flex_sync_eod_cron_trigger():
+    """flex_sync_eod must use CronTrigger at 17:00 Mon-Fri."""
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("flex_sync_eod")
+    assert job is not None, "flex_sync_eod not registered"
+    from apscheduler.triggers.cron import CronTrigger
+    assert isinstance(job.trigger, CronTrigger)
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert fields["hour"] == "17"
+    assert fields["minute"] == "0"
+    assert fields["day_of_week"] == "mon-fri"
+
+
+def test_a5e_flex_sync_eod_enqueues_digest_on_success(monkeypatch):
+    """On successful run_sync, flex_sync_eod must enqueue FLEX_SYNC_DIGEST."""
+    import types
+
+    captured: list[dict] = []
+
+    fake_result = types.SimpleNamespace(
+        sync_id="test-123",
+        status="ok",
+        sections_processed=6,
+        rows_received=42,
+        rows_inserted=10,
+        rows_updated=2,
+        anomalies=[],
+        error_message=None,
+    )
+
+    monkeypatch.setattr(
+        "agt_equities.flex_sync.run_sync",
+        lambda mode: fake_result,
+    )
+    monkeypatch.setattr(
+        "agt_equities.flex_sync.SyncMode",
+        types.SimpleNamespace(INCREMENTAL="INCREMENTAL"),
+    )
+
+    def fake_enqueue(kind, payload, *, severity="info", db_path=None):
+        captured.append({"kind": kind, "payload": payload, "severity": severity})
+        return 1
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("flex_sync_eod")
+    job.func()
+
+    assert len(captured) == 1
+    rec = captured[0]
+    assert rec["kind"] == "FLEX_SYNC_DIGEST"
+    assert rec["severity"] == "info"
+    assert rec["payload"]["sync_id"] == "test-123"
+    assert rec["payload"]["rows_received"] == 42
+    assert rec["payload"]["rows_inserted"] == 10
+
+
+def test_a5e_flex_sync_eod_enqueues_failure_on_exception(monkeypatch):
+    """On run_sync exception, must enqueue FLEX_SYNC_FAILURE with crit severity."""
+    import types
+
+    captured: list[dict] = []
+
+    def boom(mode):
+        raise RuntimeError("Flex endpoint down")
+
+    monkeypatch.setattr("agt_equities.flex_sync.run_sync", boom)
+    monkeypatch.setattr(
+        "agt_equities.flex_sync.SyncMode",
+        types.SimpleNamespace(INCREMENTAL="INCREMENTAL"),
+    )
+
+    def fake_enqueue(kind, payload, *, severity="info", db_path=None):
+        captured.append({"kind": kind, "payload": payload, "severity": severity})
+        return 1
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("flex_sync_eod")
+    job.func()  # must not raise
+
+    assert len(captured) == 1
+    rec = captured[0]
+    assert rec["kind"] == "FLEX_SYNC_FAILURE"
+    assert rec["severity"] == "crit"
+    assert "Flex endpoint down" in rec["payload"]["error"]
+
+
+def test_a5e_flex_sync_eod_swallows_alert_bus_failure(monkeypatch):
+    """Alert enqueue failure after successful sync must not propagate."""
+    import types
+
+    fake_result = types.SimpleNamespace(
+        sync_id="test-456",
+        status="ok",
+        sections_processed=3,
+        rows_received=10,
+        rows_inserted=5,
+        rows_updated=0,
+        anomalies=[],
+        error_message=None,
+    )
+
+    monkeypatch.setattr(
+        "agt_equities.flex_sync.run_sync",
+        lambda mode: fake_result,
+    )
+    monkeypatch.setattr(
+        "agt_equities.flex_sync.SyncMode",
+        types.SimpleNamespace(INCREMENTAL="INCREMENTAL"),
+    )
+
+    def boom(*a, **kw):
+        raise RuntimeError("bus down")
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", boom)
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("flex_sync_eod")
+    job.func()  # must not raise
+
+
+def test_a5e_flex_sync_eod_warns_on_error_message(monkeypatch):
+    """If run_sync returns with error_message, severity must be warn not info."""
+    import types
+
+    captured: list[dict] = []
+
+    fake_result = types.SimpleNamespace(
+        sync_id="test-789",
+        status="partial",
+        sections_processed=4,
+        rows_received=20,
+        rows_inserted=8,
+        rows_updated=0,
+        anomalies=[],
+        error_message="Trades section had parse errors",
+    )
+
+    monkeypatch.setattr(
+        "agt_equities.flex_sync.run_sync",
+        lambda mode: fake_result,
+    )
+    monkeypatch.setattr(
+        "agt_equities.flex_sync.SyncMode",
+        types.SimpleNamespace(INCREMENTAL="INCREMENTAL"),
+    )
+
+    def fake_enqueue(kind, payload, *, severity="info", db_path=None):
+        captured.append({"kind": kind, "payload": payload, "severity": severity})
+        return 1
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+    sched = _build_scheduler_with_jobs()
+    job = sched.get_job("flex_sync_eod")
+    job.func()
+
+    assert len(captured) == 1
+    assert captured[0]["severity"] == "warn"
+    assert "parse errors" in captured[0]["payload"]["error"]
