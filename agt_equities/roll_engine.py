@@ -96,6 +96,10 @@ class MarketSnapshot:
     chain: tuple[OptionQuote, ...]           # all candidate roll targets
     current_call: OptionQuote                # the contract currently short
     asof: date
+    # R4: ex-dividend context. Both None = no known upcoming ex-div, gate skipped.
+    # Populated by caller from Finnhub (see telegram_bot._build_market_snapshot_for_evaluator).
+    next_ex_div_date: Optional[date] = None
+    next_div_amount: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,9 @@ class ConstraintMatrix:
     harvest_velocity_ratio: float = 1.5
     harvest_min_pnl_pct: float = 0.50
     # Harvest (offense regime)
+    # NOTE: Rulebook v10 §Mode-2 specifies 50% profit target. Yash deliberately
+    # overrides to 90% (wider theta capture on recovered positions). Do NOT
+    # "fix" this back to 0.50 without explicit approval â€” conscious override.
     offense_harvest_pnl: float = 0.90
     # RAY floors (annualized yield)
     defense_ray_floor: float = 0.02          # 2% â€” sub-basis "any premium is gravy"
@@ -134,8 +141,13 @@ class ConstraintMatrix:
     tier2_strike_step: int = 1
     tier3_strike_step: int = 2
     tier4_strike_step: int = 0               # same-strike fallback
-    # Net-credit floor per share for cascade acceptance
-    min_credit_per_contract: float = 0.05
+    # Net-credit floor per share for cascade acceptance.
+    # R2: Mode-1 rulebook specifies "any net credit, even $0.01" â€” sub-basis
+    # defense must never refuse a profitable roll on threshold hair-splitting.
+    min_credit_per_contract: float = 0.01
+    # R1: Offense regime roll floor â€” above basis we have optionality; demand a
+    # real $0.20/contract credit before preferring roll over assignment.
+    offense_roll_min_credit: float = 0.20
     # Legacy compatibility â€” kept for the gamma cutoff delta floor
     static_delta_fallback: float = 0.40
 
@@ -253,6 +265,7 @@ def _dte(asof: date, expiry: date) -> int:
 def _select_roll_candidate(
     chain: tuple[OptionQuote, ...],
     current_strike: float,
+    current_expiry: date,
     current_call_ask: float,
     asof: date,
     strike_step: int,
@@ -276,6 +289,7 @@ def _select_roll_candidate(
     candidates = [
         q for q in chain
         if q.strike == target_strike
+        and q.expiry > current_expiry           # R5: never "roll" to same/earlier expiry
         and dte_min <= _dte(asof, q.expiry) <= dte_max
         and (q.bid - current_call_ask) >= min_credit
     ]
@@ -289,6 +303,7 @@ def _try_cascade(
     market: MarketSnapshot,
     constraints: ConstraintMatrix,
     reason_prefix: str,
+    min_credit_override: Optional[float] = None,
 ) -> EvalResult:
     """Walk the 4-tier defensive cascade. Returns RollResult on first match,
     AlertResult(CRITICAL) if all tiers fail."""
@@ -298,16 +313,22 @@ def _try_cascade(
         (3, constraints.tier3_strike_step, constraints.tier3_dte_min, constraints.tier3_dte_max),
         (4, constraints.tier4_strike_step, constraints.tier4_dte_min, constraints.tier4_dte_max),
     ]
+    min_credit = (
+        min_credit_override
+        if min_credit_override is not None
+        else constraints.min_credit_per_contract
+    )
     for tier_n, strike_step, dte_min, dte_max in tiers:
         cand = _select_roll_candidate(
             chain=market.chain,
             current_strike=pos.strike,
+            current_expiry=pos.expiry,
             current_call_ask=market.current_call.ask,
             asof=market.asof,
             strike_step=strike_step,
             dte_min=dte_min,
             dte_max=dte_max,
-            min_credit=constraints.min_credit_per_contract,
+            min_credit=min_credit,
         )
         if cand is not None:
             return RollResult(
@@ -320,7 +341,7 @@ def _try_cascade(
             )
     return AlertResult(
         severity="CRITICAL",
-        reason=f"{reason_prefix}; cascade exhausted (no tier yielded net credit ≥ {constraints.min_credit_per_contract})",
+        reason=f"{reason_prefix}; cascade exhausted (no tier yielded net credit ≥ {min_credit})",
         context={
             "ticker": pos.ticker,
             "account_id": pos.account_id,
@@ -347,6 +368,8 @@ def _evaluate_defense(
     dte = _dte(market.asof, pos.expiry)
     delta_abs = abs(call.delta)
 
+    is_itm = market.spot > pos.strike
+
     # 1. Velocity-ratio harvest gate (rapid IV crush / fast move)
     v_r, p_pct = _velocity_ratio(pos, market)
     if (
@@ -360,26 +383,50 @@ def _evaluate_defense(
             reason=f"V_r={v_r:.2f}≥{constraints.harvest_velocity_ratio} AND P_pct={p_pct:.2f}≥{constraints.harvest_min_pnl_pct}",
         )
 
-    # 2. Gamma cutoff: defense regime can't let assign â€” must roll if triggered
+    # 2. R4: Ex-dividend assignment risk. If ITM and an ex-div falls inside
+    # the position's remaining DTE, early-assignment arbitrage fires when
+    # call extrinsic < expected dividend payout. Roll preemptively.
     if (
-        dte <= constraints.gamma_cutoff_dte
-        and extrinsic <= constraints.gamma_cutoff_extrinsic
-        and delta_abs >= constraints.gamma_cutoff_delta
+        is_itm
+        and market.next_ex_div_date is not None
+        and market.next_div_amount is not None
+        and market.asof <= market.next_ex_div_date <= pos.expiry
+        and extrinsic < market.next_div_amount
     ):
         return _try_cascade(
             pos, market, constraints,
-            reason_prefix=f"GAMMA_CUTOFF dte={dte}â‰¤{constraints.gamma_cutoff_dte} ext={extrinsic:.2f}â‰¤{constraints.gamma_cutoff_extrinsic} delta={delta_abs:.2f}≥{constraints.gamma_cutoff_delta}",
+            reason_prefix=(
+                f"EX_DIV_RISK spot={market.spot:.2f}>strike={pos.strike:.2f} "
+                f"ex_div={market.next_ex_div_date.isoformat()} "
+                f"div={market.next_div_amount:.2f}>ext={extrinsic:.2f}"
+            ),
         )
 
-    # 3. Defensive roll trigger: ITM with extrinsic depleted
-    is_itm = market.spot > pos.strike
+    # 3. R8: Short-DTE ITM trigger (replaces R1 gamma cutoff). When dte is
+    # inside gamma_cutoff_dte AND we're ITM, extrinsic will compress to zero
+    # regardless of current delta; defense must force the cascade at any
+    # positive credit. The prior extrinsic+delta trigger missed PYPL-style
+    # 2-DTE ITM positions where ask still held $0.10-$0.30 of time value.
+    if is_itm and dte <= constraints.gamma_cutoff_dte:
+        return _try_cascade(
+            pos, market, constraints,
+            reason_prefix=(
+                f"SHORT_DTE_ITM dte={dte}≤{constraints.gamma_cutoff_dte} "
+                f"spot={market.spot:.2f}>strike={pos.strike:.2f} ext={extrinsic:.2f}"
+            ),
+        )
+
+    # 4. R7: Extrinsic-depleted ITM (kept â€” orthogonal to R8). Catches the
+    # mid-DTE case: 10-30 DTE, ITM, extrinsic has collapsed because spot is
+    # deep past strike. Different signature than R8 (which fires on clock
+    # regardless of extrinsic); this fires on extrinsic regardless of clock.
     if is_itm and extrinsic <= constraints.defensive_roll_extrinsic_threshold:
         return _try_cascade(
             pos, market, constraints,
-            reason_prefix=f"DEFEND ITM spot={market.spot:.2f}>strike={pos.strike:.2f} ext={extrinsic:.2f}â‰¤{constraints.defensive_roll_extrinsic_threshold}",
+            reason_prefix=f"DEFEND ITM spot={market.spot:.2f}>strike={pos.strike:.2f} ext={extrinsic:.2f}≤{constraints.defensive_roll_extrinsic_threshold}",
         )
 
-    # 4. Hold
+    # 5. Hold
     return HoldResult(
         reason=f"DEFENSE_HOLD spot={market.spot:.2f} strike={pos.strike:.2f} ext={extrinsic:.2f} dte={dte} V_r={v_r:.2f} P_pct={p_pct:.2f}",
     )
@@ -419,17 +466,64 @@ def _evaluate_offense(
             reason=f"OPPORTUNITY_COST_BREAKEVEN spot={market.spot:.2f}>basis={basis:.2f} net_per_share={net_proceeds_per_share:.2f}>basis",
         )
 
-    # 2. Gamma cutoff in offense â†’ let it call (assignment is profitable here)
+    is_itm = market.spot > pos.strike
+
+    # 2. R4: Ex-dividend gate. Offense welcomes assignment, but if we're sitting
+    # on a deep-ITM call across an ex-div where extrinsic < dividend, the
+    # counterparty will call early to capture the div. Try to roll for
+    # offense_roll_min_credit ($0.20); if cascade exhausted, ASSIGN is fine
+    # (offense regime â€” above basis, assignment is profitable anyway).
     if (
-        dte <= constraints.gamma_cutoff_dte
-        and extrinsic <= constraints.gamma_cutoff_extrinsic
-        and delta_abs >= constraints.gamma_cutoff_delta
+        is_itm
+        and market.next_ex_div_date is not None
+        and market.next_div_amount is not None
+        and market.asof <= market.next_ex_div_date <= pos.expiry
+        and extrinsic < market.next_div_amount
     ):
+        cascade = _try_cascade(
+            pos, market, constraints,
+            reason_prefix=(
+                f"OFFENSE_EX_DIV spot={market.spot:.2f}>strike={pos.strike:.2f} "
+                f"ex_div={market.next_ex_div_date.isoformat()} "
+                f"div={market.next_div_amount:.2f}>ext={extrinsic:.2f}"
+            ),
+            min_credit_override=constraints.offense_roll_min_credit,
+        )
+        if isinstance(cascade, RollResult):
+            return cascade
+        # Cascade exhausted â€” in offense, early-assign is profitable, take it.
         return AssignResult(
-            reason=f"OFFENSE_LET_IT_CALL dte={dte}â‰¤{constraints.gamma_cutoff_dte} ext={extrinsic:.2f}â‰¤{constraints.gamma_cutoff_extrinsic} delta={delta_abs:.2f}≥{constraints.gamma_cutoff_delta}",
+            reason=(
+                f"OFFENSE_EX_DIV_ASSIGN cascade_failed_at_0.20 "
+                f"ex_div={market.next_ex_div_date.isoformat()} "
+                f"div={market.next_div_amount:.2f}>ext={extrinsic:.2f}"
+            ),
         )
 
-    # 3. 90% profit harvest
+    # 3. R1 + R8: Short-DTE ITM. Replaces the prior gamma-cutoff trigger.
+    # When dte inside gamma_cutoff_dte AND ITM, try one roll at
+    # offense_roll_min_credit ($0.20) before defaulting to ASSIGN. This lets
+    # offense capture a final short-cycle credit if the chain cooperates
+    # while still preferring assignment over a marginal/unprofitable roll.
+    if is_itm and dte <= constraints.gamma_cutoff_dte:
+        cascade = _try_cascade(
+            pos, market, constraints,
+            reason_prefix=(
+                f"OFFENSE_SHORT_DTE_ITM dte={dte}≤{constraints.gamma_cutoff_dte} "
+                f"spot={market.spot:.2f}>strike={pos.strike:.2f} ext={extrinsic:.2f}"
+            ),
+            min_credit_override=constraints.offense_roll_min_credit,
+        )
+        if isinstance(cascade, RollResult):
+            return cascade
+        return AssignResult(
+            reason=(
+                f"OFFENSE_LET_IT_CALL dte={dte}≤{constraints.gamma_cutoff_dte} "
+                f"ext={extrinsic:.2f} (cascade failed at â‰¥${constraints.offense_roll_min_credit:.2f})"
+            ),
+        )
+
+    # 4. 90% profit harvest (see R3 note on offense_harvest_pnl).
     _v_r, p_pct = _velocity_ratio(pos, market)
     if p_pct >= constraints.offense_harvest_pnl:
         return HarvestResult(
@@ -467,9 +561,11 @@ def evaluate(
          If adjusted_basis is None, fall back to assigned_basis, then to
          cost_basis. If all three are None, assume defense (safer â€” never
          realize a loss against unknown basis).
-      3. Defense routing: velocity-ratio harvest â†’ gamma cutoff (forces cascade)
-         â†’ defensive roll trigger (cascade) â†’ hold.
-      4. Offense routing: opportunity cost breakeven â†’ gamma cutoff (assign)
+      3. Defense routing: velocity-ratio harvest â†’ ex-div gate (R4) â†’
+         short-DTE ITM (R8 cascade) â†’ extrinsic-depleted ITM (R7 cascade)
+         â†’ hold.
+      4. Offense routing: opportunity cost breakeven â†’ ex-div gate (R4
+         cascade-then-ASSIGN) â†’ short-DTE ITM (R1+R8 cascade-then-ASSIGN)
          â†’ 90% harvest â†’ hold.
 
     ctx.mode (PEACETIME/AMBER/WARTIME) is currently informational â€” defense
