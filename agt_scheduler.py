@@ -700,7 +700,10 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
 
     scheduler.add_job(
         _conviction_weekly_job,
-        CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=ET),
+        trigger="cron",
+        day_of_week="sun",
+        hour=20,
+        minute=0,
         id="conviction_weekly",
         name="conviction_weekly",
         replace_existing=True,

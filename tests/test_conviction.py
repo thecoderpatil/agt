@@ -130,22 +130,22 @@ class TestConvictionAlertFormat:
     """Test CONVICTION_REFRESH format branch in alerts.py."""
 
     def test_conviction_refresh_format(self):
-        from agt_equities.alerts import _format_alert_message
-        msg = _format_alert_message(
-            "CONVICTION_REFRESH",
-            {"updated": 5, "failed": 1, "total": 6},
-            severity="warn",
-        )
+        from agt_equities.alerts import format_alert_text
+        msg = format_alert_text({
+            "kind": "CONVICTION_REFRESH",
+            "payload": {"updated": 5, "failed": 1, "total": 6},
+            "severity": "warn",
+        })
         assert "5/6 updated" in msg
         assert "1 failed" in msg
-        assert "[warn]" in msg
+        assert "[WARN]" in msg
 
     def test_conviction_refresh_no_failures(self):
-        from agt_equities.alerts import _format_alert_message
-        msg = _format_alert_message(
-            "CONVICTION_REFRESH",
-            {"updated": 10, "failed": 0, "total": 10},
-            severity="info",
-        )
+        from agt_equities.alerts import format_alert_text
+        msg = format_alert_text({
+            "kind": "CONVICTION_REFRESH",
+            "payload": {"updated": 10, "failed": 0, "total": 10},
+            "severity": "info",
+        })
         assert "10/10 updated" in msg
         assert "failed" not in msg

@@ -1120,21 +1120,31 @@ def test_a5e_universe_monthly_swallows_alert_failure(monkeypatch):
 
 # ── A5e: conviction_weekly tests ───────────────────────────────────────
 
+def _build_scheduler_and_connector():
+    """Helper: like _build_scheduler_with_jobs but also returns ib_connector."""
+    import agt_scheduler
+    from agt_equities.ib_conn import IBConnector, IBConnConfig
+    sched = agt_scheduler.build_scheduler()
+    conn = IBConnector(config=IBConnConfig(client_id=2))
+    agt_scheduler.register_jobs(sched, conn)
+    return sched, conn
+
+
 class TestConvictionWeeklyJob:
     """Tests for the conviction_weekly scheduler job."""
 
-    def test_conviction_weekly_trigger(self, _build_scheduler_with_jobs):
-        scheduler, _ = _build_scheduler_with_jobs
-        job = scheduler.get_job("conviction_weekly")
+    def test_conviction_weekly_trigger(self):
+        sched = _build_scheduler_with_jobs()
+        job = sched.get_job("conviction_weekly")
         assert job is not None
         trigger = job.trigger
         from apscheduler.triggers.cron import CronTrigger
         assert isinstance(trigger, CronTrigger)
 
     @pytest.mark.asyncio
-    async def test_conviction_weekly_calls_refresh(self, _build_scheduler_with_jobs, monkeypatch):
+    async def test_conviction_weekly_calls_refresh(self, monkeypatch):
         """Job fetches IB positions, filters STK, calls refresh_conviction_data."""
-        scheduler, ib_connector = _build_scheduler_with_jobs
+        scheduler, ib_connector = _build_scheduler_and_connector()
         job = scheduler.get_job("conviction_weekly")
         assert job is not None
 
@@ -1192,9 +1202,9 @@ class TestConvictionWeeklyJob:
         assert enqueued[0][1]["updated"] == 2
 
     @pytest.mark.asyncio
-    async def test_conviction_weekly_ib_failure_enqueues_alert(self, _build_scheduler_with_jobs, monkeypatch):
+    async def test_conviction_weekly_ib_failure_enqueues_alert(self, monkeypatch):
         """When IB connect fails, job enqueues a warn-level alert."""
-        scheduler, ib_connector = _build_scheduler_with_jobs
+        scheduler, ib_connector = _build_scheduler_and_connector()
         job = scheduler.get_job("conviction_weekly")
         assert job is not None
 
@@ -1217,9 +1227,9 @@ class TestConvictionWeeklyJob:
         assert enqueued[0][2].get("severity") == "warn"
 
     @pytest.mark.asyncio
-    async def test_conviction_weekly_refresh_exception_enqueues_crit(self, _build_scheduler_with_jobs, monkeypatch):
+    async def test_conviction_weekly_refresh_exception_enqueues_crit(self, monkeypatch):
         """When refresh_conviction_data raises, job enqueues a crit-level alert."""
-        scheduler, ib_connector = _build_scheduler_with_jobs
+        scheduler, ib_connector = _build_scheduler_and_connector()
         job = scheduler.get_job("conviction_weekly")
 
         class FakeIB:
