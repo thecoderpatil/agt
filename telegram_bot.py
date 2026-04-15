@@ -8156,6 +8156,11 @@ async def _walk_mode1_chain(
             "strike", ascending=False
         )
 
+        # WHEEL-5: track the best observed strike even when none clear the
+        # 10% RAY floor, so the digest can say "STAND DOWN — best 125C @
+        # 6.4%" instead of a silent "no viable strike".
+        best_below_floor: dict | None = None
+
         for _, row in viable.iterrows():
             strike = float(row["strike"])
 
@@ -8195,9 +8200,25 @@ async def _walk_mode1_chain(
                     "low_yield": low_yield,
                     "dte_range": f"{min_dte}-{max_dte}",
                     "inception_delta": inception_delta,
+                    "below_floor": False,
                 }
 
-        return None
+            # Below floor — keep the highest-annualized observation
+            if best_below_floor is None or annualized > best_below_floor["best_annualized"]:
+                best_below_floor = {
+                    "below_floor": True,
+                    "ticker": ticker,
+                    "expiry": exp_str,
+                    "dte": dte,
+                    "dte_range": f"{min_dte}-{max_dte}",
+                    "best_strike": round(strike, 2),
+                    "best_mid": mid,
+                    "best_annualized": round(annualized, 2),
+                    "best_otm_pct": round(otm_pct, 2),
+                    "floor_pct": MODE1_MIN_ANNUALIZED_PCT,
+                }
+
+        return best_below_floor
     except Exception as exc:
         logger.warning("_walk_mode1_chain failed for %s: %s", ticker, exc)
         return None
@@ -8396,12 +8417,29 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
         result = await _walk_chain_limited(
             _walk_mode1_chain, ticker, spot, adj_basis, dte_range
         )
-        if result is None:
-            result = await _walk_chain_limited(
+        # Escalate to wider DTE band if first pass yielded nothing viable.
+        # Prefer a viable (above-floor) hit over a below-floor observation.
+        if result is None or result.get("below_floor"):
+            wider = await _walk_chain_limited(
                 _walk_mode1_chain, ticker, spot, adj_basis, (45, 60)
             )
+            if wider is not None and not wider.get("below_floor"):
+                result = wider
+            elif result is None and wider is not None:
+                result = wider  # below-floor data still preferable to None
         if result is None:
             return p, None, "No viable strike (defensive)"
+        if result.get("below_floor"):
+            # WHEEL-5: surface the best observed candidate with annualized
+            # gap to the 10% RAY floor so Yash can eyeball how close we are
+            # to being able to write instead of a silent skip.
+            reason = (
+                f"STAND DOWN — best {result['best_strike']:.2f}C "
+                f"@ {result['best_annualized']:.1f}% "
+                f"(< {result['floor_pct']:.0f}% RAY floor, "
+                f"DTE {result['dte']})"
+            )
+            return p, None, reason
 
         return p, result, None
 
