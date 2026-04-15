@@ -250,6 +250,15 @@ from agt_equities.db import (
     init_pragmas,
 )
 
+# Decoupling Sprint A Unit A5e — atomic cutover flag. When
+# USE_SCHEDULER_DAEMON=1, the standalone agt_scheduler daemon owns the
+# jobs gated below (heartbeat_writer and orphan_sweep already scheduler-
+# only; attested_sweeper and el_snapshot_writer have scheduler-side
+# counterparts via A5a / A5d.d). Default remains off for the 4-week
+# cutover window per DT Q1a-g. cross_daemon_alerts_drain is bot-owned
+# under both flag states.
+from agt_scheduler import use_scheduler_daemon as _use_scheduler_daemon
+
 
 # ---------------------------------------------------------------------------
 # Phase 3A: Mode engine helpers for Telegram commands
@@ -10414,20 +10423,35 @@ def main() -> None:
             name="attested_poller",
         )
         logger.info("Scheduled: attested_poller every 10s")
-        jq.run_repeating(
-            callback=_sweep_attested_ttl_job,
-            interval=60,
-            first=30,
-            name="attested_sweeper",
-        )
-        logger.info("Scheduled: attested_sweeper every 60s")
-        jq.run_repeating(
-            callback=_el_snapshot_writer_job,
-            interval=30,
-            first=15,
-            name="el_snapshot_writer",
-        )
-        logger.info("Scheduled: el_snapshot_writer every 30s")
+        if not _use_scheduler_daemon():
+            # A5e: scheduler daemon owns this when USE_SCHEDULER_DAEMON=1.
+            jq.run_repeating(
+                callback=_sweep_attested_ttl_job,
+                interval=60,
+                first=30,
+                name="attested_sweeper",
+            )
+            logger.info("Scheduled: attested_sweeper every 60s")
+        else:
+            logger.info(
+                "Skipped attested_sweeper registration: USE_SCHEDULER_DAEMON=1 "
+                "(owned by agt_scheduler daemon)"
+            )
+        if not _use_scheduler_daemon():
+            # A5e: scheduler daemon owns this when USE_SCHEDULER_DAEMON=1
+            # (A5d.d ported el_snapshot_writer + APEX_SURVIVAL bus alert).
+            jq.run_repeating(
+                callback=_el_snapshot_writer_job,
+                interval=30,
+                first=15,
+                name="el_snapshot_writer",
+            )
+            logger.info("Scheduled: el_snapshot_writer every 30s")
+        else:
+            logger.info(
+                "Skipped el_snapshot_writer registration: USE_SCHEDULER_DAEMON=1 "
+                "(owned by agt_scheduler daemon)"
+            )
         jq.run_repeating(
             callback=_drain_cross_daemon_alerts_job,
             interval=2,
