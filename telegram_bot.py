@@ -113,11 +113,6 @@ def _get_cooldown_seconds() -> int:
 # Sprint 1D: cooldown active tracking (audit_id → asyncio.Task)
 _cooldown_tasks: dict[str, "asyncio.Task"] = {}
 
-# Sprint 1D: STAGED alert coalescing buffer
-_staged_alert_buffer: list[dict] = []
-_staged_alert_last_flush: float = 0.0
-STAGED_COALESCE_WINDOW = 60  # seconds
-
 MAX_HISTORY          = 50
 MAX_ROUNDS           = 15
 MAX_TOKENS_PER_REPLY = 8192
@@ -9820,42 +9815,6 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ---------------------------------------------------------------------------
-# Sprint 1D: STAGED alert coalescing flush job
-# ---------------------------------------------------------------------------
-
-async def _flush_staged_alerts_job(context) -> None:
-    """Flush buffered STAGED alerts as a single digest message."""
-    if _HALTED:
-        return
-    global _staged_alert_last_flush
-    now = time.time()
-    if not _staged_alert_buffer:
-        return
-    if now - _staged_alert_last_flush < STAGED_COALESCE_WINDOW:
-        return
-
-    lines = [f"\u26a0\ufe0f {len(_staged_alert_buffer)} STAGED"]
-    for row in _staged_alert_buffer:
-        tk = row.get("ticker", "?")
-        act = row.get("action_type", "?")
-        qty = row.get("contracts") or row.get("shares") or "?"
-        unit = "c" if act == "CC" else "sh"
-        strike = f"${row['strike']:.0f}C" if row.get("strike") else ""
-        limit_p = f"@ ${row['limit_price']:.2f}" if row.get("limit_price") else ""
-        hh = (row.get("household") or "").replace("_Household", "")
-        lines.append(f"\u00b7 {tk} Sell {qty}{unit} {strike} {limit_p} | {hh}")
-
-    text = "\n".join(lines)
-    try:
-        await context.bot.send_message(chat_id=AUTHORIZED_USER_ID, text=text)
-    except Exception as exc:
-        logger.warning("staged_alert_flush: send failed: %s", exc)
-
-    _staged_alert_buffer.clear()
-    _staged_alert_last_flush = now
-
-
 # Followup #17: orphan scan state sets for resolution policy (D3)
 _OPEN_FILLED_STATES = frozenset({"Filled"})
 _OPEN_DEAD_STATES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
@@ -10469,13 +10428,6 @@ def main() -> None:
             name="el_snapshot_writer",
         )
         logger.info("Scheduled: el_snapshot_writer every 30s")
-        jq.run_repeating(
-            callback=_flush_staged_alerts_job,
-            interval=15,
-            first=20,
-            name="staged_alert_flush",
-        )
-        logger.info("Scheduled: staged_alert_flush every 15s")
         jq.run_repeating(
             callback=_drain_cross_daemon_alerts_job,
             interval=2,
