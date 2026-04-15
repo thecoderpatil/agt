@@ -1,24 +1,35 @@
 """
-agt_equities/roll_engine.py â€” V2 Router defensive evaluator (pure function).
+agt_equities/roll_engine.py — V2 Router defensive evaluator (pure function).
 
-Single source of truth for the Heitkoetter Wheel defensive surface decision:
-HOLD vs HARVEST vs ROLL vs ASSIGN vs ALERT for an open covered call.
+Single source of truth for the AGT Wheel defensive surface decision:
+HOLD / HARVEST / ROLL / ASSIGN / LIQUIDATE / ALERT for an open short call.
 
-WHEEL Sprint scope (2026-04-14):
-  - Pure function `evaluate(pos, market, ctx) -> EvalResult`
-  - Zero I/O. No DB, no ib_async, no Telegram. Caller supplies all inputs.
-  - Discriminated union return; caller dispatches on .kind.
-  - Replaces the inline State 1 / State 2 / State 3 logic currently
-    embedded in telegram_bot.py::_scan_and_stage_defensive_rolls.
+WHEEL-3 (2026-04-15) — full implementation grounded in the deep-research
+brief "Quantitative Defensive Options Mechanics: Optimizing Sub-Basis
+Covered Calls in Recovering Equity Portfolios."
 
-Sprint phasing:
-  - WHEEL-2 (this commit): scaffolding only. evaluate() returns HoldResult.
-  - WHEEL-3: implements Let-It-Call / Sub-Basis Strut / State-1 ASSIGN /
-             State-2 HARVEST / State-3 DEFEND routing, including the
-             static-Î”0.40 fallback for legacy positions where
-             inception_delta is None (the 9 NULL fill_log rows from WHEEL-1b).
-  - WHEEL-4: wires evaluate() into _scan_and_stage_defensive_rolls and
-             deletes the inline branches.
+Key design departures from the WHEEL-2 scaffold:
+  - Routing trigger is EXTRINSIC VALUE, not delta. Static/dynamic delta
+    triggers cause whipsaws; extrinsic ≤ $0.10 is the only mathematically
+    rigorous predictor of imminent assignment risk.
+  - inception_delta becomes vestigial for the defensive trigger. The
+    legacy 9 NULL fill_log rows from WHEEL-1b are no longer a problem;
+    the evaluator never reads inception_delta for routing.
+  - Two top-level regimes via `if spot < adjusted_basis`:
+      DEFENSE (sub-basis): never assign, grind premium via short rolls,
+              accept low RAY (2%), use velocity-ratio harvest, 4-tier
+              upward-strike cascade on defensive rolls.
+      OFFENSE (at/above-basis): welcome assignment, demand RAY ≥ 10%,
+              check Opportunity Cost Breakeven for legacy deep-ITM
+              positions where liquidation is mathematically dominant.
+  - LiquidateResult is a new variant emitted ONLY in offense regime when
+    BTC(call) + STC(shares) yields net proceeds above adjusted_basis.
+    Always carries requires_human_approval=True; WHEEL-4 routes to
+    Telegram alert demanding manual confirmation.
+
+Pure function. No I/O. Deterministic. WHEEL-4 wires evaluate() into
+telegram_bot.py::_scan_and_stage_defensive_rolls and deletes the inline
+State 1/2/3 logic.
 
 Reference: project_wheel_sprint_2026_04_14.md, ADR-005.
 """
@@ -33,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Inputs â€” frozen dataclasses, caller-constructed
+# Inputs — frozen dataclasses, caller-constructed
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -41,8 +52,7 @@ class PortfolioContext:
     """Per-household context the evaluator needs that isn't on the position."""
     household: str
     mode: Literal["PEACETIME", "AMBER", "WARTIME"]
-    leverage: float                          # current household leverage multiple
-    ray_floor: float = 0.10                  # 10% RAY floor â€” never lower without DT ruling
+    leverage: float
 
 
 @dataclass(frozen=True)
@@ -54,10 +64,16 @@ class Position:
     strike: float
     expiry: date
     quantity: int                            # contracts short, positive integer
-    cost_basis: float                        # underlying basis per share
-    inception_delta: Optional[float]         # None for legacy pre-Sprint-1.6 positions
-    opened_at: date                          # CC open date, for DTE math
+    cost_basis: Optional[float]              # underlying basis per share (raw); None if unknown
+    inception_delta: Optional[float]         # vestigial — kept for logging only
+    opened_at: date                          # CC open date, for V_r time-elapsed math
     avg_premium_collected: float             # cumulative premium / contracts, per share
+    # Ledger-derived bases (caller injects from _load_premium_ledger_snapshot)
+    assigned_basis: Optional[float]          # initial basis at assignment
+    adjusted_basis: Optional[float]          # basis after all premium reductions
+    # Lifecycle metadata for V_r calculation
+    initial_credit: float                    # credit collected at CC open, per share
+    initial_dte: int                         # DTE at CC open
 
 
 @dataclass(frozen=True)
@@ -76,123 +92,109 @@ class MarketSnapshot:
     """Live market data for the underlying + the relevant option chain slice."""
     ticker: str
     spot: float
-    iv30: float                              # underlying 30-day IV, for chain slicing
-    chain: tuple[OptionQuote, ...]           # candidate roll targets, any expiry/strike
+    iv30: float
+    chain: tuple[OptionQuote, ...]           # all candidate roll targets
     current_call: OptionQuote                # the contract currently short
     asof: date
 
 
 @dataclass(frozen=True)
 class ConstraintMatrix:
-    """Hard constraints the evaluator must respect (mode/RAY/DTE rails)."""
-    min_dte: int = 7
-    max_dte: int = 60
-    min_otm_pct: float = 0.0                 # 0.0 = ATM allowed; State-3 rolls can go ITM
-    max_delta_for_roll: float = 0.45         # don't roll into anything deeper than this
-    min_credit_per_contract: float = 0.05    # reject sub-nickel rolls
-    static_delta_fallback: float = 0.40      # used when position.inception_delta is None
+    """Hard constraints + tunable thresholds. Defaults are the WHEEL-3
+    research-recommended values."""
+    # Harvest (defense regime)
+    harvest_velocity_ratio: float = 1.5
+    harvest_min_pnl_pct: float = 0.50
+    # Harvest (offense regime)
+    offense_harvest_pnl: float = 0.90
+    # RAY floors (annualized yield)
+    defense_ray_floor: float = 0.02          # 2% — sub-basis "any premium is gravy"
+    offense_ray_floor: float = 0.10          # 10% — capital is fungible above basis
+    # Defensive roll trigger
+    defensive_roll_extrinsic_threshold: float = 0.10
+    # Gamma cutoff (binarized assignment risk)
+    gamma_cutoff_dte: int = 3
+    gamma_cutoff_extrinsic: float = 0.05
+    gamma_cutoff_delta: float = 0.40
+    # Roll cadence
+    standard_dte_min: int = 7
+    standard_dte_max: int = 14
+    defensive_dte_max: int = 45
+    # Cascade tier DTE windows
+    tier1_dte_min: int = 7
+    tier1_dte_max: int = 14
+    tier2_dte_min: int = 14
+    tier2_dte_max: int = 21
+    tier3_dte_min: int = 21
+    tier3_dte_max: int = 45
+    tier4_dte_min: int = 7
+    tier4_dte_max: int = 14
+    # Cascade tier strike steps (number of strikes above current)
+    tier1_strike_step: int = 1
+    tier2_strike_step: int = 1
+    tier3_strike_step: int = 2
+    tier4_strike_step: int = 0               # same-strike fallback
+    # Net-credit floor per share for cascade acceptance
+    min_credit_per_contract: float = 0.05
+    # Legacy compatibility — kept for the gamma cutoff delta floor
+    static_delta_fallback: float = 0.40
 
 
 # ---------------------------------------------------------------------------
-# Outputs â€” discriminated union
+# Outputs — discriminated union
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class HoldResult:
-    """No action. Position is within tolerance."""
     kind: Literal["HOLD"] = "HOLD"
     reason: str = ""
 
 
 @dataclass(frozen=True)
 class HarvestResult:
-    """Buy-to-close at low residual value (State-2). Frees capital for redeploy."""
+    """BTC at low residual value to free theta and reset position."""
     kind: Literal["HARVEST"] = "HARVEST"
     btc_limit: float = 0.0
-    residual_value_pct: float = 0.0          # residual / max_premium, e.g. 0.18 = 82% harvested
+    pnl_pct: float = 0.0
+    velocity_ratio: float = 0.0
     reason: str = ""
 
 
 @dataclass(frozen=True)
 class RollResult:
-    """Roll to new strike/expiry (State-3 defensive)."""
+    """Roll to new strike/expiry as a BAG order (BUY current + SELL new)."""
     kind: Literal["ROLL"] = "ROLL"
     new_strike: float = 0.0
     new_expiry: Optional[date] = None
     net_credit_per_contract: float = 0.0
     new_delta: float = 0.0
+    cascade_tier: int = 0                    # 1-4, which tier matched
     reason: str = ""
 
 
 @dataclass(frozen=True)
 class AssignResult:
-    """Let it assign. State-1 path: ITM on expiry day with no viable defensive roll."""
+    """Let it assign. Offense regime only; sub-basis never returns this."""
     kind: Literal["ASSIGN"] = "ASSIGN"
     reason: str = ""
 
 
 @dataclass(frozen=True)
-class AlertResult:
-    """No safe action exists â€” page operator. Used by WHEEL-7 CRITICAL_PAGER path."""
-    kind: Literal["ALERT"] = "ALERT"
-    severity: Literal["WARN", "CRITICAL"] = "WARN"
+class LiquidateResult:
+    """Opportunity Cost Breakeven: BTC(call) + STC(shares) for net gain.
+    Always requires human approval — never auto-fires."""
+    kind: Literal["LIQUIDATE"] = "LIQUIDATE"
+    btc_limit: float = 0.0                   # current call ask, per share
+    stc_market_ref: float = 0.0              # current spot, per share
+    contracts: int = 0
+    shares: int = 0
+    net_proceeds_per_share: float = 0.0      # spot - btc_limit
+    requires_human_approval: bool = True
     reason: str = ""
-    context: dict = field(default_factory=dict)
 
 
-EvalResult = Union[HoldResult, HarvestResult, RollResult, AssignResult, AlertResult]
-
-
-# ---------------------------------------------------------------------------
-# Pure entry point
-# ---------------------------------------------------------------------------
-
-def evaluate(
-    pos: Position,
-    market: MarketSnapshot,
-    ctx: PortfolioContext,
-    constraints: ConstraintMatrix = ConstraintMatrix(),
-) -> EvalResult:
-    """
-    Decide what to do with an open covered call.
-
-    Pure function. No I/O. Deterministic: same inputs always yield same output.
-
-    WHEEL-2 scaffolding: returns HoldResult unconditionally. WHEEL-3 implements
-    the actual routing tree:
-
-        if expiry == today and spot >= strike:
-            -> Let-It-Call (HoldResult, reason="LET_IT_CALL")
-        elif spot < cost_basis * (1 - SUB_BASIS_BUFFER):
-            -> Sub-Basis Strut (HoldResult, reason="SUB_BASIS_STRUT")
-        elif current_call.delta < HARVEST_DELTA_THRESHOLD:
-            -> HarvestResult (State-2)
-        elif current_call.delta > defense_trigger_delta(pos, constraints):
-            -> RollResult (State-3) or AssignResult if no viable roll
-        else:
-            -> HoldResult
-
-    `defense_trigger_delta` uses pos.inception_delta when available, falling
-    back to constraints.static_delta_fallback (=0.40) for legacy positions
-    where inception_delta is None (the 9 pre-Sprint-1.6 fill_log rows).
-    """
-    try:
-        # WHEEL-3 will fill this in. Until then, every call is a HOLD â€”
-        # safe default, the inline router in telegram_bot.py is still authoritative
-        # because WHEEL-4 hasn't cut over yet.
-        return HoldResult(reason="WHEEL-2 scaffold; evaluator not yet implemented")
-    except Exception as exc:  # pragma: no cover â€” defensive, evaluator is pure
-        logger.exception(
-            "roll_engine.evaluate raised on %s/%s strike=%s expiry=%s: %s",
-            pos.ticker, pos.account_id, pos.strike, pos.expiry, exc,
-        )
-        return AlertResult(
-            severity="CRITICAL",
-            reason=f"evaluator exception: {exc!r}",
-            context={
-                "ticker": pos.ticker,
-                "account_id": pos.account_id,
-                "strike": pos.strike,
-                "expiry": pos.expiry.isoformat() if pos.expiry else None,
-            },
-        )
+@dataclass(frozen=True)
+class AlertResult:
+    """No safe action exists — page operator. WHEEL-7 CRITICAL_PAGER."""
+    kind: Literal["ALERT"] = "ALERT"
+  
