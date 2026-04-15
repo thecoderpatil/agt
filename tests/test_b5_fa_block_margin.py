@@ -30,6 +30,7 @@ from agt_equities.fa_block_margin import (
     STATUS_INSUFFICIENT_NLV,
     STATUS_MODE_BLOCKED,
     STATUS_NO_SNAPSHOT,
+    STATUS_INSUFFICIENT_CASH,
     _contracts_affordable,
     allocate_csp,
     format_allocation_digest,
@@ -542,3 +543,184 @@ class TestFormatAllocationDigest:
         assert "Requested: 0" in text
         assert "\nApproved:" not in text
         assert "\nDropped:" not in text
+
+
+# ---------------------------------------------------------------------------
+# B5.b — cash (IRA) phase tests
+# ---------------------------------------------------------------------------
+
+
+class TestCashPhase:
+    def test_cash_greedy_fill(self):
+        """Cash accounts fill greedily by cash_available desc."""
+        p = CSPProposal(
+            household_id="H1",
+            ticker="ABC",
+            strike=50.0,           # $5k per contract
+            contracts_requested=4,
+            expiry="20260516",
+            mode_gate_accounts={"U_IRA_BIG": MODE_PEACETIME, "U_IRA_SMALL": MODE_PEACETIME},
+            margin_eligible={"U_IRA_BIG": False, "U_IRA_SMALL": False},
+        )
+        # BIG has $30k (6 affordable) → takes all 4. SMALL gets 0 (no remaining).
+        digest = allocate_csp(
+            p,
+            cash_snapshot={"U_IRA_BIG": 30_000.0, "U_IRA_SMALL": 10_000.0},
+        )
+        by_acct = {a.account_id: a for a in digest.allocations}
+        assert by_acct["U_IRA_BIG"].contracts_allocated == 4
+        assert by_acct["U_IRA_BIG"].margin_check_status == STATUS_APPROVED
+        # SMALL shows as allocation with zero, not dropped-in-failure.
+        assert by_acct["U_IRA_SMALL"].contracts_allocated == 0
+        assert "no remaining" in by_acct["U_IRA_SMALL"].margin_check_reason
+        assert digest.total_contracts_allocated == 4
+
+    def test_cash_insufficient_dropped(self):
+        """Cash account with $0 gets STATUS_INSUFFICIENT_CASH and drops."""
+        p = CSPProposal(
+            household_id="H1", ticker="ABC", strike=50.0,
+            contracts_requested=2, expiry="20260516",
+            mode_gate_accounts={"U_EMPTY": MODE_PEACETIME},
+            margin_eligible={"U_EMPTY": False},
+        )
+        digest = allocate_csp(p, cash_snapshot={"U_EMPTY": 0.0})
+        by_acct = {a.account_id: a for a in digest.allocations}
+        assert by_acct["U_EMPTY"].contracts_allocated == 0
+        assert by_acct["U_EMPTY"].margin_check_status == STATUS_INSUFFICIENT_CASH
+        assert digest.total_contracts_allocated == 0
+        assert len(digest.dropped_accounts) == 1
+
+    def test_cash_wartime_blocked(self):
+        """WARTIME gate applies to cash accounts same as margin."""
+        p = CSPProposal(
+            household_id="H1", ticker="ABC", strike=50.0,
+            contracts_requested=2, expiry="20260516",
+            mode_gate_accounts={
+                "U_IRA_WAR": MODE_WARTIME,
+                "U_IRA_PEACE": MODE_PEACETIME,
+            },
+            margin_eligible={"U_IRA_WAR": False, "U_IRA_PEACE": False},
+        )
+        digest = allocate_csp(
+            p,
+            cash_snapshot={"U_IRA_WAR": 100_000.0, "U_IRA_PEACE": 100_000.0},
+        )
+        by_acct = {a.account_id: a for a in digest.allocations}
+        assert by_acct["U_IRA_WAR"].margin_check_status == STATUS_MODE_BLOCKED
+        assert by_acct["U_IRA_WAR"].contracts_allocated == 0
+        # Greedy: PEACE takes all 2 (no pro-rata for cash).
+        assert by_acct["U_IRA_PEACE"].contracts_allocated == 2
+        assert digest.total_contracts_allocated == 2
+
+    def test_cash_no_snapshot_treated_as_zero(self):
+        """Cash account with no entry in cash_snapshot → 0 cash → insufficient."""
+        p = CSPProposal(
+            household_id="H1", ticker="ABC", strike=50.0,
+            contracts_requested=1, expiry="20260516",
+            mode_gate_accounts={"U_MISSING": MODE_PEACETIME},
+            margin_eligible={"U_MISSING": False},
+        )
+        digest = allocate_csp(p, cash_snapshot={})
+        by_acct = {a.account_id: a for a in digest.allocations}
+        assert by_acct["U_MISSING"].margin_check_status == STATUS_INSUFFICIENT_CASH
+        assert digest.total_contracts_allocated == 0
+
+
+class TestMixedCashMargin:
+    def test_cash_fills_first_margin_gets_residual(self):
+        """Cash accounts take greedy portion; margin pro-rata on residual."""
+        p = CSPProposal(
+            household_id="H1", ticker="ABC", strike=50.0,  # $5k/contract
+            contracts_requested=6, expiry="20260516",
+            mode_gate_accounts={
+                "U_IRA": MODE_PEACETIME,
+                "U_M1": MODE_PEACETIME,
+                "U_M2": MODE_PEACETIME,
+            },
+            margin_eligible={"U_IRA": False, "U_M1": True, "U_M2": True},
+        )
+        # IRA has $10k (2 contracts). Residual = 4 → 2 each for M1/M2.
+        digest = allocate_csp(
+            p,
+            cash_snapshot={"U_IRA": 10_000.0},
+            available_nlv_override={"U_M1": 100_000.0, "U_M2": 100_000.0},
+        )
+        by_acct = {a.account_id: a for a in digest.allocations}
+        assert by_acct["U_IRA"].contracts_allocated == 2
+        assert by_acct["U_IRA"].margin_check_status == STATUS_APPROVED
+        assert by_acct["U_M1"].contracts_allocated == 2
+        assert by_acct["U_M2"].contracts_allocated == 2
+        assert digest.total_contracts_allocated == 6
+        # Cash before margin in allocation ordering.
+        order = [a.account_id for a in digest.allocations]
+        assert order.index("U_IRA") < order.index("U_M1")
+
+    def test_cash_covers_all_margin_gets_zero(self):
+        """If cash covers full request, margin accounts see residual=0."""
+        p = CSPProposal(
+            household_id="H1", ticker="ABC", strike=10.0,
+            contracts_requested=3, expiry="20260516",
+            mode_gate_accounts={"U_IRA": MODE_PEACETIME, "U_M1": MODE_PEACETIME},
+            margin_eligible={"U_IRA": False, "U_M1": True},
+        )
+        digest = allocate_csp(
+            p,
+            cash_snapshot={"U_IRA": 100_000.0},
+            available_nlv_override={"U_M1": 100_000.0},
+        )
+        by_acct = {a.account_id: a for a in digest.allocations}
+        assert by_acct["U_IRA"].contracts_allocated == 3
+        # U_M1 not included because Phase 2 bypassed when remaining=0.
+        assert "U_M1" not in by_acct
+        assert digest.total_contracts_allocated == 3
+
+    def test_cash_insufficient_margin_fills_rest(self):
+        """Cash underfunded → more residual flows to margin pro-rata."""
+        p = CSPProposal(
+            household_id="H1", ticker="ABC", strike=50.0,
+            contracts_requested=5, expiry="20260516",
+            mode_gate_accounts={
+                "U_IRA_SMALL": MODE_PEACETIME,
+                "U_M1": MODE_PEACETIME,
+                "U_M2": MODE_PEACETIME,
+            },
+            margin_eligible={"U_IRA_SMALL": False, "U_M1": True, "U_M2": True},
+        )
+        # IRA covers only 1 contract ($5k). Residual=4 → 2 each M1/M2.
+        digest = allocate_csp(
+            p,
+            cash_snapshot={"U_IRA_SMALL": 5_000.0},
+            available_nlv_override={"U_M1": 100_000.0, "U_M2": 100_000.0},
+        )
+        by_acct = {a.account_id: a for a in digest.allocations}
+        assert by_acct["U_IRA_SMALL"].contracts_allocated == 1
+        assert by_acct["U_M1"].contracts_allocated == 2
+        assert by_acct["U_M2"].contracts_allocated == 2
+        assert digest.total_contracts_allocated == 5
+
+
+class TestFoldTogetherDigest:
+    def test_digest_folds_cash_and_margin_approved(self):
+        """Fold-together: single Approved block with cash + margin mixed."""
+        p = CSPProposal(
+            household_id="H1", ticker="ABC", strike=50.0,
+            contracts_requested=4, expiry="20260516",
+            mode_gate_accounts={"U_IRA": MODE_PEACETIME, "U_M1": MODE_PEACETIME},
+            margin_eligible={"U_IRA": False, "U_M1": True},
+        )
+        digest = allocate_csp(
+            p,
+            cash_snapshot={"U_IRA": 10_000.0},
+            available_nlv_override={"U_M1": 100_000.0},
+        )
+        rendered = format_allocation_digest(digest)
+        # Single Approved block with both accts
+        assert rendered.count("Approved:") == 1
+        assert "U_IRA:" in rendered
+        assert "U_M1:" in rendered
+        # Reason text differentiates cash vs margin source.
+        lines = rendered.splitlines()
+        ira_line = next(ln for ln in lines if "U_IRA" in ln)
+        m1_line = next(ln for ln in lines if "U_M1" in ln)
+        assert "cash:" in ira_line
+        assert "margin:" in m1_line
