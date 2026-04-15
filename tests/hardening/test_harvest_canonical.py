@@ -203,13 +203,9 @@ class TestCSPHarvestVsCanonical:
 class TestCCHarvestVsCanonical:
     """Roll engine evaluate() harvest behavior vs canonical 80/90 rule.
 
-    xfail tests capture the known mismatches (E2-E5).
+    E2-E5 fixes landed — all tests now pass without xfail.
     """
 
-    @pytest.mark.xfail(
-        reason="E2: No day-1 80% CC harvest in offense regime",
-        strict=True,
-    )
     def test_offense_day1_80pct_should_harvest(self):
         """Day-1 position in offense at 80% profit → canonical says harvest."""
         from datetime import date
@@ -248,10 +244,6 @@ class TestCCHarvestVsCanonical:
         result = evaluate(pos, market, ctx, ConstraintMatrix())
         assert isinstance(result, HarvestResult), f"Expected HarvestResult, got {result}"
 
-    @pytest.mark.xfail(
-        reason="E3/E4: CC 90% harvest fires on expiry day — should let it ride",
-        strict=True,
-    )
     def test_offense_expiry_day_should_hold(self):
         """DTE=0 at 95% profit in offense → canonical says let it ride."""
         from datetime import date
@@ -291,10 +283,6 @@ class TestCCHarvestVsCanonical:
             f"Expected HOLD on expiry day, got {result}"
         )
 
-    @pytest.mark.xfail(
-        reason="E5: Defense velocity-ratio misses slow 90% winner",
-        strict=True,
-    )
     def test_defense_slow_90pct_should_harvest(self):
         """Defense regime, 20-day position, slow grind to 91% profit.
 

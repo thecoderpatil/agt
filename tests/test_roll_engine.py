@@ -281,14 +281,21 @@ def test_r8_defense_short_dte_itm_forces_cascade_regardless_of_extrinsic():
 
 
 def test_r8_defense_short_dte_otm_does_not_trigger():
-    """2 DTE OTM → R8 does not fire, falls through to hold."""
+    """2 DTE OTM → R8 does not fire (OTM, not ITM).
+
+    Post-E5 fix: the canonical 90% harvest gate fires BEFORE R8 because
+    P_pct = (1.20 - 0.05)/1.20 = 0.9583 >= 0.90 at days_held=28 >= 2
+    and dte=2 >= 1. This is CORRECT — a 96% profit should be harvested
+    regardless of whether R8 triggers. The test now asserts HarvestResult.
+    """
     pos = _pos()
     chain = (
         _quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55, delta=0.28),
     )
     m = _market(pos, spot=48.0, current_ask=0.05, chain=chain)  # OTM
     result = evaluate(pos, m, CTX)
-    assert isinstance(result, HoldResult), f"got {type(result).__name__}: {result}"
+    assert isinstance(result, HarvestResult), f"got {type(result).__name__}: {result}"
+    assert "DEFENSE_CANONICAL_90" in result.reason
 
 
 def test_r8_offense_short_dte_itm_rolls_before_assigning():
