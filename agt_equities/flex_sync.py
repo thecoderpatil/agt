@@ -759,6 +759,28 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
         # If we got here, the atomic txn committed.
         result.status = 'success'
 
+        # --- A5d.b: digest alert via cross_daemon_alerts bus (best-effort) ---
+        # Enqueued AFTER the data txn commits but BEFORE side-effects so a
+        # later side-effect failure (desk_state regen, git push) does not
+        # gate the operator's success notification. Lazy import keeps the
+        # alerts module out of flex_sync's import graph for callers who
+        # don't need the bus. Failure here is non-fatal: log + swallow.
+        try:
+            from agt_equities.alerts import enqueue_alert
+            enqueue_alert(
+                "FLEX_SYNC_DIGEST",
+                {
+                    "sync_id": int(sync_id),
+                    "mode": mode.value if hasattr(mode, "value") else str(mode),
+                    "sections_processed": int(result.sections_processed),
+                    "rows_received": int(result.rows_received),
+                    "rows_inserted": int(result.rows_inserted),
+                },
+                severity="info",
+            )
+        except Exception as alert_exc:
+            logger.warning("flex_sync digest alert enqueue failed: %s", alert_exc)
+
         # --- Side effects (outside DB txn) ---
         # Phase 3A: Regenerate desk_state.md after successful sync
         try:

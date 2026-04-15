@@ -253,6 +253,17 @@ def format_alert_text(alert: dict[str, Any]) -> str:
             f"(ttl={ttl}h)"
         )
 
+    if kind == "FLEX_SYNC_DIGEST":
+        sid = payload.get("sync_id", "?")
+        sync_mode = payload.get("mode", "?")
+        secs = payload.get("sections_processed", "?")
+        rcv = payload.get("rows_received", "?")
+        ins = payload.get("rows_inserted", "?")
+        return (
+            f"[{severity}] flex_sync ok (sync_id={sid} mode={sync_mode}): "
+            f"{secs} sections, {rcv} rows received, {ins} upserted"
+        )
+
     # Generic fallback for unknown kinds (forward-compat for A5d.b/c/d
     # producers landing later — they will still surface via Telegram even
     # before this function gets a dedicated branch for their `kind`).

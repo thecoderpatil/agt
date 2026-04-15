@@ -258,3 +258,81 @@ def test_audit_row_survives_parse_failure(flex_db: Path, monkeypatch):
         assert rows[0][0] == "error"
     finally:
         conn.close()
+
+
+
+# ---------------------------------------------------------------------------
+# A5d.b — FLEX_SYNC_DIGEST alert enqueue tests
+# ---------------------------------------------------------------------------
+
+def test_run_sync_enqueues_flex_sync_digest_on_success(flex_db: Path, monkeypatch):
+    """A5d.b: a successful run_sync must post a FLEX_SYNC_DIGEST alert
+    onto the cross_daemon_alerts bus with the right payload shape."""
+    _disable_walker_and_side_effects(monkeypatch)
+    monkeypatch.setattr(flex_sync, "parse_flex_xml",
+                        lambda _b: _three_synthetic_sections())
+
+    captured: list[dict] = []
+
+    def fake_enqueue(kind, payload, *, severity="info", db_path=None):
+        captured.append({"kind": kind, "payload": payload, "severity": severity})
+        return 1
+
+    # Patch the source-of-truth attribute the lazy import resolves to.
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", fake_enqueue)
+
+    result = flex_sync.run_sync(flex_sync.SyncMode.ONESHOT, xml_bytes=b"<x/>")
+    assert result.status == "success"
+
+    digests = [c for c in captured if c["kind"] == "FLEX_SYNC_DIGEST"]
+    assert len(digests) == 1, f"expected 1 FLEX_SYNC_DIGEST, got {captured}"
+    rec = digests[0]
+    assert rec["severity"] == "info"
+    p = rec["payload"]
+    assert p["sync_id"] == result.sync_id
+    assert p["mode"] == "oneshot"
+    assert p["sections_processed"] == result.sections_processed
+    assert p["rows_received"] == result.rows_received
+    assert p["rows_inserted"] == result.rows_inserted
+
+
+def test_run_sync_does_not_enqueue_on_error(flex_db: Path, monkeypatch):
+    """A5d.b: when the sync fails, no FLEX_SYNC_DIGEST should be enqueued.
+    The error path runs the audit-update small-txn but skips the success-only
+    enqueue block."""
+    _disable_walker_and_side_effects(monkeypatch)
+
+    def _broken_parse(_b):
+        raise RuntimeError("synthetic parse failure")
+
+    monkeypatch.setattr(flex_sync, "parse_flex_xml", _broken_parse)
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        "agt_equities.alerts.enqueue_alert",
+        lambda kind, payload, **kw: captured.append({"kind": kind, **kw}),
+    )
+
+    result = flex_sync.run_sync(flex_sync.SyncMode.ONESHOT, xml_bytes=b"<x/>")
+    assert result.status == "error"
+    assert all(c["kind"] != "FLEX_SYNC_DIGEST" for c in captured), (
+        f"unexpected enqueue on error path: {captured}"
+    )
+
+
+def test_run_sync_enqueue_failure_does_not_crash(flex_db: Path, monkeypatch):
+    """A5d.b: a raise inside enqueue_alert must NOT propagate out of
+    run_sync. The data txn already committed; an alert-bus failure is
+    best-effort and must be logged + swallowed."""
+    _disable_walker_and_side_effects(monkeypatch)
+    monkeypatch.setattr(flex_sync, "parse_flex_xml",
+                        lambda _b: _three_synthetic_sections())
+
+    def boom(*a, **kw):
+        raise RuntimeError("simulated alert-bus down")
+
+    monkeypatch.setattr("agt_equities.alerts.enqueue_alert", boom)
+
+    result = flex_sync.run_sync(flex_sync.SyncMode.ONESHOT, xml_bytes=b"<x/>")
+    # Sync success must stand even when the alert enqueue blows up.
+    assert result.status == "success"
