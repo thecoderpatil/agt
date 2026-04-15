@@ -6834,7 +6834,14 @@ async def cmd_rollcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     status_msg = await update.message.reply_text("⏳ Running the V2 router across live short calls...")
     try:
         ib_conn = await ensure_ib_connected()
-        alerts = await _scan_and_stage_defensive_rolls(ib_conn)
+
+        async def _rollcheck_priority_cb(kind: str, payload: dict) -> None:
+            # WHEEL-7 pager — out-of-band from the bundled V2 Router alerts below.
+            await _page_critical_event(context.bot, kind, payload)
+
+        alerts = await _scan_and_stage_defensive_rolls(
+            ib_conn, priority_cb=_rollcheck_priority_cb,
+        )
 
         body = "\n\n".join(alerts) if alerts else "No V2 router actions triggered."
         msg = "━━ V2 Router Alerts ━━\n\n" + body
@@ -9223,6 +9230,246 @@ def _build_portfolio_context_for_evaluator(household: str) -> "PortfolioContext"
     )
 
 
+# ---------------------------------------------------------------------------
+# WHEEL-7 — CRITICAL_PAGER + LiquidateResult approval flow
+# ---------------------------------------------------------------------------
+# The V2 Router evaluator emits AlertResult(severity="CRITICAL") on cascade
+# exhaustion or unexpected exceptions, and LiquidateResult when a defensive
+# roll has no acceptable target and the cascade recommends a full position
+# unwind. Prior to WHEEL-7 both variants only appeared in the bundled 3:30
+# PM watchdog digest — no @here-style priority, no actionable keyboard.
+#
+# WHEEL-7 wires:
+#   * AlertResult(CRITICAL) → immediate out-of-band priority message
+#     (no keyboard, informational pager).
+#   * LiquidateResult → immediate priority message with [STAGE LIQUIDATE]
+#     [REJECT] inline keyboard. STAGE synthesizes two pending tickets
+#     (BTC calls + STC underlying), both transmit=False — operator must
+#     still run /approve to fire. REJECT logs and drops the event.
+#
+# Token store is in-memory, 30-minute TTL. Bot restart → token lost →
+# operator re-runs /rollcheck (no silent data loss).
+# ---------------------------------------------------------------------------
+
+_LIQ_STAGING_BY_TOKEN: dict[str, dict] = {}
+_LIQ_TOKEN_TTL_S = 30 * 60  # 30 minutes
+
+
+def _liq_gc() -> None:
+    """Drop expired liquidation tokens in-place."""
+    now = _datetime.now().timestamp()
+    expired = [
+        t for t, p in _LIQ_STAGING_BY_TOKEN.items()
+        if now - p.get("_created_ts", 0) > _LIQ_TOKEN_TTL_S
+    ]
+    for t in expired:
+        try:
+            del _LIQ_STAGING_BY_TOKEN[t]
+        except KeyError:
+            pass
+
+
+def _liq_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("STAGE LIQUIDATE", callback_data=f"liq:stage:{token}"),
+        InlineKeyboardButton("REJECT", callback_data=f"liq:reject:{token}"),
+    ]])
+
+
+def _build_liquidate_tickets(payload: dict) -> list[dict]:
+    """Synthesize BTC calls + STC shares tickets from a LiquidateResult payload.
+
+    Both tickets ship transmit=False so the operator must explicitly
+    /approve before anything hits the wire. The BTC leg uses the
+    evaluator's btc_limit; the STC leg is a MKT order (sized by `shares`)
+    to close the underlying immediately after the calls cover. Operator
+    can hand-edit either before approving.
+    """
+    acct_id = payload.get("account_id") or ""
+    acct_label = ACCOUNT_LABELS.get(acct_id, acct_id)
+    ticker = payload.get("ticker") or ""
+    contracts = int(payload.get("contracts") or 0)
+    shares = int(payload.get("shares") or 0)
+    btc_limit = float(payload.get("btc_limit") or 0.0)
+    strike = float(payload.get("strike") or 0.0)
+    expiry = payload.get("expiry") or ""
+
+    tickets: list[dict] = []
+    if contracts > 0 and strike > 0 and expiry:
+        tickets.append({
+            "timestamp": _datetime.now().isoformat(),
+            "account_id": acct_id,
+            "account_label": acct_label,
+            "ticker": ticker,
+            "sec_type": "OPT",
+            "action": "BUY",
+            "quantity": contracts,
+            "order_type": "LMT",
+            "limit_price": round(btc_limit, 2),
+            "expiry": str(expiry).replace("-", ""),
+            "strike": strike,
+            "right": "C",
+            "status": "staged",
+            "transmit": False,                       # operator /approve gate
+            "strategy": "WHEEL-7 Liquidate BTC",
+            "mode": "LIQUIDATE",
+            "origin": "roll_engine",
+            "v2_state": "LIQUIDATE",
+            "v2_rationale": payload.get("reason", ""),
+        })
+    if shares > 0:
+        tickets.append({
+            "timestamp": _datetime.now().isoformat(),
+            "account_id": acct_id,
+            "account_label": acct_label,
+            "ticker": ticker,
+            "sec_type": "STK",
+            "action": "SELL",
+            "quantity": shares,
+            "order_type": "MKT",
+            "status": "staged",
+            "transmit": False,                       # operator /approve gate
+            "strategy": "WHEEL-7 Liquidate STC",
+            "mode": "LIQUIDATE",
+            "origin": "roll_engine",
+            "v2_state": "LIQUIDATE",
+            "v2_rationale": payload.get("reason", ""),
+        })
+    return tickets
+
+
+async def _page_critical_event(bot, kind: str, payload: dict) -> None:
+    """Send an out-of-band priority message for a V2 Router critical event.
+
+    kind is one of 'CRITICAL' | 'LIQUIDATE'. On LIQUIDATE the payload is
+    stashed in _LIQ_STAGING_BY_TOKEN keyed on a short uuid4 token so the
+    callback handler can look it up when the operator hits STAGE/REJECT.
+    """
+    try:
+        _liq_gc()
+        if kind == "CRITICAL":
+            ticker = payload.get("ticker", "?")
+            acct = payload.get("account_id", "?")
+            reason = payload.get("reason", "")
+            text = (
+                "\U0001f6a8 <b>CRITICAL PAGER</b>\n"
+                f"Ticker: <code>{html.escape(str(ticker))}</code>\n"
+                f"Account: <code>{html.escape(str(acct))}</code>\n"
+                f"Reason: <pre>{html.escape(str(reason))}</pre>"
+            )
+            await bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=text,
+                parse_mode="HTML",
+                disable_notification=False,
+            )
+            return
+
+        if kind == "LIQUIDATE":
+            import uuid as _uuid
+            token = _uuid.uuid4().hex[:10]
+            payload = dict(payload)
+            payload["_created_ts"] = _datetime.now().timestamp()
+            _LIQ_STAGING_BY_TOKEN[token] = payload
+            ticker = payload.get("ticker", "?")
+            acct = payload.get("account_id", "?")
+            contracts = payload.get("contracts", 0)
+            shares = payload.get("shares", 0)
+            btc = payload.get("btc_limit", 0.0)
+            stc_ref = payload.get("stc_market_ref", 0.0)
+            net = payload.get("net_proceeds_per_share", 0.0)
+            reason = payload.get("reason", "")
+            text = (
+                "\U0001f6a8 <b>LIQUIDATE REQUEST</b>\n"
+                f"Ticker: <code>{html.escape(str(ticker))}</code> "
+                f"| Account: <code>{html.escape(str(acct))}</code>\n"
+                f"BTC: <code>{contracts}c @ {float(btc):.2f}</code>\n"
+                f"STC: <code>{shares}sh @ MKT (ref ~{float(stc_ref):.2f})</code>\n"
+                f"Net proceeds: <code>{float(net):.2f}/sh</code>\n"
+                f"Reason: <pre>{html.escape(str(reason))}</pre>\n"
+                "STAGE = create pending tickets (transmit=False, /approve to fire).\n"
+                "REJECT = drop event, position held."
+            )
+            await bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=_liq_keyboard(token),
+                disable_notification=False,
+            )
+            return
+    except Exception as exc:
+        logger.exception("WHEEL-7 _page_critical_event failed: %s", exc)
+
+
+async def handle_liq_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Callback handler for liq:stage:<token> and liq:reject:<token>."""
+    query = update.callback_query
+    user = update.effective_user
+    if user is None or user.id != AUTHORIZED_USER_ID:
+        try:
+            await query.answer("Unauthorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    data = (query.data or "").split(":", 2)
+    if len(data) != 3 or data[0] != "liq":
+        await query.answer("Malformed callback.", show_alert=True)
+        return
+    action, token = data[1], data[2]
+
+    _liq_gc()
+    payload = _LIQ_STAGING_BY_TOKEN.pop(token, None)
+    if payload is None:
+        try:
+            await query.answer("Token expired. Re-run /rollcheck.", show_alert=True)
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    if action == "reject":
+        try:
+            await query.answer("Rejected.")
+            await query.edit_message_text(
+                query.message.text_html + "\n\n\u274c <b>REJECTED</b> — position held.",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning("WHEEL-7 reject edit failed: %s", exc)
+        return
+
+    if action == "stage":
+        try:
+            tickets = _build_liquidate_tickets(payload)
+            if not tickets:
+                await query.answer("No tickets synthesized.", show_alert=True)
+                return
+            await asyncio.to_thread(append_pending_tickets, tickets)
+            legs = ", ".join(
+                f"{t['action']} {t['quantity']} {t['sec_type']}" for t in tickets
+            )
+            await query.answer("Staged.")
+            await query.edit_message_text(
+                query.message.text_html
+                + f"\n\n\u2705 <b>STAGED</b>: {html.escape(legs)}. "
+                "Run <code>/approve</code> to fire.",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.exception("WHEEL-7 stage failed: %s", exc)
+            try:
+                await query.answer(f"Stage failed: {exc}", show_alert=True)
+            except Exception:
+                pass
+        return
+
+    await query.answer("Unknown action.", show_alert=True)
+
+
 def _dispatch_eval_result(
     result,  # EvalResult
     pos,  # ib_async.Position
@@ -9325,7 +9572,7 @@ def _dispatch_eval_result(
 # WHEEL-4 replacement for _scan_and_stage_defensive_rolls
 # ---------------------------------------------------------------------------
 
-async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
+async def _scan_and_stage_defensive_rolls(ib_conn, priority_cb=None) -> list[str]:
     """
     V2 master router for open short calls — WHEEL-4 cutover.
 
@@ -9460,6 +9707,31 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
             alert_line, tickets = _dispatch_eval_result(
                 result, pos, current_contract, qty, strike, exp_fmt, acct_id, ticker,
             )
+
+            # WHEEL-7: out-of-band priority pager for CRITICAL + LIQUIDATE.
+            if priority_cb is not None:
+                try:
+                    if isinstance(result, LiquidateResult):
+                        await priority_cb("LIQUIDATE", {
+                            "ticker": ticker,
+                            "account_id": acct_id,
+                            "contracts": result.contracts,
+                            "shares": result.shares,
+                            "btc_limit": result.btc_limit,
+                            "stc_market_ref": result.stc_market_ref,
+                            "net_proceeds_per_share": result.net_proceeds_per_share,
+                            "strike": strike,
+                            "expiry": exp_fmt,
+                            "reason": result.reason,
+                        })
+                    elif isinstance(result, AlertResult) and result.severity == "CRITICAL":
+                        await priority_cb("CRITICAL", {
+                            "ticker": ticker,
+                            "account_id": acct_id,
+                            "reason": result.reason,
+                        })
+                except Exception as _pcb_exc:
+                    logger.warning("WHEEL-7: priority_cb raised: %s", _pcb_exc)
 
             # Finalize ROLL ticket combo_legs (needs ib_conn)
             finalized_tickets: list[dict] = []
@@ -9822,7 +10094,14 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
         # ── V2 Defensive Roll Protocol (Evaluated after DB housekeeping) ──
         try:
             ib_conn = await ensure_ib_connected()
-            roll_alerts = await _scan_and_stage_defensive_rolls(ib_conn)
+
+            async def _watchdog_priority_cb(kind: str, payload: dict) -> None:
+                # WHEEL-7 pager — out-of-band from the bundled digest below.
+                await _page_critical_event(context.bot, kind, payload)
+
+            roll_alerts = await _scan_and_stage_defensive_rolls(
+                ib_conn, priority_cb=_watchdog_priority_cb,
+            )
             alerts.extend(roll_alerts)
         except Exception as roll_exc:
             logger.warning("Watchdog defensive roll protocol failed: %s", roll_exc)
@@ -10697,6 +10976,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve:"))
     app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern=r"^dex:"))
+    app.add_handler(CallbackQueryHandler(handle_liq_callback, pattern=r"^liq:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # ── Scheduled jobs ──
