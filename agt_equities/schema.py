@@ -702,6 +702,60 @@ def register_operational_tables(conn) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ticker_universe_industry_group ON ticker_universe(gics_industry_group)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_orders_status_created_at ON pending_orders(status, created_at, id)")
+
+    # Decoupling Sprint B Unit B1: FA Block 1:N child-order tracking.
+    # One row per child (per-account) order staged under a parent FA block.
+    # Parent still lives in pending_orders; children live here with nullable
+    # ib_perm_id / ib_order_id (populated async via IBKR openOrder callback).
+    # margin_check_* columns are B5 scaffolding (CSP Allocator pre-stage) --
+    # declared now so B5 isn't a second schema migration. See DT Q4 + blind
+    # spots #1 (FA block margin contagion) and #2 (child permId race).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_order_children (
+            id INTEGER PRIMARY KEY,
+            parent_order_id INTEGER NOT NULL,
+            account_id TEXT NOT NULL,
+            child_ib_order_id INTEGER,
+            child_ib_perm_id INTEGER,
+            status TEXT NOT NULL,
+            margin_check_status TEXT,
+            margin_check_reason TEXT,
+            fill_price REAL,
+            fill_qty INTEGER,
+            fill_commission REAL,
+            fill_time TIMESTAMP,
+            last_ib_status TEXT,
+            status_history JSON,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            FOREIGN KEY (parent_order_id) REFERENCES pending_orders(id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_poc_parent "
+        "ON pending_order_children(parent_order_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_poc_perm_id "
+        "ON pending_order_children(child_ib_perm_id) "
+        "WHERE child_ib_perm_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_poc_order_id "
+        "ON pending_order_children(child_ib_order_id) "
+        "WHERE child_ib_order_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_poc_account "
+        "ON pending_order_children(account_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_poc_status "
+        "ON pending_order_children(status)"
+    )
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_executed_orders_executed_at ON executed_orders(executed_at, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_live_blotter_account_ticker ON live_blotter(account_id, ticker, sec_type, action, right, status, order_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_csp_decisions_household_ticker ON csp_decisions(household_id, ticker, timestamp)")
