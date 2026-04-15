@@ -187,3 +187,169 @@ def backfill_status_history(conn: sqlite3.Connection) -> int:
         count += 1
 
     return count
+
+
+# ---------------------------------------------------------------------------
+# Sprint B3 — pending_order_children writer helpers (force-clear cutover)
+# ---------------------------------------------------------------------------
+#
+# Writer-only. Reads against pending_order_children are NOT introduced here
+# -- the CSP Allocator (B5) will own the first consumer. These helpers exist
+# so that today's 1:1 pending_orders flow ALSO populates the 1:N child table,
+# giving B5 / ACB (B4) a hydrated history to migrate against.
+#
+# Feature flag: AGT_B3_CHILDREN_WRITER. Default ON ('1'). Set to '0' to
+# short-circuit the write at the call site (callers check; helpers do not).
+#
+# Idempotency contract: insert_pending_order_child is idempotent on
+# (parent_order_id, account_id) -- a second call with the same pair
+# updates IB ids if they were previously NULL and leaves status alone.
+
+
+import os  # noqa: E402  (deferred so we don't reorder top-of-module imports)
+
+
+def children_writer_enabled() -> bool:
+    """Return True iff the B3 child-row writer is enabled.
+
+    Reads AGT_B3_CHILDREN_WRITER from env on every call so operators can
+    toggle without a process restart (the flag is read at fill time, which
+    is infrequent relative to env-var churn).
+    """
+    return os.environ.get("AGT_B3_CHILDREN_WRITER", "1") == "1"
+
+
+def _child_row_exists(
+    conn: sqlite3.Connection,
+    parent_order_id: int,
+    account_id: str,
+) -> Optional[int]:
+    row = conn.execute(
+        "SELECT id FROM pending_order_children "
+        "WHERE parent_order_id = ? AND account_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (parent_order_id, account_id),
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
+def insert_pending_order_child(
+    conn: sqlite3.Connection,
+    *,
+    parent_order_id: int,
+    account_id: str,
+    status: str = "staged",
+    child_ib_order_id: int | None = None,
+    child_ib_perm_id: int | None = None,
+) -> int:
+    """Insert (or upsert) a pending_order_children row.
+
+    Idempotent on (parent_order_id, account_id):
+    * First call inserts the row with provided status + optional IB ids.
+    * Subsequent calls update child_ib_order_id / child_ib_perm_id if they
+      are currently NULL, and append a seeded status_history entry. Status
+      is NOT downgraded on re-call.
+
+    Returns the child row id.
+
+    Never raises on constraint-OK inputs. Caller must hold its own
+    transaction (BEGIN IMMEDIATE or tx_immediate) -- this helper does not
+    open its own transaction so it composes inside the _place_single_order
+    atomic section alongside append_status on the parent.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    existing_id = _child_row_exists(conn, parent_order_id, account_id)
+    if existing_id is not None:
+        # Upsert: only fill in IB ids if currently NULL. Do not overwrite
+        # a live value -- that would indicate a logic bug we want to surface.
+        set_fragments = []
+        params: list = []
+        if child_ib_order_id:
+            set_fragments.append(
+                "child_ib_order_id = COALESCE(child_ib_order_id, ?)"
+            )
+            params.append(int(child_ib_order_id))
+        if child_ib_perm_id:
+            set_fragments.append(
+                "child_ib_perm_id = COALESCE(child_ib_perm_id, ?)"
+            )
+            params.append(int(child_ib_perm_id))
+        if set_fragments:
+            set_fragments.append("updated_at = ?")
+            params.append(now)
+            params.append(existing_id)
+            conn.execute(
+                "UPDATE pending_order_children SET "
+                + ", ".join(set_fragments)
+                + " WHERE id = ?",
+                tuple(params),
+            )
+        return existing_id
+
+    initial_history = json.dumps([
+        {"status": status, "at": now, "by": "b3_writer"},
+    ])
+    cur = conn.execute(
+        "INSERT INTO pending_order_children "
+        "(parent_order_id, account_id, child_ib_order_id, child_ib_perm_id, "
+        " status, status_history, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            int(parent_order_id),
+            str(account_id),
+            int(child_ib_order_id) if child_ib_order_id else None,
+            int(child_ib_perm_id) if child_ib_perm_id else None,
+            str(status),
+            initial_history,
+            now,
+            now,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def update_child_ib_ids(
+    conn: sqlite3.Connection,
+    *,
+    parent_order_id: int,
+    account_id: str,
+    child_ib_order_id: int | None = None,
+    child_ib_perm_id: int | None = None,
+) -> bool:
+    """Populate child_ib_order_id / child_ib_perm_id on an existing child row.
+
+    Used by the openOrderEvent handler: IBKR assigns the real permId/orderId
+    asynchronously after placeOrder returns, so we seed the child row with
+    whatever we had at placement time then fill in the true ids here.
+
+    Matches by (parent_order_id, account_id). Returns True if a row was
+    updated. Does NOT create rows -- if the child row doesn't exist yet,
+    the caller (openOrderEvent) is racing the place-order INSERT and should
+    simply no-op; the insert will include whatever ids are available.
+
+    COALESCE semantics: existing non-NULL ids are preserved. A transition
+    from NULL -> real-id is a one-way door.
+    """
+    existing_id = _child_row_exists(conn, parent_order_id, account_id)
+    if existing_id is None:
+        return False
+    set_fragments = []
+    params: list = []
+    if child_ib_order_id:
+        set_fragments.append("child_ib_order_id = COALESCE(child_ib_order_id, ?)")
+        params.append(int(child_ib_order_id))
+    if child_ib_perm_id:
+        set_fragments.append("child_ib_perm_id = COALESCE(child_ib_perm_id, ?)")
+        params.append(int(child_ib_perm_id))
+    if not set_fragments:
+        return False
+    set_fragments.append("updated_at = ?")
+    params.append(datetime.now(timezone.utc).isoformat())
+    params.append(existing_id)
+    conn.execute(
+        "UPDATE pending_order_children SET "
+        + ", ".join(set_fragments)
+        + " WHERE id = ?",
+        tuple(params),
+    )
+    return True
