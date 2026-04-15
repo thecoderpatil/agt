@@ -2268,24 +2268,114 @@ def _credit_premium(household: str, ticker: str, amount: float) -> bool:
         return False
 
 
-def _lookup_inception_delta_from_payload(perm_id: int, client_id: int = 0) -> float | None:
-    """Look up inception_delta from pending_orders.payload.
+def _lookup_inception_delta(perm_id: int, client_id: int = 0) -> float | None:
+    """Sprint B4: FA-block-aware three-stage inception_delta resolver.
 
-    Joins on ib_perm_id first, falls back to ib_order_id if the permId
-    join misses. The fallback is required because _place_single_order
-    captures trade.order.permId synchronously immediately after
-    ib_async.placeOrder() returns, before IBKR has assigned the real
-    permId via the openOrder callback. As a result, pending_orders.ib_perm_id
-    is typically stored as 0 while trade.order.permId is later populated
-    with the real IBKR-assigned value. R5 handlers
-    (_r5_on_order_status, _r5_on_exec_details, _r5_on_commission_report)
-    rely on the same client_id (orderId) fallback to find their rows.
+    Resolution order:
+      Stage 1: pending_order_children.child_ib_perm_id  -> parent_order_id
+      Stage 2: pending_order_children.child_ib_order_id -> parent_order_id
+      Stage 3: legacy flat path pending_orders.ib_perm_id / ib_order_id
 
-    Returns None on any failure mode (no match, malformed payload,
-    missing key, non-float value, DB error). Never raises.
+    Parent payload carries ONE inception_delta shared across all children
+    (Yash 2026-04-15 lock: parent-wide; per-account basis divergence is
+    ADR-006/walker's concern, not child-delta attribution).
 
-    Sprint-1.6 fix: added client_id fallback. The underlying permId race
-    in _place_single_order is a logged followup, not in scope here.
+    Orphaned child rows (parent_order_id resolves but parent row is missing)
+    log ORPHANED_CHILD_ROW and fall through to the legacy flat path.
+
+    Returns None on total miss, malformed payload, or DB error. Never raises.
+    """
+    if not perm_id and not client_id:
+        return None
+
+    try:
+        with closing(_get_db_connection()) as conn:
+            parent_id: int | None = None
+
+            if perm_id:
+                r = conn.execute(
+                    "SELECT parent_order_id FROM pending_order_children "
+                    "WHERE child_ib_perm_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (perm_id,),
+                ).fetchone()
+                if r is not None:
+                    parent_id = int(r[0])
+
+            if parent_id is None and client_id:
+                r = conn.execute(
+                    "SELECT parent_order_id FROM pending_order_children "
+                    "WHERE child_ib_order_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (client_id,),
+                ).fetchone()
+                if r is not None:
+                    parent_id = int(r[0])
+
+            if parent_id is not None:
+                row = conn.execute(
+                    "SELECT payload FROM pending_orders WHERE id = ?",
+                    (parent_id,),
+                ).fetchone()
+                if row is None:
+                    logger.warning(
+                        "ORPHANED_CHILD_ROW: pending_order_children matched "
+                        "permId=%s client_id=%s -> parent_order_id=%s but "
+                        "pending_orders row is missing; falling through to "
+                        "flat path",
+                        perm_id, client_id, parent_id,
+                    )
+                else:
+                    payload = json.loads(row[0])
+                    value = payload.get("inception_delta")
+                    return float(value) if value is not None else None
+
+            row = None
+            if perm_id:
+                row = conn.execute(
+                    "SELECT payload FROM pending_orders "
+                    "WHERE ib_perm_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (perm_id,),
+                ).fetchone()
+            if row is None and client_id:
+                row = conn.execute(
+                    "SELECT payload FROM pending_orders "
+                    "WHERE ib_order_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (client_id,),
+                ).fetchone()
+            if row is None:
+                logger.info(
+                    "no pending_orders match for permId=%s client_id=%s "
+                    "(manual order, pre-sprint-1.2 row, or pre-staged child)",
+                    perm_id, client_id,
+                )
+                return None
+
+            payload = json.loads(row[0])
+            value = payload.get("inception_delta")
+            return float(value) if value is not None else None
+
+    except (json.JSONDecodeError, sqlite3.Error) as e:
+        logger.warning(
+            "pending_orders payload lookup failed for "
+            "permId=%s client_id=%s: %s",
+            perm_id, client_id, e,
+        )
+        return None
+    except (TypeError, ValueError) as e:
+        logger.warning(
+            "malformed inception_delta in payload for "
+            "permId=%s client_id=%s: %s",
+            perm_id, client_id, e,
+        )
+        return None
+
+
+def _lookup_inception_delta_legacy(perm_id: int, client_id: int = 0) -> float | None:
+    """Pre-B4 flat-path resolver preserved behind USE_FA_BLOCK_CHILDREN_READER=0
+    for a 2-sprint deprecation window. Verbatim pre-B4 behavior.
     """
     if not perm_id and not client_id:
         return None
@@ -2337,6 +2427,52 @@ def _lookup_inception_delta_from_payload(perm_id: int, client_id: int = 0) -> fl
         return None
 
 
+def _lookup_inception_delta_from_payload(perm_id: int, client_id: int = 0) -> float | None:
+    """Sprint B4 shim. Dispatches between the new FA-block-aware resolver
+    and the preserved legacy resolver based on USE_FA_BLOCK_CHILDREN_READER.
+    Defaults to the new resolver. Name preserved so existing monkeypatches
+    on telegram_bot._lookup_inception_delta_from_payload keep working.
+    Strict flag semantics: anything other than "0" selects the new resolver.
+    """
+    if os.getenv("USE_FA_BLOCK_CHILDREN_READER", "1") == "0":
+        return _lookup_inception_delta_legacy(perm_id, client_id)
+    return _lookup_inception_delta(perm_id, client_id)
+
+
+def _enqueue_inception_delta_miss(
+    household: str,
+    ticker: str,
+    perm_id: int,
+    client_id: int,
+    acct_id: str,
+    exec_id: str,
+) -> None:
+    """Sprint B4: best-effort push INCEPTION_DELTA_MISS onto the
+    cross_daemon_alerts bus after resolver+retry budget is exhausted.
+    Fire-and-forget; never raises. Severity=info (book-and-log posture;
+    WHEEL evaluator handles NULL inception_delta downstream).
+    """
+    try:
+        from agt_equities.alerts import enqueue_alert
+        enqueue_alert(
+            "INCEPTION_DELTA_MISS",
+            {
+                "household": household,
+                "ticker": ticker,
+                "perm_id": perm_id,
+                "client_id": client_id,
+                "acct_id": acct_id,
+                "exec_id": exec_id,
+            },
+            severity="info",
+        )
+    except Exception as exc:
+        logger.warning(
+            "INCEPTION_DELTA_MISS alert enqueue failed (%s/%s acct=%s): %s",
+            household, ticker, acct_id, exc,
+        )
+
+
 def _on_cc_fill(trade, fill):
     """SELL CALL filled — credit CC premium to ledger (atomic)."""
     try:
@@ -2386,6 +2522,11 @@ def _on_cc_fill(trade, fill):
                 "permId=%s client_id=%s (fill books without inception_delta)",
                 perm_id, client_id,
             )
+            # Sprint B4: surface on cross_daemon_alerts bus (book-and-log).
+            _enqueue_inception_delta_miss(
+                household, ticker, perm_id, client_id,
+                acct_id, execution.execId,
+            )
 
         if _apply_fill_atomically(execution.execId, ticker, "SELL_CALL",
                                   fill_qty, fill_price, total_premium,
@@ -2402,7 +2543,12 @@ def _on_cc_fill(trade, fill):
 
 
 def _on_csp_premium_fill(trade, fill):
-    """SELL PUT filled — credit CSP premium to ledger (atomic)."""
+    """SELL PUT filled — credit CSP premium to ledger (atomic).
+
+    Sprint B4: retrofitted with B2-style bounded retry on inception_delta
+    lookup to close parity with _on_cc_fill. FA-block CSP children hit the
+    same child permId race as CC children.
+    """
     try:
         contract = trade.contract
         order = trade.order
@@ -2428,12 +2574,36 @@ def _on_csp_premium_fill(trade, fill):
         fill_qty = abs(execution.shares)
         total_premium = round(fill_price * 100 * fill_qty, 2)
 
+        # Sprint B4: mirror _on_cc_fill B2 retry. 3 x 0.5s = 1.5s budget.
+        perm_id = getattr(order, 'permId', None) or 0
+        client_id = getattr(order, 'orderId', None) or 0
+        inception_delta = None
+        for _b4_attempt in range(3):
+            inception_delta = _lookup_inception_delta_from_payload(perm_id, client_id)
+            if inception_delta is not None:
+                break
+            if _b4_attempt < 2:
+                time.sleep(0.5)
+        if inception_delta is None:
+            logger.warning(
+                "inception_delta lookup miss after 3 retries: "
+                "permId=%s client_id=%s (CSP fill books without inception_delta)",
+                perm_id, client_id,
+            )
+            _enqueue_inception_delta_miss(
+                household, ticker, perm_id, client_id,
+                acct_id, execution.execId,
+            )
+
         if _apply_fill_atomically(execution.execId, ticker, "SELL_PUT",
                                   fill_qty, fill_price, total_premium,
-                                  acct_id, household):
+                                  acct_id, household,
+                                  inception_delta=inception_delta):
             logger.info(
-                "CSP premium: %s %s +$%.2f (%d contracts @ $%.2f)",
+                "CSP premium: %s %s +$%.2f (%d contracts @ $%.2f) "
+                "inception_delta=%s",
                 household, ticker, total_premium, fill_qty, fill_price,
+                inception_delta,
             )
     except Exception as exc:
         logger.exception("_on_csp_premium_fill failed: %s", exc)

@@ -264,6 +264,20 @@ def format_alert_text(alert: dict[str, Any]) -> str:
             f"{secs} sections, {rcv} rows received, {ins} upserted"
         )
 
+    if kind == "INCEPTION_DELTA_MISS":
+        # Sprint B4: fill callback could not resolve inception_delta from
+        # the FA-block reader or legacy flat path after 3 retries.
+        hh = payload.get("household", "?")
+        tk = payload.get("ticker", "?")
+        acct = payload.get("acct_id", "?")
+        perm = payload.get("perm_id", "?")
+        client = payload.get("client_id", "?")
+        return (
+            f"[{severity}] inception_delta miss: {hh}/{tk} acct={acct} "
+            f"permId={perm} clientId={client} "
+            f"(fill booked without inception_delta)"
+        )
+
     if kind == "APEX_SURVIVAL":
         # A5d.d: critical leverage-safety alert produced by scheduler-side
         # el_snapshot_writer when excess_liquidity / NLV <= 0.08 on a
