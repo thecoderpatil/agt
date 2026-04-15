@@ -2299,9 +2299,26 @@ def _on_cc_fill(trade, fill):
 
         # Sprint-1.3: extract inception_delta from pending_orders payload
         # Sprint-1.6: pass client_id for ib_order_id fallback (permId race)
+        # Sprint B B2: bounded retry for FA-block child permId race -- the
+        # child execDetailsEvent can fire before the openOrder callback has
+        # written ib_perm_id/ib_order_id to pending_orders. Retry budget:
+        # 3 attempts x 0.5s = 1.5s total. On exhaustion, fill still books
+        # but without inception_delta (logged at WARNING).
         perm_id = getattr(order, 'permId', None) or 0
         client_id = getattr(order, 'orderId', None) or 0
-        inception_delta = _lookup_inception_delta_from_payload(perm_id, client_id)
+        inception_delta = None
+        for _b2_attempt in range(3):
+            inception_delta = _lookup_inception_delta_from_payload(perm_id, client_id)
+            if inception_delta is not None:
+                break
+            if _b2_attempt < 2:
+                time.sleep(0.5)
+        if inception_delta is None:
+            logger.warning(
+                "inception_delta lookup miss after 3 retries: "
+                "permId=%s client_id=%s (fill books without inception_delta)",
+                perm_id, client_id,
+            )
 
         if _apply_fill_atomically(execution.execId, ticker, "SELL_CALL",
                                   fill_qty, fill_price, total_premium,
