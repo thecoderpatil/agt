@@ -274,6 +274,8 @@ def test_open_order_handler_populates_perm_id(bot_module, monkeypatch):
     c = _sq.connect(":memory:")
     c.row_factory = _sq.Row
     register_operational_tables(c)
+    from agt_equities.schema import _extend_pending_orders
+    _extend_pending_orders(c)
     cur = c.execute(
         "INSERT INTO pending_orders (payload, status, ib_order_id, created_at) "
         "VALUES ('{}', 'sent', 4242, datetime('now'))"
@@ -285,7 +287,14 @@ def test_open_order_handler_populates_perm_id(bot_module, monkeypatch):
     )
     c.commit()
 
-    monkeypatch.setattr(bot_module, "_get_db_connection", lambda: c)
+    class _ConnProxy:
+        def __init__(self, inner): self._c = inner
+        def execute(self, *a, **kw): return self._c.execute(*a, **kw)
+        def executemany(self, *a, **kw): return self._c.executemany(*a, **kw)
+        def commit(self): return self._c.commit()
+        def rollback(self): return self._c.rollback()
+        def close(self): pass
+    monkeypatch.setattr(bot_module, "_get_db_connection", lambda: _ConnProxy(c))
     trade = _make_open_order_trade(order_id=4242, perm_id=55555, account="U21971297")
     bot_module._on_open_order_write_child(trade)
 
@@ -312,14 +321,22 @@ def test_open_order_handler_kill_switch_short_circuits(bot_module, monkeypatch):
 
 def test_open_order_handler_noop_on_orphan(bot_module, monkeypatch):
     import sqlite3 as _sq
-    from agt_equities.schema import register_operational_tables
+    from agt_equities.schema import register_operational_tables, _extend_pending_orders
 
     c = _sq.connect(":memory:")
     c.row_factory = _sq.Row
     register_operational_tables(c)
+    _extend_pending_orders(c)
     c.commit()
 
-    monkeypatch.setattr(bot_module, "_get_db_connection", lambda: c)
+    class _ConnProxy:
+        def __init__(self, inner): self._c = inner
+        def execute(self, *a, **kw): return self._c.execute(*a, **kw)
+        def executemany(self, *a, **kw): return self._c.executemany(*a, **kw)
+        def commit(self): return self._c.commit()
+        def rollback(self): return self._c.rollback()
+        def close(self): pass
+    monkeypatch.setattr(bot_module, "_get_db_connection", lambda: _ConnProxy(c))
     trade = _make_open_order_trade(order_id=999999, perm_id=888888, account="U21971297")
     bot_module._on_open_order_write_child(trade)
 
@@ -331,14 +348,18 @@ def test_open_order_handler_noop_on_orphan(bot_module, monkeypatch):
 def test_open_order_handler_swallows_exceptions(bot_module, monkeypatch, caplog):
     import logging
 
+    # agt_bridge logger is propagate=False + has its own handler, so default
+    # caplog (attached to root) misses records. Flip propagate for the test.
+    logging.getLogger("agt_bridge").propagate = True
+    caplog.set_level(logging.WARNING)
+
     def _boom():
         raise RuntimeError("db dead")
 
     monkeypatch.setattr(bot_module, "_get_db_connection", _boom)
     trade = _make_open_order_trade()
-    with caplog.at_level(logging.WARNING, logger=bot_module.logger.name):
-        bot_module._on_open_order_write_child(trade)
+    bot_module._on_open_order_write_child(trade)
     assert any(
-        "B3 openOrderEvent handler error" in rec.message
+        "B3 openOrderEvent handler error" in rec.getMessage()
         for rec in caplog.records
     )

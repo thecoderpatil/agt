@@ -1,6 +1,12 @@
 # AGT CI test dependency pins. Sourced via PyPI latest-stable at time of
 # pinning (2026-04-14). Edit deliberately — bumping any line forces a
 # cache-key-invalidating rebuild in .gitlab-ci.yml.
+#
+# FU-CI-DEPS-EXPAND (2026-04-15): added heavy deps required to live-import
+# telegram_bot.py in CI, so tests that exercise the bot (test_b2, test_b4,
+# test_inception_delta_fill, test_b3 open_order_handler tests) actually
+# execute rather than being deselected/skipped. Floor deps from the bot's
+# transitive import tree as of main 49c40871.
 pytest==9.0.3
 pytest-asyncio==1.3.0
 hypothesis>=6.150,<7
@@ -8,3 +14,15 @@ apscheduler==3.11.2
 pytz==2026.1.post1
 ib_async==2.1.0
 python-dotenv==1.0.1
+
+# Heavy runtime deps pulled in by telegram_bot.py import chain.
+anthropic
+python-telegram-bot
+finnhub-python
+yfinance
+pandas
+numpy
+fastapi
+uvicorn
+tiktoken
+requests
