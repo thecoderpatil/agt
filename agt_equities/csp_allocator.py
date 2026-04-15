@@ -964,3 +964,81 @@ def _format_digest(result: AllocatorResult) -> list[str]:
     if not result.staged and not result.skipped and not result.errors:
         lines.append("CSP Allocator: no candidates processed")
     return lines
+
+
+# ---------------------------------------------------------------------------
+# B5: local margin math -- DB-backed CSP availability check
+# ---------------------------------------------------------------------------
+#
+# local_margin_check() queries v_available_nlv to verify that an account has
+# sufficient available_el to absorb new CSP notional (strike * qty * 100).
+# This allows pre-stage margin checks without a live IBKR round-trip, using
+# the latest el_snapshot minus open commitment notional from
+# pending_order_children.
+#
+# Fail-open contract:
+#   - No el_snapshot for account -> (True, "no_snapshot").  Prevents blocking
+#     orders when el_snapshots is empty (fresh restart before first poll).
+#   - Any exception -> (True, "check_error: ...").  A margin check failure
+#     must never abort an order placement.
+#
+# Kill switch: AGT_B5_LOCAL_MARGIN_CHECK=0 disables.  Only the literal "0"
+# disables; any other value keeps default-ON behaviour.
+
+import os as _b5_os
+import sqlite3 as _b5_sqlite3
+
+
+def local_margin_check_enabled() -> bool:
+    """Return True iff the B5 local margin check is enabled.
+
+    Reads AGT_B5_LOCAL_MARGIN_CHECK on each call so operators can toggle
+    without a process restart. Default ON; only "0" disables.
+    """
+    return _b5_os.environ.get("AGT_B5_LOCAL_MARGIN_CHECK", "1") != "0"
+
+
+def local_margin_check(
+    conn: _b5_sqlite3.Connection,
+    account_id: str,
+    notional: float,
+) -> tuple[bool, str]:
+    """Query v_available_nlv to check if account_id can absorb `notional`.
+
+    Returns (ok: bool, reason: str).
+      ok=True  -- available_el >= notional, or no snapshot (fail-open).
+      ok=False -- available_el < notional; reason carries the rejection detail.
+
+    Never raises. All exceptions return (True, "check_error: ...").
+    """
+    try:
+        row = conn.execute(
+            "SELECT available_el, available_nlv, committed_csp_notional "
+            "FROM v_available_nlv WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return (True, "no_snapshot")
+        # Support both sqlite3.Row (name-indexed) and plain tuple
+        try:
+            available_el = float(row["available_el"] or 0.0)
+            committed    = float(row["committed_csp_notional"] or 0.0)
+        except TypeError:
+            available_el = float(row[0] or 0.0)
+            committed    = float(row[2] or 0.0)
+        if available_el < notional:
+            return (
+                False,
+                f"available_el ${available_el:,.0f} < notional ${notional:,.0f} "
+                f"(committed ${committed:,.0f})",
+            )
+        return (
+            True,
+            f"available_el ${available_el:,.0f} >= notional ${notional:,.0f}",
+        )
+    except Exception as exc:
+        logger.warning(
+            "local_margin_check failed for %s: %s (fail-open)", account_id, exc,
+        )
+        return (True, f"check_error: {exc}")
+

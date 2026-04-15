@@ -6900,6 +6900,33 @@ async def _place_single_order(
                         insert_pending_order_child,
                     )
                     if children_writer_enabled() and acct_id:
+                        # B5: local margin check (advisory-only; never blocks)
+                        _mc_status: str | None = None
+                        _mc_reason: str | None = None
+                        try:
+                            from agt_equities.csp_allocator import (
+                                local_margin_check_enabled,
+                                local_margin_check,
+                            )
+                            if (local_margin_check_enabled()
+                                    and sec_type == "OPT" and right == "P"):
+                                _csp_notional = float(strike or 0) * int(qty or 0) * 100
+                                if _csp_notional > 0:
+                                    _mc_ok, _mc_reason = local_margin_check(
+                                        conn, acct_id, _csp_notional,
+                                    )
+                                    _mc_status = "ok" if _mc_ok else "blocked"
+                                    if not _mc_ok:
+                                        logger.warning(
+                                            "B5 margin check blocked #%d %s/%s "
+                                            "(advisory-only, order proceeds): %s",
+                                            db_id, acct_id, ticker, _mc_reason,
+                                        )
+                        except Exception as _b5_exc:
+                            logger.warning(
+                                "B5 margin check failed for #%d: %s (non-fatal)",
+                                db_id, _b5_exc,
+                            )
                         insert_pending_order_child(
                             conn,
                             parent_order_id=db_id,
@@ -6907,6 +6934,8 @@ async def _place_single_order(
                             status='sent',
                             child_ib_order_id=ib_order_id,
                             child_ib_perm_id=ib_perm_id,
+                            margin_check_status=_mc_status,
+                            margin_check_reason=_mc_reason,
                         )
                 except Exception as b3_exc:
                     logger.warning(

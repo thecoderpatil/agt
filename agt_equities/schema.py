@@ -1357,6 +1357,62 @@ def register_master_log_tables(conn) -> None:
     """)
 
 
+    # ---------------------------------------------------------------------------
+    # Sprint B5: v_available_nlv — per-account available NLV view.
+    # Computes available_el / available_nlv by subtracting open (non-terminal)
+    # CSP commitment notional from the latest per-account el_snapshot.
+    # Used by csp_allocator.local_margin_check() for DB-backed pre-stage checks
+    # without a live IBKR round-trip. margin_check_* on pending_order_children
+    # (declared in B1) are populated by insert_pending_order_child() in B5.
+    # ---------------------------------------------------------------------------
+    conn.execute("""
+        CREATE VIEW IF NOT EXISTS v_available_nlv AS
+        WITH latest_snap AS (
+            SELECT e.account_id,
+                   e.nlv,
+                   e.excess_liquidity,
+                   e.buying_power,
+                   e.timestamp
+            FROM   el_snapshots e
+            WHERE  e.account_id IS NOT NULL
+              AND  e.timestamp = (
+                       SELECT MAX(e2.timestamp)
+                       FROM   el_snapshots e2
+                       WHERE  e2.account_id = e.account_id
+                   )
+        ),
+        open_csp_notional AS (
+            SELECT poc.account_id,
+                   SUM(
+                       CAST(json_extract(po.payload, '$.strike')    AS REAL)
+                       * CAST(json_extract(po.payload, '$.quantity') AS REAL)
+                       * 100.0
+                   ) AS committed_notional
+            FROM   pending_order_children poc
+            JOIN   pending_orders po ON po.id = poc.parent_order_id
+            WHERE  poc.status NOT IN (
+                       'filled', 'cancelled', 'rejected', 'failed',
+                       'expired', 'rejected_naked', 'superseded',
+                       'duplicate_skipped'
+                   )
+              AND  json_extract(po.payload, '$.right')            = 'P'
+              AND  UPPER(json_extract(po.payload, '$.action'))    = 'SELL'
+            GROUP BY poc.account_id
+        )
+        SELECT s.account_id,
+               s.nlv                                             AS nlv_snapshot,
+               s.excess_liquidity                                AS el_snapshot,
+               s.buying_power                                    AS bp_snapshot,
+               s.timestamp                                       AS snapshot_at,
+               COALESCE(n.committed_notional, 0.0)              AS committed_csp_notional,
+               MAX(0.0, s.excess_liquidity
+                        - COALESCE(n.committed_notional, 0.0))  AS available_el,
+               MAX(0.0, s.nlv
+                        - COALESCE(n.committed_notional, 0.0))  AS available_nlv
+        FROM   latest_snap s
+        LEFT JOIN open_csp_notional n ON n.account_id = s.account_id
+    """)
+
 def _extend_pending_orders(conn) -> None:
     """Add R5 order lifecycle columns to pending_orders if missing.
     Silently skips if pending_orders table doesn't exist (test DBs)."""

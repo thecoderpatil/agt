@@ -241,6 +241,8 @@ def insert_pending_order_child(
     status: str = "staged",
     child_ib_order_id: int | None = None,
     child_ib_perm_id: int | None = None,
+    margin_check_status: str | None = None,
+    margin_check_reason: str | None = None,
 ) -> int:
     """Insert (or upsert) a pending_order_children row.
 
@@ -292,8 +294,9 @@ def insert_pending_order_child(
     cur = conn.execute(
         "INSERT INTO pending_order_children "
         "(parent_order_id, account_id, child_ib_order_id, child_ib_perm_id, "
-        " status, status_history, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " status, status_history, margin_check_status, margin_check_reason, "
+        " created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             int(parent_order_id),
             str(account_id),
@@ -301,6 +304,8 @@ def insert_pending_order_child(
             int(child_ib_perm_id) if child_ib_perm_id else None,
             str(status),
             initial_history,
+            margin_check_status,
+            margin_check_reason,
             now,
             now,
         ),
