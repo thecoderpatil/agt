@@ -290,57 +290,96 @@ class TestV2StateRouter(unittest.TestCase):
 
 
 class TestV2ChainWalkers(unittest.TestCase):
+    """Unified _walk_cc_chain (2026-04-15): basis-anchored ascending walk.
+
+    Anchor = smallest chain strike >= paper_basis (round UP). Walk ascending.
+    Band = 30-130% annualized. Step up on >130, stand down on <30. No
+    defensive sub-basis walk-down — Yash stages those manually.
+    """
 
     @patch("telegram_bot._ibkr_get_chain", new_callable=AsyncMock)
     @patch("telegram_bot._ibkr_get_expirations", new_callable=AsyncMock)
-    def test_mode1_chain_walks_down_from_acb_buffer(
+    def test_basis_anchor_hit_in_band(
         self,
         mock_expirations,
         mock_chain,
     ):
+        """Anchor strike premium sits inside 30-130% band => take it."""
         import telegram_bot
 
         expiry = (telegram_bot._date.today() + telegram_bot._timedelta(days=21)).isoformat()
         mock_expirations.return_value = [expiry]
+        # At strike=100, mid=2.00, dte=21: (2.00/100)*(365/21)*100 = 34.76% => in band.
         mock_chain.return_value = [
-            {"strike": 95.0, "bid": 0.70, "ask": 0.80},
-            {"strike": 100.0, "bid": 0.30, "ask": 0.40},
-            {"strike": 105.0, "bid": 0.45, "ask": 0.55},
-            {"strike": 108.0, "bid": 0.25, "ask": 0.35},
-            {"strike": 110.0, "bid": 0.80, "ask": 0.90},
+            {"strike": 100.0, "bid": 1.90, "ask": 2.10},
+            {"strike": 105.0, "bid": 1.00, "ask": 1.20},
         ]
 
-        result = _run(telegram_bot._walk_mode1_chain("AAPL", 80.0, 100.0, (14, 30)))
+        result = _run(telegram_bot._walk_cc_chain("AAPL", 95.0, 100.0, (14, 30)))
 
         self.assertIsNotNone(result)
-        # Per C7.2: strike_floor=spot*1.03=82.4,
-        # strike_ceiling=acb*1.20=120.0. Walker iterates descending,
-        # picks highest strike with viable premium. At spot=80,
-        # acb=100: strike 110 is the highest strike in the test
-        # fixture's mock chain with bid above the floor.
-        self.assertEqual(result["strike"], 110.0)
+        self.assertFalse(result.get("below_floor", False))
+        self.assertEqual(result["strike"], 100.0)
+        self.assertEqual(result["branch"], "BASIS_ANCHOR")
 
     @patch("telegram_bot._ibkr_get_chain", new_callable=AsyncMock)
     @patch("telegram_bot._ibkr_get_expirations", new_callable=AsyncMock)
-    def test_harvest_chain_selects_highest_strike_in_band(
+    def test_step_up_when_anchor_above_band(
         self,
         mock_expirations,
         mock_chain,
     ):
+        """Anchor annualized > 130% => step up to next strike inside band."""
         import telegram_bot
 
         expiry = (telegram_bot._date.today() + telegram_bot._timedelta(days=21)).isoformat()
         mock_expirations.return_value = [expiry]
+        # strike=100, mid=10.00, dte=21: (10/100)*(365/21)*100 = 173.8% => step up.
+        # strike=105, mid=4.00, dte=21: (4/105)*(365/21)*100 =  66.2% => BAND HIT.
         mock_chain.return_value = [
-            {"strike": 100.0, "bid": 2.00, "ask": 2.20},
-            {"strike": 105.0, "bid": 1.80, "ask": 2.00},
-            {"strike": 110.0, "bid": 1.50, "ask": 1.70},
+            {"strike": 100.0, "bid": 9.90, "ask": 10.10},
+            {"strike": 105.0, "bid": 3.90, "ask": 4.10},
+            {"strike": 110.0, "bid": 0.50, "ask": 0.70},
         ]
 
-        result = _run(telegram_bot._walk_harvest_chain("AAPL", 102.0, 100.0, (14, 30)))
+        result = _run(telegram_bot._walk_cc_chain("AAPL", 100.0, 100.0, (14, 30)))
 
         self.assertIsNotNone(result)
+        self.assertFalse(result.get("below_floor", False))
         self.assertEqual(result["strike"], 105.0)
+        self.assertEqual(result["branch"], "BASIS_STEP_UP")
+
+    @patch("telegram_bot._ibkr_get_chain", new_callable=AsyncMock)
+    @patch("telegram_bot._ibkr_get_expirations", new_callable=AsyncMock)
+    def test_stand_down_when_anchor_below_floor(
+        self,
+        mock_expirations,
+        mock_chain,
+    ):
+        """Anchor annualized < 30% and no higher strike cures it => stand down
+        with a below_floor dict (so the digest can surface the gap instead of
+        silently skipping). Walker never picks a sub-band strike and never
+        walks below paper_basis.
+        """
+        import telegram_bot
+
+        expiry = (telegram_bot._date.today() + telegram_bot._timedelta(days=21)).isoformat()
+        mock_expirations.return_value = [expiry]
+        # strike=100, mid=0.50, dte=21: (0.50/100)*(365/21)*100 = 8.69% => stand down.
+        mock_chain.return_value = [
+            {"strike": 100.0, "bid": 0.45, "ask": 0.55},
+            {"strike": 105.0, "bid": 0.20, "ask": 0.30},
+        ]
+
+        result = _run(telegram_bot._walk_cc_chain("AAPL", 80.0, 100.0, (14, 30)))
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.get("below_floor", False))
+        self.assertEqual(result["best_strike"], 100.0)
+        self.assertAlmostEqual(result["best_annualized"], 8.69, places=1)
+        self.assertEqual(result["floor_pct"], 30.0)
+        # Must NOT produce a staging-shaped dict
+        self.assertNotIn("expiry", result)
 
 
 if __name__ == "__main__":

@@ -1479,16 +1479,15 @@ _SECTOR_MAP_FALLBACK: dict[str, str] = {
     "JNJ":  "Drug Manufacturers - General",
 }
 EXCLUDED_TICKERS = {"IBKR", "TRAW.CVR", "SPX", "SLS", "GTLB"}
-MODE1_MIN_ANNUALIZED_PCT = 10.0
-MODE1_MIN_OTM_PCT = 5.0   # Defensive buffer — 3% was too tight
-MODE1_LOW_YIELD_PCT = 8.0  # Warn on 5-8% annualized (floor is 5%)
-MODE1_ABSOLUTE_BID_FLOOR = 0.03
 
-# ── Harvest (Mode 2 / Fully Amortized) — 30%/130% Heitkoetter band ──
-HARVEST_MIN_ANNUALIZED_PCT  = 30.0
-HARVEST_MAX_ANNUALIZED_PCT  = 130.0
-HARVEST_ABSOLUTE_BID_FLOOR  = 0.10
-HARVEST_TARGET_DTE          = (14, 30)
+# ── Unified Covered Call Engine (2026-04-15 Yash ruling) ──
+# Basis-anchored walker: anchor = paper basis (round UP to nearest chain
+# strike). Band = 30%-130% annualized. Step up on >130%, stand down on <30%.
+# No defensive sub-basis lane — Yash stages those manually.
+CC_MIN_ANN    = 30.0   # floor annualized %
+CC_MAX_ANN    = 130.0  # ceiling annualized %
+CC_BID_FLOOR  = 0.03   # skip quotes below this mid
+CC_TARGET_DTE = (14, 30)
 
 # ── Rule 8 Dynamic Exit — V7 Amendments ──
 DYNAMIC_EXIT_TARGET_PCT = 0.15    # 15% buffer target (not 20%)
@@ -8372,152 +8371,48 @@ async def _fetch_account_pnl(account_ids: list[str]) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: /mode1 command — chain walk + order staging
+# /cc command — unified basis-anchored covered call engine
 # ---------------------------------------------------------------------------
 
-async def _walk_mode1_chain(
+async def _walk_cc_chain(
     ticker: str,
     spot: float,
-    adjusted_basis: float,
-    target_dte_range: tuple[int, int] = (14, 30),
+    paper_basis: float,
+    target_dte_range: tuple[int, int] = CC_TARGET_DTE,
 ) -> dict | None:
     """
-    Walk the options chain for a Mode 1 CC candidate.
-    Anchor = adjusted cost basis (ACB).
-    Walk DOWN from the ACB + 10% spot buffer, never below ACB.
-    Returns the best strike dict or None if nothing viable.
-    """
-    try:
-        raw_expiries = await _ibkr_get_expirations(ticker)
-        today = _date.today()
+    Unified basis-anchored covered call walker.
 
-        min_dte, max_dte = target_dte_range
-        candidates: list[tuple[str, int]] = []
-        for exp_str in raw_expiries:
-            try:
-                exp_date = _date.fromisoformat(exp_str)
-            except ValueError:
-                continue
-            dte = (exp_date - today).days
-            if min_dte <= dte <= max_dte:
-                candidates.append((exp_str, dte))
+    Algorithm (per 2026-04-15 Yash ruling):
+      1. Anchor = smallest chain strike >= paper_basis (round UP). Never walk
+         below paper basis. Defensive sub-basis writes are out of scope for
+         the LLM — Yash stages those manually.
+      2. Walk ASCENDING from the anchor strike:
+           - If mid < CC_BID_FLOOR ($0.03): skip (garbage quote).
+           - If annualized > CC_MAX_ANN (130%): too much premium for this
+             strike. Step up (ticker is likely being offered a fat premium
+             because the market expects a rip through the strike).
+           - If CC_MIN_ANN <= annualized <= CC_MAX_ANN: BAND HIT. Return.
+           - If annualized < CC_MIN_ANN (30%): STAND DOWN. Returning a
+             below-floor observation so the digest can surface the gap
+             instead of a silent skip.
+      3. No delta gate (Yash: reconsider only if we see problem trades).
+      4. No earnings gate (deferred to follow-up).
 
-        if not candidates:
-            return None
+    Anchor is paper_basis (initial_basis) NOT adjusted_basis. The assigned-
+    paper-basis anchor is the rulebook's intent; ACB amortization is a P&L
+    accounting artifact, not a strike-selection anchor.
 
-        # Pick the expiry closest to the midpoint of our target range
-        mid_target = (min_dte + max_dte) // 2
-        exp_str, dte = min(candidates, key=lambda x: abs(x[1] - mid_target))
+    Returns on hit:
+      {branch: "BASIS_ANCHOR" | "BASIS_STEP_UP", ticker, expiry, dte, strike,
+       bid, annualized, otm_pct, walk_away_pnl, dte_range, inception_delta}
 
-        # Strike range per Rulebook Rule 7 Mode 1 + V2 Router refactor:
-        # No write-time ACB floor — assignment-below-basis protection
-        # lives in the V2 Router rolling path, not here. Walker hunts
-        # from 3% OTM above spot up to 20% above adjusted basis,
-        # prefers highest strike with viable premium.
-        strike_floor = max(0.0, spot * 1.03)
-        strike_ceiling = max(strike_floor, adjusted_basis * 1.20)
+    Returns on stand-down (no viable strike in 30-130 band, but we have
+    data to show Yash):
+      {below_floor: True, best_strike, best_annualized, floor_pct: 30.0,
+       dte, ticker}
 
-        try:
-            chain_data = await _ibkr_get_chain(ticker, exp_str, right='C',
-                                                min_strike=strike_floor,
-                                                max_strike=strike_ceiling)
-            calls = pd.DataFrame(chain_data)
-        except Exception:
-            return None
-
-        if calls is None or not isinstance(calls, pd.DataFrame) or calls.empty:
-            return None
-
-        calls = calls.copy()
-        calls["strike"] = pd.to_numeric(calls["strike"], errors="coerce")
-        calls = calls.dropna(subset=["strike"])
-
-        # Walk down from the buffered ceiling toward ACB, never below ACB.
-        viable = calls[
-            (calls["strike"] >= strike_floor)
-            & (calls["strike"] <= strike_ceiling)
-        ].sort_values(
-            "strike", ascending=False
-        )
-
-        # WHEEL-5: track the best observed strike even when none clear the
-        # 10% RAY floor, so the digest can say "STAND DOWN — best 125C @
-        # 6.4%" instead of a silent "no viable strike".
-        best_below_floor: dict | None = None
-
-        for _, row in viable.iterrows():
-            strike = float(row["strike"])
-
-            raw_bid = row.get("bid")
-            raw_ask = row.get("ask")
-            bid = float(raw_bid) if pd.notna(raw_bid) else 0.0
-            ask = float(raw_ask) if pd.notna(raw_ask) else 0.0
-
-            mid = round((bid + ask) / 2.0, 2) if bid and ask else bid
-
-            if mid < MODE1_ABSOLUTE_BID_FLOOR:
-                continue
-
-            annualized = (mid / spot) * (365 / dte) * 100 if spot > 0 else 0
-            otm_pct = ((strike - spot) / spot) * 100
-
-            if annualized >= MODE1_MIN_ANNUALIZED_PCT:
-                low_yield = annualized < MODE1_LOW_YIELD_PCT
-                # Sprint-1.2: extract inception_delta from chain DTO
-                try:
-                    raw_delta = row.get("delta")
-                    inception_delta = float(raw_delta) if raw_delta is not None else None
-                except (TypeError, ValueError) as _id_exc:
-                    logger.warning(
-                        "inception_delta extraction failed for %s %.1f%s: %s",
-                        ticker, strike, "C", _id_exc,
-                    )
-                    inception_delta = None
-                return {
-                    "ticker": ticker,
-                    "expiry": exp_str,
-                    "dte": dte,
-                    "strike": round(strike, 2),
-                    "bid": mid,  # Overridden to Mid per V2 Execution Spec
-                    "annualized": round(annualized, 2),
-                    "otm_pct": round(otm_pct, 2),
-                    "low_yield": low_yield,
-                    "dte_range": f"{min_dte}-{max_dte}",
-                    "inception_delta": inception_delta,
-                    "below_floor": False,
-                }
-
-            # Below floor — keep the highest-annualized observation
-            if best_below_floor is None or annualized > best_below_floor["best_annualized"]:
-                best_below_floor = {
-                    "below_floor": True,
-                    "ticker": ticker,
-                    "expiry": exp_str,
-                    "dte": dte,
-                    "dte_range": f"{min_dte}-{max_dte}",
-                    "best_strike": round(strike, 2),
-                    "best_mid": mid,
-                    "best_annualized": round(annualized, 2),
-                    "best_otm_pct": round(otm_pct, 2),
-                    "floor_pct": MODE1_MIN_ANNUALIZED_PCT,
-                }
-
-        return best_below_floor
-    except Exception as exc:
-        logger.warning("_walk_mode1_chain failed for %s: %s", ticker, exc)
-        return None
-
-
-async def _walk_harvest_chain(
-    ticker: str,
-    spot: float,
-    assigned_basis: float,
-    target_dte_range: tuple[int, int] = HARVEST_TARGET_DTE,
-) -> dict | None:
-    """
-    Walk the options chain for a Mode 2 / Fully Amortized Harvest CC.
-    Anchor = assigned basis (initial_basis).
-    Select the HIGHEST strike that still yields within the 30-130% band.
+    Returns None on hard failure (no expiries, empty chain, IB exception).
     """
     try:
         raw_expiries = await _ibkr_get_expirations(ticker)
@@ -8540,10 +8435,16 @@ async def _walk_harvest_chain(
         mid_target = (min_dte + max_dte) // 2
         exp_str, dte = min(candidates, key=lambda x: abs(x[1] - mid_target))
 
+        # Cap chain breadth at max(spot*1.5, paper_basis*1.3) — annualized
+        # decays fast as strike climbs, so 150% spot / 130% basis covers the
+        # step-up search comfortably.
+        chain_ceiling = max(spot * 1.5, paper_basis * 1.3)
         try:
-            chain_data = await _ibkr_get_chain(ticker, exp_str, right='C',
-                                                min_strike=assigned_basis,
-                                                max_strike=max(spot * 1.3, assigned_basis))
+            chain_data = await _ibkr_get_chain(
+                ticker, exp_str, right='C',
+                min_strike=paper_basis,
+                max_strike=chain_ceiling,
+            )
             calls = pd.DataFrame(chain_data)
         except Exception:
             return None
@@ -8555,9 +8456,16 @@ async def _walk_harvest_chain(
         calls["strike"] = pd.to_numeric(calls["strike"], errors="coerce")
         calls = calls.dropna(subset=["strike"])
 
-        viable = calls[calls["strike"] >= assigned_basis].sort_values(
-            "strike", ascending=False
+        # Anchor = smallest strike >= paper_basis (round UP).
+        viable = calls[calls["strike"] >= paper_basis].sort_values(
+            "strike", ascending=True
         )
+
+        if viable.empty:
+            return None
+
+        anchor_strike_val = float(viable.iloc[0]["strike"])
+        best_observed: dict | None = None  # for stand-down reporting
 
         for _, row in viable.iterrows():
             strike = float(row["strike"])
@@ -8568,23 +8476,41 @@ async def _walk_harvest_chain(
 
             mid = round((bid + ask) / 2.0, 2) if bid and ask else bid
 
-            if mid < HARVEST_ABSOLUTE_BID_FLOOR:
+            if mid < CC_BID_FLOOR:
+                # Garbage quote — keep walking up in case deeper strikes
+                # have real markets. (Unusual but cheap to guard.)
                 continue
 
             annualized = (mid / strike) * (365 / dte) * 100 if strike > 0 else 0
             otm_pct = ((strike - spot) / spot) * 100 if spot > 0 else 0
 
-            if annualized < HARVEST_MIN_ANNUALIZED_PCT:
-                continue
-            if annualized > HARVEST_MAX_ANNUALIZED_PCT:
+            # Track best observed regardless of floor — for stand-down digest.
+            if best_observed is None or annualized > best_observed["best_annualized"]:
+                best_observed = {
+                    "below_floor": True,
+                    "ticker": ticker,
+                    "best_strike": round(strike, 2),
+                    "best_annualized": round(annualized, 2),
+                    "floor_pct": CC_MIN_ANN,
+                    "dte": dte,
+                }
+
+            if annualized > CC_MAX_ANN:
+                # Too much premium — step up.
                 continue
 
-            # Walk-away P&L per share = strike + premium - assigned_basis
+            if annualized < CC_MIN_ANN:
+                # We've walked past the band (or anchor itself was below
+                # floor). Stand down — do not pick a sub-30% strike.
+                break
+
+            # 30 <= ann <= 130: BAND HIT.
+            branch = "BASIS_ANCHOR" if strike == anchor_strike_val else "BASIS_STEP_UP"
+
             walk_away_pnl = _compute_walk_away_pnl(
-                assigned_basis, strike, mid, quantity=1, multiplier=1
+                paper_basis, strike, mid, quantity=1, multiplier=1
             ).walk_away_pnl_per_share
 
-            # Sprint-1.2: extract inception_delta from chain DTO
             try:
                 raw_delta = row.get("delta")
                 inception_delta = float(raw_delta) if raw_delta is not None else None
@@ -8594,12 +8520,14 @@ async def _walk_harvest_chain(
                     ticker, strike, "C", _id_exc,
                 )
                 inception_delta = None
+
             return {
+                "branch": branch,
                 "ticker": ticker,
                 "expiry": exp_str,
                 "dte": dte,
                 "strike": round(strike, 2),
-                "bid": mid,  # Overridden to Mid per V2 Execution Spec
+                "bid": mid,  # mid per V2 Execution Spec
                 "annualized": round(annualized, 2),
                 "otm_pct": round(otm_pct, 2),
                 "walk_away_pnl": round(walk_away_pnl, 2),
@@ -8607,17 +8535,28 @@ async def _walk_harvest_chain(
                 "inception_delta": inception_delta,
             }
 
-        return None
+        # Fell off the end of the ascending walk without a band hit.
+        return best_observed
     except Exception as exc:
-        logger.warning("_walk_harvest_chain failed for %s: %s", ticker, exc)
+        logger.warning("_walk_cc_chain failed for %s: %s", ticker, exc)
         return None
 
 
 async def _run_cc_logic(household_filter: str | None = None) -> dict:
     """
-    Unified CC pipeline — stages both Defensive (Mode 1) and Harvest
-    (Mode 2 / Fully Amortized) covered calls in a single pass.
-    Returns dict with "main_text" (str).
+    Unified basis-anchored CC pipeline.
+
+    One code path per uncovered position — no Mode 1 / Mode 2 split. Strike
+    selection is basis-anchored (paper basis, round UP to nearest chain
+    strike). Band = CC_MIN_ANN..CC_MAX_ANN annualized (30%-130%). Below-floor
+    observations surface as stand-downs so Yash can see how close we are
+    rather than getting a silent skip.
+
+    Defensive (sub-basis) writes are out of scope per 2026-04-15 Yash
+    ruling; he stages those manually. Existing MODE_1_DEFENSIVE rows in
+    cc_cycle_log and pending_orders remain valid for historical reads
+    (Rule 8 trigger, roll_watchlist etc.) — the engine just no longer
+    produces new ones.
     """
     # Retry discovery once on IB failure
     disco = await _discover_positions(household_filter)
@@ -8628,30 +8567,28 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
     if disco.get("error"):
         logger.warning("CC discovery warning: %s", disco["error"])
 
-    # Classify targets by mode
-    defensive_targets: list[dict] = []
-    harvest_targets: list[dict] = []
+    # Flatten all uncovered positions into a single target list — no mode split.
+    cc_targets: list[dict] = []
     for hh_data in disco["households"].values():
         for p in hh_data["positions"]:
             if p["available_contracts"] < 1:
                 continue
-            if p["mode"] == "MODE_1":
-                defensive_targets.append(p)
-            elif p["mode"] in ("MODE_2", "FULLY_AMORTIZED"):
-                harvest_targets.append(p)
+            # Need a paper basis to anchor. If missing, skip loudly.
+            if p.get("initial_basis", 0) <= 0:
+                continue
+            cc_targets.append(p)
 
-    if not defensive_targets and not harvest_targets:
+    if not cc_targets:
         return {
             "main_text": "No positions with uncovered shares for CC staging.",
         }
 
-    staged_defensive: list[dict] = []
-    staged_harvest: list[dict] = []
+    staged: list[dict] = []
     skipped: list[dict] = []
 
-    # ── Detect overweight positions for Dynamic Exit carve-out ──
+    # ── Dynamic Exit carve-out (unchanged from prior implementation) ──
     dynamic_exit_staged: list[dict] = []
-    excess_carveout: dict[str, int] = {}  # "household|ticker" -> excess_contracts
+    excess_carveout: dict[str, int] = {}
 
     for hh_name, hh_data in disco["households"].items():
         hh_nlv = hh_data.get("household_nlv", 0)
@@ -8674,7 +8611,6 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                 key = f"{p['household']}|{p['ticker']}"
                 excess_carveout[key] = scope["excess_contracts"]
 
-                # Stage dynamic exit candidate (replaces CIO payload generation)
                 try:
                     stage_result = await _stage_dynamic_exit_candidate(
                         p["ticker"], hh_name, hh_data, p,
@@ -8685,56 +8621,40 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                     logger.warning("Dynamic exit staging failed for %s: %s",
                                    p["ticker"], de_exc)
 
-    # ── Defensive (Mode 1) — parallel chain walks ──
-    async def _walk_defensive_target(p):
-        """Walk chain for one defensive target. Returns (p, result, skip_reason)."""
+    # ── Unified basis-anchored chain walks (parallel) ──
+    async def _walk_target(p):
+        """Walk chain for one target. Returns (p, result, skip_reason)."""
         ticker = p["ticker"]
         spot = p["spot_price"]
-        adj_basis = p["adjusted_basis"]
+        paper_basis = p["initial_basis"]
 
         if spot <= 0:
             return p, None, "No spot price"
 
-        gap_pct = ((adj_basis - spot) / adj_basis * 100) if adj_basis > 0 else 0
-        dte_range = (21, 30) if gap_pct > 15 else (7, 21)
-
         result = await _walk_chain_limited(
-            _walk_mode1_chain, ticker, spot, adj_basis, dte_range
+            _walk_cc_chain, ticker, spot, paper_basis, CC_TARGET_DTE
         )
-        # Escalate to wider DTE band if first pass yielded nothing viable.
-        # Prefer a viable (above-floor) hit over a below-floor observation.
-        if result is None or result.get("below_floor"):
-            wider = await _walk_chain_limited(
-                _walk_mode1_chain, ticker, spot, adj_basis, (45, 60)
-            )
-            if wider is not None and not wider.get("below_floor"):
-                result = wider
-            elif result is None and wider is not None:
-                result = wider  # below-floor data still preferable to None
         if result is None:
-            return p, None, "No viable strike (defensive)"
+            return p, None, "No viable strike"
         if result.get("below_floor"):
-            # WHEEL-5: surface the best observed candidate with annualized
-            # gap to the 10% RAY floor so Yash can eyeball how close we are
-            # to being able to write instead of a silent skip.
             reason = (
-                f"STAND DOWN — best {result['best_strike']:.2f}C "
-                f"@ {result['best_annualized']:.1f}% "
-                f"(< {result['floor_pct']:.0f}% RAY floor, "
+                f"STAND DOWN \u2014 best {result['best_strike']:.2f}C "
+                f"@ {result['best_annualized']:.1f}% ann "
+                f"(< {result['floor_pct']:.0f}% floor, "
                 f"DTE {result['dte']})"
             )
             return p, None, reason
 
         return p, result, None
 
-    defensive_results = await asyncio.gather(
-        *[_walk_defensive_target(p) for p in defensive_targets],
+    results = await asyncio.gather(
+        *[_walk_target(p) for p in cc_targets],
         return_exceptions=True,
     )
 
-    for item in defensive_results:
+    for item in results:
         if isinstance(item, Exception):
-            logger.warning("Defensive chain walk failed: %s", item)
+            logger.warning("CC chain walk failed: %s", item)
             continue
 
         p, result, skip_reason = item
@@ -8744,9 +8664,10 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                 "ticker": p["ticker"],
                 "reason": skip_reason,
                 "household": p["household"],
-                "mode": "DEFENSIVE",
+                "mode": p.get("mode", ""),
                 "spot": p["spot_price"],
                 "adjusted_basis": p.get("adjusted_basis", 0),
+                "initial_basis": p.get("initial_basis", 0),
             })
             continue
 
@@ -8760,9 +8681,10 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                     "ticker": p["ticker"],
                     "reason": f"All contracts reserved for Dynamic Exit ({carved}c)",
                     "household": p["household"],
-                    "mode": "DEFENSIVE",
+                    "mode": p.get("mode", ""),
                     "spot": p["spot_price"],
                     "adjusted_basis": p.get("adjusted_basis", 0),
+                    "initial_basis": p.get("initial_basis", 0),
                 })
                 continue
 
@@ -8775,7 +8697,6 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                 break
             acct_shares = acct_info["shares"]
 
-            # Per-account encumbrance: filled + working + staged
             acct_filled = sum(
                 sc["contracts"]
                 for sc in p.get("existing_short_calls", [])
@@ -8803,119 +8724,36 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                 "quantity": acct_contracts,
                 "limit_price": result["bid"],
                 "annualized_yield": result["annualized"],
-                "mode": "MODE_1_DEFENSIVE",
-                "status": "staged",
-            }
-            staged_defensive.append({**ticket, **result})
-
-    # ── Harvest (Mode 2 / Fully Amortized) — parallel chain walks ──
-    async def _walk_harvest_target(p):
-        """Walk chain for one harvest target. Returns (p, result, skip_reason)."""
-        ticker = p["ticker"]
-        spot = p["spot_price"]
-        initial_basis = p["initial_basis"]
-
-        if spot <= 0:
-            return p, None, "No spot price"
-
-        result = await _walk_chain_limited(
-            _walk_harvest_chain, ticker, spot, initial_basis, HARVEST_TARGET_DTE
-        )
-        if result is None:
-            return p, None, "No viable strike (harvest)"
-
-        return p, result, None
-
-    harvest_results = await asyncio.gather(
-        *[_walk_harvest_target(p) for p in harvest_targets],
-        return_exceptions=True,
-    )
-
-    for item in harvest_results:
-        if isinstance(item, Exception):
-            logger.warning("Harvest chain walk failed: %s", item)
-            continue
-
-        p, result, skip_reason = item
-
-        if skip_reason:
-            skipped.append({
-                "ticker": p["ticker"],
-                "reason": skip_reason,
-                "household": p["household"],
-                "mode": "HARVEST",
-                "spot": p["spot_price"],
-                "adjusted_basis": p.get("adjusted_basis", 0),
-            })
-            continue
-
-        remaining_available = p["available_contracts"]
-        ticker = p["ticker"]
-        working_pa = p.get("working_per_account", {})
-        staged_pa = p.get("staged_per_account", {})
-
-        for acct_id, acct_info in p["accounts_with_shares"].items():
-            if remaining_available < 1:
-                break
-            acct_shares = acct_info["shares"]
-
-            # Per-account encumbrance: filled + working + staged
-            acct_filled = sum(
-                sc["contracts"]
-                for sc in p.get("existing_short_calls", [])
-                if sc.get("account") == acct_id
-            )
-            acct_working = working_pa.get(f"{acct_id}|{ticker}", 0)
-            acct_staged = staged_pa.get(f"{acct_id}|{ticker}", 0)
-            acct_encumbered = acct_filled + acct_working + acct_staged
-
-            uncovered_shares = max(0, acct_shares - (acct_encumbered * 100))
-            acct_contracts = min(uncovered_shares // 100, remaining_available)
-            if acct_contracts < 1:
-                continue
-            remaining_available -= acct_contracts
-
-            ticket = {
-                "account_id": acct_id,
-                "household": p["household"],
-                "ticker": ticker,
-                "action": "SELL",
-                "sec_type": "OPT",
-                "right": "C",
-                "strike": result["strike"],
-                "expiry": result["expiry"],
-                "quantity": acct_contracts,
-                "limit_price": result["bid"],
-                "annualized_yield": result["annualized"],
+                # All unified-walker tickets log as MODE_2_HARVEST for DB
+                # compatibility (roll_watchlist / cc_cycle_log readers).
+                # Branch ("BASIS_ANCHOR" vs "BASIS_STEP_UP") rides in the
+                # merged result dict for the digest.
                 "mode": "MODE_2_HARVEST",
                 "status": "staged",
             }
-            staged_harvest.append({**ticket, **result})
+            staged.append({**ticket, **result})
 
     # Write all staged tickets to SQLite
-    all_staged = staged_defensive + staged_harvest
-    if all_staged:
+    if staged:
         try:
             with closing(_get_db_connection()) as conn:
                 with tx_immediate(conn):
                     conn.execute(
                         "UPDATE pending_orders SET status = 'superseded' WHERE status = 'staged'"
                     )
-            await asyncio.to_thread(append_pending_tickets, all_staged)
+            await asyncio.to_thread(append_pending_tickets, staged)
 
-            # Log BOTH staged and skipped to cycle log
             cycle_log_entries = []
-            for s in all_staged:
+            for s in staged:
                 entry = dict(s)
-                if s.get("low_yield"):
-                    entry["flag"] = "LOW_YIELD"
-                else:
-                    entry["flag"] = "NORMAL" if s.get("mode") == "MODE_1_DEFENSIVE" else "HARVEST_OK"
+                entry["flag"] = "HARVEST_OK"
                 cycle_log_entries.append(entry)
 
             for sk in skipped:
                 reason = sk.get("reason", "")
-                if "no viable strike" in reason.lower():
+                if "stand down" in reason.lower():
+                    flag = "STAND_DOWN"
+                elif "no viable strike" in reason.lower():
                     flag = "NO_VIABLE_STRIKE"
                 elif "no spot" in reason.lower():
                     flag = "SKIPPED"
@@ -8924,7 +8762,7 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                 skip_entry = {
                     "ticker": sk["ticker"],
                     "household": sk.get("household", ""),
-                    "mode": sk.get("mode", "DEFENSIVE"),
+                    "mode": sk.get("mode", "") or "MODE_2_HARVEST",
                     "flag": flag,
                     "spot_price": sk.get("spot", 0),
                     "adjusted_basis": sk.get("adjusted_basis", 0),
@@ -8938,11 +8776,18 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
     # Build output message
     lines = []
 
-    if staged_defensive:
-        lines.append("\u2501\u2501 Defensive CCs (Mode 1) \u2501\u2501")
+    if staged:
+        lines.append("\u2501\u2501 Covered Calls \u2501\u2501")
         lines.append("")
-        for s in staged_defensive:
+        for s in staged:
             label = ACCOUNT_LABELS.get(s["account_id"], s["account_id"])
+            pnl_label = (
+                f"+${s['walk_away_pnl']:.2f}"
+                if s.get("walk_away_pnl", 0) >= 0
+                else f"-${abs(s['walk_away_pnl']):.2f}"
+            )
+            branch = s.get("branch", "BASIS_ANCHOR")
+            branch_tag = "anchor" if branch == "BASIS_ANCHOR" else "step-up"
             lines.append(
                 f"{s['ticker']} | SELL -{s['quantity']}c "
                 f"${s['strike']:.0f}C {s['expiry']} @ ${s['bid']:.2f}"
@@ -8950,25 +8795,7 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
             lines.append(
                 f"  {s['annualized']:.1f}% ann \u00b7 "
                 f"{s['otm_pct']:.1f}% OTM \u00b7 {s['dte']}d \u00b7 "
-                f"{label}"
-            )
-            if s.get("low_yield"):
-                lines.append("  \u26a0\ufe0f LOW-YIELD \u2014 consider extended DTE")
-            lines.append("")
-
-    if staged_harvest:
-        lines.append("\u2501\u2501 Harvest CCs (Mode 2) \u2501\u2501")
-        lines.append("")
-        for s in staged_harvest:
-            label = ACCOUNT_LABELS.get(s["account_id"], s["account_id"])
-            pnl_label = f"+${s['walk_away_pnl']:.2f}" if s.get("walk_away_pnl", 0) >= 0 else f"-${abs(s['walk_away_pnl']):.2f}"
-            lines.append(
-                f"{s['ticker']} | SELL -{s['quantity']}c "
-                f"${s['strike']:.0f}C {s['expiry']} @ ${s['bid']:.2f}"
-            )
-            lines.append(
-                f"  {s['annualized']:.1f}% ann \u00b7 "
-                f"{s['otm_pct']:.1f}% OTM \u00b7 {s['dte']}d \u00b7 "
+                f"{branch_tag} \u00b7 "
                 f"walk-away {pnl_label}/sh \u00b7 {label}"
             )
             lines.append("")
@@ -8976,7 +8803,9 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
     if dynamic_exit_staged:
         staged_count = sum(1 for r in dynamic_exit_staged if r["staged"])
         total_candidates = len(dynamic_exit_staged)
-        lines.append(f"\u2501\u2501 Dynamic Exits: {staged_count}/{total_candidates} STAGED \u2501\u2501")
+        lines.append(
+            f"\u2501\u2501 Dynamic Exits: {staged_count}/{total_candidates} STAGED \u2501\u2501"
+        )
         for r in dynamic_exit_staged:
             lines.append(f"  {r['summary']}")
         lines.append("")
@@ -8987,8 +8816,7 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
             lines.append(f"  {sk['ticker']}: {sk['reason']}")
         lines.append("")
 
-    total = len(staged_defensive) + len(staged_harvest)
-    lines.append(f"Defensive: {len(staged_defensive)} | Harvest: {len(staged_harvest)} | Total: {total}")
+    lines.append(f"Staged: {len(staged)}")
     lines.append("/approve to send \u00b7 /reject to clear")
 
     try:
@@ -9007,6 +8835,7 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
 
 # Backward compat alias
 _run_mode1_logic = _run_cc_logic
+
 
 
 
