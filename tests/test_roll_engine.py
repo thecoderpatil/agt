@@ -11,6 +11,9 @@ from datetime import date, timedelta
 
 import pytest
 
+# CI gate: Sprint A marker + explicit file list in .gitlab-ci.yml.
+pytestmark = pytest.mark.sprint_a
+
 from agt_equities.roll_engine import (
     AssignResult,
     AlertResult,
