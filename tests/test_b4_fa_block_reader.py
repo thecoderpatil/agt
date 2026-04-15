@@ -27,15 +27,6 @@ from unittest.mock import patch
 
 import pytest
 
-# B4 tests live-import telegram_bot for resolver + CSP retry coverage, which
-# pulls heavy deps (anthropic, telegram, ib_async) intentionally not in
-# requirements-ci.txt. importorskip mirrors test_b2 / test_inception_delta_fill:
-# collected in CI but skipped when heavy deps absent; local smoke (uv py312)
-# is canonical signal per feedback_run_tests_via_gitlab_ci.
-pytest.importorskip("anthropic")
-pytest.importorskip("telegram")
-pytest.importorskip("ib_async")
-
 pytestmark = pytest.mark.sprint_a
 
 

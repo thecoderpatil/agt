@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.sprint_a
+
 
 @pytest.fixture()
 def bot_module():

@@ -45,6 +45,12 @@ variables:
   PYTHONDONTWRITEBYTECODE: "1"
   PYTHONUNBUFFERED: "1"
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  # telegram_bot.py reads these at import time. Fakes are sufficient for
+  # test collection + live-import — no network calls occur in sprint_a tests.
+  TELEGRAM_BOT_TOKEN: "ci_fake_bot_token_not_used"
+  TELEGRAM_USER_ID: "0"
+  ANTHROPIC_API_KEY: "ci_fake_anthropic_key_not_used"
+  FINNHUB_API_KEY: "ci_fake_finnhub_key_not_used"
 
 .python_setup: &python_setup
   image: python:3.12-slim
