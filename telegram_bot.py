@@ -29,7 +29,7 @@ import time
 from collections import defaultdict
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
-from datetime import date as _date, datetime as _datetime, time as _time, timedelta as _timedelta, timezone as _timezone
+from datetime import date, date as _date, datetime as _datetime, time as _time, timedelta as _timedelta, timezone as _timezone
 from zoneinfo import ZoneInfo as _ZoneInfo
 from pathlib import Path
 
