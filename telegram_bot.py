@@ -113,11 +113,6 @@ def _get_cooldown_seconds() -> int:
 # Sprint 1D: cooldown active tracking (audit_id → asyncio.Task)
 _cooldown_tasks: dict[str, "asyncio.Task"] = {}
 
-# Sprint 1D: STAGED alert coalescing buffer
-_staged_alert_buffer: list[dict] = []
-_staged_alert_last_flush: float = 0.0
-STAGED_COALESCE_WINDOW = 60  # seconds
-
 MAX_HISTORY          = 50
 MAX_ROUNDS           = 15
 MAX_TOKENS_PER_REPLY = 8192
@@ -254,6 +249,15 @@ from agt_equities.db import (
     tx_immediate,
     init_pragmas,
 )
+
+# Decoupling Sprint A Unit A5e — atomic cutover flag. When
+# USE_SCHEDULER_DAEMON=1, the standalone agt_scheduler daemon owns the
+# jobs gated below (heartbeat_writer and orphan_sweep already scheduler-
+# only; attested_sweeper and el_snapshot_writer have scheduler-side
+# counterparts via A5a / A5d.d). Default remains off for the 4-week
+# cutover window per DT Q1a-g. cross_daemon_alerts_drain is bot-owned
+# under both flag states.
+from agt_scheduler import use_scheduler_daemon as _use_scheduler_daemon
 
 
 # ---------------------------------------------------------------------------
@@ -450,8 +454,9 @@ def _log_cc_cycle(entries: list[dict]) -> None:
         logger.warning("_log_cc_cycle failed: %s", exc)
 
 
-
-init_db()
+# A4 (Decoupling Sprint A): init_db() moved from module scope into main()
+# so importing telegram_bot does not touch the on-disk DB. Daemon callers
+# unaffected — main() invokes init_db() before any handler runs.
 
 # Sprint 1C: loud paper mode startup log
 if PAPER_MODE:
@@ -8881,310 +8886,31 @@ async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
 _scheduled_mode1 = _scheduled_cc
 
 
-# ---------------------------------------------------------------------------
-
-def _build_position_for_evaluator(
-    pos,  # ib_async.Position
-    ledger_snapshot: dict | None,
-    exp_date: date,
-) -> "Position":
-    """Construct a roll_engine.Position from IBKR position + ledger snapshot.
-
-    Velocity-ratio-sensitive fields (opened_at, initial_credit, initial_dte)
-    are best-effort from avgCost. When unavailable, evaluator degrades
-    gracefully: velocity-ratio harvest gate returns 0.0 and is bypassed;
-    extrinsic-value + gamma-cutoff paths still route correctly.
-    """
-    ticker = pos.contract.symbol.upper()
-    acct_id = pos.account
-    household = ACCOUNT_TO_HOUSEHOLD.get(acct_id, "")
-    strike = float(pos.contract.strike)
-    qty = abs(int(pos.position))
-
-    assigned_basis = None
-    adjusted_basis = None
-    if ledger_snapshot:
-        raw_initial = ledger_snapshot.get("initial_basis")
-        raw_adjusted = ledger_snapshot.get("adjusted_basis")
-        if raw_initial is not None:
-            assigned_basis = float(raw_initial)
-        if raw_adjusted is not None:
-            adjusted_basis = float(raw_adjusted)
-
-    # Initial credit: avgCost / 100 (matches existing inline heuristic at
-    # legacy line 9024). When unavailable, velocity-ratio gate returns 0.
-    initial_credit = abs(float(getattr(pos, "avgCost", 0.0) or 0.0)) / 100.0
-
-    # opened_at / initial_dte: not tracked at fill-log granularity today.
-    # Use today as opened_at and current dte as initial_dte — makes V_r ~0
-    # (t_pct ~0) which falls through to extrinsic-based routing. This is
-    # the intended graceful degradation per WHEEL-3 research brief.
-    today = date.today()
-    initial_dte = max(0, (exp_date - today).days)
-
-    return Position(
-        ticker=ticker,
-        account_id=acct_id,
-        household=household,
-        strike=strike,
-        expiry=exp_date,
-        quantity=qty,
-        cost_basis=assigned_basis,
-        inception_delta=None,  # vestigial in WHEEL-3 evaluator
-        opened_at=today,
-        avg_premium_collected=initial_credit,
-        assigned_basis=assigned_basis,
-        adjusted_basis=adjusted_basis,
-        initial_credit=initial_credit,
-        initial_dte=initial_dte,
-    )
-
-
-async def _build_market_snapshot_for_evaluator(
-    ib_conn,
-    ticker: str,
-    spot: float,
-    current_call_quote: "OptionQuote",
-    exp_date: date,
-    strike: float,
-    adjusted_basis: float | None,
-) -> "MarketSnapshot":
-    """Pre-fetch the option chain window needed for cascade evaluation.
-
-    Fetches expirations in [today+7, today+45] DTE band, strikes from
-    current_strike down one step to current_strike + 2 steps up (covers
-    all 4 cascade tiers: +0, +1, +1, +2). Returns a tuple of OptionQuote.
-
-    On fetch failure: returns MarketSnapshot with empty chain — evaluator
-    emits AlertResult(CRITICAL) from cascade exhaustion.
-    """
-    today = date.today()
-    chain_quotes: list[OptionQuote] = []
-
-    try:
-        raw_expirations = await _ibkr_get_expirations(ticker)
-    except Exception as exc:
-        logger.warning("WHEEL-4: expirations fetch failed for %s: %s", ticker, exc)
-        raw_expirations = []
-
-    target_expirations: list[tuple[str, date, int]] = []
-    for exp_str in raw_expirations or []:
-        try:
-            d = date.fromisoformat(exp_str)
-        except (TypeError, ValueError):
-            continue
-        dte = (d - today).days
-        if 7 <= dte <= 45:
-            target_expirations.append((exp_str, d, dte))
-
-    # Strike window: from current_strike (tier4) to ~3 strikes above
-    # (more than enough for tier1/2/3 +1/+1/+2 steps).
-    strike_floor = strike
-    strike_ceiling_candidates = [strike * 1.25, spot * 1.25]
-    if adjusted_basis is not None:
-        strike_ceiling_candidates.append(adjusted_basis * 1.30)
-    strike_ceiling = max(strike_ceiling_candidates)
-
-    for exp_str, exp_d, _dte in target_expirations:
-        try:
-            chain_data = await _ibkr_get_chain(
-                ticker, exp_str, right="C",
-                min_strike=strike_floor, max_strike=strike_ceiling,
-            )
-        except Exception as exc:
-            logger.warning("WHEEL-4: chain fetch failed for %s %s: %s", ticker, exp_str, exc)
-            continue
-
-        for row in chain_data or []:
-            try:
-                q_strike = float(row.get("strike"))
-                q_bid = row.get("bid")
-                q_ask = row.get("ask")
-                q_delta = row.get("delta")
-            except (TypeError, ValueError):
-                continue
-            if q_bid is None or pd.isna(q_bid):
-                continue
-            if q_ask is None or pd.isna(q_ask):
-                continue
-            if q_delta is None or pd.isna(q_delta):
-                q_delta_val = 0.0
-            else:
-                q_delta_val = float(q_delta)
-            chain_quotes.append(OptionQuote(
-                strike=q_strike,
-                expiry=exp_d,
-                bid=float(q_bid),
-                ask=float(q_ask),
-                delta=q_delta_val,
-                iv=float(row.get("impliedVol") or 0.0),
-            ))
-
-    return MarketSnapshot(
-        ticker=ticker,
-        spot=float(spot),
-        iv30=float(current_call_quote.iv or 0.0),
-        chain=tuple(chain_quotes),
-        current_call=current_call_quote,
-        asof=today,
-    )
-
-
-def _build_portfolio_context_for_evaluator(household: str) -> "PortfolioContext":
-    """Build PortfolioContext from current desk mode + leverage snapshot.
-
-    Leverage is informational for the evaluator (defense regime runs
-    regardless of household mode). Fallback to 0.0 on any read failure
-    rather than block the scan.
-    """
-    try:
-        current_mode = _get_current_desk_mode()
-    except Exception as exc:
-        logger.warning("WHEEL-4: mode lookup failed (%s) — assuming PEACETIME", exc)
-        current_mode = "PEACETIME"
-
-    # Leverage: pulled from el_snapshots if available; otherwise 0.0.
-    leverage = 0.0
-    try:
-        with closing(_get_db_connection()) as conn:
-            row = conn.execute(
-                """SELECT leverage FROM el_snapshots
-                   WHERE household_id = ?
-                   ORDER BY snapshot_date DESC, snapshot_time DESC LIMIT 1""",
-                (household,),
-            ).fetchone()
-            if row and row[0] is not None:
-                leverage = float(row[0])
-    except Exception as exc:
-        logger.debug("WHEEL-4: leverage lookup failed for %s: %s", household, exc)
-
-    return PortfolioContext(
-        household=household or "UNKNOWN",
-        mode=current_mode,
-        leverage=leverage,
-    )
-
-
-def _dispatch_eval_result(
-    result,  # EvalResult
-    pos,  # ib_async.Position
-    current_call_contract,  # qualified Contract for the current short
-    qty: int,
-    strike: float,
-    exp_fmt: str,
-    acct_id: str,
-    ticker: str,
-) -> tuple[str | None, list[dict]]:
-    """Translate an EvalResult into (alert_line, tickets_to_stage).
-
-    Tickets returned here are NOT yet appended — caller is responsible for
-    `append_pending_tickets` so it can batch + error-handle per ticker.
-    """
-    # HOLD — no-op, no alert (reduces noise on a normal scan)
-    if isinstance(result, HoldResult):
-        return None, []
-
-    # HARVEST — BTC at ask
-    if isinstance(result, HarvestResult):
-        ticket = {
-            "timestamp": _datetime.now().isoformat(),
-            "account_id": acct_id,
-            "account_label": ACCOUNT_LABELS.get(acct_id, acct_id),
-            "ticker": ticker,
-            "sec_type": "OPT",
-            "action": "BUY",
-            "order_type": "LMT",
-            "right": "C",
-            "strike": strike,
-            "expiry": exp_fmt,
-            "quantity": qty,
-            "limit_price": round(result.btc_limit, 2),
-            "status": "staged",
-            "transmit": True,
-            "strategy": "WHEEL-4 Harvest BTC",
-            "mode": "HARVEST",
-            "origin": "roll_engine",
-            "v2_state": "HARVEST",
-            "v2_rationale": result.reason,
-        }
-        return f"[HARVEST] {ticker} {result.reason}", [ticket]
-
-    # ROLL — 2-leg BAG
-    if isinstance(result, RollResult):
-        # Caller qualifies the new sell contract (needs ib_conn) — we return
-        # the ticket skeleton and let the scan finalize it. See scan body.
-        ticket = {
-            "timestamp": _datetime.now().isoformat(),
-            "account_id": acct_id,
-            "account_label": ACCOUNT_LABELS.get(acct_id, acct_id),
-            "ticker": ticker,
-            "sec_type": "BAG",
-            "action": "BUY",
-            "quantity": qty,
-            "order_type": "LMT",
-            # net_credit is received → limit price is NEGATIVE of credit,
-            # i.e., we "buy" the spread for a debit of -credit. A positive
-            # credit_per_contract means we pay -credit (i.e., receive).
-            "limit_price": round(-result.net_credit_per_contract, 2),
-            "status": "staged",
-            "transmit": True,
-            "strategy": f"WHEEL-4 Cascade Roll T{result.cascade_tier}",
-            "mode": "DEFEND",
-            "origin": "roll_engine",
-            "v2_state": "DEFEND",
-            "v2_rationale": result.reason,
-            "strike": result.new_strike,
-            "expiry": result.new_expiry.strftime("%Y%m%d") if result.new_expiry else None,
-            "right": "C",
-            # combo_legs filled in by caller (needs ib_conn.qualifyContractsAsync)
-            "_roll_result": result,  # marker for caller
-        }
-        return f"[DEFEND T{result.cascade_tier}] {ticker} → {result.new_strike} @ {result.new_expiry} credit={result.net_credit_per_contract:.2f}", [ticket]
-
-    # ASSIGN — alert only
-    if isinstance(result, AssignResult):
-        return f"[ASSIGN] {ticker} {result.reason}", []
-
-    # LIQUIDATE — alert only, requires_human_approval. No auto-stage.
-    if isinstance(result, LiquidateResult):
-        return (
-            f"[LIQUIDATE REQUESTED] {ticker} × {result.contracts}c / {result.shares}sh  "
-            f"BTC@{result.btc_limit:.2f} STC@spot≈{result.stc_market_ref:.2f}  "
-            f"net={result.net_proceeds_per_share:.2f}/sh  — MANUAL APPROVAL REQUIRED  "
-            f"({result.reason})"
-        ), []
-
-    # ALERT — severity → prefix
-    if isinstance(result, AlertResult):
-        prefix = "[CRITICAL]" if result.severity == "CRITICAL" else "[WARN]"
-        return f"{prefix} {ticker} {result.reason}", []
-
-    logger.error("WHEEL-4: unknown EvalResult variant: %r", result)
-    return f"[CRITICAL] {ticker} unknown evaluator result variant", []
-
-
-# ---------------------------------------------------------------------------
-# WHEEL-4 replacement for _scan_and_stage_defensive_rolls
-# ---------------------------------------------------------------------------
-
 async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
     """
-    V2 master router for open short calls — WHEEL-4 cutover.
+    V2 master router for open short calls.
+    Routes each live short call through States 1-3 in lexicographical order.
+    Returns a list of alert strings for Telegram.
 
-    Builds Position/MarketSnapshot/PortfolioContext from live IBKR data and
-    dispatches each open short call through `roll_engine.evaluate()`.
-    The inline State 1/2/3 logic that lived here through 2026-04-15 has
-    been replaced by a single evaluator call.
-
-    ADR-005: WARTIME-allowed via the v2_router site in _pre_trade_gates.
-    Mode is logged here for operator visibility but NOT gated at staging —
-    execution gate enforces it.
+    ADR-005: V2 is WARTIME-allowed via the v2_router site in
+    _pre_trade_gates. Mode is logged here for operator visibility but
+    is NOT gated at staging — execution gate enforces it.
     """
     if _HALTED:
         logger.info("V2 router: skipped (desk halted)")
         return ["[V2 ROUTER] Skipped — desk halted via /halt."]
 
-    alerts: list[str] = []
+    from datetime import date
+    import math
+
+    try:
+        current_mode = _get_current_desk_mode()
+    except Exception as mode_exc:
+        logger.warning("V2 router: mode lookup failed (%s) — assuming PEACETIME", mode_exc)
+        current_mode = "PEACETIME"
+
+    alerts: list[str] = [f"━━ V2 Router [mode={current_mode}] ━━"]
+    logger.info("V2 router: scan starting in mode=%s", current_mode)
     try:
         positions = await ib_conn.reqPositionsAsync()
         short_calls = [
@@ -9198,168 +8924,279 @@ async def _scan_and_stage_defensive_rolls(ib_conn) -> list[str]:
         if not short_calls:
             return []
 
-        # Build one PortfolioContext per household; cache across positions.
-        ctx_cache: dict[str, PortfolioContext] = {}
-        ledger_cache: dict[tuple[str, str], dict | None] = {}  # (acct, ticker) per ADR-006
-
-        ib_conn.reqMarketDataType(4)  # delayed-frozen, set once
-        first_household = ACCOUNT_TO_HOUSEHOLD.get(short_calls[0].account, "") if short_calls else ""
-        header_ctx = ctx_cache.setdefault(
-            first_household, _build_portfolio_context_for_evaluator(first_household),
-        )
-        alerts.append(f"━━ V2 Router [mode={header_ctx.mode}] ━━")
-        logger.info("V2 router (WHEEL-4): scan starting in mode=%s", header_ctx.mode)
+        ib_conn.reqMarketDataType(4)  # Set once for the connection
+        ledger_cache: dict[tuple[str, str], dict | None] = {}  # key: (account_id, ticker) per ADR-006
 
         for pos in short_calls:
             ticker = pos.contract.symbol.upper()
-            acct_id = pos.account
-            household = ACCOUNT_TO_HOUSEHOLD.get(acct_id, "")
             strike = float(pos.contract.strike)
             qty = abs(int(pos.position))
+            acct_id = pos.account
+            household = ACCOUNT_TO_HOUSEHOLD.get(acct_id, "")
 
-            # --- Resolve expiry -------------------------------------------------
+            # Calculate DTE
             exp_fmt = str(pos.contract.lastTradeDateOrContractMonth)
             try:
                 exp_date = date(int(exp_fmt[:4]), int(exp_fmt[4:6]), int(exp_fmt[6:8]))
+                dte = (exp_date - date.today()).days
             except (ValueError, TypeError):
                 continue
-            if exp_date < date.today():
+            if dte < 0:
                 continue
 
-            # --- Live spot -------------------------------------------------------
+            # Fetch Spot
             try:
                 spot = float(await _ibkr_get_spot(ticker))
             except Exception as exc:
-                logger.warning("WHEEL-4: spot fetch failed for %s: %s", ticker, exc)
+                logger.warning("Failed to fetch spot for %s roll evaluation: %s", ticker, exc)
                 continue
 
-            # --- Greeks + top-of-book for the currently-open short --------------
+            # Fetch Greeks and top-of-book for the live short call
             qual_contracts = await ib_conn.qualifyContractsAsync(pos.contract)
             if not qual_contracts:
                 continue
-            current_contract = qual_contracts[0]
-            ticker_data = ib_conn.reqMktData(current_contract, "106", False, False)
-            await asyncio.sleep(2)
+
+            ticker_data = ib_conn.reqMktData(qual_contracts[0], "106", False, False)
+            await asyncio.sleep(2)  # Linear wait acceptable for EOD watchdog (<10 positions)
+
             ask = getattr(ticker_data, "ask", getattr(ticker_data, "delayedAsk", None))
             bid = getattr(ticker_data, "bid", getattr(ticker_data, "delayedBid", None))
-            delta_val = None
-            iv_val = None
-            if getattr(ticker_data, "modelGreeks", None):
-                delta_val = ticker_data.modelGreeks.delta
-                iv_val = ticker_data.modelGreeks.impliedVol
-            elif getattr(ticker_data, "bidGreeks", None):
-                delta_val = ticker_data.bidGreeks.delta
-                iv_val = getattr(ticker_data.bidGreeks, "impliedVol", None)
-            ib_conn.cancelMktData(current_contract)
 
-            if (ask is None or bid is None or delta_val is None
-                    or math.isnan(ask) or math.isnan(bid) or math.isnan(delta_val)):
+            delta = None
+            if getattr(ticker_data, "modelGreeks", None):
+                delta = ticker_data.modelGreeks.delta
+            elif getattr(ticker_data, "bidGreeks", None):
+                delta = ticker_data.bidGreeks.delta
+
+            ib_conn.cancelMktData(qual_contracts[0])
+
+            if ask is None or bid is None or delta is None or math.isnan(ask) or math.isnan(bid) or math.isnan(delta):
                 continue
 
-            current_call_quote = OptionQuote(
-                strike=strike,
-                expiry=exp_date,
-                bid=float(bid),
-                ask=float(ask),
-                delta=float(delta_val),
-                iv=float(iv_val) if iv_val is not None and not math.isnan(iv_val) else 0.0,
-            )
+            ask = float(ask)
+            bid = float(bid)
+            delta = abs(float(delta))
+            intrinsic_value = max(0.0, spot - strike)
+            extrinsic_value = ask - intrinsic_value
+            spread = max(0.0, ask - bid)
 
-            # --- Ledger snapshot (per-account, ADR-006) -------------------------
+            # ADR-006: per-account key — household-aggregated basis is an
+            # Act 60 Chapter 2 compliance defect. The scan iterates positions
+            # per-account, so cache keys must be per-account too.
             ledger_key = (acct_id, ticker)
             if ledger_key not in ledger_cache:
                 ledger_cache[ledger_key] = (
                     await asyncio.to_thread(
-                        _load_premium_ledger_snapshot, household, ticker, acct_id,
+                        _load_premium_ledger_snapshot,
+                        household, ticker, acct_id,
                     )
                     if household else None
                 )
             ledger_snapshot = ledger_cache.get(ledger_key)
+            assigned_basis = None
+            adjusted_basis = None
+            if ledger_snapshot:
+                raw_initial = ledger_snapshot.get("initial_basis")
+                raw_adjusted = ledger_snapshot.get("adjusted_basis")
+                if raw_initial is not None:
+                    assigned_basis = float(raw_initial)
+                if raw_adjusted is not None:
+                    adjusted_basis = float(raw_adjusted)
 
-            adj_basis = None
-            if ledger_snapshot and ledger_snapshot.get("adjusted_basis") is not None:
-                adj_basis = float(ledger_snapshot["adjusted_basis"])
-
-            # --- Build evaluator inputs ----------------------------------------
-            eval_pos = _build_position_for_evaluator(pos, ledger_snapshot, exp_date)
-            market = await _build_market_snapshot_for_evaluator(
-                ib_conn, ticker, spot, current_call_quote, exp_date, strike, adj_basis,
-            )
-            ctx = ctx_cache.setdefault(
-                household, _build_portfolio_context_for_evaluator(household),
-            )
-
-            # --- Evaluate -------------------------------------------------------
-            try:
-                result = roll_engine.evaluate(eval_pos, market, ctx)
-            except Exception as eval_exc:
-                # Belt-and-suspenders: evaluate() already wraps try/except,
-                # but we're not taking chances with live capital.
-                logger.exception("WHEEL-4: evaluator raised unexpectedly for %s: %s", ticker, eval_exc)
-                alerts.append(f"[CRITICAL] {ticker} evaluator raised: {eval_exc!r}")
+            # STATE 1 — ASSIGN (Act 60 Velocity)
+            if assigned_basis is not None and spot >= assigned_basis and delta >= 0.85:
+                alerts.append(
+                    f"[ASSIGN] {ticker} Delta > 0.85. Letting shares get called away."
+                )
                 continue
 
-            alert_line, tickets = _dispatch_eval_result(
-                result, pos, current_contract, qty, strike, exp_fmt, acct_id, ticker,
-            )
+            # STATE 1 — ASSIGN (Microstructure Trap)
+            if intrinsic_value > 0 and (
+                extrinsic_value <= spread or extrinsic_value <= 0.05
+            ):
+                alerts.append(
+                    f"[ASSIGN] {ticker} Extrinsic exhausted. Parity breached. Defense standing down."
+                )
+                continue
 
-            # Finalize ROLL ticket combo_legs (needs ib_conn)
-            finalized_tickets: list[dict] = []
-            for tk in tickets:
-                if tk.get("sec_type") == "BAG" and "_roll_result" in tk:
-                    roll_res = tk.pop("_roll_result")
+            # STATE 2 — HARVEST (Capital Efficiency)
+            initial_credit = abs(float(getattr(pos, "avgCost", 0.0) or 0.0)) / 100.0
+            pnl_pct = (
+                (initial_credit - ask) / initial_credit
+                if initial_credit > 0
+                else 0.0
+            )
+            ray = (ask / strike) * (365 / dte) if strike > 0 and dte > 0 else float("inf")
+            if pnl_pct >= 0.85 or ray < 0.10:
+                ticket = {
+                    "timestamp": _datetime.now().isoformat(),
+                    "account_id": acct_id,
+                    "account_label": ACCOUNT_LABELS.get(acct_id, acct_id),
+                    "ticker": ticker,
+                    "sec_type": "OPT",
+                    "action": "BUY",
+                    "order_type": "LMT",
+                    "right": "C",
+                    "strike": strike,
+                    "expiry": exp_fmt,
+                    "quantity": qty,
+                    "limit_price": round(ask, 2),
+                    "status": "staged",
+                    "transmit": True,
+                    "strategy": "V2 Harvest BTC",
+                    "mode": "STATE_2_HARVEST",
+                    "origin": "v2_router",
+                    "v2_state": "HARVEST",
+                    "v2_rationale": (
+                        f"pnl_pct={pnl_pct:.3f} ray={ray:.3f} "
+                        f"initial_credit={initial_credit:.2f} ask={ask:.2f}"
+                    ),
+                }
+                try:
+                    await asyncio.to_thread(append_pending_tickets, [ticket])
+                    alerts.append(f"[HARVEST] {ticker} Capital dead. Staging BTC.")
+                except Exception as stage_exc:
+                    logger.warning("Failed to stage BTC for %s: %s", ticker, stage_exc)
+                continue
+
+            # STATE 3 — DEFEND (EV-Accretive Roll)
+            if adjusted_basis is not None and spot < adjusted_basis and delta >= 0.40:
+                best_roll = None
+                try:
+                    expirations = await _ibkr_get_expirations(ticker)
+                except Exception as chain_exc:
+                    logger.warning("Failed to fetch expirations for %s defense: %s", ticker, chain_exc)
+                    expirations = []
+
+                for tgt_exp in expirations:
+                    try:
+                        tgt_date = date.fromisoformat(tgt_exp)
+                    except ValueError:
+                        continue
+
+                    tgt_dte = (tgt_date - date.today()).days
+                    if tgt_dte <= dte or tgt_dte >= 90:
+                        continue
+
+                    try:
+                        chain_data = await _ibkr_get_chain(
+                            ticker,
+                            tgt_exp,
+                            right='C',
+                            min_strike=strike,
+                            max_strike=max(strike * 1.5, spot * 1.5, (adjusted_basis or strike) * 1.5),
+                        )
+                    except Exception as chain_exc:
+                        logger.warning(
+                            "Failed to fetch future chain for %s %s: %s",
+                            ticker, tgt_exp, chain_exc,
+                        )
+                        continue
+
+                    for c in chain_data or []:
+                        try:
+                            roll_strike = float(c.get("strike"))
+                        except (TypeError, ValueError):
+                            continue
+                        if roll_strike <= strike:
+                            continue
+
+                        raw_sell_bid = c.get("bid")
+                        if raw_sell_bid is None or pd.isna(raw_sell_bid):
+                            continue
+
+                        sell_bid = float(raw_sell_bid)
+                        debit_paid = round(ask - sell_bid, 2)
+                        if debit_paid <= 0:
+                            continue
+
+                        intrinsic_gained = roll_strike - strike
+                        ev_ratio = (intrinsic_gained - debit_paid) / debit_paid
+                        if ev_ratio < 2.0:
+                            continue
+
+                        candidate = {
+                            "sell_expiry": tgt_exp,
+                            "sell_expiry_ib": tgt_exp.replace("-", ""),
+                            "sell_strike": roll_strike,
+                            "sell_bid": sell_bid,
+                            "debit_paid": debit_paid,
+                            "intrinsic_gained": intrinsic_gained,
+                            "ev_ratio": ev_ratio,
+                            "dte": tgt_dte,
+                        }
+                        if best_roll is None or (
+                            candidate["ev_ratio"],
+                            candidate["sell_strike"],
+                            -candidate["dte"],
+                        ) > (
+                            best_roll["ev_ratio"],
+                            best_roll["sell_strike"],
+                            -best_roll["dte"],
+                        ):
+                            best_roll = candidate
+
+                if best_roll:
                     sell_contract = ib_async.Option(
                         symbol=ticker,
-                        lastTradeDateOrContractMonth=(
-                            roll_res.new_expiry.strftime("%Y%m%d")
-                            if roll_res.new_expiry else exp_fmt
-                        ),
-                        strike=roll_res.new_strike,
+                        lastTradeDateOrContractMonth=best_roll["sell_expiry_ib"],
+                        strike=best_roll["sell_strike"],
                         right="C",
                         exchange="SMART",
                     )
-                    try:
-                        qual_sell = await ib_conn.qualifyContractsAsync(sell_contract)
-                    except Exception as q_exc:
-                        logger.warning("WHEEL-4: sell-leg qualify failed for %s: %s", ticker, q_exc)
-                        alerts.append(f"[WARN] {ticker} roll qualify failed: {q_exc!r}")
-                        continue
-                    if not qual_sell:
-                        alerts.append(f"[WARN] {ticker} roll sell-leg did not qualify")
-                        continue
-                    tk["combo_legs"] = [
-                        {
-                            "conId": current_contract.conId or pos.contract.conId,
-                            "ratio": 1,
+                    qual_sell = await ib_conn.qualifyContractsAsync(sell_contract)
+                    if qual_sell:
+                        ticket = {
+                            "timestamp": _datetime.now().isoformat(),
+                            "account_id": acct_id,
+                            "account_label": ACCOUNT_LABELS.get(acct_id, acct_id),
+                            "ticker": ticker,
+                            "sec_type": "BAG",
                             "action": "BUY",
-                            "exchange": "SMART",
-                            "strike": strike,
-                            "expiry": exp_fmt,
-                        },
-                        {
-                            "conId": qual_sell[0].conId,
-                            "ratio": 1,
-                            "action": "SELL",
-                            "exchange": "SMART",
-                            "strike": roll_res.new_strike,
-                            "expiry": tk.get("expiry"),
-                        },
-                    ]
-                finalized_tickets.append(tk)
-
-            if finalized_tickets:
-                try:
-                    await asyncio.to_thread(append_pending_tickets, finalized_tickets)
-                except Exception as stage_exc:
-                    logger.warning("WHEEL-4: append_pending_tickets failed for %s: %s", ticker, stage_exc)
-                    alerts.append(f"[WARN] {ticker} ticket staging failed: {stage_exc!r}")
-
-            if alert_line:
-                alerts.append(alert_line)
+                            "quantity": qty,
+                            "order_type": "LMT",
+                            "limit_price": round(best_roll["debit_paid"], 2),
+                            "status": "staged",
+                            "transmit": True,
+                            "strategy": "V2 EV-Accretive Roll",
+                            "mode": "STATE_3_DEFEND",
+                            "origin": "v2_router",
+                            "v2_state": "DEFEND",
+                            "v2_rationale": (
+                                f"adjusted_basis={adjusted_basis:.2f} spot={spot:.2f} "
+                                f"delta={delta:.3f} ev_ratio={best_roll['ev_ratio']:.2f} "
+                                f"debit={best_roll['debit_paid']:.2f}"
+                            ),
+                            "strike": best_roll["sell_strike"],
+                            "expiry": best_roll["sell_expiry_ib"],
+                            "right": "C",
+                            "combo_legs": [
+                                {
+                                    "conId": qual_contracts[0].conId or pos.contract.conId,
+                                    "ratio": 1,
+                                    "action": "BUY",
+                                    "exchange": "SMART",
+                                    "strike": strike,
+                                    "expiry": exp_fmt,
+                                },
+                                {
+                                    "conId": qual_sell[0].conId,
+                                    "ratio": 1,
+                                    "action": "SELL",
+                                    "exchange": "SMART",
+                                    "strike": best_roll["sell_strike"],
+                                    "expiry": best_roll["sell_expiry_ib"],
+                                },
+                            ],
+                        }
+                        try:
+                            await asyncio.to_thread(append_pending_tickets, [ticket])
+                            alerts.append(f"[DEFEND] {ticker} EV-Accretive Roll staged.")
+                        except Exception as stage_exc:
+                            logger.warning("Failed to stage defensive roll for %s: %s", ticker, stage_exc)
 
     except Exception as exc:
-        logger.exception("WHEEL-4 scan failed: %s", exc)
-        alerts.append(f"[CRITICAL] V2 Router scan crashed: {exc!r}")
+        logger.warning("Defensive roll scan failed: %s", exc)
 
     return alerts
 
@@ -9987,42 +9824,6 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ---------------------------------------------------------------------------
-# Sprint 1D: STAGED alert coalescing flush job
-# ---------------------------------------------------------------------------
-
-async def _flush_staged_alerts_job(context) -> None:
-    """Flush buffered STAGED alerts as a single digest message."""
-    if _HALTED:
-        return
-    global _staged_alert_last_flush
-    now = time.time()
-    if not _staged_alert_buffer:
-        return
-    if now - _staged_alert_last_flush < STAGED_COALESCE_WINDOW:
-        return
-
-    lines = [f"\u26a0\ufe0f {len(_staged_alert_buffer)} STAGED"]
-    for row in _staged_alert_buffer:
-        tk = row.get("ticker", "?")
-        act = row.get("action_type", "?")
-        qty = row.get("contracts") or row.get("shares") or "?"
-        unit = "c" if act == "CC" else "sh"
-        strike = f"${row['strike']:.0f}C" if row.get("strike") else ""
-        limit_p = f"@ ${row['limit_price']:.2f}" if row.get("limit_price") else ""
-        hh = (row.get("household") or "").replace("_Household", "")
-        lines.append(f"\u00b7 {tk} Sell {qty}{unit} {strike} {limit_p} | {hh}")
-
-    text = "\n".join(lines)
-    try:
-        await context.bot.send_message(chat_id=AUTHORIZED_USER_ID, text=text)
-    except Exception as exc:
-        logger.warning("staged_alert_flush: send failed: %s", exc)
-
-    _staged_alert_buffer.clear()
-    _staged_alert_last_flush = now
-
-
 # Followup #17: orphan scan state sets for resolution policy (D3)
 _OPEN_FILLED_STATES = frozenset({"Filled"})
 _OPEN_DEAD_STATES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
@@ -10308,6 +10109,53 @@ async def _sweep_attested_ttl_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("attested_sweeper error: %s", exc)
 
 
+async def _drain_cross_daemon_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A5d: bot-side consumer for the cross_daemon_alerts bus.
+
+    Runs every 2s via jq.run_repeating. Drains pending alerts emitted by
+    agt_scheduler producers (A5c onward) and dispatches each by `kind` to
+    the operator's Telegram via context.bot.send_message. Marks each row
+    'sent' on successful delivery, 'failed' on delivery exception (the
+    alerts module retries on subsequent drain up to MAX_ATTEMPTS=3 then
+    transitions terminal 'failed' for operator triage).
+
+    Safe no-op when the table is empty. Safe under USE_SCHEDULER_DAEMON=0:
+    no producers are running on the scheduler side, so the bus stays empty.
+    """
+    if _HALTED:
+        return
+    try:
+        from agt_equities.alerts import (
+            drain_pending_alerts,
+            mark_alert_sent,
+            mark_alert_failed,
+            format_alert_text,
+        )
+    except Exception as exc:
+        logger.error("alerts module import failed: %s", exc)
+        return
+    try:
+        alerts = drain_pending_alerts(limit=20)
+    except Exception as exc:
+        logger.error("drain_pending_alerts failed: %s", exc)
+        return
+    for a in alerts:
+        aid = a.get("id")
+        try:
+            text = format_alert_text(a)
+            await context.bot.send_message(chat_id=AUTHORIZED_USER_ID, text=text)
+            try:
+                mark_alert_sent(aid)
+            except Exception as exc:
+                logger.error("mark_alert_sent(%s) failed: %s", aid, exc)
+        except Exception as exc:
+            logger.error("cross_daemon_alerts dispatch %s failed: %s", aid, exc)
+            try:
+                mark_alert_failed(aid, str(exc))
+            except Exception as exc2:
+                logger.error("mark_alert_failed(%s) failed: %s", aid, exc2)
+
+
 async def _poll_attested_rows(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Poll for ATTESTED rows and push TRANSMIT/CANCEL keyboards to operator.
 
@@ -10487,6 +10335,7 @@ async def _el_snapshot_writer_job(
 
 
 def main() -> None:
+    init_db()  # A4: lazy DB init at daemon boot, not import
     logger.info(
         "Starting AGT Equities Bridge — Hybrid Architecture "
         "(default: Haiku 4.5 | /think: Sonnet 4.6 | /deep: Opus 4.6 | "
@@ -10574,27 +10423,42 @@ def main() -> None:
             name="attested_poller",
         )
         logger.info("Scheduled: attested_poller every 10s")
+        if not _use_scheduler_daemon():
+            # A5e: scheduler daemon owns this when USE_SCHEDULER_DAEMON=1.
+            jq.run_repeating(
+                callback=_sweep_attested_ttl_job,
+                interval=60,
+                first=30,
+                name="attested_sweeper",
+            )
+            logger.info("Scheduled: attested_sweeper every 60s")
+        else:
+            logger.info(
+                "Skipped attested_sweeper registration: USE_SCHEDULER_DAEMON=1 "
+                "(owned by agt_scheduler daemon)"
+            )
+        if not _use_scheduler_daemon():
+            # A5e: scheduler daemon owns this when USE_SCHEDULER_DAEMON=1
+            # (A5d.d ported el_snapshot_writer + APEX_SURVIVAL bus alert).
+            jq.run_repeating(
+                callback=_el_snapshot_writer_job,
+                interval=30,
+                first=15,
+                name="el_snapshot_writer",
+            )
+            logger.info("Scheduled: el_snapshot_writer every 30s")
+        else:
+            logger.info(
+                "Skipped el_snapshot_writer registration: USE_SCHEDULER_DAEMON=1 "
+                "(owned by agt_scheduler daemon)"
+            )
         jq.run_repeating(
-            callback=_sweep_attested_ttl_job,
-            interval=60,
-            first=30,
-            name="attested_sweeper",
+            callback=_drain_cross_daemon_alerts_job,
+            interval=2,
+            first=5,
+            name="cross_daemon_alerts_drain",
         )
-        logger.info("Scheduled: attested_sweeper every 60s")
-        jq.run_repeating(
-            callback=_el_snapshot_writer_job,
-            interval=30,
-            first=15,
-            name="el_snapshot_writer",
-        )
-        logger.info("Scheduled: el_snapshot_writer every 30s")
-        jq.run_repeating(
-            callback=_flush_staged_alerts_job,
-            interval=15,
-            first=20,
-            name="staged_alert_flush",
-        )
-        logger.info("Scheduled: staged_alert_flush every 15s")
+        logger.info("Scheduled: cross_daemon_alerts_drain every 2s")
 
         # Sprint 1F Fix 2: daily beta cache refresh (04:00 local, pre-market)
         async def _beta_cache_refresh_job(context):
