@@ -11222,4 +11222,11 @@ def main() -> None:
 
     # Sprint 1C+1D outbound formatting now handled by AGTFormattedBot subclass
     # (replaces monkey-patch that broke on PTB 22.7 TelegramObject._frozen lockdown).
-    # Followup #14 still open:
+    # Followup #14 still open: ~53 reply_text sites bypass _format_outbound.
+    logger.info("Outbound formatting via AGTFormattedBot (paper=%s, mode prefix=active)", PAPER_MODE)
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
