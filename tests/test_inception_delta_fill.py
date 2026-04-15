@@ -21,6 +21,8 @@ from unittest.mock import patch
 import pytest
 import sys
 
+pytestmark = pytest.mark.sprint_a
+
 # A4 (Decoupling Sprint A): tripwire exemption removed.
 # init_db() is no longer called at telegram_bot import time.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
