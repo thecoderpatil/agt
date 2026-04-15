@@ -7,3 +7,4 @@ hypothesis>=6.150,<7
 apscheduler==3.11.2
 pytz==2026.1.post1
 ib_async==2.1.0
+python-dotenv==1.0.1
