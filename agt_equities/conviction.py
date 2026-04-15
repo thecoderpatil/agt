@@ -18,6 +18,8 @@ from contextlib import closing
 from datetime import datetime as _datetime, timezone as _timezone
 from zoneinfo import ZoneInfo
 
+import yfinance as yf
+
 from agt_equities.db import get_db_connection, tx_immediate
 
 logger = logging.getLogger("agt_bridge.conviction")
@@ -57,8 +59,6 @@ def compute_conviction_tier(ticker: str) -> dict:
     Returns ``{"tier": str, "modifier": float, "inputs": {...}}``.
     """
     try:
-        import yfinance as yf
-
         yf_tkr = yf.Ticker(ticker)
         info = yf_tkr.info or {}
 
