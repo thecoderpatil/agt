@@ -267,12 +267,147 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("attested_sweeper")
 
-    # Unit A5b/c will append the remaining production jobs:
-    #   cc_daily, watchdog_daily, universe_monthly, conviction_weekly,
-    #   flex_sync_eod, attested_poller (10s), el_snapshot_writer (30s),
-    #   staged_alert_flush (15s), beta_cache_refresh (daily 04:00),
-    #   beta_startup, corporate_intel_refresh (daily 05:00),
-    #   corporate_intel_startup.
+    # ------------------------------------------------------------------
+    # A5d.d: EL snapshot writer — polls IB accountSummaryAsync every 30s,
+    # writes one row per active account to el_snapshots, and emits an
+    # APEX_SURVIVAL alert onto cross_daemon_alerts when
+    # excess_liquidity / NLV <= 0.08 on a margin-eligible account
+    # (15-min per-account debounce; 30s per-account write debounce).
+    #
+    # Dormant under USE_SCHEDULER_DAEMON=0 (daemon not running); bot-side
+    # telegram_bot._el_snapshot_writer_job continues to own this surface
+    # until the A5e atomic cutover flips the flag.
+    # ------------------------------------------------------------------
+    _el_last_write: dict[str, float] = {}
+    _apex_last_alert: dict[str, float] = {}
+    _EL_WRITE_DEBOUNCE_SECONDS = 30.0
+    _APEX_ALERT_DEBOUNCE_SECONDS = 900.0  # 15 min; matches bot behavior
+    _APEX_EL_THRESHOLD = 0.08
+
+    async def _el_snapshot_writer_job() -> None:
+        """Poll accountSummary, write el_snapshots, emit APEX alerts onto bus.
+
+        All failure modes (IB down, accountSummaryAsync exception, DB write
+        error, alert enqueue error) are swallowed + logged — the job must
+        not crash the scheduler event loop.
+        """
+        import time
+        from contextlib import closing
+        try:
+            from agt_equities.config import (
+                ACTIVE_ACCOUNTS,
+                MARGIN_ACCOUNTS,
+                ACCOUNT_TO_HOUSEHOLD,
+            )
+        except Exception as exc:
+            logger.error("el_snapshot_writer: config import failed: %s", exc)
+            return
+        try:
+            ib = await ib_connector.ensure_connected()
+        except Exception as exc:
+            logger.debug("el_snapshot_writer: IB not available: %s", exc)
+            return
+        try:
+            summary = await ib.accountSummaryAsync()
+        except Exception as exc:
+            logger.debug(
+                "el_snapshot_writer: accountSummaryAsync failed: %s", exc,
+            )
+            return
+        if not summary:
+            return
+
+        now = time.time()
+        _WANTED = {"NetLiquidation", "ExcessLiquidity", "BuyingPower"}
+        acct_data: dict[str, dict[str, float]] = {}
+        for item in summary:
+            if item.account not in ACTIVE_ACCOUNTS:
+                continue
+            if item.tag not in _WANTED:
+                continue
+            acct_data.setdefault(item.account, {})
+            try:
+                acct_data[item.account][item.tag] = float(item.value)
+            except (TypeError, ValueError):
+                continue
+
+        for acct_id, data in acct_data.items():
+            nlv = float(data.get("NetLiquidation") or 0.0)
+            if nlv <= 0:
+                continue
+            excess_liquidity = float(data.get("ExcessLiquidity") or 0.0)
+            hh = ACCOUNT_TO_HOUSEHOLD.get(acct_id, "Unknown")
+
+            if acct_id in MARGIN_ACCOUNTS:
+                el_pct = excess_liquidity / nlv if nlv else 0.0
+                if el_pct <= _APEX_EL_THRESHOLD:
+                    if now - _apex_last_alert.get(acct_id, 0.0) > _APEX_ALERT_DEBOUNCE_SECONDS:
+                        try:
+                            from agt_equities.alerts import enqueue_alert
+                            enqueue_alert(
+                                "APEX_SURVIVAL",
+                                {
+                                    "account_id": acct_id,
+                                    "household": hh,
+                                    "el_pct": float(el_pct),
+                                    "nlv": float(nlv),
+                                    "excess_liquidity": float(excess_liquidity),
+                                },
+                                severity="critical",
+                            )
+                            _apex_last_alert[acct_id] = now
+                        except Exception as alert_exc:
+                            logger.error(
+                                "APEX_SURVIVAL alert enqueue failed for %s: %s",
+                                acct_id, alert_exc,
+                            )
+                    # Skip DB write while APEX condition active (matches bot).
+                    continue
+                else:
+                    _apex_last_alert.pop(acct_id, None)
+            else:
+                _apex_last_alert.pop(acct_id, None)
+
+            last = _el_last_write.get(acct_id, 0.0)
+            if now - last < _EL_WRITE_DEBOUNCE_SECONDS:
+                continue
+
+            try:
+                from agt_equities.db import get_db_connection, tx_immediate
+                with closing(get_db_connection()) as conn:
+                    with tx_immediate(conn):
+                        conn.execute(
+                            "INSERT INTO el_snapshots "
+                            "(account_id, household, excess_liquidity, nlv, "
+                            "buying_power, source) "
+                            "VALUES (?, ?, ?, ?, ?, 'ibkr_live')",
+                            (
+                                acct_id, hh, excess_liquidity, nlv,
+                                data.get("BuyingPower"),
+                            ),
+                        )
+                _el_last_write[acct_id] = now
+            except Exception as db_exc:
+                logger.warning(
+                    "el_snapshot_writer: DB write failed for %s: %s",
+                    acct_id, db_exc,
+                )
+
+    scheduler.add_job(
+        _el_snapshot_writer_job,
+        trigger="interval",
+        seconds=30,
+        id="el_snapshot_writer",
+        name="el_snapshot_writer",
+        replace_existing=True,
+    )
+    registered.append("el_snapshot_writer")
+
+    # Unit A5 remaining: cc_daily, watchdog_daily, universe_monthly,
+    #   conviction_weekly, flex_sync_eod, attested_poller (10s),
+    #   beta_cache_refresh (daily 04:00), beta_startup,
+    #   corporate_intel_refresh (daily 05:00), corporate_intel_startup.
+    #   el_snapshot_writer shipped in A5d.d.
     return registered
 
 
