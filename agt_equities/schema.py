@@ -1422,6 +1422,71 @@ def register_master_log_tables(conn) -> None:
     """)
 
 
+def _register_autonomous_tables(conn) -> None:
+    """Autonomous paper-trading session state (cross-run context).
+
+    autonomous_session_log: append-only log of every scheduled task run.
+    Each row captures what the task saw, decided, and did. Downstream
+    tasks query recent rows to build context without needing shared memory.
+
+    readiness_gate: tracks the 3-dimension live-readiness assessment.
+    Dimension 1 (operational coverage): binary per-segment.
+    Dimension 2 (risk discipline): continuous metrics over window.
+    Dimension 3 (P&L coherence): strategy-level sanity checks.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS autonomous_session_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_name   TEXT NOT NULL,
+            run_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            summary     TEXT,
+            positions_snapshot  JSON,
+            orders_snapshot     JSON,
+            actions_taken       JSON,
+            errors              JSON,
+            metrics             JSON,
+            notes               TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS readiness_gate (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            dimension   TEXT NOT NULL,
+            segment     TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'untested',
+            last_tested TEXT,
+            evidence    TEXT,
+            notes       TEXT,
+            UNIQUE(dimension, segment)
+        )
+    """)
+
+    # Seed operational coverage segments if empty
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM readiness_gate WHERE dimension = 'operational'"
+    ).fetchone()[0]
+    if existing == 0:
+        segments = [
+            ("csp_entry", "untested", "Scan → stage → approve → fill → DB"),
+            ("csp_harvest", "untested", "Detect profitable short puts → BTC → DB"),
+            ("put_assignment", "untested", "IB event → new shares → CC pivot"),
+            ("cc_entry", "untested", "Scan → stage → approve → fill → DB"),
+            ("cc_harvest", "untested", "Detect profitable short calls → BTC → DB"),
+            ("cc_roll", "untested", "ITM detection → roll_engine → stage spread → fill"),
+            ("call_assignment", "untested", "IB event → shares removed → cycle closed"),
+            ("error_recovery", "untested", "Gateway drop → reconnect → state reconciliation"),
+            ("multiday_persistence", "untested", "Positions survive overnight, reconcile"),
+        ]
+        for seg, status, notes in segments:
+            conn.execute(
+                "INSERT INTO readiness_gate (dimension, segment, status, notes) "
+                "VALUES ('operational', ?, ?, ?)",
+                (seg, status, notes),
+            )
+        conn.commit()
+
+
 def _extend_pending_orders(conn) -> None:
     """Add R5 order lifecycle columns to pending_orders if missing.
     Silently skips if pending_orders table doesn't exist (test DBs)."""

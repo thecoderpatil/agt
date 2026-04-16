@@ -337,6 +337,9 @@ def init_db() -> None:
         # ── Master Log Refactor v3: Bucket 2 + Bucket 3 new tables ──
         from agt_equities.schema import register_master_log_tables
         register_master_log_tables(conn)
+        # ── Autonomous paper-trading state tables ──
+        from agt_equities.schema import _register_autonomous_tables
+        _register_autonomous_tables(conn)
 
     _cleanup_test_orders()
     _load_todays_usage()
