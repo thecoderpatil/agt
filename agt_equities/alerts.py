@@ -347,3 +347,45 @@ __all__: Iterable[str] = (
     "get_alert",
     "format_alert_text",
 )
+
+
+# ---------------------------------------------------------------------------
+# MR #1: alert_yash() convenience wrapper
+# ---------------------------------------------------------------------------
+
+
+def alert_yash(
+    kind: str,
+    subject: str,
+    body: str,
+    *,
+    severity: str = "crit",
+    extra: dict[str, Any] | None = None,
+    db_path: str | Path | None = None,
+) -> int:
+    """Enqueue a cross_daemon alert destined for Yash's Telegram chat.
+
+    The bot's 2-second drain loop picks it up and delivers. Designed to be
+    called from anywhere (scheduler jobs, money-path gates, breaker trips)
+    without needing a Telegram bot token or direct chat access.
+
+    Args:
+        kind: short uppercase tag (e.g. 'CIRCUIT_BREAKER_TRIP').
+        subject: one-line headline.
+        body: free-form multi-line text.
+        severity: 'info' | 'warn' | 'crit'. Defaults to 'crit'.
+        extra: optional JSON-serializable dict merged into the payload.
+        db_path: explicit DB path for tests.
+
+    Returns the new alert_id.
+    """
+    payload: dict[str, Any] = {
+        "subject": subject,
+        "body": body,
+        "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+    }
+    if extra:
+        for k, v in extra.items():
+            if k not in payload:
+                payload[k] = v
+    return enqueue_alert(kind, payload, severity=severity, db_path=db_path)

@@ -6433,6 +6433,22 @@ async def _pre_trade_gates(
         if _HALTED:
             return (False, "Desk halted via /halt — restart bot to resume")
 
+        # Gate 0a: Circuit breaker (MR #1)
+        try:
+            from scripts.circuit_breaker import run_all_checks as _cb_run
+            _cb = _cb_run()
+            if _cb.get("halted"):
+                viols = _cb.get("violations", [])
+                reasons = "; ".join(
+                    v.get("reason", v.get("check", "unknown")) for v in viols[:3]
+                )
+                return (False, f"Circuit breaker HALTED: {reasons}")
+        except ImportError:
+            logger.warning("_pre_trade_gates: circuit_breaker unavailable")
+        except Exception as _cb_exc:
+            logger.error("_pre_trade_gates: breaker failed: %s", _cb_exc)
+            return (False, f"Circuit breaker internal error: {_cb_exc}")
+
         # Gate 1: Mode gate — WARTIME whitelist (ADR-005 R4)
         mode = _get_current_desk_mode()
         WARTIME_ALLOWED_SITES = ("dex", "v2_router", "legacy_approve")
@@ -7048,6 +7064,25 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     sections: list[str] = ["\u2501\u2501 Daily Scan \u2501\u2501"]
 
+    # MR #1: Circuit breaker pre-flight
+    try:
+        from scripts.circuit_breaker import run_all_checks as _cb_run
+        _cb = _cb_run()
+        if _cb.get("halted"):
+            viols = _cb.get("violations", [])
+            reasons = "; ".join(v.get("reason", v.get("check", "?")) for v in viols[:3])
+            await status_msg.edit_text(
+                f"\u274c Circuit breaker HALTED \u2014 daily scan blocked.\n{reasons}"
+            )
+            return
+    except ImportError:
+        logger.warning("cmd_daily: circuit_breaker unavailable \u2014 proceeding")
+    except Exception as _cb_exc:
+        await status_msg.edit_text(
+            f"\u274c Circuit breaker internal error: {_cb_exc} \u2014 scan aborted."
+        )
+        return
+
     try:
         ib_conn = await ensure_ib_connected()
     except Exception as exc:
@@ -7170,7 +7205,15 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 capture_output=True, text=True, timeout=15,
                 cwd=str(_Path(__file__).parent),
             )
-            cb_data = json.loads(result.stdout.split("\n")[0]) if result.stdout else {}
+            # raw_decode consumes the first JSON value from stdout, ignoring
+            # any trailing human-readable status lines printed by __main__.
+            if result.stdout:
+                try:
+                    cb_data, _ = json.JSONDecoder().raw_decode(result.stdout.lstrip())
+                except json.JSONDecodeError:
+                    cb_data = {}
+            else:
+                cb_data = {}
             if cb_data.get("halted"):
                 cb_status = "HALTED — CIRCUIT BREAKER TRIPPED"
             elif not cb_data.get("ok"):
@@ -7299,7 +7342,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         with closing(_get_db_connection()) as conn:
             conn.row_factory = sqlite3.Row
             nlv_rows = conn.execute(
-                "SELECT account_id, nlv, excess_liquidity, timestamp "
+                "SELECT account_id, nlv, excess_liquidity, nlv_timestamp "
                 "FROM v_available_nlv"
             ).fetchall()
         if nlv_rows:
@@ -7308,7 +7351,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 sections.append(
                     f"  {r['account_id']}: ${r['nlv']:,.0f} "
                     f"(EL: ${r['excess_liquidity']:,.0f}) "
-                    f"@ {r['timestamp'][:16]}"
+                    f"@ {(r['nlv_timestamp'] or '')[:16]}"
                 )
         else:
             sections.append("\n[NLV SNAPSHOT] No data in v_available_nlv")
@@ -7363,7 +7406,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if status_line:
                 sections.append(f"  {status_line.replace('## ', '')}")
             if expires_line:
-                sections.append(f"  {expires_line.strip('*')}")
+                sections.append(f"  {expires_line.replace('**', '')}")
             if focus_lines:
                 sections.append("  Focus:")
                 for fl in focus_lines[:6]:
@@ -11465,7 +11508,85 @@ async def _el_snapshot_writer_job(
         logger.debug("el_snapshot_writer: %s", exc)
 
 
+
+# ---------------------------------------------------------------------------
+# MR #1: Singleton lockfile — prevent dual-instance collisions on clientId=1
+# ---------------------------------------------------------------------------
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Return True if the given PID is alive on the current OS."""
+    if pid <= 0:
+        return False
+    try:
+        if sys.platform.startswith("win"):
+            import subprocess as _sp
+            result = _sp.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in (result.stdout or "")
+        else:
+            os.kill(pid, 0)
+            return True
+    except Exception:
+        return False
+
+
+def _acquire_singleton_lock() -> None:
+    """Enforce single-instance bot. Abort on live collision; reclaim stale."""
+    from pathlib import Path as _Path
+    import atexit as _atexit
+
+    lock_path = _Path(__file__).resolve().parent / ".bot.pid"
+    try:
+        if lock_path.exists():
+            raw = lock_path.read_text(encoding="utf-8").strip()
+            try:
+                existing_pid = int(raw)
+            except ValueError:
+                existing_pid = -1
+            if existing_pid > 0 and _pid_is_alive(existing_pid):
+                msg = (
+                    f"Singleton lock: another bot is already running "
+                    f"(PID={existing_pid}). Kill it (or `nssm stop AGTBotService`) "
+                    f"before starting a new instance."
+                )
+                logger.error(msg)
+                print(msg, file=sys.stderr)
+                sys.exit(1)
+            else:
+                logger.warning(
+                    "Singleton lock: stale .bot.pid (PID=%r not alive); overwriting.",
+                    raw,
+                )
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.warning("Singleton lock: unreadable .bot.pid (%s); will overwrite.", exc)
+
+    try:
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+        logger.info("Singleton lock acquired: PID=%d path=%s", os.getpid(), lock_path)
+    except OSError as exc:
+        logger.warning("Singleton lock: failed to write .bot.pid (%s); proceeding.", exc)
+        return
+
+    def _release() -> None:
+        try:
+            if lock_path.exists():
+                current = lock_path.read_text(encoding="utf-8").strip()
+                if current == str(os.getpid()):
+                    lock_path.unlink()
+        except Exception:
+            pass
+
+    _atexit.register(_release)
+
+
 def main() -> None:
+    # MR #1: single-instance enforcement before any IB / Telegram contact
+    _acquire_singleton_lock()
     init_db()  # A4: lazy DB init at daemon boot, not import
     logger.info(
         "Starting AGT Equities Bridge — Hybrid Architecture "
