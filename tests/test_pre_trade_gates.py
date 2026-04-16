@@ -68,7 +68,7 @@ class TestModeGate(unittest.TestCase):
 
 
 class TestNotionalGate(unittest.TestCase):
-    """Gate 2: $25k notional ceiling."""
+    """Gate 2: notional calculation (ceiling removed 2026-04-16)."""
 
     @patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
     def test_opt_above_ceiling(self, _mock):

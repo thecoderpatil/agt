@@ -6400,8 +6400,6 @@ async def handle_dex_callback(
 # Sprint 1A: Unified pre-trade safety gates
 # ---------------------------------------------------------------------------
 
-PRE_TRADE_NOTIONAL_CEILING = 25_000
-
 
 async def _pre_trade_gates(
     order,
@@ -6473,8 +6471,7 @@ async def _pre_trade_gates(
         else:
             return (False, f"Notional gate: unsupported secType {sec_type} — fail-closed")
 
-        if notional > PRE_TRADE_NOTIONAL_CEILING:
-            return (False, f"Notional ${notional:,.0f} exceeds ${PRE_TRADE_NOTIONAL_CEILING:,} ceiling")
+        # (Notional ceiling removed 2026-04-16 — mode gates + margin math are real controls)
 
         # Gate 3: Non-wheel filter — OPT, STK, BAG (ADR-005 CC4)
         ALLOWED_SECTYPES = ("OPT", "STK", "BAG")
