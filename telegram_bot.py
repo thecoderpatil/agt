@@ -10297,7 +10297,7 @@ _OPEN_LIVE_STATES = frozenset({
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/scan — dry-run CSP entry scan. Posts allocator digest, stages nothing."""
+    """/scan — CSP entry scan. Stages allocator output for /approve."""
     if not is_authorized(update):
         return
 
@@ -10365,21 +10365,27 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        # ── 5. Build extras_provider + run allocator in dry-run ──
+        # ── 5. Build extras_provider + run allocator ──
         sector_map = build_watchlist_sector_map(watchlist)
         extras_provider = make_minimal_extras_provider(sector_map)
+
+        # B5.c-bridge-2: live staging (default) or dry-run via env flag.
+        _scan_live = os.getenv("AGT_SCAN_LIVE", "1") == "1"
+        _staging_cb = append_pending_tickets if _scan_live else None
 
         result = run_csp_allocator(
             ray_candidates=candidates,
             snapshots=snapshots,
             vix=vix,
             extras_provider=extras_provider,
-            staging_callback=None,  # DRY-RUN — bridge-2 flips this on.
+            staging_callback=_staging_cb,
         )
 
         # ── 6. Post digest ──
+        staged_n = result.total_staged_contracts
+        mode_tag = "STAGED" if _scan_live and staged_n else "dry-run"
         header = [
-            f"\u2501\u2501 /scan (dry-run) \u2501\u2501",
+            f"\u2501\u2501 /scan ({mode_tag}) \u2501\u2501",
             f"Candidates scanned: {len(candidates)}  \u00b7  VIX: {vix:.1f}",
             "",
         ]
@@ -10389,6 +10395,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             update,
             f"<pre>{html.escape(digest)}</pre>",
         )
+        if _scan_live and staged_n:
+            await update.message.reply_text(
+                f"\u2705 {staged_n} contract(s) staged. Use /approve to review and transmit.",
+            )
 
     except Exception as exc:
         logger.exception("cmd_scan failed")

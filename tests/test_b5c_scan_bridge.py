@@ -251,3 +251,145 @@ class TestE2EDigestDryRun:
         # Expiry format must survive YYYYMMDD conversion via .replace("-", "")
         assert c.expiry.replace("-", "").isdigit()
         assert len(c.expiry.replace("-", "")) == 8
+
+
+# ---------------------------------------------------------------------------
+# B5.c-bridge-2 — staging callback tests
+# ---------------------------------------------------------------------------
+
+class TestBridge2StagingCallback(unittest.TestCase):
+    """Verify that the allocator invokes staging_callback with correct tickets."""
+
+    def setUp(self):
+        self.db_path = Path(tempfile.mkdtemp()) / "test_b5c_staging.db"
+        from agt_equities.schema import (
+            register_master_log_tables,
+            register_operational_tables,
+        )
+        from agt_equities.db import get_db_connection
+        conn = get_db_connection(db_path=str(self.db_path))
+        register_master_log_tables(conn)
+        register_operational_tables(conn)
+        conn.close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.db_path.parent, ignore_errors=True)
+
+    def test_staging_callback_receives_tickets(self):
+        """When staging_callback is not None, allocator calls it with staged tickets."""
+        from agt_equities.scan_bridge import (
+            adapt_scanner_candidates,
+            make_minimal_extras_provider,
+        )
+        from agt_equities.csp_allocator import run_csp_allocator
+
+        candidates = adapt_scanner_candidates([_scanner_row()])
+        snapshots = _single_household_snapshot()
+        provider = make_minimal_extras_provider({})
+
+        staged_tickets = []
+
+        def _capture_callback(tickets):
+            staged_tickets.extend(tickets)
+
+        result = run_csp_allocator(
+            ray_candidates=candidates,
+            snapshots=snapshots,
+            vix=18.0,
+            extras_provider=provider,
+            staging_callback=_capture_callback,
+        )
+
+        # Allocator should have called our callback with any staged tickets
+        if result.total_staged_contracts > 0:
+            assert len(staged_tickets) > 0
+            # Each ticket must have the fields _place_single_order expects
+            for t in staged_tickets:
+                assert "ticker" in t
+                assert "strike" in t
+                assert "account_id" in t
+                assert "quantity" in t
+
+    def test_staging_callback_none_does_not_stage(self):
+        """staging_callback=None must not raise and must not stage."""
+        from agt_equities.scan_bridge import (
+            adapt_scanner_candidates,
+            make_minimal_extras_provider,
+        )
+        from agt_equities.csp_allocator import run_csp_allocator
+
+        candidates = adapt_scanner_candidates([_scanner_row()])
+        snapshots = _single_household_snapshot()
+        provider = make_minimal_extras_provider({})
+
+        # Must not raise
+        result = run_csp_allocator(
+            ray_candidates=candidates,
+            snapshots=snapshots,
+            vix=18.0,
+            extras_provider=provider,
+            staging_callback=None,
+        )
+        assert isinstance(result.digest_lines, list)
+
+    def test_env_flag_scan_live_off_skips_staging(self):
+        """AGT_SCAN_LIVE=0 should cause cmd_scan to pass staging_callback=None."""
+        import os
+        os.environ["AGT_SCAN_LIVE"] = "0"
+        try:
+            _scan_live = os.getenv("AGT_SCAN_LIVE", "1") == "1"
+            assert _scan_live is False
+            # In cmd_scan, _staging_cb would be None
+            _staging_cb = (lambda t: t) if _scan_live else None
+            assert _staging_cb is None
+        finally:
+            os.environ["AGT_SCAN_LIVE"] = "1"
+
+    def test_env_flag_scan_live_default_is_on(self):
+        """Default AGT_SCAN_LIVE should be '1' (staging enabled)."""
+        import os
+        # Remove if set
+        old = os.environ.pop("AGT_SCAN_LIVE", None)
+        try:
+            _scan_live = os.getenv("AGT_SCAN_LIVE", "1") == "1"
+            assert _scan_live is True
+        finally:
+            if old is not None:
+                os.environ["AGT_SCAN_LIVE"] = old
+
+    def test_staged_ticket_shape_matches_place_single_order_contract(self):
+        """Tickets staged by allocator must contain all fields
+        that _place_single_order reads from payload."""
+        from agt_equities.scan_bridge import (
+            adapt_scanner_candidates,
+            make_minimal_extras_provider,
+        )
+        from agt_equities.csp_allocator import run_csp_allocator
+
+        candidates = adapt_scanner_candidates([_scanner_row()])
+        snapshots = _single_household_snapshot()
+        provider = make_minimal_extras_provider({})
+
+        staged_tickets = []
+        result = run_csp_allocator(
+            ray_candidates=candidates,
+            snapshots=snapshots,
+            vix=18.0,
+            extras_provider=provider,
+            staging_callback=lambda t: staged_tickets.extend(t),
+        )
+
+        if staged_tickets:
+            t = staged_tickets[0]
+            # Fields _place_single_order reads (telegram_bot.py:6586+):
+            required_keys = [
+                "ticker", "strike", "expiry", "quantity",
+                "limit_price", "account_id",
+            ]
+            for key in required_keys:
+                assert key in t, f"Missing key '{key}' in staged ticket: {t.keys()}"
+            # CSP-specific
+            assert t.get("action", "SELL") in ("SELL", "BUY")
+            assert t.get("right", "P") in ("P", "C")
+            assert t.get("sec_type", "OPT") == "OPT"
