@@ -1,12 +1,12 @@
-"""agt_equities.scan_bridge — Sprint B5.c-bridge-1 glue layer.
+"""agt_equities.scan_bridge — Sprint B5.c bridge layer (bridge-1 + bridge-2).
 
 Bridges ``pxo_scanner.scan_csp_candidates`` (emits dicts) to
 ``csp_allocator.run_csp_allocator`` (expects objects with attribute access
 and an injected ``extras_provider``).
 
-This module is intentionally pure: no IB calls, no DB, no Telegram imports.
-The live ``/scan`` command in ``telegram_bot.py`` composes it with
-``_discover_positions`` + ``_fetch_household_buying_power_snapshot`` +
+This module is intentionally pure: no IB calls, no DB, no Telegram imports,
+no yfinance. The live ``/scan`` command in ``telegram_bot.py`` composes it
+with ``_discover_positions`` + ``_fetch_household_buying_power_snapshot`` +
 ``run_csp_allocator`` (staging_callback=None → dry-run).
 
 Unit conventions (verified against csp_allocator + pxo_scanner as of
@@ -32,9 +32,9 @@ Gate tolerance (verified against CSP_GATE_REGISTRY):
   ``sector_map`` / ``correlations`` are missing or empty.
 
 So a minimal extras_provider that supplies only ``sector_map`` is
-acceptable for bridge-1 (dry-run digest). A richer provider (delta +
-earnings + correlations) lands in bridge-2 when the staging path goes
-hot.
+acceptable for bridge-1 (dry-run digest). The bridge-2 provider supplies
+real delta, days_to_earnings, and correlations so Rules 3, 4, and 7
+actually enforce their gates.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ class ScanCandidate:
     Fields required by ``csp_allocator``:
         ticker, strike, mid, expiry (YYYY-MM-DD), annualized_yield.
     Convenience fields (preserved for digest / downstream consumers):
-        dte, otm_pct, capital_required, headline, sector.
+        dte, otm_pct, capital_required, headline, sector, delta.
     """
 
     ticker: str
@@ -68,6 +68,7 @@ class ScanCandidate:
     capital_required: float = 0.0
     headline: str = ""
     sector: str = "Unknown"
+    delta: float = 0.0
 
 
 def adapt_scanner_candidates(rows: list[dict]) -> list[ScanCandidate]:
@@ -95,6 +96,12 @@ def adapt_scanner_candidates(rows: list[dict]) -> list[ScanCandidate]:
             continue
         if not ticker or strike <= 0 or premium < 0 or not expiry:
             continue
+        # Delta: scanner emits abs(delta) as float; 0.0 fallback if missing.
+        raw_delta = row.get("delta")
+        try:
+            delta = abs(float(raw_delta)) if raw_delta is not None else 0.0
+        except (TypeError, ValueError):
+            delta = 0.0
         out.append(
             ScanCandidate(
                 ticker=ticker,
@@ -107,13 +114,14 @@ def adapt_scanner_candidates(rows: list[dict]) -> list[ScanCandidate]:
                 capital_required=float(row.get("capital_required", 0.0) or 0.0),
                 headline=str(row.get("headline", "") or ""),
                 sector=str(row.get("sector", "Unknown") or "Unknown"),
+                delta=delta,
             )
         )
     return out
 
 
 # ---------------------------------------------------------------------------
-# extras_provider factory
+# extras_provider factories
 # ---------------------------------------------------------------------------
 
 
@@ -158,6 +166,51 @@ def make_minimal_extras_provider(
             "correlations": {},
             "delta": None,
             "days_to_earnings": None,
+        }
+
+    return _provider
+
+
+def make_bridge2_extras_provider(
+    sector_map: dict[str, str],
+    earnings_map: dict[str, int | None],
+    correlation_pairs: dict[tuple[str, str], float],
+) -> Callable[[dict, Any], dict]:
+    """Return a bridge-2 extras_provider with real gate data.
+
+    Unlike the bridge-1 minimal provider, this supplies:
+      - ``delta``: read from ``candidate.delta`` (carried through from
+        pxo_scanner via ScanCandidate).
+      - ``days_to_earnings``: looked up from ``earnings_map`` by ticker.
+      - ``correlations``: the full pre-computed pairwise dict.
+      - ``sector_map``: same as bridge-1.
+
+    All four fields are populated so Rules 3, 4, and 7 actually enforce
+    their gates instead of fail-opening on None/empty.
+
+    The returned callable is pure and snapshot-free: it closes over the
+    injected maps and reads candidate.delta per call. Safe to reuse
+    across a full allocator run.
+
+    Args:
+        sector_map: {TICKER: GICS_sector} from the watchlist.
+        earnings_map: {TICKER: days_to_next_earnings or None}.
+            Built by ``scan_extras.fetch_earnings_map()``.
+        correlation_pairs: {(ticker_a, ticker_b): correlation}.
+            Built by ``scan_extras.build_correlation_pairs()``.
+            Order-independent — rule_4 checks both (a,b) and (b,a).
+    """
+    frozen_sectors = dict(sector_map)
+    frozen_earnings = dict(earnings_map)
+    frozen_corr = dict(correlation_pairs)
+
+    def _provider(hh: dict, candidate: Any) -> dict:
+        ticker = getattr(candidate, "ticker", "").upper()
+        return {
+            "sector_map": frozen_sectors,
+            "correlations": frozen_corr,
+            "delta": getattr(candidate, "delta", None),
+            "days_to_earnings": frozen_earnings.get(ticker),
         }
 
     return _provider
