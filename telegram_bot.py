@@ -10567,7 +10567,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         from agt_equities.scan_bridge import (
             adapt_scanner_candidates,
             build_watchlist_sector_map,
-            make_minimal_extras_provider,
+            make_bridge2_extras_provider,
         )
         candidates = adapt_scanner_candidates(rows)
         if not candidates:
@@ -10606,9 +10606,34 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
+        # ── 4b. Fetch bridge-2 extras (earnings, correlations) ──
+        await status_msg.edit_text("\U0001f50d Fetching earnings + correlations\u2026")
+        from agt_equities.scan_extras import (
+            fetch_earnings_map,
+            build_correlation_pairs,
+        )
+        candidate_tickers = [c.ticker for c in candidates]
+
+        # Collect all holding tickers across households for correlation
+        all_holding_tickers: set[str] = set()
+        for _hh_snap in snapshots.values():
+            all_holding_tickers.update(_hh_snap.get("existing_positions", {}).keys())
+            all_holding_tickers.update(_hh_snap.get("existing_csps", {}).keys())
+
+        earnings_map = await asyncio.to_thread(
+            fetch_earnings_map, candidate_tickers,
+        )
+        correlation_pairs = await asyncio.to_thread(
+            build_correlation_pairs,
+            candidate_tickers,
+            sorted(all_holding_tickers),
+        )
+
         # ── 5. Build extras_provider + run allocator ──
         sector_map = build_watchlist_sector_map(watchlist)
-        extras_provider = make_minimal_extras_provider(sector_map)
+        extras_provider = make_bridge2_extras_provider(
+            sector_map, earnings_map, correlation_pairs,
+        )
 
         # B5.c-bridge-2: live staging (default) or dry-run via env flag.
         _scan_live = os.getenv("AGT_SCAN_LIVE", "1") == "1"
