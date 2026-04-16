@@ -45,6 +45,9 @@ import yfinance as yf
 from agt_equities.execution_gate import assert_execution_enabled, ExecutionDisabledError
 from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 from agt_equities import roll_engine
+from agt_equities.cc_engine import (
+    CCPickerInput, CCWrite, CCStandDown, ChainStrike, pick_cc_strike,
+)
 from agt_equities.roll_engine import (
     ConstraintMatrix, MarketSnapshot, OptionQuote, PortfolioContext, Position,
     HoldResult, HarvestResult, RollResult, AssignResult, LiquidateResult, AlertResult,
@@ -7681,8 +7684,11 @@ async def _discover_positions(
                 "account_id": acct,
                 "label": ACCOUNT_LABELS.get(acct, acct),
                 "shares": 0,
+                "avg_cost_ibkr": 0.0,
             })
             acct_entry["shares"] += qty
+            # Per-account cost basis from IBKR (WHEEL-5 fix: no blending)
+            acct_entry["avg_cost_ibkr"] = float(pos.avgCost)
 
         elif c.secType == "OPT" and pos.position < 0:
             right = getattr(c, "right", "")
@@ -7800,6 +7806,7 @@ async def _discover_positions(
                     "total_premium_collected": c.premium_total,
                     "shares_owned": int(c.shares_held),
                     "adjusted_basis": round(c.adjusted_basis, 4) if c.adjusted_basis else None,
+                    "_cycle": c,  # WHEEL-5: keep for paper_basis_for_account()
                 }
         except Exception as ml_exc:
             logger.warning("Walker batch pre-fetch failed, falling back to legacy: %s", ml_exc)
@@ -7847,6 +7854,20 @@ async def _discover_positions(
             initial_basis = rec["avg_cost_ibkr"]
             total_prem = 0.0
             adj_basis = rec["avg_cost_ibkr"]
+
+        # WHEEL-5: populate per-account paper_basis in accounts_with_shares
+        _w5_cycle = ledger.get("_cycle") if ledger else None
+        for _acct_id, _acct_info in rec["accounts_with_shares"].items():
+            if _w5_cycle is not None:
+                try:
+                    _per_acct_basis = _w5_cycle.paper_basis_for_account(_acct_id)
+                    if _per_acct_basis is not None:
+                        _acct_info["paper_basis"] = round(_per_acct_basis, 4)
+                        continue
+                except Exception:
+                    pass
+            # Fallback: use IBKR per-account avgCost
+            _acct_info.setdefault("paper_basis", _acct_info.get("avg_cost_ibkr", initial_basis))
 
         spot = spot_prices.get(tkr, 0.0)
 
@@ -8342,34 +8363,116 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                     logger.warning("Dynamic exit staging failed for %s: %s",
                                    p["ticker"], de_exc)
 
-    # ── Unified basis-anchored chain walks (parallel) ──
-    async def _walk_target(p):
-        """Walk chain for one target. Returns (p, result, skip_reason)."""
+    # ── WHEEL-5: Per-account basis-anchored chain walks (parallel) ──
+    # Fetch IB chain once per ticker, then run pick_cc_strike per account
+    # with that account's paper_basis. This fixes the household-blended
+    # basis bug (UBER Roth@$73 vs Individual@$86 example).
+
+    async def _fetch_chain_for_ticker(ticker, spot, min_basis, dte_range):
+        """Fetch IB options chain and return (chain_strikes, expiry, dte) or None."""
+        try:
+            raw_expiries = await _ibkr_get_expirations(ticker)
+            today = _date.today()
+            min_dte, max_dte = dte_range
+            cands = []
+            for exp_str in raw_expiries:
+                try:
+                    exp_date = _date.fromisoformat(exp_str)
+                except ValueError:
+                    continue
+                dte = (exp_date - today).days
+                if min_dte <= dte <= max_dte:
+                    cands.append((exp_str, dte))
+            if not cands:
+                return None
+            mid_target = (min_dte + max_dte) // 2
+            exp_str, dte = min(cands, key=lambda x: abs(x[1] - mid_target))
+
+            chain_ceiling = max(spot * 1.5, min_basis * 1.3) if min_basis > 0 else spot * 1.5
+            try:
+                chain_data = await _ibkr_get_chain(
+                    ticker, exp_str, right='C',
+                    min_strike=max(0, min_basis * 0.95),  # slight buffer below lowest basis
+                    max_strike=chain_ceiling,
+                )
+                calls = pd.DataFrame(chain_data)
+            except Exception:
+                return None
+            if calls is None or not isinstance(calls, pd.DataFrame) or calls.empty:
+                return None
+            calls = calls.copy()
+            calls["strike"] = pd.to_numeric(calls["strike"], errors="coerce")
+            calls = calls.dropna(subset=["strike"])
+            chain_strikes = tuple(
+                ChainStrike(
+                    strike=float(row["strike"]),
+                    bid=float(row.get("bid") or 0) if pd.notna(row.get("bid")) else 0.0,
+                    ask=float(row.get("ask") or 0) if pd.notna(row.get("ask")) else 0.0,
+                    delta=float(row.get("delta")) if row.get("delta") is not None and pd.notna(row.get("delta")) else None,
+                )
+                for _, row in calls.iterrows()
+            )
+            return chain_strikes, exp_str, dte
+        except Exception as exc:
+            logger.warning("_fetch_chain_for_ticker failed for %s: %s", ticker, exc)
+            return None
+
+    async def _walk_target_per_account(p):
+        """WHEEL-5: fetch chain once, run pick_cc_strike per account.
+
+        Returns (p, per_account_results: list[(acct_id, CCResult)], skip_reason).
+        """
         ticker = p["ticker"]
         spot = p["spot_price"]
-        paper_basis = p["initial_basis"]
 
         if spot <= 0:
-            return p, None, "No spot price"
+            return p, [], "No spot price"
 
-        result = await _walk_chain_limited(
-            _walk_cc_chain, ticker, spot, paper_basis, CC_TARGET_DTE
+        # Find the lowest basis across all accounts (for chain fetch range)
+        accounts = p.get("accounts_with_shares", {})
+        if not accounts:
+            return p, [], "No accounts with shares"
+        min_basis = min(
+            a.get("paper_basis", p.get("initial_basis", 0))
+            for a in accounts.values()
         )
-        if result is None:
-            return p, None, "No viable strike"
-        if result.get("below_floor"):
-            reason = (
-                f"STAND DOWN \u2014 best {result['best_strike']:.2f}C "
-                f"@ {result['best_annualized']:.1f}% ann "
-                f"(< {result['floor_pct']:.0f}% floor, "
-                f"DTE {result['dte']})"
-            )
-            return p, None, reason
+        if min_basis <= 0:
+            min_basis = p.get("initial_basis", 0)
+        if min_basis <= 0:
+            return p, [], "No valid basis"
 
-        return p, result, None
+        chain_result = await _walk_chain_limited(
+            _fetch_chain_for_ticker, ticker, spot, min_basis, CC_TARGET_DTE
+        )
+        if chain_result is None:
+            return p, [], "No viable chain"
+        chain_strikes, expiry, dte = chain_result
+
+        # Run pick_cc_strike per account with account-specific basis
+        per_account_results = []
+        for acct_id, acct_info in accounts.items():
+            acct_basis = acct_info.get("paper_basis", p.get("initial_basis", 0))
+            if acct_basis <= 0:
+                continue
+            inp = CCPickerInput(
+                ticker=ticker,
+                account_id=acct_id,
+                paper_basis=acct_basis,
+                spot=spot,
+                dte=dte,
+                expiry=expiry,
+                chain=chain_strikes,
+                min_ann=CC_MIN_ANN,
+                max_ann=CC_MAX_ANN,
+                bid_floor=CC_BID_FLOOR,
+            )
+            result = pick_cc_strike(inp)
+            per_account_results.append((acct_id, result))
+
+        return p, per_account_results, None
 
     results = await asyncio.gather(
-        *[_walk_target(p) for p in cc_targets],
+        *[_walk_target_per_account(p) for p in cc_targets],
         return_exceptions=True,
     )
 
@@ -8378,7 +8481,7 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
             logger.warning("CC chain walk failed: %s", item)
             continue
 
-        p, result, skip_reason = item
+        p, per_account_results, skip_reason = item
 
         if skip_reason:
             skipped.append({
@@ -8413,10 +8516,34 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
         working_pa = p.get("working_per_account", {})
         staged_pa = p.get("staged_per_account", {})
 
-        for acct_id, acct_info in p["accounts_with_shares"].items():
+        for acct_id, cc_result in per_account_results:
             if remaining_available < 1:
                 break
-            acct_shares = acct_info["shares"]
+
+            # STAND_DOWN for this account — add to skipped with account detail
+            if isinstance(cc_result, CCStandDown):
+                skipped.append({
+                    "ticker": ticker,
+                    "reason": (
+                        f"STAND DOWN \u2014 {acct_id}: best {cc_result.best_strike:.2f}C "
+                        f"@ {cc_result.best_annualized:.1f}% ann "
+                        f"(< {cc_result.floor_pct:.0f}% floor, "
+                        f"DTE {cc_result.dte})"
+                    ),
+                    "household": p["household"],
+                    "mode": p.get("mode", ""),
+                    "spot": p["spot_price"],
+                    "adjusted_basis": p.get("adjusted_basis", 0),
+                    "initial_basis": p["accounts_with_shares"].get(acct_id, {}).get(
+                        "paper_basis", p.get("initial_basis", 0)
+                    ),
+                    "account_id": acct_id,
+                })
+                continue
+
+            # CCWrite — build ticket for this account
+            acct_info = p["accounts_with_shares"].get(acct_id, {})
+            acct_shares = acct_info.get("shares", 0)
 
             acct_filled = sum(
                 sc["contracts"]
@@ -8433,6 +8560,21 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                 continue
             remaining_available -= acct_contracts
 
+            # Convert CCWrite to dict for backward compat with staging pipeline
+            result_dict = {
+                "branch": cc_result.branch,
+                "ticker": cc_result.ticker,
+                "expiry": cc_result.expiry,
+                "dte": cc_result.dte,
+                "strike": cc_result.strike,
+                "bid": cc_result.mid,
+                "annualized": cc_result.annualized,
+                "otm_pct": cc_result.otm_pct,
+                "walk_away_pnl": cc_result.walk_away_pnl,
+                "dte_range": f"{CC_TARGET_DTE[0]}-{CC_TARGET_DTE[1]}",
+                "inception_delta": cc_result.inception_delta,
+            }
+
             ticket = {
                 "account_id": acct_id,
                 "household": p["household"],
@@ -8440,19 +8582,15 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                 "action": "SELL",
                 "sec_type": "OPT",
                 "right": "C",
-                "strike": result["strike"],
-                "expiry": result["expiry"],
+                "strike": cc_result.strike,
+                "expiry": cc_result.expiry,
                 "quantity": acct_contracts,
-                "limit_price": result["bid"],
-                "annualized_yield": result["annualized"],
-                # All unified-walker tickets log as MODE_2_HARVEST for DB
-                # compatibility (roll_watchlist / cc_cycle_log readers).
-                # Branch ("BASIS_ANCHOR" vs "BASIS_STEP_UP") rides in the
-                # merged result dict for the digest.
+                "limit_price": cc_result.mid,
+                "annualized_yield": cc_result.annualized,
                 "mode": "MODE_2_HARVEST",
                 "status": "staged",
             }
-            staged.append({**ticket, **result})
+            staged.append({**ticket, **result_dict})
 
     # Write all staged tickets to SQLite
     if staged:
