@@ -6,7 +6,7 @@ One-shot schtasks registrar for bot_liveness_watchdog.ps1. MR #2.
 Registers a scheduled task "AGT_Bot_Liveness_Watchdog" that runs the
 watchdog every 5 minutes, 7 days a week. The watchdog itself is cheap
 (single SQLite read + optional INSERT), so we skip RTH gating and let
-it always run — if the bot is down outside RTH that's still useful
+it always run - if the bot is down outside RTH that's still useful
 signal, and a stale row that persists past RTH open would otherwise
 get noticed by the first human /report anyway.
 
@@ -66,7 +66,7 @@ Register-ScheduledTask `
     -Settings $settings `
     -RunLevel Highest `
     -User $env:USERNAME `
-    -Description "AGT bot heartbeat liveness watchdog — MR #2" | Out-Null
+    -Description "AGT bot heartbeat liveness watchdog - MR #2" | Out-Null
 
-Write-Host "Registered '$TaskName' — every $IntervalMinutes min starting $start"
+Write-Host "Registered '$TaskName' - every $IntervalMinutes min starting $start"
 Write-Host "Log: C:\AGT_Telegram_Bridge\logs\bot_liveness_watchdog.log"

@@ -10,7 +10,7 @@ Telegram + Gmail drafts. If the row is missing entirely (age=NULL) the
 watchdog also enqueues.
 
 Registered by scripts/register_watchdog_schtask.ps1 to run every 5 min
-during RTH. Safe to run outside RTH — the only side effect on a stale
+during RTH. Safe to run outside RTH - the only side effect on a stale
 detection is a row in cross_daemon_alerts, which is cheap.
 
 Reads DB read-only. Writes are guarded by a single INSERT with
@@ -19,7 +19,7 @@ the bot process directly.
 
 .NOTES
 - Exit 0: healthy or alert enqueued successfully.
-- Exit 1: could not open DB (disk or path problem — log + return).
+- Exit 1: could not open DB (disk or path problem - log + return).
 - Exit 2: alert insert failed after DB read succeeded.
 #>
 
@@ -59,7 +59,7 @@ if ($sqlite) {
         exit 1
     }
 } else {
-    # Python fallback — uses uri read-only for safety.
+    # Python fallback - uses uri read-only for safety.
     $py = @"
 import sqlite3, sys
 try:
@@ -90,7 +90,7 @@ except Exception as e:
 }
 
 if ([string]::IsNullOrWhiteSpace($out)) {
-    # No row at all — treat as stale.
+    # No row at all - treat as stale.
     $ageSec = -1
     $pid_   = -1
 } else {
@@ -108,11 +108,11 @@ if ([string]::IsNullOrWhiteSpace($out)) {
 Write-Log "watchdog read age_sec=$ageSec pid=$pid_"
 
 if ($ageSec -ge 0 -and $ageSec -le $StaleSecs) {
-    # Healthy — no alert.
+    # Healthy - no alert.
     exit 0
 }
 
-# Stale or missing — enqueue a crit alert.
+# Stale or missing - enqueue a crit alert.
 $reason = if ($ageSec -lt 0) { "heartbeat row missing" } else { "heartbeat age ${ageSec}s > ${StaleSecs}s" }
 $subject = "Bot liveness watchdog: $reason"
 $body    = "pid_in_row=$pid_ age_sec=$ageSec threshold=${StaleSecs}s"
