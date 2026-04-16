@@ -1,14 +1,21 @@
 """
-tests/wheel/test_roll_engine.py — pure-function evaluator unit tests.
+tests/wheel/test_roll_engine.py — WHEEL-6 evaluator unit tests.
 
-WHEEL-3. No DB, no IB, no Telegram, no fixtures beyond stdlib. Each test
-constructs the minimal Position / MarketSnapshot / PortfolioContext needed
-to exercise one routing decision in isolation.
+Pure-function tests covering the empirical-rules rewrite. No DB, no IB,
+no Telegram. Each test builds minimal Position/MarketSnapshot/PortfolioContext
+to exercise one routing decision.
 
-Convention:
-- Helpers `_make_*` build minimal-valid instances with safe defaults.
-- Tests override only the fields under test.
-- `_chain` builds OptionQuote tuples for cascade tests.
+Decision tree under test:
+  1. Missing current_call → ALERT
+  2. Expiry day → HOLD (let ride)
+  3. 80/90 harvest → HARVEST
+  4. Strike ≥ paper basis, ITM → ASSIGN (or LIQUIDATE)
+  5. Strike ≥ paper basis, OTM → HOLD
+  6. Strike < paper basis, OTM → HOLD
+  7. Strike < paper basis, ITM, not urgent → HOLD
+  8. Strike < paper basis, ITM, urgent → ROLL (+1/+1)
+  9. Max rolls → ALERT
+  10. No candidate → ALERT
 """
 from __future__ import annotations
 
@@ -68,6 +75,8 @@ def _pos(
     assigned_basis=120.0,
     adjusted_basis=110.0,
     avg_premium_collected=2.00,
+    cumulative_roll_debit=0.0,
+    roll_count=0,
 ) -> Position:
     return Position(
         ticker="CRM",
@@ -84,6 +93,8 @@ def _pos(
         adjusted_basis=adjusted_basis,
         initial_credit=initial_credit,
         initial_dte=initial_dte,
+        cumulative_roll_debit=cumulative_roll_debit,
+        roll_count=roll_count,
     )
 
 
@@ -104,377 +115,12 @@ def _market(
     )
 
 
-def _chain(
-    *,
-    base_strike=100.0,
-    strike_steps=(0, 5, 10),
-    dte_offsets=(10, 17, 24, 35),
-    bid_func=None,
-    delta_func=None,
-) -> tuple[OptionQuote, ...]:
-    """Build a synthetic chain. bid_func(strike, dte) overrides default bid."""
-    quotes = []
-    for sd in strike_steps:
-        for dte_off in dte_offsets:
-            strike = base_strike + sd
-            expiry = ASOF + timedelta(days=dte_off)
-            if bid_func is not None:
-                bid = bid_func(strike, dte_off)
-            else:
-                bid = max(0.05, 2.0 - sd * 0.10 + dte_off * 0.05)
-            delta = (delta_func(strike, dte_off) if delta_func else max(0.05, 0.50 - sd * 0.05))
-            quotes.append(OptionQuote(
-                strike=strike,
-                expiry=expiry,
-                bid=bid,
-                ask=round(bid + 0.05, 2),
-                delta=delta,
-                iv=0.40,
-            ))
-    return tuple(quotes)
-
-
 # ---------------------------------------------------------------------------
-# Regime gating
+# 1. Safety: missing current_call
 # ---------------------------------------------------------------------------
 
-def test_regime_defense_when_spot_below_adjusted_basis():
-    # initial_credit=0 disables the harvest gate so the regime branch is observable
-    pos = _pos(adjusted_basis=110.0, initial_credit=0.0)
-    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.50, delta=0.20))
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, HoldResult)
-    assert "DEFENSE_HOLD" in result.reason
-
-
-def test_regime_offense_when_spot_above_adjusted_basis():
-    pos = _pos(adjusted_basis=80.0, strike=100.0, initial_credit=0.0)
-    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.50, delta=0.20))
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, HoldResult)
-    assert "OFFENSE_HOLD" in result.reason
-
-
-def test_regime_defense_when_basis_unknown():
-    """All basis fields None → safer to assume defense."""
-    pos = _pos(adjusted_basis=None, assigned_basis=None, cost_basis=None,
-               initial_credit=0.0)
-    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.50, delta=0.20))
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, HoldResult)
-    assert "DEFENSE_HOLD" in result.reason
-
-
-# ---------------------------------------------------------------------------
-# Defense — velocity-ratio harvest gate
-# ---------------------------------------------------------------------------
-
-def test_defense_harvest_when_velocity_ratio_high_and_pnl_high():
-    # initial_credit=2.00, current ask=0.40 → P_pct=0.80
-    # initial_dte=14, opened 3 days ago → T_pct=3/14=0.214
-    # V_r = 0.80 / 0.214 = 3.74
-    pos = _pos(initial_credit=2.00, initial_dte=14,
-               opened_at=ASOF - timedelta(days=3))
-    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.40, delta=0.20))
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, HarvestResult)
-    assert result.pnl_pct >= 0.50
-    assert result.velocity_ratio >= 1.5
-
-
-def test_defense_no_harvest_when_pnl_below_floor():
-    # P_pct = 0.20 — even if V_r is high, sub-50% blocks harvest
-    pos = _pos(initial_credit=2.00, initial_dte=14,
-               opened_at=ASOF - timedelta(days=1))
-    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=1.60, delta=0.20))
-    result = evaluate(pos, market, _ctx())
-    assert not isinstance(result, HarvestResult)
-
-
-def test_defense_no_harvest_when_velocity_ratio_below_threshold():
-    # P_pct=0.50 but T_pct=0.50 → V_r=1.0 (below 1.5 threshold)
-    pos = _pos(initial_credit=2.00, initial_dte=14,
-               opened_at=ASOF - timedelta(days=7))
-    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=1.00, delta=0.20))
-    result = evaluate(pos, market, _ctx())
-    assert not isinstance(result, HarvestResult)
-
-
-def test_defense_harvest_skipped_when_initial_credit_zero():
-    """V_r calc returns 0 when initial_credit ≤ 0; harvest gate must not fire."""
-    pos = _pos(initial_credit=0.0)
-    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.10, delta=0.10))
-    result = evaluate(pos, market, _ctx())
-    assert not isinstance(result, HarvestResult)
-
-
-# ---------------------------------------------------------------------------
-# Defense — defensive roll trigger (extrinsic ≤ $0.10 AND ITM)
-# ---------------------------------------------------------------------------
-
-def test_defense_roll_when_itm_and_extrinsic_depleted():
-    # spot=105, strike=100 → ITM by $5. ask=5.05 → extrinsic=$0.05
-    chain = _chain(base_strike=100.0, strike_steps=(5, 10),
-                   dte_offsets=(10,),
-                   bid_func=lambda s, d: 6.00)  # generous bids on roll candidates
-    market = _market(
-        spot=105.0,
-        chain=chain,
-        current_call=_quote(strike=100.0, ask=5.05, delta=0.85),
-    )
-    pos = _pos(strike=100.0)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, RollResult)
-    assert result.cascade_tier == 1
-    assert result.new_strike == 105.0
-
-
-def test_defense_no_roll_when_extrinsic_above_threshold():
-    # spot=105, strike=100, ask=5.50 → extrinsic=$0.50 > $0.10
-    market = _market(
-        spot=105.0,
-        current_call=_quote(strike=100.0, ask=5.50, delta=0.85),
-    )
-    pos = _pos(strike=100.0)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, HoldResult)
-
-
-def test_defense_no_roll_when_otm():
-    # spot=95 < strike=100 → OTM, no defensive trigger even if ext is low.
-    # initial_credit=0 disables the unrelated harvest gate.
-    market = _market(
-        spot=95.0,
-        current_call=_quote(strike=100.0, ask=0.05, delta=0.10),
-    )
-    pos = _pos(strike=100.0, initial_credit=0.0)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, HoldResult)
-
-
-# ---------------------------------------------------------------------------
-# Defense — cascade tier coverage
-# ---------------------------------------------------------------------------
-
-def test_cascade_tier1_match_strike_plus_one_dte_7_to_14():
-    # Force a defensive roll, build chain so only Tier 1 has a match
-    chain = (
-        OptionQuote(strike=105.0, expiry=ASOF + timedelta(days=10),
-                    bid=6.00, ask=6.05, delta=0.50, iv=0.40),
-    )
-    market = _market(
-        spot=105.0, chain=chain,
-        current_call=_quote(strike=100.0, ask=5.05, delta=0.85),
-    )
-    pos = _pos(strike=100.0)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, RollResult)
-    assert result.cascade_tier == 1
-
-
-def test_cascade_tier2_match_when_tier1_dte_window_empty():
-    # Tier 1 needs DTE 7-14; Tier 2 needs DTE 14-21. Chain only has DTE 18.
-    chain = (
-        OptionQuote(strike=105.0, expiry=ASOF + timedelta(days=18),
-                    bid=6.50, ask=6.55, delta=0.50, iv=0.40),
-    )
-    market = _market(
-        spot=105.0, chain=chain,
-        current_call=_quote(strike=100.0, ask=5.05, delta=0.85),
-    )
-    pos = _pos(strike=100.0)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, RollResult)
-    assert result.cascade_tier == 2
-
-
-def test_cascade_tier3_match_strike_plus_two_dte_21_to_45():
-    # Only candidate is +2 strikes at DTE 30
-    chain = (
-        OptionQuote(strike=110.0, expiry=ASOF + timedelta(days=30),
-                    bid=6.50, ask=6.55, delta=0.45, iv=0.40),
-        # Add the +1 strike that doesn't qualify (only one strike above current
-        # would not let us request strike_step=2 if we only had 1, so must
-        # include +1 at non-matching DTE)
-        OptionQuote(strike=105.0, expiry=ASOF + timedelta(days=60),
-                    bid=8.00, ask=8.05, delta=0.45, iv=0.40),
-    )
-    market = _market(
-        spot=105.0, chain=chain,
-        current_call=_quote(strike=100.0, ask=5.05, delta=0.85),
-    )
-    pos = _pos(strike=100.0)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, RollResult)
-    assert result.cascade_tier == 3
-    assert result.new_strike == 110.0
-
-
-def test_cascade_tier4_same_strike_fallback():
-    # No higher strikes available — only same-strike at DTE 10
-    chain = (
-        OptionQuote(strike=100.0, expiry=ASOF + timedelta(days=10),
-                    bid=6.00, ask=6.05, delta=0.85, iv=0.40),
-    )
-    market = _market(
-        spot=105.0, chain=chain,
-        current_call=_quote(strike=100.0, ask=5.05, delta=0.85),
-    )
-    pos = _pos(strike=100.0)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, RollResult)
-    assert result.cascade_tier == 4
-    assert result.new_strike == 100.0
-
-
-def test_cascade_exhausted_returns_alert_critical():
-    # Chain exists but no candidate yields net credit ≥ $0.05
-    chain = (
-        OptionQuote(strike=105.0, expiry=ASOF + timedelta(days=10),
-                    bid=4.00, ask=4.05, delta=0.50, iv=0.40),  # net credit = -1.05
-        OptionQuote(strike=100.0, expiry=ASOF + timedelta(days=10),
-                    bid=4.50, ask=4.55, delta=0.85, iv=0.40),  # net credit = -0.55
-    )
-    market = _market(
-        spot=105.0, chain=chain,
-        current_call=_quote(strike=100.0, ask=5.05, delta=0.85),
-    )
-    pos = _pos(strike=100.0)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, AlertResult)
-    assert result.severity == "CRITICAL"
-    assert "cascade exhausted" in result.reason
-
-
-def test_cascade_empty_chain_returns_alert():
-    market = _market(
-        spot=105.0, chain=(),
-        current_call=_quote(strike=100.0, ask=5.05, delta=0.85),
-    )
-    pos = _pos(strike=100.0)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, AlertResult)
-
-
-# ---------------------------------------------------------------------------
-# Defense — gamma cutoff
-# ---------------------------------------------------------------------------
-
-def test_defense_gamma_cutoff_forces_cascade():
-    # DTE=2, ext=0.03, delta=0.50 → all three cutoff conditions met
-    chain = (
-        OptionQuote(strike=105.0, expiry=ASOF + timedelta(days=10),
-                    bid=6.00, ask=6.05, delta=0.50, iv=0.40),
-    )
-    market = _market(
-        spot=100.5, chain=chain,
-        current_call=_quote(strike=100.0,
-                            expiry=ASOF + timedelta(days=2),
-                            ask=0.53, delta=0.50),
-    )
-    pos = _pos(strike=100.0, expiry=ASOF + timedelta(days=2),
-               initial_credit=0.0)  # disables harvest gate
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, RollResult)
-    assert "GAMMA_CUTOFF" in result.reason
-
-
-# ---------------------------------------------------------------------------
-# Offense — Opportunity Cost Breakeven
-# ---------------------------------------------------------------------------
-
-def test_offense_liquidate_when_breakeven_holds():
-    # adjusted_basis=80, spot=150, deep ITM strike=100, call ask=51 (mostly intrinsic)
-    # net_per_share = 150 - 51 = 99 > basis=80 → LIQUIDATE
-    pos = _pos(strike=100.0, adjusted_basis=80.0, quantity=2)
-    market = _market(
-        spot=150.0,
-        current_call=_quote(strike=100.0, ask=51.00, delta=0.95),
-    )
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, LiquidateResult)
-    assert result.requires_human_approval is True
-    assert result.contracts == 2
-    assert result.shares == 200
-    assert result.net_proceeds_per_share == pytest.approx(99.0, abs=0.01)
-
-
-def test_offense_no_liquidate_when_breakeven_fails():
-    # spot just barely above basis but buyback eats too much
-    pos = _pos(strike=100.0, adjusted_basis=80.0)
-    market = _market(
-        spot=82.0,
-        current_call=_quote(strike=100.0, ask=0.50, delta=0.20),  # OTM, not deep ITM
-    )
-    result = evaluate(pos, market, _ctx())
-    assert not isinstance(result, LiquidateResult)
-
-
-# ---------------------------------------------------------------------------
-# Offense — gamma cutoff → AssignResult
-# ---------------------------------------------------------------------------
-
-def test_offense_gamma_cutoff_lets_assign():
-    # Set adjusted_basis high enough that breakeven (spot - call_ask) < basis,
-    # otherwise LiquidateResult fires before gamma cutoff.
-    # spot=102, ask=2.03, basis=101 → net_per_share=99.97 < basis → no liquidate
-    pos = _pos(strike=100.0, adjusted_basis=101.0,
-               expiry=ASOF + timedelta(days=2),
-               initial_credit=0.0)  # disables harvest path
-    market = _market(
-        spot=102.0,
-        current_call=_quote(strike=100.0, expiry=ASOF + timedelta(days=2),
-                            ask=2.03, delta=0.85),
-    )
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, AssignResult)
-    assert "OFFENSE_LET_IT_CALL" in result.reason
-
-
-# ---------------------------------------------------------------------------
-# Offense — 90% harvest
-# ---------------------------------------------------------------------------
-
-def test_offense_harvest_at_90_pct_pnl():
-    # initial_credit=2.00, ask=0.18 → P_pct = 0.91
-    pos = _pos(adjusted_basis=80.0, initial_credit=2.00,
-               opened_at=ASOF - timedelta(days=10))
-    market = _market(
-        spot=90.0,
-        current_call=_quote(strike=100.0, ask=0.18, delta=0.10),
-    )
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, HarvestResult)
-    assert result.pnl_pct >= 0.90
-    assert "OFFENSE_HARVEST" in result.reason
-
-
-# ---------------------------------------------------------------------------
-# Edge cases
-# ---------------------------------------------------------------------------
-
-def test_legacy_null_inception_delta_routes_via_extrinsic():
-    """The 9 fill_log NULL rows from WHEEL-1b — evaluator must not depend on
-    inception_delta for routing. Position with inception_delta=None still
-    routes correctly via extrinsic-based defensive trigger."""
-    chain = (
-        OptionQuote(strike=105.0, expiry=ASOF + timedelta(days=10),
-                    bid=6.00, ask=6.05, delta=0.50, iv=0.40),
-    )
-    market = _market(
-        spot=105.0, chain=chain,
-        current_call=_quote(strike=100.0, ask=5.05, delta=0.85),
-    )
-    pos = _pos(strike=100.0, inception_delta=None)
-    result = evaluate(pos, market, _ctx())
-    assert isinstance(result, RollResult)
-    assert result.cascade_tier == 1
-
-
-def test_evaluator_exception_returns_alert_critical():
-    """Defensive try/except shell must convert any exception to AlertResult."""
+def test_missing_current_call_returns_alert():
     pos = _pos()
-    # Pass a market with current_call=None — explicitly handled before regime gate
     market = MarketSnapshot(
         ticker="CRM", spot=90.0, iv30=0.45,
         chain=(), current_call=None, asof=ASOF,  # type: ignore[arg-type]
@@ -484,10 +130,303 @@ def test_evaluator_exception_returns_alert_critical():
     assert result.severity == "CRITICAL"
 
 
-def test_eval_result_is_discriminated_union_kind_field():
-    """Every result variant must expose a unique .kind for caller dispatch."""
-    pos = _pos()
-    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.50, delta=0.20))
+# ---------------------------------------------------------------------------
+# 2. Expiry day — let ride
+# ---------------------------------------------------------------------------
+
+def test_expiry_day_hold():
+    pos = _pos(expiry=ASOF)  # DTE = 0
+    market = _market(spot=90.0, current_call=_quote(ask=0.03))
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, HoldResult)
+    assert "EXPIRY_LET_RIDE" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# 3. Canonical 80/90 harvest
+# ---------------------------------------------------------------------------
+
+def test_harvest_day1_80pct():
+    """Day-1 position at ≥80% profit → harvest."""
+    pos = _pos(initial_credit=2.00, opened_at=ASOF)  # days_held=0
+    market = _market(spot=90.0, current_call=_quote(ask=0.40))
+    # P_pct = (2.00 - 0.40) / 2.00 = 0.80
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, HarvestResult)
+    assert result.pnl_pct >= 0.80
+    assert "DAY1_HARVEST" in result.reason
+
+
+def test_harvest_day2_plus_90pct():
+    """Day-2+ position at ≥90% profit → harvest."""
+    pos = _pos(initial_credit=2.00, opened_at=ASOF - timedelta(days=5))
+    market = _market(spot=90.0, current_call=_quote(ask=0.18))
+    # P_pct = (2.00 - 0.18) / 2.00 = 0.91
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, HarvestResult)
+    assert result.pnl_pct >= 0.90
+    assert "CANONICAL_90" in result.reason
+
+
+def test_no_harvest_below_threshold():
+    """Day-2 position at 60% profit → no harvest."""
+    pos = _pos(initial_credit=2.00, opened_at=ASOF - timedelta(days=5))
+    market = _market(spot=90.0, current_call=_quote(ask=0.80))
+    # P_pct = (2.00 - 0.80) / 2.00 = 0.60 < 0.90
+    result = evaluate(pos, market, _ctx())
+    assert not isinstance(result, HarvestResult)
+
+
+def test_no_harvest_zero_initial_credit():
+    """Zero initial_credit → harvest gate disabled."""
+    pos = _pos(initial_credit=0.0)
+    market = _market(spot=90.0, current_call=_quote(ask=0.01))
+    result = evaluate(pos, market, _ctx())
+    assert not isinstance(result, HarvestResult)
+
+
+# ---------------------------------------------------------------------------
+# 4. Strike ≥ paper basis — welcome assignment
+# ---------------------------------------------------------------------------
+
+def test_above_basis_itm_lets_assign():
+    """Strike ≥ paper basis AND ITM → ASSIGN.
+
+    Set prices so net_proceeds (spot - ask) ≤ basis, avoiding the
+    LiquidateResult opportunity-cost gate.
+    """
+    # paper basis = 95, strike = 100, spot = 101, ask = 7.00
+    # net_proceeds = 101 - 7.00 = 94.00 ≤ basis 95 → no liquidate
+    pos = _pos(strike=100.0, assigned_basis=95.0, initial_credit=0.0)
+    market = _market(spot=101.0, current_call=_quote(strike=100.0, ask=7.00))
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, AssignResult)
+    assert "ABOVE_PAPER_BASIS" in result.reason
+
+
+def test_above_basis_otm_holds():
+    """Strike ≥ paper basis AND OTM → HOLD."""
+    pos = _pos(strike=100.0, assigned_basis=95.0, initial_credit=0.0)
+    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.50))
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, HoldResult)
+    assert "ABOVE_PAPER_BASIS_OTM" in result.reason
+
+
+def test_above_basis_liquidate_opportunity():
+    """Strike ≥ basis, deep ITM, BTC+STC net > basis → LIQUIDATE."""
+    # basis=80, strike=100, spot=150, call ask=51 → net=99 > 80
+    pos = _pos(strike=100.0, assigned_basis=80.0, quantity=2, initial_credit=0.0)
+    market = _market(
+        spot=150.0,
+        current_call=_quote(strike=100.0, ask=51.00, delta=0.95),
+    )
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, LiquidateResult)
+    assert result.requires_human_approval is True
+    assert result.contracts == 2
+    assert result.shares == 200
+
+
+# ---------------------------------------------------------------------------
+# 5. Below paper basis — OTM → hold
+# ---------------------------------------------------------------------------
+
+def test_below_basis_otm_holds():
+    """Strike < paper basis, OTM → hold, theta working."""
+    # paper basis = 120, strike = 100, spot = 90 → OTM, below basis
+    pos = _pos(strike=100.0, assigned_basis=120.0, initial_credit=0.0)
+    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.50))
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, HoldResult)
+    assert "BELOW_BASIS_OTM" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# 6. Below basis, ITM but not urgent — hold
+# ---------------------------------------------------------------------------
+
+def test_below_basis_itm_not_urgent_holds():
+    """ITM but DTE=10, extrinsic=$2.00 → not urgent, hold."""
+    pos = _pos(
+        strike=100.0, assigned_basis=120.0, initial_credit=0.0,
+        expiry=ASOF + timedelta(days=10),
+    )
+    market = _market(
+        spot=105.0,
+        current_call=_quote(
+            strike=100.0, ask=7.00,  # intrinsic=5, extrinsic=2.00
+            expiry=ASOF + timedelta(days=10),
+        ),
+    )
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, HoldResult)
+    assert "NOT_URGENT" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# 7. Below basis, ITM, urgent — ROLL
+# ---------------------------------------------------------------------------
+
+def test_below_basis_itm_short_dte_rolls():
+    """Strike < basis, ITM, DTE=2 → roll +1 strike."""
+    pos = _pos(
+        strike=100.0, assigned_basis=120.0, initial_credit=0.0,
+        expiry=ASOF + timedelta(days=2),
+    )
+    chain = (
+        _quote(strike=105.0, expiry=ASOF + timedelta(days=10), bid=6.00, ask=6.05),
+    )
+    market = _market(
+        spot=105.0,
+        chain=chain,
+        current_call=_quote(
+            strike=100.0, ask=5.05,
+            expiry=ASOF + timedelta(days=2),
+        ),
+    )
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, RollResult)
+    assert result.new_strike == 105.0
+    assert "ROLL_UP_OUT" in result.reason
+
+
+def test_below_basis_itm_extrinsic_depleted_rolls():
+    """Strike < basis, ITM, DTE=15 but extrinsic=$0.05 → roll.
+
+    Chain candidate must be within fallback DTE window (3-21) and have
+    expiry > current expiry.
+    """
+    pos = _pos(
+        strike=100.0, assigned_basis=120.0, initial_credit=0.0,
+        expiry=ASOF + timedelta(days=15),
+    )
+    # Candidate: strike 105, expiry 7 days after current (DTE=22 from asof,
+    # within fallback 3-21? No — need DTE within window. Use DTE=20.)
+    chain = (
+        _quote(strike=105.0, expiry=ASOF + timedelta(days=20), bid=6.00, ask=6.05),
+    )
+    market = _market(
+        spot=115.0,
+        chain=chain,
+        current_call=_quote(
+            strike=100.0, ask=15.05,  # intrinsic=15, extrinsic=0.05
+            expiry=ASOF + timedelta(days=15),
+        ),
+    )
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, RollResult)
+    assert result.new_strike == 105.0
+
+
+def test_roll_uses_fallback_dte_window():
+    """No candidate in primary 5-14 DTE window, but exists in fallback 3-21."""
+    pos = _pos(
+        strike=100.0, assigned_basis=120.0, initial_credit=0.0,
+        expiry=ASOF + timedelta(days=2),
+    )
+    chain = (
+        _quote(strike=105.0, expiry=ASOF + timedelta(days=18), bid=6.50, ask=6.55),
+    )
+    market = _market(
+        spot=105.0,
+        chain=chain,
+        current_call=_quote(
+            strike=100.0, ask=5.05,
+            expiry=ASOF + timedelta(days=2),
+        ),
+    )
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, RollResult)
+    assert result.new_strike == 105.0
+
+
+# ---------------------------------------------------------------------------
+# 8. Circuit breakers
+# ---------------------------------------------------------------------------
+
+def test_max_rolls_alerts():
+    """roll_count ≥ max_rolls → ALERT, not ROLL."""
+    pos = _pos(
+        strike=100.0, assigned_basis=120.0, initial_credit=0.0,
+        expiry=ASOF + timedelta(days=2),
+        roll_count=10,
+    )
+    chain = (
+        _quote(strike=105.0, expiry=ASOF + timedelta(days=10), bid=6.00, ask=6.05),
+    )
+    market = _market(
+        spot=105.0,
+        chain=chain,
+        current_call=_quote(strike=100.0, ask=5.05, expiry=ASOF + timedelta(days=2)),
+    )
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, AlertResult)
+    assert "MAX_ROLLS" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# 9. No roll candidate → ALERT
+# ---------------------------------------------------------------------------
+
+def test_no_candidate_alerts():
+    """Empty chain → no roll candidate → ALERT."""
+    pos = _pos(
+        strike=100.0, assigned_basis=120.0, initial_credit=0.0,
+        expiry=ASOF + timedelta(days=2),
+    )
+    market = _market(
+        spot=105.0,
+        chain=(),
+        current_call=_quote(strike=100.0, ask=5.05, expiry=ASOF + timedelta(days=2)),
+    )
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, AlertResult)
+    assert "NO_ROLL_CANDIDATE" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+def test_basis_unknown_assumes_below_basis():
+    """All basis fields None → assume below basis (safer, never assign at unknown loss)."""
+    pos = _pos(
+        assigned_basis=None, adjusted_basis=None, cost_basis=None,
+        initial_credit=0.0,
+    )
+    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.50))
+    result = evaluate(pos, market, _ctx())
+    # OTM with unknown basis → should hold (below-basis OTM path)
+    assert isinstance(result, HoldResult)
+
+
+def test_basis_falls_back_to_cost_basis():
+    """assigned_basis=None → falls back to cost_basis for paper basis."""
+    # spot=101, ask=7.00 → net_proceeds=94 ≤ basis=95 → no liquidate
+    pos = _pos(
+        strike=100.0, assigned_basis=None, cost_basis=95.0,
+        initial_credit=0.0,
+    )
+    market = _market(spot=101.0, current_call=_quote(strike=100.0, ask=7.00))
+    # strike=100 >= cost_basis=95 → above basis → let assign
+    result = evaluate(pos, market, _ctx())
+    assert isinstance(result, AssignResult)
+
+
+def test_null_inception_delta_routes_correctly():
+    """inception_delta=None must not crash — field is vestigial."""
+    pos = _pos(inception_delta=None, initial_credit=0.0)
+    market = _market(spot=90.0, current_call=_quote(strike=100.0, ask=0.50))
     result = evaluate(pos, market, _ctx())
     assert hasattr(result, "kind")
-    assert result.kind in {"HOLD", "HARVEST", "ROLL", "ASSIGN", "LIQUIDATE", "ALERT"}
+
+
+def test_exception_returns_alert_critical():
+    """Defensive try/except shell converts any exception to AlertResult."""
+    pos = _pos()
+    market = MarketSnapshot(
+        ticker="CRM", spot=90.0, iv30=0.45,
+        chain=(), current_call=None, asof=ASOF,  # type: ignore[arg-type]
+    )
+   

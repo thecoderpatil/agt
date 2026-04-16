@@ -1,12 +1,11 @@
-"""WHEEL roll-logic hardening tests — R1/R2/R4/R5/R7/R8.
+"""WHEEL-6 roll-engine hardening tests.
 
-Covers the 7-defect hardening MR on top of the WHEEL-3 Single Unified Evaluator.
-Each test holds one defect's behavior as an invariant so regressions surface
-instantly.
+Covers empirical-rules edge cases on top of the core decision tree tests
+in tests/wheel/test_roll_engine.py. Focus: trigger boundaries, roll
+candidate selection, backward compat, paper-basis resolution.
 """
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import date, timedelta
 
 import pytest
@@ -26,6 +25,7 @@ from agt_equities.roll_engine import (
     PortfolioContext,
     Position,
     RollResult,
+    _find_roll_target,
     _select_roll_candidate,
     evaluate,
 )
@@ -51,10 +51,12 @@ def _pos(**overrides) -> Position:
         inception_delta=0.25,
         opened_at=TODAY - timedelta(days=28),
         avg_premium_collected=1.20,
-        assigned_basis=55.0,
-        adjusted_basis=55.0,                # defense by default
+        assigned_basis=55.0,                # paper basis
+        adjusted_basis=52.0,                # adjusted (not used for roll target)
         initial_credit=1.20,
         initial_dte=30,
+        cumulative_roll_debit=0.0,
+        roll_count=0,
     )
     base.update(overrides)
     return Position(**base)
@@ -77,76 +79,174 @@ def _market(pos: Position, spot: float, current_ask: float, chain: tuple[OptionQ
 
 
 # ---------------------------------------------------------------------------
-# R2 — Mode-1 defense min_credit default is $0.01
+# Roll trigger boundary tests
 # ---------------------------------------------------------------------------
 
-def test_r2_defense_min_credit_default_is_one_cent():
-    """ConstraintMatrix default: defense cascade accepts a $0.01 credit per
-    rulebook v10 §Mode-1 'any net credit, even $0.01'."""
-    cm = ConstraintMatrix()
-    assert cm.min_credit_per_contract == 0.01
-
-
-def test_r2_defense_cascade_accepts_penny_credit():
-    """Sub-basis ITM with only a $0.02 credit available → must roll, not alert."""
-    pos = _pos()  # 2 DTE ITM when spot > 50
-    # Chain: tier1 target is strike 51 (step 1), DTE in [7,14]
-    tier1_exp = TODAY + timedelta(days=10)
-    chain = (
-        _quote(51.0, tier1_exp, bid=0.30, ask=0.35, delta=0.28),
-    )
+def test_trigger_dte_boundary_at_3():
+    """DTE=3 ITM → triggers roll (≤ 3)."""
+    pos = _pos(expiry=TODAY + timedelta(days=3), initial_credit=0.0)
+    chain = (_quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55),)
     m = _market(pos, spot=52.0, current_ask=0.28, chain=chain)
-    # Net credit = 0.30 - 0.28 = 0.02 ≥ 0.01 default
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, RollResult), f"got {type(result).__name__}: {result}"
-    assert result.cascade_tier == 1
-    assert result.new_strike == 51.0
-
-
-# ---------------------------------------------------------------------------
-# R1 — Offense tries $0.20 roll before ASSIGN
-# ---------------------------------------------------------------------------
-
-def test_r1_offense_short_dte_itm_rolls_at_twenty_cents():
-    """Offense regime with a viable $0.25 credit at tier1 → RollResult, not ASSIGN."""
-    # basis 51.8 keeps offense (spot 52 > basis) but skips opp-cost breakeven
-    # (net_proceeds 51.75 !> basis 51.8).
-    pos = _pos(cost_basis=51.8, assigned_basis=51.8, adjusted_basis=51.8)
-    tier1_exp = TODAY + timedelta(days=10)
-    chain = (
-        _quote(51.0, tier1_exp, bid=0.50, ask=0.55, delta=0.28),
-    )
-    m = _market(pos, spot=52.0, current_ask=0.25, chain=chain)
-    # Net credit = 0.50 - 0.25 = 0.25 ≥ 0.20 offense floor
     result = evaluate(pos, m, CTX)
     assert isinstance(result, RollResult), f"got {type(result).__name__}: {result}"
 
 
-def test_r1_offense_short_dte_itm_falls_back_to_assign():
-    """Offense regime with only $0.05 credit available (below $0.20 floor) → ASSIGN."""
-    pos = _pos(cost_basis=51.8, assigned_basis=51.8, adjusted_basis=51.8)
-    tier1_exp = TODAY + timedelta(days=10)
-    chain = (
-        _quote(51.0, tier1_exp, bid=0.30, ask=0.35, delta=0.28),
+def test_trigger_dte_4_itm_not_urgent():
+    """DTE=4 ITM with healthy extrinsic → NOT urgent, hold."""
+    pos = _pos(
+        expiry=TODAY + timedelta(days=4),
+        initial_credit=0.0,
     )
-    m = _market(pos, spot=52.0, current_ask=0.25, chain=chain)
-    # Net credit = 0.30 - 0.25 = 0.05 < 0.20 offense floor → cascade fails → ASSIGN
+    m = _market(
+        pos, spot=51.0,
+        current_ask=2.00,  # intrinsic=1, extrinsic=1.00 >> 0.10
+        chain=(),
+    )
     result = evaluate(pos, m, CTX)
-    assert isinstance(result, AssignResult), f"got {type(result).__name__}: {result}"
+    assert isinstance(result, HoldResult)
+    assert "NOT_URGENT" in result.reason
+
+
+def test_trigger_extrinsic_at_009():
+    """DTE=15 ITM but extrinsic=$0.09 → triggers roll (< 0.10)."""
+    pos = _pos(
+        expiry=TODAY + timedelta(days=15),
+        initial_credit=0.0,
+    )
+    # Chain candidate within fallback DTE window, expiry > current
+    chain = (_quote(51.0, TODAY + timedelta(days=20), bid=2.50, ask=2.55),)
+    # spot=52, strike=50, ask=2.09 → intrinsic=2, extrinsic=0.09
+    m = _market(pos, spot=52.0, current_ask=2.09, chain=chain)
+    result = evaluate(pos, m, CTX)
+    assert isinstance(result, RollResult), f"got {type(result).__name__}: {result}"
+
+
+def test_trigger_extrinsic_above_threshold_holds():
+    """DTE=15 ITM but extrinsic=$0.50 → not urgent, hold."""
+    pos = _pos(
+        expiry=TODAY + timedelta(days=15),
+        initial_credit=0.0,
+    )
+    m = _market(pos, spot=52.0, current_ask=2.50, chain=())  # ext=0.50
+    result = evaluate(pos, m, CTX)
+    assert isinstance(result, HoldResult)
 
 
 # ---------------------------------------------------------------------------
-# R5 — Roll candidate filter: never select same-or-earlier expiry
+# Paper basis vs adjusted basis
 # ---------------------------------------------------------------------------
 
-def test_r5_roll_candidate_filters_same_expiry():
-    """_select_roll_candidate must reject a quote on current_expiry even if net
-    credit is otherwise sufficient (prevents "horizontal roll to self")."""
+def test_paper_basis_not_adjusted_basis_gates_roll():
+    """Roll decision uses paper basis (assigned_basis), not adjusted_basis.
+
+    assigned_basis=55 (paper), adjusted_basis=52 (after premiums).
+    strike=53, spot=54 → ITM.
+    strike=53 < paper_basis=55 → below basis, should roll.
+    strike=53 > adjusted_basis=52 → would be 'above basis' if using wrong field.
+    """
+    pos = _pos(
+        strike=53.0, assigned_basis=55.0, adjusted_basis=52.0,
+        expiry=TODAY + timedelta(days=2),
+        initial_credit=0.0,
+    )
+    chain = (_quote(54.0, TODAY + timedelta(days=10), bid=0.60, ask=0.65),)
+    m = _market(pos, spot=54.0, current_ask=1.10, chain=chain)
+    result = evaluate(pos, m, CTX)
+    # Must ROLL (below paper basis), NOT ASSIGN (which would happen with adjusted_basis)
+    assert isinstance(result, RollResult), (
+        f"Expected RollResult (below paper basis), got {type(result).__name__}: {result}"
+    )
+
+
+def test_above_paper_basis_assigns():
+    """Strike ≥ paper basis → let assign even if below adjusted_basis.
+
+    Set ask high enough that net_proceeds (spot - ask) ≤ basis,
+    avoiding the LiquidateResult opportunity-cost gate.
+    """
+    pos = _pos(
+        strike=56.0, assigned_basis=55.0, adjusted_basis=52.0,
+        expiry=TODAY + timedelta(days=2),
+        initial_credit=0.0,
+    )
+    # spot=56.5, ask=2.00 → net_proceeds=54.5 ≤ basis=55 → no liquidate
+    m = _market(pos, spot=56.5, current_ask=2.00, chain=())
+    result = evaluate(pos, m, CTX)
+    assert isinstance(result, AssignResult)
+    assert "ABOVE_PAPER_BASIS" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# _find_roll_target unit tests
+# ---------------------------------------------------------------------------
+
+def test_find_roll_target_picks_next_strike_up():
+    chain = (
+        _quote(51.0, TODAY + timedelta(days=10), bid=1.00),
+        _quote(52.0, TODAY + timedelta(days=10), bid=0.80),
+        _quote(53.0, TODAY + timedelta(days=10), bid=0.60),
+    )
+    cand = _find_roll_target(
+        chain=chain, current_strike=50.0,
+        current_expiry=TODAY + timedelta(days=2),
+        asof=TODAY, dte_min=5, dte_max=14,
+    )
+    assert cand is not None
+    assert cand.strike == 51.0  # one strike up, not two
+
+
+def test_find_roll_target_rejects_same_or_earlier_expiry():
+    chain = (
+        _quote(51.0, TODAY + timedelta(days=2), bid=1.00),   # same expiry
+        _quote(51.0, TODAY + timedelta(days=1), bid=1.20),   # earlier expiry
+    )
+    cand = _find_roll_target(
+        chain=chain, current_strike=50.0,
+        current_expiry=TODAY + timedelta(days=2),
+        asof=TODAY, dte_min=1, dte_max=14,
+    )
+    assert cand is None
+
+
+def test_find_roll_target_picks_closest_to_7dte():
+    chain = (
+        _quote(51.0, TODAY + timedelta(days=5), bid=0.50),   # 5 DTE
+        _quote(51.0, TODAY + timedelta(days=8), bid=0.70),   # 8 DTE (closest to 7)
+        _quote(51.0, TODAY + timedelta(days=14), bid=1.00),  # 14 DTE
+    )
+    cand = _find_roll_target(
+        chain=chain, current_strike=50.0,
+        current_expiry=TODAY + timedelta(days=2),
+        asof=TODAY, dte_min=5, dte_max=14,
+    )
+    assert cand is not None
+    assert cand.expiry == TODAY + timedelta(days=8)
+
+
+def test_find_roll_target_no_strikes_above():
+    chain = (
+        _quote(49.0, TODAY + timedelta(days=10), bid=2.00),
+        _quote(50.0, TODAY + timedelta(days=10), bid=1.50),
+    )
+    cand = _find_roll_target(
+        chain=chain, current_strike=50.0,
+        current_expiry=TODAY + timedelta(days=2),
+        asof=TODAY, dte_min=5, dte_max=14,
+    )
+    assert cand is None
+
+
+# ---------------------------------------------------------------------------
+# _select_roll_candidate backward compat
+# ---------------------------------------------------------------------------
+
+def test_legacy_select_roll_candidate_filters_same_expiry():
+    """Backward-compat wrapper rejects same/earlier expiry."""
     current_exp = TODAY + timedelta(days=10)
     later_exp = TODAY + timedelta(days=14)
     chain = (
-        _quote(51.0, current_exp, bid=1.00, ask=1.10, delta=0.28),  # same expiry — must skip
-        _quote(51.0, later_exp, bid=0.50, ask=0.55, delta=0.28),    # proper forward roll
+        _quote(51.0, current_exp, bid=1.00),    # same expiry — skip
+        _quote(51.0, later_exp, bid=0.50),       # forward roll
     )
     cand = _select_roll_candidate(
         chain=chain, current_strike=50.0, current_expiry=current_exp,
@@ -157,252 +257,47 @@ def test_r5_roll_candidate_filters_same_expiry():
     assert cand.expiry == later_exp
 
 
-def test_r5_roll_candidate_filters_earlier_expiry():
-    earlier_exp = TODAY + timedelta(days=5)
-    current_exp = TODAY + timedelta(days=10)
-    chain = (
-        _quote(51.0, earlier_exp, bid=1.00, ask=1.10, delta=0.28),
-    )
-    cand = _select_roll_candidate(
-        chain=chain, current_strike=50.0, current_expiry=current_exp,
-        current_call_ask=0.25, asof=TODAY,
-        strike_step=1, dte_min=3, dte_max=21, min_credit=0.01,
-    )
-    assert cand is None
-
-
 # ---------------------------------------------------------------------------
-# R4 — Ex-dividend gate (defense + offense)
+# Harvest at expiry boundary
 # ---------------------------------------------------------------------------
 
-def test_r4_defense_ex_div_within_dte_triggers_cascade():
-    """ITM + ex-div inside DTE window + extrinsic < div → force cascade."""
-    # Mid-DTE position to avoid R8 (short-DTE ITM) firing first.
+def test_harvest_skipped_at_expiry_even_if_profitable():
+    """DTE=0 with 95% profit → no harvest, let ride."""
     pos = _pos(
-        expiry=TODAY + timedelta(days=7),
-        opened_at=TODAY - timedelta(days=23),
+        initial_credit=1.20, initial_dte=30,
+        opened_at=TODAY - timedelta(days=30),
+        expiry=TODAY,  # DTE = 0
     )
-    ex_div = TODAY + timedelta(days=5)  # inside DTE window
-    tier1_exp = TODAY + timedelta(days=14)  # tier1 DTE [7,14], > current_expiry
-    chain = (
-        _quote(51.0, tier1_exp, bid=2.35, ask=2.40, delta=0.30),
-    )
-    # Current call ITM (spot 52 > strike 50), extrinsic ≈ 0.30, div 0.50 → gate fires.
-    m = _market(
-        pos, spot=52.0, current_ask=2.30, chain=chain,
-        next_ex_div_date=ex_div, next_div_amount=0.50,
-    )
+    m = _market(pos, spot=48.0, current_ask=0.06, chain=())
     result = evaluate(pos, m, CTX)
-    assert isinstance(result, RollResult), f"got {type(result).__name__}: {result}"
-    assert "EX_DIV_RISK" in result.reason
-
-
-def test_r4_defense_ex_div_outside_dte_does_not_trigger():
-    """Ex-div AFTER expiry → gate does not fire."""
-    pos = _pos(
-        expiry=TODAY + timedelta(days=10),
-        opened_at=TODAY - timedelta(days=5),
-    )
-    ex_div_far = TODAY + timedelta(days=30)  # after expiry
-    chain = (
-        _quote(51.0, TODAY + timedelta(days=18), bid=0.60, ask=0.65, delta=0.30),
-    )
-    # Spot < strike (OTM), current_ask high enough that velocity harvest doesn't fire.
-    m = _market(
-        pos, spot=49.0, current_ask=0.90, chain=chain,
-        next_ex_div_date=ex_div_far, next_div_amount=0.50,
-    )
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, HoldResult), f"got {type(result).__name__}: {result}"
-
-
-def test_r4_offense_ex_div_with_viable_roll_returns_roll():
-    # basis 50 keeps offense (spot 52 > 50) but skips opp-cost breakeven
-    # (net_proceeds 49.70 !> basis 50).
-    pos = _pos(
-        cost_basis=50.0, assigned_basis=50.0, adjusted_basis=50.0,
-        expiry=TODAY + timedelta(days=7),
-        opened_at=TODAY - timedelta(days=23),
-    )
-    ex_div = TODAY + timedelta(days=5)
-    chain = (
-        _quote(51.0, TODAY + timedelta(days=14), bid=2.80, ask=2.85, delta=0.40),
-    )
-    m = _market(
-        pos, spot=52.0, current_ask=2.30, chain=chain,
-        next_ex_div_date=ex_div, next_div_amount=0.50,
-    )
-    # Net credit 2.80 - 2.30 = 0.50 ≥ 0.20 offense floor
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, RollResult)
-    assert "OFFENSE_EX_DIV" in result.reason
-
-
-def test_r4_offense_ex_div_cascade_failure_assigns():
-    pos = _pos(
-        cost_basis=50.0, assigned_basis=50.0, adjusted_basis=50.0,
-        expiry=TODAY + timedelta(days=7),
-        opened_at=TODAY - timedelta(days=23),
-    )
-    ex_div = TODAY + timedelta(days=5)
-    chain = (
-        _quote(51.0, TODAY + timedelta(days=14), bid=2.35, ask=2.40, delta=0.40),
-    )
-    m = _market(
-        pos, spot=52.0, current_ask=2.30, chain=chain,
-        next_ex_div_date=ex_div, next_div_amount=0.50,
-    )
-    # Net credit 2.35 - 2.30 = 0.05 < 0.20 offense floor → cascade fails → OFFENSE_EX_DIV_ASSIGN
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, AssignResult)
-    assert "OFFENSE_EX_DIV_ASSIGN" in result.reason
+    assert isinstance(result, HoldResult)
+    assert "EXPIRY_LET_RIDE" in result.reason
 
 
 # ---------------------------------------------------------------------------
-# R8 — Short-DTE ITM trigger replaces gamma cutoff
+# Constraint defaults
 # ---------------------------------------------------------------------------
 
-def test_r8_defense_short_dte_itm_forces_cascade_regardless_of_extrinsic():
-    """2 DTE ITM with $0.25 extrinsic remaining → must still cascade.
-    Prior gamma cutoff required extrinsic ≤ $0.05 AND delta ≥ 0.40; R8 fires
-    purely on dte + ITM."""
-    pos = _pos()  # 2 DTE ITM
-    tier1_exp = TODAY + timedelta(days=10)
-    chain = (
-        _quote(51.0, tier1_exp, bid=0.50, ask=0.55, delta=0.28),
-    )
-    # Current call: spot 51 > strike 50, ask 2.25 → intrinsic 1, extrinsic 1.25
-    # Prior gamma-cutoff would NOT fire (extrinsic >> 0.05).
-    # R8 fires purely on dte ≤ 3 AND ITM.
-    m = _market(pos, spot=51.0, current_ask=0.25, chain=chain)
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, RollResult), f"got {type(result).__name__}: {result}"
-    assert "SHORT_DTE_ITM" in result.reason
-
-
-def test_r8_defense_short_dte_otm_does_not_trigger():
-    """2 DTE OTM → R8 does not fire (OTM, not ITM).
-
-    Post-E5 fix: the canonical 90% harvest gate fires BEFORE R8 because
-    P_pct = (1.20 - 0.05)/1.20 = 0.9583 >= 0.90 at days_held=28 >= 2
-    and dte=2 >= 1. This is CORRECT — a 96% profit should be harvested
-    regardless of whether R8 triggers. The test now asserts HarvestResult.
-    """
-    pos = _pos()
-    chain = (
-        _quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55, delta=0.28),
-    )
-    m = _market(pos, spot=48.0, current_ask=0.05, chain=chain)  # OTM
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, HarvestResult), f"got {type(result).__name__}: {result}"
-    assert "DEFENSE_CANONICAL_90" in result.reason
-
-
-def test_r8_offense_short_dte_itm_rolls_before_assigning():
-    pos = _pos(
-        cost_basis=51.3, assigned_basis=51.3, adjusted_basis=51.3,
-    )  # offense but breakeven skipped (net 51.25 !> basis 51.3)
-    chain = (
-        _quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55, delta=0.28),
-    )
-    m = _market(pos, spot=51.5, current_ask=0.25, chain=chain)
-    # Net credit 0.50 - 0.25 = 0.25 ≥ 0.20
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, RollResult)
-    assert "OFFENSE_SHORT_DTE_ITM" in result.reason
-
-
-def test_r8_offense_short_dte_itm_cascade_exhausted_assigns():
-    pos = _pos(cost_basis=51.3, assigned_basis=51.3, adjusted_basis=51.3)
-    chain = (
-        _quote(51.0, TODAY + timedelta(days=10), bid=0.30, ask=0.35, delta=0.28),
-    )
-    m = _market(pos, spot=51.5, current_ask=0.25, chain=chain)
-    # Net credit 0.05 < 0.20 → fails → ASSIGN
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, AssignResult)
-    assert "OFFENSE_LET_IT_CALL" in result.reason
-
-
-# ---------------------------------------------------------------------------
-# Constraint defaults sanity
-# ---------------------------------------------------------------------------
-
-def test_constraints_defaults_reflect_hardening():
+def test_constraints_defaults_wheel6():
     cm = ConstraintMatrix()
-    assert cm.min_credit_per_contract == 0.01, "R2"
-    assert cm.offense_roll_min_credit == 0.20, "R1"
-    assert cm.offense_harvest_pnl == 0.90, "R3 override (deliberate)"
+    assert cm.roll_trigger_dte == 3
+    assert cm.roll_trigger_extrinsic == 0.10
+    assert cm.max_rolls == 10
+    assert cm.harvest_day1_pct == 0.80
+    assert cm.harvest_standard_pct == 0.90
+    # Legacy fields still present
+    assert cm.min_credit_per_contract == 0.01
+    assert cm.offense_roll_min_credit == 0.20
 
 
 # ---------------------------------------------------------------------------
-# Earnings-week gate — offense regime skips cascade (harvest-and-re-enter
-# handled outside roll_engine). Defense regime is unaffected.
+# Roll count tracking
 # ---------------------------------------------------------------------------
 
-def _offense_short_dte_itm_pos() -> Position:
-    """Short-DTE ITM offense setup — mirrors test_r8_offense_short_dte_itm_*.
-
-    2 DTE, strike 50, spot will be 51.5, basis 51.3. Net proceeds 51.25
-    ≤ basis 51.3 so OPPORTUNITY_COST_BREAKEVEN does NOT fire. Offense
-    because adjusted_basis=51.3 < spot=51.5. Hits R1+R8 cascade trigger —
-    which is exactly where the earnings-week gate lives."""
-    return _pos(
-        cost_basis=51.3, assigned_basis=51.3, adjusted_basis=51.3,
+def test_roll_count_in_reason():
+    """RollResult reason includes the roll count for operator visibility."""
+    pos = _pos(
+        strike=50.0, assigned_basis=55.0, initial_credit=0.0,
+        expiry=TODAY + timedelta(days=2), roll_count=3,
     )
-
-
-def test_earnings_week_offense_skips_cascade():
-    """Offense regime + short-DTE ITM + earnings THIS ISO week → HoldResult
-    with OFFENSE_EARNINGS_WEEK_SKIP_CASCADE. No roll staged."""
-    pos = _offense_short_dte_itm_pos()
-    chain = (_quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55, delta=0.28),)
-    m = _market(
-        pos, spot=51.5, current_ask=0.25, chain=chain,
-        next_earnings_date=TODAY + timedelta(days=2),   # same ISO week
-    )
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, HoldResult), f"got {type(result).__name__}: {result}"
-    assert "OFFENSE_EARNINGS_WEEK_SKIP_CASCADE" in result.reason
-
-
-def test_earnings_week_offense_different_week_cascades_normally():
-    """Offense regime + earnings in a LATER ISO week → cascade proceeds (roll)."""
-    pos = _offense_short_dte_itm_pos()
-    chain = (_quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55, delta=0.28),)
-    m = _market(
-        pos, spot=51.5, current_ask=0.25, chain=chain,
-        next_earnings_date=TODAY + timedelta(days=21),  # 3 weeks out
-    )
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, RollResult), f"should roll, got {type(result).__name__}: {result}"
-    assert "OFFENSE_SHORT_DTE_ITM" in result.reason
-
-
-def test_earnings_week_none_fails_open():
-    """next_earnings_date=None (missing / stale cache) → cascade proceeds."""
-    pos = _offense_short_dte_itm_pos()
-    chain = (_quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55, delta=0.28),)
-    m = _market(
-        pos, spot=51.5, current_ask=0.25, chain=chain,
-        next_earnings_date=None,
-    )
-    result = evaluate(pos, m, CTX)
-    assert isinstance(result, RollResult), f"should roll, got {type(result).__name__}: {result}"
-    assert not (isinstance(result, HoldResult) and "EARNINGS_WEEK" in result.reason)
-
-
-def test_earnings_week_defense_regime_unaffected():
-    """Defense regime (sub-basis ITM) → earnings-week gate does NOT fire; roll proceeds."""
-    pos = _pos()  # 2 DTE ITM, adjusted_basis=55, spot=52 → defense
-    tier1_exp = TODAY + timedelta(days=10)
-    chain = (_quote(51.0, tier1_exp, bid=0.50, ask=0.55, delta=0.30),)
-    m = _market(
-        pos, spot=52.0, current_ask=0.25, chain=chain,
-        next_earnings_date=TODAY + timedelta(days=2),  # same ISO week
-    )
-    result = evaluate(pos, m, CTX)
-    # Defense must still roll — CCs may roll through earnings to avoid
-    # assignment at a loss.
-    assert isinstance(result, RollResult), \
-        f"defense must roll through earnings; got {type(result).__name__}: {result}"
+ 
