@@ -242,8 +242,9 @@ def _load_transfer_events(
         if qty == 0:
             continue  # skip cash-only transfers
 
+        if acct not in ACCOUNT_TO_HOUSEHOLD: continue  # paper mode: skip events for accounts not in active map
         acct = r['account_id']
-        hh = ACCOUNT_TO_HOUSEHOLD.get(acct, 'Unknown_Household')
+        hh = ACCOUNT_TO_HOUSEHOLD[acct]
         symbol = r['symbol'] or ''
         # Extract underlying ticker from option symbol (e.g. "ADBE  251010P00332500" → "ADBE")
         tk = (r['underlying_symbol'] or symbol.split()[0] or '').strip()
