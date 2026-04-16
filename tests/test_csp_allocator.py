@@ -1631,3 +1631,256 @@ def test_orchestrator_digest_format():
     empty_lines = _format_digest(empty)
     assert len(empty_lines) >= 1
     assert "no candidates processed" in empty_lines[0]
+
+
+# ===========================================================================
+# DT Q4 interface seam tests — CSPCandidate contract, approval_gate,
+# candidate_reasoning payload. These are the load-bearing seams that let
+# paper (identity gate) and live (Telegram digest gate) run from one
+# codebase. See project_end_state_vision.md.
+# ===========================================================================
+
+
+def test_csp_candidate_protocol_scan_candidate_conforms():
+    """ScanCandidate (pxo_scanner adapter) satisfies the CSPCandidate
+    Protocol via runtime_checkable isinstance check."""
+    from agt_equities.csp_allocator import CSPCandidate
+    from agt_equities.scan_bridge import ScanCandidate
+    sc = ScanCandidate(
+        ticker="AAPL",
+        strike=150.0,
+        mid=1.50,
+        expiry="2026-05-16",
+        annualized_yield=0.22,
+    )
+    assert isinstance(sc, CSPCandidate)
+
+
+def test_csp_candidate_protocol_simple_namespace_conforms():
+    """A duck-typed SimpleNamespace with the 5 required attributes
+    satisfies the Protocol — unblocks RAYCandidate and the future
+    LLM digest tool from needing to inherit from a concrete base."""
+    from agt_equities.csp_allocator import CSPCandidate
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    assert isinstance(cand, CSPCandidate)
+
+
+def test_csp_candidate_protocol_missing_attr_fails():
+    """An object missing a required attribute must NOT satisfy the
+    Protocol. Runtime_checkable catches the contract violation."""
+    from agt_equities.csp_allocator import CSPCandidate
+    broken = SimpleNamespace(
+        ticker="AAPL", strike=150.0, mid=1.50, expiry="2026-05-16",
+        # annualized_yield missing
+    )
+    assert not isinstance(broken, CSPCandidate)
+
+
+def test_approval_gate_default_is_identity():
+    """No approval_gate kwarg → all candidates proceed (paper mode).
+
+    Baseline behavior must be preserved for backwards-compatibility
+    with every existing caller in telegram_bot.py / scan_bridge.py.
+    """
+    hh = _fake_hh_snapshot()
+    snapshots = {"Yash_Household": hh}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+    )
+    # 1 candidate in → 1 reasoning entry, approved
+    assert len(result.candidate_reasoning) == 1
+    entry = result.candidate_reasoning[0]
+    assert entry["approval_status"] == "approved"
+    assert entry["approval_reason"] == ""
+    assert entry["ticker"] == "AAPL"
+
+
+def test_approval_gate_rejects_all_candidates():
+    """Gate that returns [] → no allocation work, all candidates
+    appear in skipped + reasoning as rejected."""
+    hh = _fake_hh_snapshot()
+    snapshots = {"Yash_Household": hh}
+    cands = [
+        _fake_candidate(ticker="AAPL", strike=150.0),
+        _fake_candidate(ticker="MSFT", strike=400.0),
+    ]
+    gate_calls: list = []
+
+    def reject_all(cs):
+        gate_calls.append(list(cs))
+        return []
+
+    result = run_csp_allocator(
+        cands, snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+        approval_gate=reject_all,
+    )
+    # Gate called exactly once on the full list
+    assert len(gate_calls) == 1
+    assert len(gate_calls[0]) == 2
+    # No staging
+    assert result.staged == []
+    # Both candidates surface in skipped with pre-allocation marker
+    assert len(result.skipped) == 2
+    assert all(s["household"] == "(pre-allocation)" for s in result.skipped)
+    assert all(s["reason"] == "approval_gate rejected" for s in result.skipped)
+    # Both in reasoning with rejected status
+    assert len(result.candidate_reasoning) == 2
+    for entry in result.candidate_reasoning:
+        assert entry["approval_status"] == "rejected"
+        assert entry["approval_reason"] == "approval_gate rejected"
+        # Rejected candidates produce no per-household outcome rows
+        assert entry["households"] == []
+
+
+def test_approval_gate_selects_subset():
+    """Gate that returns 1 of 2 candidates → only the survivor hits
+    households. The dropped candidate still produces a reasoning
+    entry so observability is preserved."""
+    hh = _fake_hh_snapshot()
+    snapshots = {"Yash_Household": hh}
+    cand_a = _fake_candidate(ticker="AAPL", strike=150.0)
+    cand_b = _fake_candidate(ticker="MSFT", strike=400.0)
+
+    def pick_aapl_only(cs):
+        return [c for c in cs if c.ticker == "AAPL"]
+
+    result = run_csp_allocator(
+        [cand_a, cand_b], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+        approval_gate=pick_aapl_only,
+    )
+    # AAPL should stage; MSFT should only appear in pre-allocation skipped
+    staged_tickers = {t["ticker"] for t in result.staged}
+    assert "AAPL" in staged_tickers
+    assert "MSFT" not in staged_tickers
+
+    # Reasoning has both, differentiated by approval_status
+    status_by_ticker = {
+        e["ticker"]: e["approval_status"]
+        for e in result.candidate_reasoning
+    }
+    assert status_by_ticker == {"AAPL": "approved", "MSFT": "rejected"}
+
+    # MSFT has no household rows (never allocated); AAPL has 1 (staged)
+    aapl_entry = next(
+        e for e in result.candidate_reasoning if e["ticker"] == "AAPL"
+    )
+    msft_entry = next(
+        e for e in result.candidate_reasoning if e["ticker"] == "MSFT"
+    )
+    assert len(aapl_entry["households"]) == 1
+    assert aapl_entry["households"][0]["outcome"] == "staged"
+    assert aapl_entry["households"][0]["contracts"] >= 1
+    assert msft_entry["households"] == []
+
+
+def test_approval_gate_exception_falls_back_to_identity():
+    """A broken approval_gate must NOT abort the run — paper mode
+    would lose a full day's scan to a gate bug. Fall back to identity
+    and surface the error in result.errors for triage."""
+    hh = _fake_hh_snapshot()
+    snapshots = {"Yash_Household": hh}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+
+    def broken_gate(cs):
+        raise RuntimeError("digest LLM unreachable")
+
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+        approval_gate=broken_gate,
+    )
+    # Error surfaced
+    assert any(
+        e["household"] == "(approval_gate)" and "RuntimeError" in e["error"]
+        for e in result.errors
+    )
+    # But allocation still ran (identity fallback)
+    assert len(result.staged) >= 1
+    assert result.candidate_reasoning[0]["approval_status"] == "approved"
+
+
+def test_candidate_reasoning_carries_upstream_payload():
+    """A candidate with a `.reasoning` dict (e.g. from a future LLM
+    digest) has that payload copied verbatim into
+    candidate_reasoning.upstream_reasoning so the post-allocation
+    audit surface retains the full decision trail."""
+    hh = _fake_hh_snapshot()
+    snapshots = {"Yash_Household": hh}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+    # Attach an upstream reasoning payload (what the LLM digest will do)
+    cand.reasoning = {
+        "rank": 1,
+        "rationale": "RAY 24% + IVR 45 + Z-score 4.1",
+        "news_bullets": ["Q2 beat", "buyback raise"],
+    }
+
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+    )
+    entry = result.candidate_reasoning[0]
+    assert entry["upstream_reasoning"]["rank"] == 1
+    assert "RAY 24%" in entry["upstream_reasoning"]["rationale"]
+    assert entry["upstream_reasoning"]["news_bullets"] == ["Q2 beat", "buyback raise"]
+
+
+def test_candidate_reasoning_records_per_household_outcome():
+    """Each (candidate × household) pair that the allocator visits
+    appends a households entry with outcome ∈ {staged, skipped, error}.
+    This is the surface the digest tool consumes to explain WHY a
+    candidate did or didn't land."""
+    yash_hh = _fake_hh_snapshot()
+    # Vikram household that will fail rule_1 (pre-existing concentration)
+    vikram_hh = _fake_hh_snapshot(
+        household="Vikram_Household",
+        hh_nlv=100_000.0,
+        hh_margin_nlv=100_000.0,
+        hh_margin_el=100_000.0,
+        existing_positions={
+            "AAPL": {
+                "total_shares": 0, "spot": 0.0,
+                "current_value": 25_000.0,  # > 20% of $100K
+                "sector": "Technology Hardware",
+            },
+        },
+    )
+    snapshots = {"Yash_Household": yash_hh, "Vikram_Household": vikram_hh}
+    cand = _fake_candidate(ticker="AAPL", strike=150.0)
+
+    result = run_csp_allocator(
+        [cand], snapshots, vix=18.0,
+        extras_provider=_empty_extras,
+        staging_callback=None,
+    )
+    entry = result.candidate_reasoning[0]
+    by_hh = {h["household"]: h for h in entry["households"]}
+    # Yash: staged
+    assert by_hh["Yash_Household"]["outcome"] == "staged"
+    assert by_hh["Yash_Household"]["contracts"] >= 1
+    # Vikram: skipped on rule_1
+    assert by_hh["Vikram_Household"]["outcome"] == "skipped"
+    assert "rule_1_concentration" in by_hh["Vikram_Household"]["reason"]
+
+
+def test_default_approval_gate_is_identity_callable():
+    """The public default gate must be importable + behave as identity.
+    Live code paths that build their own gate need a reference for
+    'what paper does' — this is that reference."""
+    from agt_equities.csp_allocator import _default_approval_gate
+    cands = [
+        _fake_candidate(ticker="AAPL"),
+        _fake_candidate(ticker="MSFT"),
+    ]
+    out = _default_approval_gate(cands)
+    assert out == cands
+    # Returns a list copy, not the input reference (caller mutation safety)
+    assert out is not cands
