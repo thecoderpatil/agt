@@ -107,3 +107,22 @@ side-effect-free for the on-disk database.
 asserts via AST that `telegram_bot.py` contains zero module-level
 `init_db()` calls and that `def main` still calls `init_db()` in its
 body.
+
+
+## Category 3 — csp_allocator routing tests → allocate_csp → get_ro_connection
+
+**Signature:** `sqlite3.OperationalError: unable to open database file`
+in `fa_block_margin.allocate_csp` → `_fetch_available_nlv` → `get_ro_connection(db_path=None)`.
+
+**Affected tests (3):**
+- `tests/test_csp_allocator.py::test_route_partial_when_household_cannot_fit_all`
+- `tests/test_csp_allocator.py::test_route_spills_from_ira_to_margin_when_ira_full`
+- `tests/test_csp_allocator.py::test_orchestrator_mutates_snapshot_between_candidates`
+
+**Root cause:** `_csp_route_to_accounts` → `_build_and_allocate` → `allocate_csp`
+opens a read-only DB connection to query `v_available_nlv` (margin NLV view).
+When called in CI without a production DB, the tripwire path fires.
+
+**Fix-by:** FU-INTEGRATION-TEST-FIXTURES — inject a temp SQLite with
+`el_snapshots` + `v_available_nlv` view, or pass `available_nlv_override`
+kwarg through the call chain. Moderate effort (4 sites to thread).
