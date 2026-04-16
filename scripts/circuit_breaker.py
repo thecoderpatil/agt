@@ -48,7 +48,10 @@ def check_daily_order_limit() -> dict:
         ).fetchone()
         count = row["cnt"] if row else 0
         if count >= MAX_DAILY_ORDERS:
-            return {"ok": False, "reason": f"Daily order limit reached: {count}/{MAX_DAILY_ORDERS}"}
+            return {
+                "ok": False, "halted": True,
+                "reason": f"Daily order limit reached: {count}/{MAX_DAILY_ORDERS}",
+            }
         return {"ok": True, "count": count, "limit": MAX_DAILY_ORDERS}
     finally:
         conn.close()
@@ -72,7 +75,10 @@ def check_daily_notional() -> dict:
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
         if total >= MAX_DAILY_NOTIONAL:
-            return {"ok": False, "reason": f"Daily notional limit: ${total:,.0f} >= ${MAX_DAILY_NOTIONAL:,.0f}"}
+            return {
+                "ok": False, "halted": True,
+                "reason": f"Daily notional limit: ${total:,.0f} >= ${MAX_DAILY_NOTIONAL:,.0f}",
+            }
         return {"ok": True, "notional": total, "limit": MAX_DAILY_NOTIONAL}
     finally:
         conn.close()
@@ -153,6 +159,41 @@ def check_nlv_drop() -> dict:
         conn.close()
 
 
+def check_vix() -> dict:
+    """Check CBOE VIX level; halt if >= VIX_HALT_THRESHOLD.
+
+    Uses yfinance spot quote on ^VIX. Soft-fails open (ok=True with a
+    warning) on any fetch error — refusing to trade because yfinance is
+    flaky would be more dangerous than proceeding. The halt branch only
+    fires when we have a real number >= threshold.
+    """
+    try:
+        import yfinance as yf  # local import — circuit_breaker is loaded cheaply
+        t = yf.Ticker("^VIX")
+        # fast_info is the current snapshot; history(period='1d') is a fallback.
+        level = None
+        try:
+            level = float(t.fast_info.last_price)
+        except Exception:
+            try:
+                hist = t.history(period="1d", interval="1m")
+                if hist is not None and not hist.empty:
+                    level = float(hist["Close"].iloc[-1])
+            except Exception:
+                level = None
+        if level is None or level <= 0:
+            return {"ok": True, "warning": "VIX fetch returned no usable level"}
+        if level >= VIX_HALT_THRESHOLD:
+            return {
+                "ok": False, "halted": True,
+                "reason": f"VIX {level:.2f} >= {VIX_HALT_THRESHOLD} halt threshold",
+                "vix": level,
+            }
+        return {"ok": True, "vix": level, "threshold": VIX_HALT_THRESHOLD}
+    except Exception as exc:
+        return {"ok": True, "warning": f"VIX check failed: {exc}"}
+
+
 def check_directive_freshness() -> dict:
     """Check if _WEEKLY_ARCHITECT_DIRECTIVE.md exists and is fresh enough."""
     directive_path = Path("_WEEKLY_ARCHITECT_DIRECTIVE.md")
@@ -177,6 +218,7 @@ def run_all_checks() -> dict:
         "daily_notional": check_daily_notional(),
         "consecutive_errors": check_consecutive_errors(),
         "nlv_drop": check_nlv_drop(),
+        "vix": check_vix(),
         "directive": check_directive_freshness(),
     }
 
