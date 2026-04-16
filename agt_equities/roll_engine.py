@@ -251,6 +251,7 @@ def _check_harvest(
     Day 2+ (days_held ≥ 2): harvest at ≥ 90% profit.
     Never harvests on expiry day (dte ≤ 0) — let it ride.
     Never harvests when initial_credit is zero (no signal).
+    Never harvests on stale/invalid ask (ask ≤ 0 means IBKR has no quote).
     """
     if pos.initial_credit <= 0:
         return None
@@ -260,7 +261,18 @@ def _check_harvest(
         return None
 
     call = market.current_call
+
+    # Guard: IBKR returns ask ≤ 0 when market is closed or no quote exists.
+    # P_pct > 1.0 is mathematically impossible on a short option — reject.
+    if call.ask <= 0:
+        return None
+
     p_pct = (pos.initial_credit - call.ask) / pos.initial_credit
+
+    if p_pct > 1.0:
+        # Stale or corrupted ask — should never exceed 100% profit
+        return None
+
     days_held = (market.asof - pos.opened_at).days
 
     if days_held <= 1 and p_pct >= constraints.harvest_day1_pct:
@@ -386,6 +398,18 @@ def evaluate(
             )
 
         call = market.current_call
+
+        # 0b. Stale-data guard: IBKR returns ask ≤ 0 when market closed
+        if call.ask < 0 or market.spot <= 0:
+            return AlertResult(
+                severity="WARN",
+                reason=(
+                    f"STALE_MARKET_DATA ask={call.ask} spot={market.spot} "
+                    f"— skipping evaluation (market likely closed)"
+                ),
+                context={"ticker": pos.ticker, "account_id": pos.account_id},
+            )
+
         dte = _dte(market.asof, pos.expiry)
         is_itm = market.spot > pos.strike
         basis = _paper_basis(pos)
