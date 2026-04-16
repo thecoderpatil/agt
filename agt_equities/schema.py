@@ -1487,6 +1487,34 @@ def _register_autonomous_tables(conn) -> None:
         conn.commit()
 
 
+    # ── MR feat(remediation): remediation_incidents registry ──
+    # State machine for the weekly remediation task. See agt_equities/remediation.py.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS remediation_incidents (
+            incident_id       TEXT PRIMARY KEY,
+            first_detected    TEXT NOT NULL,
+            directive_source  TEXT,
+            fix_authored_at   TEXT,
+            mr_iid            INTEGER,
+            branch_name       TEXT,
+            status            TEXT NOT NULL DEFAULT 'new',
+            rejection_reasons TEXT,
+            last_nudged_at    TEXT,
+            architect_reason  TEXT,
+            updated_at        TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_remediation_incidents_status
+        ON remediation_incidents(status)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_remediation_incidents_mr_iid
+        ON remediation_incidents(mr_iid)
+    """)
+    conn.commit()
+
+
 def _extend_pending_orders(conn) -> None:
     """Add R5 order lifecycle columns to pending_orders if missing.
     Silently skips if pending_orders table doesn't exist (test DBs)."""

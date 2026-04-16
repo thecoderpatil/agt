@@ -9253,6 +9253,169 @@ async def _scheduled_flex_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# feat(remediation): /approve_rem /reject_rem /list_rem  — weekly remediation
+# ---------------------------------------------------------------------------
+# These handlers gate the `agt-remediation-weekly` scheduled task's MRs.
+# See agt_equities/remediation.py for the state machine and GitLab API
+# helpers. Yash replies `/approve_rem <id>` or `/reject_rem <id> <reason>` in
+# Telegram; we merge or close the MR via API and advance the state row.
+
+
+async def cmd_list_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/list_rem — show remediation MRs currently awaiting Yash approval."""
+    if not is_authorized(update):
+        return
+    try:
+        from agt_equities import remediation as _rem
+        rows = await asyncio.to_thread(_rem.list_awaiting)
+    except Exception as exc:
+        logger.exception("/list_rem: list_awaiting failed")
+        await update.message.reply_text(f"/list_rem error: {exc}")
+        return
+
+    if not rows:
+        await update.message.reply_text("No remediation MRs awaiting approval.")
+        return
+
+    lines = ["\u2501\u2501 Awaiting Approval \u2501\u2501"]
+    for r in rows:
+        iid = r.get("incident_id")
+        mr = r.get("mr_iid")
+        authored = r.get("fix_authored_at") or "—"
+        last_nudge = r.get("last_nudged_at") or "—"
+        lines.append(
+            f"{iid}  |  MR !{mr}  |  authored {authored}  |  last nudge {last_nudge}"
+        )
+    lines.append("")
+    lines.append("/approve_rem <id>    /reject_rem <id> <reason>")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_approve_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/approve_rem <incident_id> — lower approvals, merge MR, flip row."""
+    if not is_authorized(update):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /approve_rem <incident_id>   (see /list_rem)"
+        )
+        return
+    incident_id = args[0].strip()
+
+    try:
+        from agt_equities import remediation as _rem
+        row = await asyncio.to_thread(_rem.get_state, incident_id)
+    except Exception as exc:
+        logger.exception("/approve_rem: state lookup failed")
+        await update.message.reply_text(f"/approve_rem error: {exc}")
+        return
+
+    if row is None:
+        await update.message.reply_text(f"Unknown incident: {incident_id}")
+        return
+    if row.get("status") != _rem.STATUS_AWAITING:
+        await update.message.reply_text(
+            f"{incident_id} is in state '{row.get('status')}' — "
+            f"only 'awaiting_approval' can be merged."
+        )
+        return
+
+    mr_iid = row.get("mr_iid")
+    if not mr_iid:
+        await update.message.reply_text(
+            f"{incident_id} has no MR iid on record — cannot merge."
+        )
+        return
+
+    try:
+        await asyncio.to_thread(_rem.gitlab_lower_approval_rule, int(mr_iid))
+        merge_resp = await asyncio.to_thread(_rem.gitlab_merge_mr, int(mr_iid))
+    except Exception as exc:
+        logger.exception("/approve_rem: GitLab merge failed")
+        await update.message.reply_text(
+            f"Merge failed for MR !{mr_iid}: {exc}\n"
+            f"Row left at 'awaiting_approval' — retry or merge manually."
+        )
+        return
+
+    merged_state = (merge_resp or {}).get("state", "unknown")
+    if merged_state != "merged":
+        await update.message.reply_text(
+            f"GitLab did not confirm merge (state={merged_state}). "
+            f"Row left at 'awaiting_approval'."
+        )
+        return
+
+    try:
+        await asyncio.to_thread(_rem.mark_merged, incident_id)
+    except Exception as exc:
+        logger.exception("/approve_rem: DB mark_merged failed after merge")
+        await update.message.reply_text(
+            f"MR !{mr_iid} merged, but DB update failed: {exc}\n"
+            f"Fix the row manually: status='merged'."
+        )
+        return
+
+    await update.message.reply_text(
+        f"\u2705 Merged {incident_id} (MR !{mr_iid})."
+    )
+
+
+async def cmd_reject_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reject_rem <incident_id> <reason...> — close MR, advance reject state."""
+    if not is_authorized(update):
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /reject_rem <incident_id> <reason...>"
+        )
+        return
+    incident_id = args[0].strip()
+    reason = " ".join(args[1:]).strip()
+    if not reason:
+        await update.message.reply_text("Reason required — be specific.")
+        return
+
+    try:
+        from agt_equities import remediation as _rem
+        row = await asyncio.to_thread(_rem.get_state, incident_id)
+    except Exception as exc:
+        logger.exception("/reject_rem: state lookup failed")
+        await update.message.reply_text(f"/reject_rem error: {exc}")
+        return
+
+    if row is None:
+        await update.message.reply_text(f"Unknown incident: {incident_id}")
+        return
+
+    mr_iid = row.get("mr_iid")
+    if mr_iid:
+        try:
+            await asyncio.to_thread(_rem.gitlab_close_mr, int(mr_iid))
+        except Exception as exc:
+            logger.warning("/reject_rem: gitlab_close_mr failed: %s", exc)
+            # Non-fatal: still advance the state machine so next run sees the
+            # rejection. Yash can close the stale MR manually.
+
+    try:
+        updated = await asyncio.to_thread(
+            _rem.mark_rejected, incident_id, reason,
+        )
+    except Exception as exc:
+        logger.exception("/reject_rem: mark_rejected failed")
+        await update.message.reply_text(f"/reject_rem error: {exc}")
+        return
+
+    await update.message.reply_text(
+        f"\u274c Rejected {incident_id} -> {updated.get('status')} "
+        f"(MR !{mr_iid or '—'} closed).\n"
+        f"Reason logged: {reason}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Phase 3A: Mode commands
 # ---------------------------------------------------------------------------
 
@@ -11973,6 +12136,9 @@ def main() -> None:
     app.add_handler(CommandHandler("resume",    cmd_resume))
     app.add_handler(CommandHandler("daily",     cmd_daily))
     app.add_handler(CommandHandler("report",    cmd_report))
+    app.add_handler(CommandHandler("list_rem",    cmd_list_rem))
+    app.add_handler(CommandHandler("approve_rem", cmd_approve_rem))
+    app.add_handler(CommandHandler("reject_rem",  cmd_reject_rem))
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve:"))
     app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern=r"^dex:"))
