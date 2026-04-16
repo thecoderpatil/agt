@@ -115,6 +115,7 @@ class ConstraintMatrix:
     roll_dte_max: int = 14                       # max DTE for roll target
     roll_dte_fallback_min: int = 3               # fallback min DTE
     roll_dte_fallback_max: int = 21              # fallback max DTE
+    min_annualized_roll_yield: float = 0.10       # 10% floor on roll yield
 
     # --- Legacy WHEEL-3 fields (backward compat, not used in evaluate) ---
     harvest_velocity_ratio: float = 1.5
@@ -292,6 +293,18 @@ def _check_harvest(
     return None
 
 
+
+def _annualized_roll_yield(credit: float, strike: float, dte: int) -> float:
+    """Annualized return on capital for a roll credit.
+
+    Mirrors cc_engine's _annualized_roi(): (credit / strike) * (365 / dte).
+    Returns 0.0 on invalid inputs to avoid division-by-zero.
+    """
+    if strike <= 0 or dte <= 0 or credit <= 0:
+        return 0.0
+    return (credit / strike) * (365.0 / dte)
+
+
 def _find_roll_target(
     chain: tuple[OptionQuote, ...],
     current_strike: float,
@@ -413,6 +426,44 @@ def evaluate(
         dte = _dte(market.asof, pos.expiry)
         is_itm = market.spot > pos.strike
         basis = _paper_basis(pos)
+
+
+        # 0c. Dividend assignment risk: ITM CC near ex-div with extrinsic < dividend
+        #     Early assignment is rational when extrinsic < dividend amount.
+        #     Fire BEFORE any other evaluation — this is a safety gate.
+        if (
+            market.next_ex_div_date is not None
+            and market.next_div_amount is not None
+            and market.next_div_amount > 0
+        ):
+            try:
+                days_to_ex_div = (market.next_ex_div_date - market.asof).days
+                if days_to_ex_div <= 1 and is_itm:
+                    ext = _extrinsic_value(call, market.spot)
+                    if ext < market.next_div_amount:
+                        result = AlertResult(
+                            severity="CRITICAL",
+                            reason=(
+                                f"DIVIDEND_ASSIGNMENT_RISK "
+                                f"ex_div={market.next_ex_div_date.isoformat()} "
+                                f"days={days_to_ex_div} "
+                                f"extrinsic=${ext:.2f}<div=${market.next_div_amount:.2f} "
+                                f"spot={market.spot:.2f} strike={pos.strike:.2f}"
+                            ),
+                            context={
+                                "ticker": pos.ticker,
+                                "account_id": pos.account_id,
+                                "next_ex_div_date": market.next_ex_div_date.isoformat(),
+                                "next_div_amount": market.next_div_amount,
+                                "extrinsic": round(ext, 4),
+                                "spot": market.spot,
+                                "strike": pos.strike,
+                            },
+                        )
+                        _log_decision(pos, market, basis, result)
+                        return result
+            except Exception:
+                pass  # bad date math → skip check, don't block evaluation
 
         # 1. Expiry day — let it ride, don't pay spread to close
         if dte <= 0:
@@ -548,6 +599,35 @@ def evaluate(
         if candidate is not None:
             net_credit = round(candidate.bid - call.ask, 4)
             new_dte = _dte(market.asof, candidate.expiry)
+
+            # Yield floor gate: reject roll candidates below min annualized yield.
+            # If credit is negative (debit roll), yield is 0 → always below floor,
+            # but below-basis defense rolls are exempt (we pay debit to grind up).
+            # Only enforce when net_credit > 0 (credit roll that's just too small).
+            if net_credit > 0:
+                ann_yield = _annualized_roll_yield(net_credit, candidate.strike, new_dte)
+                if ann_yield < constraints.min_annualized_roll_yield:
+                    result = AlertResult(
+                        severity="WARN",
+                        reason=(
+                            f"ROLL_YIELD_BELOW_FLOOR "
+                            f"ann_yield={ann_yield:.4f}<floor={constraints.min_annualized_roll_yield} "
+                            f"credit={net_credit:.4f} strike={candidate.strike:.2f} "
+                            f"dte={new_dte} — consider assignment"
+                        ),
+                        context={
+                            "ticker": pos.ticker,
+                            "account_id": pos.account_id,
+                            "ann_yield": round(ann_yield, 4),
+                            "floor": constraints.min_annualized_roll_yield,
+                            "net_credit": net_credit,
+                            "candidate_strike": candidate.strike,
+                            "candidate_dte": new_dte,
+                        },
+                    )
+                    _log_decision(pos, market, basis, result)
+                    return result
+
             result = RollResult(
                 new_strike=candidate.strike,
                 new_expiry=candidate.expiry,

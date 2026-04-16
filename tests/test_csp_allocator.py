@@ -29,6 +29,9 @@ from types import SimpleNamespace
 
 import pytest
 
+# CI gate: Sprint A marker + explicit file list in .gitlab-ci.yml.
+pytestmark = pytest.mark.sprint_a
+
 from agt_equities.config import (
     ACCOUNT_TO_HOUSEHOLD,
     HOUSEHOLD_MAP,
@@ -39,6 +42,7 @@ from agt_equities.csp_allocator import (
     AllocatorResult,
     _csp_check_rule_1,
     _csp_check_rule_2,
+    _csp_check_vix_acceleration,
     _csp_check_rule_3,
     _csp_check_rule_4,
     _csp_check_rule_6,
@@ -1177,14 +1181,82 @@ def test_rule_7_working_order_on_ticker_rejected():
 
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# VIX acceleration veto gate
+# ---------------------------------------------------------------------------
+
+class TestVixAccelerationGate:
+    """Verify VIX 3-session rate-of-change blocks CSP entries."""
+
+    def test_vix_22pct_rise_blocks_all_csps(self):
+        """VIX 18→22 in 3 sessions (22.2% rise) → all CSPs blocked."""
+        hh = _fake_hh_snapshot()
+        cand = _fake_candidate(ticker="AAPL", strike=150.0)
+        extras = {"vix_history": [22.0, 20.5, 19.0, 18.0]}
+        passed, reason = _csp_check_vix_acceleration(hh, cand, 1, 22.0, extras)
+        assert not passed
+        assert "vix_acceleration" in reason
+        assert "22.2%" in reason or "22%" in reason  # formatting may vary
+
+    def test_vix_19pct_rise_passes(self):
+        """VIX 18→21.4 in 3 sessions (18.9% rise) → passes (< 20%)."""
+        hh = _fake_hh_snapshot()
+        cand = _fake_candidate(ticker="AAPL", strike=150.0)
+        extras = {"vix_history": [21.4, 20.0, 19.0, 18.0]}
+        passed, reason = _csp_check_vix_acceleration(hh, cand, 1, 21.4, extras)
+        assert passed
+        assert reason == ""
+
+    def test_vix_exactly_20pct_passes(self):
+        """VIX 18→21.6 exactly 20% → passes (threshold is strict >20%)."""
+        hh = _fake_hh_snapshot()
+        cand = _fake_candidate(ticker="AAPL", strike=150.0)
+        extras = {"vix_history": [21.6, 20.0, 19.0, 18.0]}
+        passed, reason = _csp_check_vix_acceleration(hh, cand, 1, 21.6, extras)
+        assert passed
+
+    def test_vix_decline_passes(self):
+        """VIX falling → always passes."""
+        hh = _fake_hh_snapshot()
+        cand = _fake_candidate(ticker="AAPL", strike=150.0)
+        extras = {"vix_history": [16.0, 18.0, 20.0, 22.0]}
+        passed, reason = _csp_check_vix_acceleration(hh, cand, 1, 16.0, extras)
+        assert passed
+
+    def test_missing_vix_history_failopen(self):
+        """No VIX history → fail-open (pass)."""
+        hh = _fake_hh_snapshot()
+        cand = _fake_candidate(ticker="AAPL", strike=150.0)
+        passed, _ = _csp_check_vix_acceleration(hh, cand, 1, 22.0, {})
+        assert passed
+
+    def test_insufficient_vix_history_failopen(self):
+        """Only 2 data points → fail-open."""
+        hh = _fake_hh_snapshot()
+        cand = _fake_candidate(ticker="AAPL", strike=150.0)
+        extras = {"vix_history": [22.0, 20.0]}
+        passed, _ = _csp_check_vix_acceleration(hh, cand, 1, 22.0, extras)
+        assert passed
+
+    def test_zero_baseline_failopen(self):
+        """VIX 3 sessions ago = 0 → fail-open (avoid div/zero)."""
+        hh = _fake_hh_snapshot()
+        cand = _fake_candidate(ticker="AAPL", strike=150.0)
+        extras = {"vix_history": [22.0, 15.0, 10.0, 0.0]}
+        passed, _ = _csp_check_vix_acceleration(hh, cand, 1, 22.0, extras)
+        assert passed
+
+
 # Registry structural test
 # ---------------------------------------------------------------------------
 
-def test_registry_contains_all_six_gates_in_order():
+def test_registry_contains_all_seven_gates_in_order():
     """CSP_GATE_REGISTRY names must match the expected list in order."""
     expected = [
         "rule_1_concentration",
         "rule_2_el_deployment",
+        "vix_acceleration",
         "rule_3_sector",
         "rule_4_correlation",
         "rule_6_vikram_el_floor",
@@ -1192,7 +1264,7 @@ def test_registry_contains_all_six_gates_in_order():
     ]
     actual = [name for name, _ in CSP_GATE_REGISTRY]
     assert actual == expected
-    assert len(CSP_GATE_REGISTRY) == 6
+    assert len(CSP_GATE_REGISTRY) == 7
     # All entries must be callable with the uniform gate signature
     hh = _fake_hh_snapshot()
     cand = _fake_candidate(ticker="AAPL", strike=150.0)
