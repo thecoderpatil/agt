@@ -51,6 +51,8 @@ import logging
 import time
 from datetime import date
 
+from agt_equities.dates import et_today
+
 import ib_async  # noqa: F401  (whitelisted import — ib is type-hinted below)
 
 from agt_equities import ib_chains
@@ -269,7 +271,7 @@ async def run_phase_5(
     n_ticker_zero_survivors = 0
 
     survivors: list[StrikeCandidate] = []
-    today = date.today()
+    today = et_today()
 
     for candidate in candidates:
         ticker = candidate.ticker

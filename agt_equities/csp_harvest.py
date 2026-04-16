@@ -39,6 +39,7 @@ from datetime import datetime as _datetime
 from typing import Any, Callable
 
 from agt_equities.config import ACCOUNT_TO_HOUSEHOLD
+from agt_equities.dates import et_today
 
 logger = logging.getLogger(__name__)
 
@@ -284,7 +285,7 @@ async def scan_csp_harvest_candidates(
     except Exception as mdt_exc:
         logger.warning("csp_harvest: reqMarketDataType(4) failed: %s", mdt_exc)
 
-    today = _date.today()
+    today = et_today()
 
     for pos in short_puts:
         ticker = pos.contract.symbol.upper()

@@ -14,6 +14,8 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
+
+from agt_equities.dates import et_today
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -310,7 +312,7 @@ async def get_expirations(ib, ticker: str) -> list[str]:
 
         # Convert expirations from YYYYMMDD to YYYY-MM-DD
         expirations = []
-        today = date.today()
+        today = et_today()
         for exp_str in sorted(best_chain.expirations):
             try:
                 exp_date = datetime.strptime(exp_str, "%Y%m%d").date()
