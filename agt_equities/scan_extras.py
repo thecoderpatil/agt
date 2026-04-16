@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 from datetime import date, timedelta
+
+from agt_equities.dates import et_today
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -57,7 +59,7 @@ def fetch_earnings_map(
             )
             return {t.upper(): None for t in tickers}
 
-    ref_date = today or date.today()
+    ref_date = today or et_today()
     result: dict[str, int | None] = {}
 
     for ticker in tickers:
