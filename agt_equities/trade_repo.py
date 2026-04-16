@@ -105,7 +105,8 @@ def _load_trade_events(
     for r in rows:
         raw = dict(r)
         acct = r['account_id']
-        hh = ACCOUNT_TO_HOUSEHOLD.get(acct, 'Unknown_Household')
+        if acct not in ACCOUNT_TO_HOUSEHOLD: continue  # paper mode: skip events for accounts not in active map
+        hh = ACCOUNT_TO_HOUSEHOLD[acct]
         # Determine ticker: prefer underlying_symbol, fall back to symbol for STK
         tk = r['underlying_symbol'] or r['symbol']
         if tk in EXCLUDED_TICKERS:
