@@ -29,6 +29,7 @@ tmp_path DB without monkeypatching agt_equities.db.DB_PATH.
 from __future__ import annotations
 
 import json
+import os
 import time
 from contextlib import closing
 from pathlib import Path
@@ -346,6 +347,8 @@ __all__: Iterable[str] = (
     "mark_alert_failed",
     "get_alert",
     "format_alert_text",
+    "stage_gmail_draft",
+    "GMAIL_DRAFTS_DIR",
 )
 
 
@@ -389,3 +392,121 @@ def alert_yash(
             if k not in payload:
                 payload[k] = v
     return enqueue_alert(kind, payload, severity=severity, db_path=db_path)
+
+
+# ---------------------------------------------------------------------------
+# MR #2: Gmail draft staging consumer for severity='crit' alerts
+# ---------------------------------------------------------------------------
+
+# Staged drafts live here. A separate out-of-process tool
+# (scripts/drain_gmail_drafts.py) or an interactive Cowork session pushes
+# them into actual Gmail drafts via the Gmail API — the bot does NOT
+# embed Gmail OAuth, intentionally: no creds in the bot process.
+GMAIL_DRAFTS_DIR: Path = Path("logs") / "gmail_drafts"
+
+_GMAIL_TO_DEFAULT: str = "yashpatil@gmail.com"
+
+
+def _safe_slug(text: str, maxlen: int = 40) -> str:
+    out = []
+    for ch in text.strip():
+        if ch.isalnum() or ch in ("-", "_"):
+            out.append(ch)
+        elif ch in (" ", "\t"):
+            out.append("_")
+    slug = "".join(out)[:maxlen]
+    return slug or "alert"
+
+
+def stage_gmail_draft(
+    alert: dict[str, Any],
+    *,
+    output_dir: str | Path | None = None,
+    to_addr: str = _GMAIL_TO_DEFAULT,
+) -> Path | None:
+    """Stage a Gmail draft file for a drained alert.
+
+    Writes a JSON sidecar under ``output_dir`` (defaults to
+    ``logs/gmail_drafts``). Never auto-sends — the file is picked up later
+    by an out-of-process tool with Gmail OAuth creds.
+
+    Returns the draft path on success or None if the alert is not a
+    ``severity='crit'`` row (lower severities are Telegram-only and do not
+    escalate to email). Returns None on any write failure with a logged
+    warning; heartbeat semantics — the caller must not rely on this for
+    correctness, only for escalation.
+    """
+    try:
+        severity = str(alert.get("severity") or "info").lower()
+        if severity != "crit":
+            return None
+
+        out_dir = Path(output_dir) if output_dir is not None else GMAIL_DRAFTS_DIR
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            # Couldn't create the staging dir — log and bail out.
+            import logging as _logging
+            _logging.getLogger("agt_equities.alerts").warning(
+                "stage_gmail_draft: mkdir(%s) failed: %s", out_dir, exc
+            )
+            return None
+
+        aid = alert.get("id") or int(_now() * 1000)
+        kind = str(alert.get("kind") or "alert")
+        ts = time.strftime("%Y%m%dT%H%M%S", time.localtime())
+        fname = f"{ts}_{aid}_{_safe_slug(kind)}.json"
+        draft_path = out_dir / fname
+
+        payload = alert.get("payload") or {}
+        if isinstance(payload, str):
+            # Defensive: drain_pending_alerts already decodes, but accept raw.
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {"_raw": payload}
+
+        subject_line = str(payload.get("subject") or kind)
+        body_line = str(payload.get("body") or "")
+
+        draft_doc: dict[str, Any] = {
+            "alert_id": aid,
+            "severity": severity,
+            "kind": kind,
+            "staged_at_ts": _now(),
+            "staged_at_iso": time.strftime(
+                "%Y-%m-%dT%H:%M:%S%z", time.localtime()
+            ),
+            "to": to_addr,
+            "subject": f"[AGT CRIT] {kind} — {subject_line}",
+            "body": body_line,
+            "payload": payload,
+        }
+
+        tmp_path = draft_path.with_suffix(".json.tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(draft_doc, indent=2, default=str),
+                encoding="utf-8",
+            )
+            os.replace(tmp_path, draft_path)
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger("agt_equities.alerts").warning(
+                "stage_gmail_draft: write(%s) failed: %s", draft_path, exc
+            )
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            return None
+
+        return draft_path
+    except Exception as exc:  # pragma: no cover — defensive outermost guard
+        import logging as _logging
+        _logging.getLogger("agt_equities.alerts").warning(
+            "stage_gmail_draft unexpected failure: %s", exc
+        )
+        return None
+

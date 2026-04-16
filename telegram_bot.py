@@ -11251,6 +11251,17 @@ async def post_init(app) -> None:
             await _alert_telegram(alert)
     except Exception as exc:
         logger.error("Cold-start wartime pin alert failed: %s — continuing", exc)
+
+    # MR #2: 30s bot heartbeat writer (daemon_heartbeat table). DT Q3 ruling.
+    try:
+        from agt_equities.heartbeat import register_bot_heartbeat
+        jq_hb = app.job_queue
+        if jq_hb is not None:
+            register_bot_heartbeat(jq_hb)
+        else:
+            logger.warning("post_init: JobQueue missing — bot_heartbeat not registered")
+    except Exception as exc:
+        logger.error("post_init: register_bot_heartbeat failed: %s", exc)
 # ---------------------------------------------------------------------------
 # Beta Impl 3: ATTESTED row poller (R6 — 10s interval, idempotent delivery)
 # ---------------------------------------------------------------------------
@@ -11310,6 +11321,12 @@ async def _drain_cross_daemon_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as exc:
         logger.error("drain_pending_alerts failed: %s", exc)
         return
+    # MR #2: late-import stage_gmail_draft so unit tests that import
+    # telegram_bot without an alerts module (rare) don't blow up here.
+    try:
+        from agt_equities.alerts import stage_gmail_draft
+    except Exception:
+        stage_gmail_draft = None  # type: ignore[assignment]
     for a in alerts:
         aid = a.get("id")
         try:
@@ -11319,6 +11336,17 @@ async def _drain_cross_daemon_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> 
                 mark_alert_sent(aid)
             except Exception as exc:
                 logger.error("mark_alert_sent(%s) failed: %s", aid, exc)
+            # MR #2: escalate crit-severity alerts to a Gmail draft file.
+            # Never blocks Telegram delivery; failures are logged-only.
+            if stage_gmail_draft is not None:
+                try:
+                    severity = str(a.get("severity") or "").lower()
+                    if severity == "crit":
+                        stage_gmail_draft(a)
+                except Exception as exc:
+                    logger.warning(
+                        "stage_gmail_draft(alert=%s) failed: %s", aid, exc
+                    )
         except Exception as exc:
             logger.error("cross_daemon_alerts dispatch %s failed: %s", aid, exc)
             try:
