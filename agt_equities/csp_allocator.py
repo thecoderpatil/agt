@@ -38,7 +38,7 @@ no routing, no staging — those land in M1.2 through M1.5.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 from agt_equities.config import (
     ACCOUNT_TO_HOUSEHOLD,
@@ -54,6 +54,96 @@ from agt_equities.fa_block_margin import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# CSPCandidate contract (load-bearing interface seam — DT Q4)
+# ---------------------------------------------------------------------------
+#
+# End-state autonomy vision (2026-04-16, project_end_state_vision.md):
+#
+#   Paper  = full autonomy. Screener → allocator → staging, no human.
+#   Live   = full autonomy EXCEPT CSP selection. Screener emits N
+#            candidates → LLM digest + Telegram yes/no → allocator
+#            consumes the approved subset. CSP selection is the one
+#            wheel decision that never goes human-out-of-the-loop.
+#
+# The seam that makes both paths executable from one codebase:
+#
+#   1. `CSPCandidate` — an explicit attribute contract the allocator
+#      consumes. `ScanCandidate` (pxo_scanner adapter, scan_bridge.py)
+#      and `RAYCandidate` (screener terminal output, screener/types.py)
+#      both conform via duck typing. Protocol makes the contract
+#      enforceable for the future digest tool's output shape.
+#
+#   2. `approval_gate` — pluggable Callable[[list], list] on
+#      `run_csp_allocator`. Default = identity (paper pass-through).
+#      Live wires a Telegram-digest gate that drops non-approved
+#      candidates before any household work is done.
+#
+#   3. `AllocatorResult.candidate_reasoning` — per-candidate
+#      observability payload. Shape is stable so the future digest
+#      tool can consume allocator output as training signal /
+#      retrospective audit surface without internal refactor.
+#
+# Building the LLM digest tool is a SEPARATE ticket, post-allocator.
+# Adding LLM plumbing to this sprint pollutes paper debug signal with
+# API failure modes and bloats scope (news feeds, prompt eng, multi-
+# candidate Telegram UI). The seam here is what makes that ticket
+# additive instead of a rewrite.
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class CSPCandidate(Protocol):
+    """Attribute contract the CSP allocator consumes.
+
+    Any object satisfying this Protocol is a valid allocator input.
+    `ScanCandidate` (pxo_scanner adapter) and `RAYCandidate` (screener
+    terminal output) both conform.
+
+    Required attributes
+    -------------------
+    ticker : str                 — upper-cased root symbol (e.g. "AAPL")
+    strike : float               — put strike
+    mid : float                  — mid-market premium per contract
+    expiry : str                 — expiry date "YYYY-MM-DD"
+    annualized_yield : float     — RAY / annualized ROI, decimal OR
+                                   percent per pxo_scanner convention
+
+    Optional attributes (read via getattr with safe defaults)
+    ---------------------------------------------------------
+    dte : int                    — days to expiry
+    sector : str                 — GICS sector / industry group
+    delta : float                — abs(delta) of the short put
+    otm_pct : float              — strike-to-spot OTM distance
+    reasoning : dict             — optional per-candidate reasoning
+                                   payload from upstream (e.g. LLM
+                                   digest). Copied verbatim into
+                                   AllocatorResult.candidate_reasoning.
+    """
+
+    ticker: str
+    strike: float
+    mid: float
+    expiry: str
+    annualized_yield: float
+
+
+# Default approval gate for paper / full-autonomy mode: identity pass-through.
+# Live CSP path will inject a Telegram-digest approval gate here.
+def _default_approval_gate(
+    candidates: list[CSPCandidate],
+) -> list[CSPCandidate]:
+    """Identity approval gate — paper-mode default.
+
+    Returns the full candidate list unchanged. Live mode will inject
+    a Telegram LLM digest gate that:
+      1. Renders a ranked digest of the top N candidates to Yash
+      2. Awaits yes/no per candidate
+      3. Returns only the approved subset
+    """
+    return list(candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -726,11 +816,47 @@ from dataclasses import dataclass, field
 
 @dataclass
 class AllocatorResult:
-    """Result of running the CSP allocator over a set of candidates."""
+    """Result of running the CSP allocator over a set of candidates.
+
+    Fields
+    ------
+    staged : list of ticket dicts successfully routed + (optionally) persisted
+    skipped : list of {household, ticker, reason} for household-level rejects
+              (gate failure, sizing=0, all-account veto). Also carries
+              `{household: "(pre-allocation)", ticker, reason}` entries
+              for candidates dropped by the approval_gate.
+    errors : list of {household, ticker, error} for unhandled exceptions
+    digest_lines : human-readable Telegram-output lines
+    candidate_reasoning : per-candidate observability payload (LOAD-BEARING
+        — the future LLM digest tool consumes this as its input shape).
+        One entry per INPUT candidate, independent of approval or gate
+        outcome. Shape:
+          {
+            "ticker": str,
+            "strike": float,
+            "expiry": str,
+            "annualized_yield": float,
+            "approval_status": "approved" | "rejected",
+            "approval_reason": str,        # "" if approved
+            "upstream_reasoning": dict,    # copied from candidate.reasoning
+                                           # if present, else {}
+            "households": [
+              {
+                "household": str,
+                "outcome": "staged" | "skipped" | "error",
+                "tickets": int,            # # of tickets created
+                "contracts": int,          # total contracts staged
+                "reason": str,             # gate/sizing/routing reason
+                                           # ("" on staged)
+              }, ...
+            ],
+          }
+    """
     staged: list[dict] = field(default_factory=list)
     skipped: list[dict] = field(default_factory=list)  # [{household, ticker, reason}]
     errors: list[dict] = field(default_factory=list)   # [{household, ticker, error}]
     digest_lines: list[str] = field(default_factory=list)
+    candidate_reasoning: list[dict] = field(default_factory=list)
 
     @property
     def total_staged_contracts(self) -> int:
@@ -750,10 +876,16 @@ def run_csp_allocator(
     vix: float,
     extras_provider: Callable[[dict, Any], dict],
     staging_callback: Callable[[list[dict]], None] | None = None,
+    *,
+    approval_gate: Callable[[list], list] | None = None,
 ) -> AllocatorResult:
-    """Run the CSP allocator over a set of RAY candidates.
+    """Run the CSP allocator over a set of candidates.
 
-    For each (candidate, household) pair:
+    The candidate list first passes through `approval_gate` (default =
+    identity pass-through for paper mode). Live mode injects a Telegram
+    LLM digest gate so only human-approved candidates reach allocation.
+
+    For each approved (candidate, household) pair:
       1. Build per-candidate extras dict via extras_provider(hh, candidate).
          The provider supplies sector_map, correlations, delta,
          days_to_earnings for the gates that need them.
@@ -770,9 +902,15 @@ def run_csp_allocator(
          cash_available on the affected accounts so the next
          candidate sees the reduced capacity.
 
+    Every INPUT candidate produces one entry in
+    result.candidate_reasoning — independent of approval or gate
+    outcome — so the future LLM digest tool has a stable audit
+    surface to consume as training signal.
+
     Args:
-        ray_candidates: Screener output. Each must have .ticker,
-            .strike, .mid, .expiry (YYYY-MM-DD), .annualized_yield.
+        ray_candidates: Screener output. Each must conform to the
+            CSPCandidate attribute contract (.ticker, .strike, .mid,
+            .expiry YYYY-MM-DD, .annualized_yield).
         snapshots: Output of _fetch_household_buying_power_snapshot().
             MUTATED IN PLACE as candidates are allocated — pass a
             copy if the caller wants to preserve the original.
@@ -783,22 +921,77 @@ def run_csp_allocator(
             caller (cmd_scan in M1.5) supplies a concrete provider.
         staging_callback: Optional. Called with each list of tickets
             that passed gates+sizing+routing. None = dry-run.
+        approval_gate: Keyword-only. Optional pluggable gate called
+            ONCE on the full candidate list before allocation. Must
+            return a list (subset of input). Default = identity
+            (paper pass-through). Live mode injects Telegram digest.
+            Rejected candidates appear in result.skipped with
+            household="(pre-allocation)" and in
+            candidate_reasoning with approval_status="rejected".
 
     Returns:
-        AllocatorResult with staged, skipped, errors, digest_lines.
+        AllocatorResult with staged, skipped, errors, digest_lines,
+        candidate_reasoning.
 
     Raises:
         Never. All per-candidate errors are caught and logged to
         result.errors so one broken candidate doesn't abort the run.
+        A broken `approval_gate` that raises falls back to identity
+        (paper-safe default) and logs the error.
     """
     result = AllocatorResult()
 
+    # ── Stage 0: approval gate ──
+    # Called once on the full list. Identity default for paper; live
+    # mode wires a Telegram digest gate. A broken gate degrades to
+    # identity to preserve paper-mode behavior — we'd rather allocate
+    # than silently drop the whole scan on a gate bug.
+    gate_fn = approval_gate or _default_approval_gate
+    try:
+        approved = list(gate_fn(list(ray_candidates)))
+    except Exception as exc:
+        logger.exception(
+            "csp_allocator: approval_gate raised — falling back to identity",
+        )
+        result.errors.append({
+            "household": "(approval_gate)",
+            "ticker": "*",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        approved = list(ray_candidates)
+
+    # Identity-by-membership: anything in the input that is not
+    # approved (by object identity) was rejected by the gate.
+    approved_ids = {id(c) for c in approved}
+
+    # ── Initialize per-candidate reasoning skeleton for ALL inputs ──
+    reasoning_by_id: dict[int, dict] = {}
     for candidate in ray_candidates:
+        entry = _init_reasoning_entry(candidate)
+        if id(candidate) in approved_ids:
+            entry["approval_status"] = "approved"
+            entry["approval_reason"] = ""
+        else:
+            entry["approval_status"] = "rejected"
+            entry["approval_reason"] = "approval_gate rejected"
+            # Also surface in skipped for Telegram digest visibility
+            result.skipped.append({
+                "household": "(pre-allocation)",
+                "ticker": getattr(candidate, "ticker", "?"),
+                "reason": "approval_gate rejected",
+            })
+        reasoning_by_id[id(candidate)] = entry
+        result.candidate_reasoning.append(entry)
+
+    # ── Stage 1+: approved candidates × households ──
+    for candidate in approved:
+        reasoning = reasoning_by_id[id(candidate)]
         for hh_name, hh in snapshots.items():
             try:
                 _process_one(
                     hh, hh_name, candidate, vix,
                     extras_provider, staging_callback, result,
+                    reasoning=reasoning,
                 )
             except Exception as exc:
                 logger.exception(
@@ -810,10 +1003,36 @@ def run_csp_allocator(
                     "ticker": getattr(candidate, "ticker", "?"),
                     "error": f"{type(exc).__name__}: {exc}",
                 })
+                reasoning["households"].append({
+                    "household": hh_name,
+                    "outcome": "error",
+                    "tickets": 0,
+                    "contracts": 0,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
 
     result.digest_lines = _format_digest(result)
     return result
 
+
+def _init_reasoning_entry(candidate: Any) -> dict:
+    """Build the per-candidate reasoning skeleton.
+
+    Copies `upstream_reasoning` verbatim from candidate.reasoning if
+    present - that's how the future LLM digest tool will thread its
+    per-candidate rationale into the allocator audit surface.
+    """
+    upstream = getattr(candidate, "reasoning", None)
+    return {
+        "ticker": getattr(candidate, "ticker", "?"),
+        "strike": float(getattr(candidate, "strike", 0.0) or 0.0),
+        "expiry": str(getattr(candidate, "expiry", "") or ""),
+        "annualized_yield": float(getattr(candidate, "annualized_yield", 0.0) or 0.0),
+        "approval_status": "",
+        "approval_reason": "",
+        "upstream_reasoning": dict(upstream) if isinstance(upstream, dict) else {},
+        "households": [],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -916,8 +1135,28 @@ def _process_one(
     extras_provider: Callable,
     staging_callback: Callable | None,
     result: AllocatorResult,
+    *,
+    reasoning: dict | None = None,
 ) -> None:
-    """Process one (household, candidate) pair. Mutates hh + result."""
+    """Process one (household, candidate) pair. Mutates hh + result.
+
+    `reasoning` is the per-candidate dict from
+    `result.candidate_reasoning`. When provided, a per-household
+    outcome row is appended so the future LLM digest tool can audit
+    which households took vs. rejected each candidate and why.
+    Passing None preserves backwards compatibility for any legacy
+    direct callers.
+    """
+    def _record(outcome: str, reason: str, tickets: int = 0, contracts: int = 0) -> None:
+        if reasoning is not None:
+            reasoning["households"].append({
+                "household": hh_name,
+                "outcome": outcome,
+                "tickets": tickets,
+                "contracts": contracts,
+                "reason": reason,
+            })
+
     # Step 1: build extras
     extras = extras_provider(hh, candidate) or {}
 
@@ -933,19 +1172,22 @@ def _process_one(
                 "ticker": candidate.ticker,
                 "reason": f"{gate_name}: {reason}",
             })
+            _record("skipped", f"{gate_name}: {reason}")
             return
 
     # Step 3: size at household level
     n_contracts = _csp_size_household(hh, candidate, vix)
     if n_contracts < 1:
+        sizing_reason = (
+            "sizing returned 0 "
+            "(sub-integer at 10% target or ceiling breach)"
+        )
         result.skipped.append({
             "household": hh_name,
             "ticker": candidate.ticker,
-            "reason": (
-                "sizing returned 0 "
-                "(sub-integer at 10% target or ceiling breach)"
-            ),
+            "reason": sizing_reason,
         })
+        _record("skipped", sizing_reason)
         return
 
     # Step 4: route via fa_block_margin allocator (B5.b).
@@ -970,6 +1212,7 @@ def _process_one(
             "reason": reason,
             "allocation_digest": alloc_digest,
         })
+        _record("skipped", reason)
         return
 
     # Step 5: stage (or dry-run)
@@ -986,12 +1229,15 @@ def _process_one(
                 "ticker": candidate.ticker,
                 "error": f"staging failed: {exc}",
             })
+            _record("error", f"staging failed: {exc}")
             return
 
     # Attach the allocator digest to each ticket for _format_digest.
     for t in tickets:
         t["_allocation_digest"] = alloc_digest
     result.staged.extend(tickets)
+    total_contracts = sum(t["quantity"] for t in tickets)
+    _record("staged", "", tickets=len(tickets), contracts=total_contracts)
 
     # Step 6: mutate snapshot to prevent double-booking
     collateral_per_contract = candidate.strike * 100
