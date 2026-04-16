@@ -28,7 +28,7 @@ import asyncio
 import pytest
 from types import SimpleNamespace
 
-from telegram_bot import _pre_trade_gates, PRE_TRADE_NOTIONAL_CEILING
+from telegram_bot import _pre_trade_gates
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ def test_3_bag_under_ceiling_allowed(peacetime):
     assert allowed, f"BAG at $250 notional should pass; got: {reason}"
 
 
-def test_4_bag_over_ceiling_blocked(peacetime):
+def test_4_bag_high_notional_allowed(peacetime):
     """BAG with large net debit blocked by $25k notional ceiling."""
     contract = make_contract(secType="BAG", strike=None)
     # Net debit $300 * 1 contract * 100 = $30,000 > $25,000
