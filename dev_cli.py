@@ -59,6 +59,53 @@ def _init():
     bot.IB_CLIENT_ID = CLI_CLIENT_ID
 
 
+
+
+# ════════════════════════════════════════════════════════
+# MR #2: autonomous_session_log writer (paper-mode observability)
+# ════════════════════════════════════════════════════════
+
+def _log_session(
+    task_name: str,
+    summary: str,
+    *,
+    actions: dict | list | None = None,
+    errors: dict | list | None = None,
+    metrics: dict | None = None,
+    notes: str | None = None,
+) -> int | None:
+    """Append a row to autonomous_session_log. Best-effort — failure never
+    prevents the CLI command from returning. Returns the inserted rowid or
+    None on failure. Keeps payload columns as JSON strings per schema.py.
+    """
+    try:
+        payload = (
+            task_name,
+            datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            summary,
+            None,                                                # positions_snapshot
+            None,                                                # orders_snapshot
+            json.dumps(actions, default=str) if actions is not None else None,
+            json.dumps(errors, default=str) if errors is not None else None,
+            json.dumps(metrics, default=str) if metrics is not None else None,
+            notes,
+        )
+        with closing(get_db_connection()) as conn:
+            with tx_immediate(conn):
+                cur = conn.execute(
+                    "INSERT INTO autonomous_session_log "
+                    "(task_name, run_at, summary, positions_snapshot, "
+                    " orders_snapshot, actions_taken, errors, metrics, notes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    payload,
+                )
+                return cur.lastrowid
+    except Exception as exc:
+        # dev_cli must never die on session-log failure — paper ops continue.
+        print(f"[warn] _log_session({task_name!r}) failed: {exc}", file=sys.stderr)
+        return None
+
+
 # ════════════════════════════════════════════════════════
 # COMMAND: positions
 # ════════════════════════════════════════════════════════
@@ -101,6 +148,8 @@ async def cmd_scan_daily(args):
     print(f"\n{'='*70}")
     print(f"DAILY SCAN  —  {datetime.now().strftime('%H:%M:%S ET')}")
     print(f"{'='*70}")
+
+    _log_session("dev_cli.scan_daily.begin", "dev_cli scan-daily started")
 
     # This is the exact function cmd_daily() calls.
     # ensure_ib_connected() is called inside _run_cc_logic, etc.
@@ -164,6 +213,16 @@ async def cmd_scan_daily(args):
 
     print(f"\n{'='*70}")
     print("SCAN COMPLETE")
+    _log_session(
+        "dev_cli.scan_daily.end",
+        f"sections={len(sections)}",
+        metrics={"section_titles": [t for t, _ in sections]},
+        errors=[
+            {"section": t, "body": b}
+            for t, b in sections
+            if b.startswith("ERROR")
+        ] or None,
+    )
 
 
 # ════════════════════════════════════════════════════════
@@ -178,6 +237,12 @@ async def cmd_stage_cc(args):
     if hh_filter:
         print(f"Household filter: {hh_filter}")
     print(f"{'='*70}")
+
+    _log_session(
+        "dev_cli.stage_cc.begin",
+        f"household={hh_filter or 'ALL'}",
+        metrics={"household": hh_filter},
+    )
 
     # This is the EXACT function that /cc invokes.
     result = await bot._run_cc_logic(hh_filter)
@@ -196,6 +261,16 @@ async def cmd_stage_cc(args):
         print(f"\n  SKIPPED ({len(skipped)}):")
         for s in skipped:
             print(f"    {s}")
+
+    _log_session(
+        "dev_cli.stage_cc.end",
+        f"staged={len(staged)} skipped={len(skipped)}",
+        metrics={
+            "household": hh_filter,
+            "staged_count": len(staged),
+            "skipped_count": len(skipped),
+        },
+    )
 
 
 # ════════════════════════════════════════════════════════
@@ -410,6 +485,12 @@ async def _approve_single(order_id: int):
     """Transition staged -> sent via the production execution bridge."""
     print(f"\n  --- Approving order #{order_id} ---")
 
+    _log_session(
+        "dev_cli.approve.begin",
+        f"order_id={order_id}",
+        metrics={"order_id": order_id},
+    )
+
     # CAS: staged -> processing (same guard as handle_approve_callback)
     with closing(get_db_connection()) as conn:
         with tx_immediate(conn):
@@ -458,6 +539,19 @@ async def _approve_single(order_id: int):
     if final:
         print(f"  DB state: status={final[0]} ib_order={final[1]} "
               f"perm={final[2]} ib_status={final[3]}")
+
+    _log_session(
+        "dev_cli.approve.end",
+        f"order_id={order_id} success={success}",
+        metrics={
+            "order_id": order_id,
+            "success": bool(success),
+            "final_status": (final[0] if final else None),
+            "ib_order_id": (final[1] if final else None),
+            "ib_perm_id": (final[2] if final else None),
+        },
+        errors=[{"message": message}] if not success else None,
+    )
 
 
 # ════════════════════════════════════════════════════════
