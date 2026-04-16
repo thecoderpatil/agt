@@ -477,6 +477,17 @@ if PAPER_MODE:
 else:
     logger.info("LIVE MODE — primary port %d, fallback %d", IB_TWS_PORT, IB_TWS_FALLBACK)
 
+# MR !70: paper autopilot. When PAPER_MODE is on, staged orders auto-execute
+# without a Telegram /approve gate — paper's job is to exercise bot → IBKR
+# end-to-end. Live stays fully gated. Kill-switch: PAPER_AUTO_EXECUTE=0.
+PAPER_AUTO_EXECUTE = PAPER_MODE and os.environ.get("PAPER_AUTO_EXECUTE", "1") != "0"
+if PAPER_MODE:
+    logger.warning(
+        "PAPER_AUTO_EXECUTE=%s — paper orders %s without /approve",
+        PAPER_AUTO_EXECUTE,
+        "will auto-submit" if PAPER_AUTO_EXECUTE else "require manual /approve",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Conversation history & rate-limiting
@@ -5675,6 +5686,100 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
 
 
+async def _auto_execute_staged(
+    ib_conn=None,
+) -> tuple[int, int, list[str], str]:
+    """CAS-claim every staged pending_orders row and place them via IB.
+
+    Shared sweeper for:
+      - handle_approve_callback(action="all") [manual /approve on live or paper]
+      - cmd_daily [PAPER autopilot after 3-engine scan]
+      - _scheduled_cc [PAPER autopilot after CC auto-stage]
+
+    Returns (placed, failed, result_lines, status) where status is one of:
+      - "none"     : no staged orders
+      - "race"     : another approver claimed them first
+      - "ib_fail"  : IB connection failed, claimed rows reverted to staged
+      - "ok"       : orders placed (placed + failed sum to >= 1)
+
+    ARCHITECTURE (MR !70): factored out of handle_approve_callback. Same
+    read/await/write phase separation, same CAS guard. No DB connection
+    held across await. Reverts claimed rows on IB failure so nothing is
+    stranded.
+    """
+    # ── READ phase: get staged IDs ──
+    with closing(_get_db_connection()) as conn:
+        staged_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM pending_orders WHERE status = 'staged' ORDER BY id"
+            ).fetchall()
+        ]
+    if not staged_ids:
+        return 0, 0, [], "none"
+
+    # ── WRITE phase: CAS claim staged → processing ──
+    placeholders = ",".join("?" * len(staged_ids))
+    with closing(_get_db_connection()) as conn:
+        with tx_immediate(conn):
+            claimed = conn.execute(
+                f"UPDATE pending_orders SET status = 'processing' "
+                f"WHERE id IN ({placeholders}) AND status = 'staged'",
+                staged_ids,
+            ).rowcount
+    if claimed == 0:
+        return 0, 0, [], "race"
+
+    # ── READ phase: fetch claimed rows ──
+    with closing(_get_db_connection()) as conn:
+        rows = conn.execute(
+            f"SELECT id, payload FROM pending_orders "
+            f"WHERE id IN ({placeholders}) AND status = 'processing' "
+            f"ORDER BY id",
+            staged_ids,
+        ).fetchall()
+    claimed_ids = [row["id"] for row in rows]
+
+    # ── AWAIT phase: IB connect + positions cache ──
+    try:
+        if ib_conn is None:
+            ib_conn = await ensure_ib_connected()
+        cached_positions = await ib_conn.reqPositionsAsync()
+    except Exception as ib_exc:
+        try:
+            reverted = _revert_pending_order_claims(claimed_ids)
+            if reverted > 0:
+                logger.warning(
+                    "Reverted %d claimed rows after IB connection failure",
+                    reverted,
+                )
+        except Exception:
+            logger.exception("revert after ib_fail also failed")
+        return 0, 0, [f"\u274c IB connection failed: {ib_exc}"], "ib_fail"
+
+    # ── AWAIT phase: place orders (no conn held) ──
+    placed = 0
+    failed = 0
+    results_lines: list[str] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+            success, msg = await _place_single_order(
+                payload, row["id"], cached_positions
+            )
+            if success:
+                placed += 1
+                results_lines.append(f"\u2705 {msg}")
+            else:
+                failed += 1
+                results_lines.append(f"\u274c {msg}")
+        except Exception as exc:
+            failed += 1
+            results_lines.append(f"\u274c Order #{row['id']}: {exc}")
+            logger.exception("_auto_execute_staged: order #%s failed", row["id"])
+
+    return placed, failed, results_lines, "ok"
+
+
 async def handle_approve_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -5720,88 +5825,27 @@ async def handle_approve_callback(
             return
 
         if action == "all":
-            # ── READ phase: get staged IDs ──
-            with closing(_get_db_connection()) as conn:
-                staged_ids = [
-                    r["id"] for r in conn.execute(
-                        "SELECT id FROM pending_orders WHERE status = 'staged' ORDER BY id"
-                    ).fetchall()
-                ]
-
-            # ── AWAIT phase (conn released) ──
-            if not staged_ids:
+            # MR !70: delegate to shared sweeper. Same CAS + revert-on-ib-fail.
+            placed, failed, body_lines, status = await _auto_execute_staged()
+            if status == "none":
                 await query.edit_message_text("No staged orders remaining.")
                 return
-
-            # ── WRITE phase: CAS claim staged → processing ──
-            placeholders = ",".join("?" * len(staged_ids))
-            with closing(_get_db_connection()) as conn:
-                with tx_immediate(conn):
-                    claimed = conn.execute(
-                        f"UPDATE pending_orders SET status = 'processing' "
-                        f"WHERE id IN ({placeholders}) AND status = 'staged'",
-                        staged_ids,
-                    ).rowcount
-
-            # ── AWAIT phase (conn released) ──
-            if claimed == 0:
+            if status == "race":
                 await query.edit_message_text("Orders already being processed.")
                 return
-
-            # ── READ phase: fetch claimed rows ──
-            with closing(_get_db_connection()) as conn:
-                rows = conn.execute(
-                    f"SELECT id, payload FROM pending_orders "
-                    f"WHERE id IN ({placeholders}) AND status = 'processing' "
-                    f"ORDER BY id",
-                    staged_ids,
-                ).fetchall()
-                claimed_ids = [row["id"] for row in rows]
-
-            # ── AWAIT phase: place orders (no conn held) ──
-            placed = 0
-            failed = 0
-            results_lines = ["\u2501\u2501 Orders Placed \u2501\u2501", ""]
-
-            try:
-                ib_conn = await ensure_ib_connected()
-                cached_positions = await ib_conn.reqPositionsAsync()
-            except Exception as ib_exc:
-                # Revert claimed rows back to staged so they're not stranded
-                try:
-                    reverted = _revert_pending_order_claims(claimed_ids)
-                    if reverted > 0:
-                        logger.warning(
-                            "Reverted %d claimed rows after IB connection failure",
-                            reverted,
-                        )
-                except Exception:
-                    pass
+            if status == "ib_fail":
+                msg = body_lines[0] if body_lines else "\u274c IB connection failed"
                 await query.edit_message_text(
-                    f"\u274c IB connection failed: {ib_exc}\n"
-                    f"Orders reverted to staged. Try /approve again after /reconnect."
+                    f"{msg}\nOrders reverted to staged. Try /approve again after /reconnect."
                 )
                 return
-
-            for row in rows:
-                try:
-                    payload = json.loads(row["payload"])
-                    success, msg = await _place_single_order(
-                        payload, row["id"], cached_positions
-                    )
-                    if success:
-                        placed += 1
-                        results_lines.append(f"\u2705 {msg}")
-                    else:
-                        failed += 1
-                        results_lines.append(f"\u274c {msg}")
-                except Exception as exc:
-                    failed += 1
-                    results_lines.append(f"\u274c Order #{row['id']}: {exc}")
-
-            results_lines.append("")
-            results_lines.append(f"Placed: {placed} | Failed: {failed}")
-
+            results_lines = [
+                "\u2501\u2501 Orders Placed \u2501\u2501",
+                "",
+                *body_lines,
+                "",
+                f"Placed: {placed} | Failed: {failed}",
+            ]
             output = "\n".join(results_lines)
             try:
                 await query.edit_message_text(
@@ -7054,7 +7098,11 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
       2. Roll check (open short calls via roll_engine.evaluate)
       3. CSP harvest (open short puts profit-take)
 
-    Everything lands in the normal /approve queue. No autonomous execution.
+    Paper (PAPER_MODE + PAPER_AUTO_EXECUTE): auto-executes staged rows
+    immediately after the 3-engine pass via _auto_execute_staged. No
+    /approve gate — paper's job is to exercise bot → IBKR end-to-end.
+
+    Live: everything lands in the normal /approve queue.
     """
     if not is_authorized(update):
         return
@@ -7144,6 +7192,28 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         logger.exception("cmd_daily: CSP harvest failed")
         sections.append(f"\n\u25b6 CSP HARVEST\n\u274c Error: {exc}")
+
+    # --- 4. Paper autopilot: auto-execute staged rows (no /approve gate) ---
+    if PAPER_MODE and PAPER_AUTO_EXECUTE:
+        try:
+            ap_placed, ap_failed, ap_lines, ap_status = await _auto_execute_staged(ib_conn)
+            if ap_status == "none":
+                ap_text = "No orders staged for auto-execute."
+            elif ap_status == "race":
+                ap_text = "Another sweeper claimed the orders first."
+            elif ap_status == "ib_fail":
+                ap_text = ap_lines[0] if ap_lines else "IB connection failed."
+            else:
+                ap_text = f"Placed: {ap_placed} | Failed: {ap_failed}"
+                if ap_lines:
+                    trimmed = ap_lines[:10]
+                    ap_text += "\n" + "\n".join(trimmed)
+                    if len(ap_lines) > 10:
+                        ap_text += f"\n... ({len(ap_lines) - 10} more)"
+            sections.append(f"\n\u25b6 AUTO-EXECUTE\n{ap_text}")
+        except Exception as exc:
+            logger.exception("cmd_daily: paper auto-execute failed")
+            sections.append(f"\n\u25b6 AUTO-EXECUTE\n\u274c Error: {exc}")
 
     # --- Digest ---
     msg = "\n".join(sections)
@@ -9285,7 +9355,13 @@ async def cmd_cure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily 9:45 AM ET — auto-stage Defensive + Harvest CCs."""
+    """Daily 9:45 AM ET — auto-stage Defensive + Harvest CCs.
+
+    Paper (PAPER_MODE + PAPER_AUTO_EXECUTE): auto-executes staged rows
+    immediately after CC staging via _auto_execute_staged. No /approve gate.
+
+    Live: CC rows land in /approve queue.
+    """
     try:
         now_et = _datetime.now(ET)
         if now_et.weekday() >= 5:
@@ -9304,6 +9380,38 @@ async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
             text=f"<pre>{html.escape(result_text)}</pre>",
             parse_mode="HTML",
         )
+
+        # MR !70: paper autopilot. Drain any staged rows (CC or otherwise)
+        # through IB without a human gate. Live skips this branch.
+        if PAPER_MODE and PAPER_AUTO_EXECUTE:
+            try:
+                ap_placed, ap_failed, ap_lines, ap_status = await _auto_execute_staged()
+                if ap_status == "ok":
+                    exec_msg = f"[PAPER AUTO-EXEC] Placed: {ap_placed} | Failed: {ap_failed}"
+                    if ap_lines:
+                        exec_msg += "\n" + "\n".join(ap_lines[:10])
+                        if len(ap_lines) > 10:
+                            exec_msg += f"\n... ({len(ap_lines) - 10} more)"
+                elif ap_status == "ib_fail":
+                    exec_msg = ap_lines[0] if ap_lines else "[PAPER AUTO-EXEC] IB connection failed"
+                elif ap_status == "race":
+                    exec_msg = "[PAPER AUTO-EXEC] No-op (race: another sweeper claimed)"
+                else:
+                    exec_msg = "[PAPER AUTO-EXEC] No staged orders"
+                await context.bot.send_message(
+                    chat_id=AUTHORIZED_USER_ID,
+                    text=f"<pre>{html.escape(exec_msg)}</pre>",
+                    parse_mode="HTML",
+                )
+            except Exception as auto_exc:
+                logger.exception("Scheduled CC auto-execute failed")
+                try:
+                    await context.bot.send_message(
+                        chat_id=AUTHORIZED_USER_ID,
+                        text=f"[PAPER AUTO-EXEC] Failed: {auto_exc}",
+                    )
+                except Exception:
+                    pass
 
     except Exception as exc:
         logger.exception("Scheduled CC failed")
