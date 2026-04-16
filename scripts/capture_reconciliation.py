@@ -284,4 +284,5 @@ def main():
     return 0 if not disagreements else 1
 
 
-if __name__ == "__ma
+if __name__ == "__main__":
+    sys.exit(main())
