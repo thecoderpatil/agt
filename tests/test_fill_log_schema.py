@@ -6,7 +6,11 @@ import unittest
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
+
 from agt_equities.schema import register_operational_tables
+
+pytestmark = pytest.mark.sprint_a
 
 
 class TestFillLogInceptionDelta(unittest.TestCase):
