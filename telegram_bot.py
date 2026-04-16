@@ -7130,6 +7130,282 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
 
 
+# ---------------------------------------------------------------------------
+# /report — full autonomous pipeline status report (on-demand)
+# ---------------------------------------------------------------------------
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/report — Comprehensive pipeline status for Yash to triage in Cowork.
+
+    Pulls from: circuit breaker, readiness gate, session logs, active cycles,
+    pending orders, IB connectivity, and the weekly directive.
+    Pure read-only — no side effects.
+    """
+    if not is_authorized(update):
+        return
+
+    status_msg = await update.message.reply_text(
+        "Compiling full pipeline report..."
+    )
+    sections: list[str] = []
+
+    # ── 1. Header ──
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    ET = _tz(_td(hours=-4))  # EDT
+    now_et = _dt.now(ET)
+    sections.append(
+        f"AGT EQUITIES — PIPELINE REPORT\n"
+        f"Generated: {now_et.strftime('%Y-%m-%d %H:%M ET')}\n"
+        f"{'=' * 40}"
+    )
+
+    # ── 2. Circuit Breaker Status ──
+    try:
+        import subprocess, sys as _sys
+        from pathlib import Path as _Path
+        cb_path = _Path(__file__).parent / "scripts" / "circuit_breaker.py"
+        if cb_path.exists():
+            result = subprocess.run(
+                [_sys.executable, str(cb_path)],
+                capture_output=True, text=True, timeout=15,
+                cwd=str(_Path(__file__).parent),
+            )
+            cb_data = json.loads(result.stdout.split("\n")[0]) if result.stdout else {}
+            if cb_data.get("halted"):
+                cb_status = "HALTED — CIRCUIT BREAKER TRIPPED"
+            elif not cb_data.get("ok"):
+                viols = cb_data.get("violations", [])
+                cb_status = f"VIOLATIONS ({len(viols)}): " + "; ".join(
+                    v.get("reason", "unknown") for v in viols
+                )
+            else:
+                cb_status = "ALL CLEAR"
+            warns = cb_data.get("warnings", [])
+            warn_str = ""
+            if warns:
+                warn_str = "\n  Warnings: " + "; ".join(
+                    w.get("warning", "") for w in warns
+                )
+            sections.append(f"\n[CIRCUIT BREAKER] {cb_status}{warn_str}")
+
+            # Extract individual check details
+            checks = cb_data.get("checks", {})
+            if checks:
+                for name, detail in checks.items():
+                    status_icon = "OK" if detail.get("ok") else "FAIL"
+                    extra = ""
+                    if name == "daily_orders" and "count" in detail:
+                        extra = f" ({detail['count']}/{detail['limit']})"
+                    elif name == "daily_notional" and "notional" in detail:
+                        extra = f" (${detail['notional']:,.0f}/${detail['limit']:,.0f})"
+                    elif name == "directive" and detail.get("has_directive"):
+                        age = detail.get("age_days", "?")
+                        stale = " STALE" if detail.get("stale") else ""
+                        extra = f" ({age}d old{stale})"
+                    sections.append(f"  {status_icon:>4} {name}{extra}")
+        else:
+            sections.append("\n[CIRCUIT BREAKER] scripts/circuit_breaker.py not found")
+    except Exception as exc:
+        sections.append(f"\n[CIRCUIT BREAKER] Error: {exc}")
+
+    # ── 3. IB Gateway Status ──
+    try:
+        global ib
+        if ib is not None and ib.isConnected():
+            accts = ib.managedAccounts()
+            acct_str = ", ".join(accts) if accts else "none"
+            cid = ib.client.clientId if ib.client else "?"
+            sections.append(f"\n[IB GATEWAY] Connected (clientId={cid})\n  Accounts: {acct_str}")
+        else:
+            sections.append("\n[IB GATEWAY] DISCONNECTED")
+    except Exception as exc:
+        sections.append(f"\n[IB GATEWAY] Error: {exc}")
+
+    # ── 4. Readiness Gate ──
+    try:
+        with closing(_get_db_connection()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT segment, status, last_tested, evidence "
+                "FROM readiness_gate ORDER BY id"
+            ).fetchall()
+        if rows:
+            validated = sum(1 for r in rows if r["status"] == "validated")
+            total = len(rows)
+            sections.append(f"\n[READINESS GATE] {validated}/{total}")
+            for r in rows:
+                icon = "OK" if r["status"] == "validated" else "  "
+                tested = r["last_tested"] or "never"
+                sections.append(f"  [{icon:>2}] {r['segment']:<25} {tested}")
+        else:
+            sections.append("\n[READINESS GATE] No segments configured")
+    except Exception as exc:
+        sections.append(f"\n[READINESS GATE] Error: {exc}")
+
+    # ── 5. Active Cycles (position summary) ──
+    try:
+        from agt_equities import trade_repo
+        from agt_equities.config import ACTIVE_ACCOUNTS, ACCOUNT_TO_HOUSEHOLD
+        cycles = trade_repo.get_active_cycles()
+        # Group by household
+        hh_summary: dict[str, dict] = {}
+        for c in cycles:
+            hh = c.get("household_id", "unknown")
+            if hh not in hh_summary:
+                hh_summary[hh] = {"short_puts": 0, "short_calls": 0, "shares": 0, "tickers": set()}
+            hh_summary[hh]["tickers"].add(c.get("ticker", "?"))
+            phase = c.get("phase", "")
+            if "csp" in str(phase).lower() or "short_put" in str(phase).lower():
+                hh_summary[hh]["short_puts"] += 1
+            elif "cc" in str(phase).lower() or "short_call" in str(phase).lower():
+                hh_summary[hh]["short_calls"] += 1
+            if c.get("shares", 0) > 0:
+                hh_summary[hh]["shares"] += c.get("shares", 0)
+
+        sections.append(f"\n[ACTIVE CYCLES] {len(cycles)} total")
+        for hh, s in hh_summary.items():
+            sections.append(
+                f"  {hh}: {len(s['tickers'])} tickers, "
+                f"{s['short_puts']} CSP, {s['short_calls']} CC, "
+                f"{s['shares']} shares"
+            )
+    except Exception as exc:
+        sections.append(f"\n[ACTIVE CYCLES] Error: {exc}")
+
+    # ── 6. Pending Orders ──
+    try:
+        with closing(_get_db_connection()) as conn:
+            conn.row_factory = sqlite3.Row
+            orders = conn.execute(
+                "SELECT id, status, payload FROM pending_orders "
+                "WHERE date(created_at) = date('now') "
+                "ORDER BY id DESC"
+            ).fetchall()
+        by_status: dict[str, int] = {}
+        for o in orders:
+            st = o["status"]
+            by_status[st] = by_status.get(st, 0) + 1
+        total_orders = len(orders)
+        status_parts = ", ".join(f"{v} {k}" for k, v in sorted(by_status.items()))
+        sections.append(
+            f"\n[TODAY'S ORDERS] {total_orders} total"
+            + (f" ({status_parts})" if status_parts else "")
+        )
+    except Exception as exc:
+        sections.append(f"\n[TODAY'S ORDERS] Error: {exc}")
+
+    # ── 7. NLV per Account ──
+    try:
+        with closing(_get_db_connection()) as conn:
+            conn.row_factory = sqlite3.Row
+            nlv_rows = conn.execute(
+                "SELECT account_id, nlv, excess_liquidity, timestamp "
+                "FROM v_available_nlv"
+            ).fetchall()
+        if nlv_rows:
+            sections.append(f"\n[NLV SNAPSHOT]")
+            for r in nlv_rows:
+                sections.append(
+                    f"  {r['account_id']}: ${r['nlv']:,.0f} "
+                    f"(EL: ${r['excess_liquidity']:,.0f}) "
+                    f"@ {r['timestamp'][:16]}"
+                )
+        else:
+            sections.append("\n[NLV SNAPSHOT] No data in v_available_nlv")
+    except Exception as exc:
+        sections.append(f"\n[NLV SNAPSHOT] Error: {exc}")
+
+    # ── 8. Recent Session Logs (last 10) ──
+    try:
+        with closing(_get_db_connection()) as conn:
+            conn.row_factory = sqlite3.Row
+            logs = conn.execute(
+                "SELECT task_name, run_at, summary, errors "
+                "FROM autonomous_session_log "
+                "ORDER BY id DESC LIMIT 10"
+            ).fetchall()
+        if logs:
+            sections.append(f"\n[SESSION LOG] Last {len(logs)} runs:")
+            for r in logs:
+                errs = r["errors"]
+                has_err = errs and errs != "null" and errs != "[]"
+                icon = "ERR" if has_err else " ok"
+                summary = (r["summary"] or "no summary")[:60]
+                sections.append(
+                    f"  [{icon}] {r['run_at'][:16]} {r['task_name']}: {summary}"
+                )
+        else:
+            sections.append("\n[SESSION LOG] No entries yet")
+    except Exception as exc:
+        sections.append(f"\n[SESSION LOG] Error: {exc}")
+
+    # ── 9. Weekly Directive Status ──
+    try:
+        from pathlib import Path as _Path
+        directive_path = _Path(__file__).parent / "_WEEKLY_ARCHITECT_DIRECTIVE.md"
+        if directive_path.exists():
+            content = directive_path.read_text(encoding="utf-8")
+            # Extract key fields
+            lines = content.splitlines()
+            status_line = next((l for l in lines if l.startswith("## Status:")), None)
+            expires_line = next((l for l in lines if l.startswith("**Expires:")), None)
+            focus_start = None
+            focus_lines = []
+            for i, l in enumerate(lines):
+                if "## Current Focus" in l:
+                    focus_start = i
+                elif focus_start and l.startswith("## ") and i > focus_start:
+                    break
+                elif focus_start and l.strip().startswith("- "):
+                    focus_lines.append(l.strip())
+
+            sections.append(f"\n[DIRECTIVE]")
+            if status_line:
+                sections.append(f"  {status_line.replace('## ', '')}")
+            if expires_line:
+                sections.append(f"  {expires_line.strip('*')}")
+            if focus_lines:
+                sections.append("  Focus:")
+                for fl in focus_lines[:6]:
+                    sections.append(f"    {fl}")
+        else:
+            sections.append("\n[DIRECTIVE] No _WEEKLY_ARCHITECT_DIRECTIVE.md found")
+    except Exception as exc:
+        sections.append(f"\n[DIRECTIVE] Error: {exc}")
+
+    # ── 10. Safety Rails Summary ──
+    try:
+        from pathlib import Path as _Path
+        rails_path = _Path(__file__).parent / "_SAFETY_RAILS.md"
+        if rails_path.exists():
+            sections.append(f"\n[SAFETY RAILS] Active (_SAFETY_RAILS.md present)")
+        else:
+            sections.append(f"\n[SAFETY RAILS] WARNING: _SAFETY_RAILS.md NOT FOUND")
+    except Exception as exc:
+        sections.append(f"\n[SAFETY RAILS] Error: {exc}")
+
+    sections.append(f"\n{'=' * 40}\nEnd of report. Paste into Cowork to triage.")
+
+    # ── Send ──
+    msg = "\n".join(sections)
+    try:
+        await status_msg.edit_text(
+            f"<pre>{html.escape(msg)}</pre>", parse_mode="HTML",
+        )
+    except Exception:
+        # Message too long — split into chunks
+        for i in range(0, len(msg), 4000):
+            chunk = msg[i:i + 4000]
+            if i == 0:
+                await status_msg.edit_text(
+                    f"<pre>{html.escape(chunk)}</pre>", parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    f"<pre>{html.escape(chunk)}</pre>", parse_mode="HTML",
+                )
+
+
 # /cycles TICKER — show CC cycle history from cc_cycle_log
 # ---------------------------------------------------------------------------
 
@@ -11229,6 +11505,7 @@ def main() -> None:
     app.add_handler(CommandHandler("halt",      cmd_halt))
     app.add_handler(CommandHandler("resume",    cmd_resume))
     app.add_handler(CommandHandler("daily",     cmd_daily))
+    app.add_handler(CommandHandler("report",    cmd_report))
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve:"))
     app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern=r"^dex:"))
