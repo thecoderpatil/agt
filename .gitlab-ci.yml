@@ -39,6 +39,35 @@
 #     new Sprint A *file* = one-line CI edit; adding a new Sprint A
 #     *test* inside an existing file = zero CI edits.
 
+# -------------------------------------------------------------------
+# Compute-minute discipline — workflow:rules
+# -------------------------------------------------------------------
+# Problem (observed 2026-04-16): 337 pipelines in 6 days burned the free
+# tier 400-minute quota. 26% of runs were duplicates — a branch push with
+# an open MR triggered BOTH a branch pipeline AND a merge_request_event
+# pipeline for the same SHA.
+#
+# Fix: only run ONE pipeline per code state.
+#   - If an MR is open for the branch → MR event pipeline runs, branch
+#     push pipeline is skipped (dedup).
+#   - If no MR is open yet → branch push pipeline runs (lets pre-MR smoke
+#     tests still run on feature branches).
+#   - main gets its own pipeline on push (post-merge canonical signal).
+#
+# Also: commits with `[skip ci]` in the message are honored by GitLab and
+# consume zero minutes — use for docs/notes/memory-only changes.
+workflow:
+  rules:
+    # Merge-request event pipelines always run
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # Skip branch-push pipeline when an MR is already open for the branch
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    # main post-merge pipeline (canonical signal after squash-merge)
+    - if: $CI_COMMIT_BRANCH == "main"
+    # Feature-branch first push (before MR exists)
+    - if: $CI_COMMIT_BRANCH
+
 stages:
   - test
 
