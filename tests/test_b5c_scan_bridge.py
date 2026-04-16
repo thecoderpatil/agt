@@ -256,6 +256,33 @@ class TestE2EDigestDryRun:
         assert len(c.expiry.replace("-", "")) == 8
 
 
+
+def _single_household_snapshot(hh_name="TestHH", acct_id="U001", nlv=100_000.0):
+    """Standalone household snapshot for bridge-2 tests."""
+    return {
+        hh_name: {
+            "household": hh_name,
+            "hh_nlv": nlv,
+            "hh_margin_nlv": nlv,
+            "hh_margin_el": nlv * 0.5,
+            "accounts": {
+                acct_id: {
+                    "account_id": acct_id,
+                    "nlv": nlv,
+                    "el": nlv * 0.5,
+                    "buying_power": nlv * 2.0,
+                    "cash_available": nlv,
+                    "margin_eligible": False,
+                    "mode": "PEACETIME",
+                },
+            },
+            "existing_positions": {},
+            "existing_csps": {},
+            "working_order_tickers": set(),
+            "staged_order_tickers": set(),
+        },
+    }
+
 # ---------------------------------------------------------------------------
 # B5.c-bridge-2 — staging callback tests
 # ---------------------------------------------------------------------------
