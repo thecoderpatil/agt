@@ -441,29 +441,44 @@ async def get_chain_for_expiry(
         # Qualify in batch (ib_async handles this efficiently)
         qualified = await ib.qualifyContractsAsync(*contracts)
 
-        # Request snapshots
-        tickers_data = {}
-        for qc in qualified:
-            if qc.conId == 0:
-                continue  # invalid contract
-            td = ib.reqMktData(qc, '', True, False)  # snapshot=True
-            tickers_data[qc.strike] = td
-
-        # Wait briefly for snapshots to populate
+        # ── Chunked snapshot fetch ──────────────────────────────────
+        # IBKR enforces a ~100 concurrent reqMktData snapshot limit.
+        # Exceeding it silently drops subscriptions, producing NaN or
+        # stale data for the overshoot strikes.  We chunk at 80 to
+        # leave headroom for concurrent spot fetches from other
+        # coroutines.
+        #
+        # Each chunk: subscribe → sleep → collect → cancel.
+        # try/finally ensures cancelMktData fires even if
+        # _build_chain_rows raises mid-loop (subscription leak guard).
         import asyncio
-        await asyncio.sleep(2)
 
-        # C6.2: NaN-safe coercion loop extracted to _build_chain_rows
-        # as a pure module-level helper for unit testability. Preserves
-        # the pre-C6.2 output shape and valid-data semantics exactly.
-        results = _build_chain_rows(tickers_data)
+        _SNAPSHOT_CHUNK = 80
+        valid_contracts = [qc for qc in qualified if qc.conId != 0]
+        results = []
 
-        # Cancel market data subscriptions
-        for td in tickers_data.values():
+        for chunk_start in range(0, len(valid_contracts), _SNAPSHOT_CHUNK):
+            chunk = valid_contracts[chunk_start:chunk_start + _SNAPSHOT_CHUNK]
+            tickers_data = {}
             try:
-                ib.cancelMktData(td.contract)
-            except Exception:
-                pass
+                for qc in chunk:
+                    td = ib.reqMktData(qc, '', True, False)  # snapshot=True
+                    tickers_data[qc.strike] = td
+
+                await asyncio.sleep(2)
+
+                # C6.2: NaN-safe coercion via _build_chain_rows
+                results.extend(_build_chain_rows(tickers_data))
+            finally:
+                # Cancel subscriptions — must fire even on exception
+                for td in tickers_data.values():
+                    try:
+                        ib.cancelMktData(td.contract)
+                    except Exception:
+                        pass
+
+        # Ensure final output is in ascending strike order across chunks
+        results.sort(key=lambda r: r['strike'])
 
         latency = (time.time() - t0) * 1000
         _log_fetch(ticker, 'IBKR', latency, True)
@@ -595,38 +610,46 @@ async def get_spots_batch(ib, tickers: list[str]) -> dict[str, float]:
         contracts = [ib_async.Stock(tk, 'SMART', 'USD') for tk in need_fetch]
         qualified = await ib.qualifyContractsAsync(*contracts)
 
-        # Fire all reqMktData
-        ticker_map = {}  # contract -> ticker
-        for qc, tk in zip(qualified, need_fetch):
-            if qc.conId == 0:
-                continue
-            td = ib.reqMktData(qc, '', False, False)
-            ticker_map[qc] = (tk, td)
+        # ── Chunked spot fetch (try/finally prevents subscription leaks)
+        _SPOT_CHUNK = 80
+        valid_pairs = [
+            (qc, tk) for qc, tk in zip(qualified, need_fetch)
+            if qc.conId != 0
+        ]
 
-        await asyncio.sleep(2.5)
-
-        # Collect prices (C6.2: NaN-safe via _safe_float)
-        for qc, (tk, td) in ticker_map.items():
-            price = None
-            for val in [td.last, td.close, td.marketPrice()]:
-                safe_val = _safe_float(val)
-                if safe_val > 0 and safe_val != float('inf'):
-                    price = safe_val
-                    break
-            if price is None:
-                safe_bid = _safe_float(td.bid)
-                safe_ask = _safe_float(td.ask)
-                if safe_bid > 0 and safe_ask > 0:
-                    price = (safe_bid + safe_ask) / 2.0
-
+        for chunk_start in range(0, len(valid_pairs), _SPOT_CHUNK):
+            chunk = valid_pairs[chunk_start:chunk_start + _SPOT_CHUNK]
+            ticker_map = {}
             try:
-                ib.cancelMktData(qc)
-            except Exception:
-                pass
+                for qc, tk in chunk:
+                    td = ib.reqMktData(qc, '', False, False)
+                    ticker_map[qc] = (tk, td)
 
-            if price and price > 0:
-                result[tk] = price
-                _spot_cache[tk] = (price, time.time())
+                await asyncio.sleep(2.5)
+
+                # Collect prices (C6.2: NaN-safe via _safe_float)
+                for qc, (tk, td) in ticker_map.items():
+                    price = None
+                    for val in [td.last, td.close, td.marketPrice()]:
+                        safe_val = _safe_float(val)
+                        if safe_val > 0 and safe_val != float('inf'):
+                            price = safe_val
+                            break
+                    if price is None:
+                        safe_bid = _safe_float(td.bid)
+                        safe_ask = _safe_float(td.ask)
+                        if safe_bid > 0 and safe_ask > 0:
+                            price = (safe_bid + safe_ask) / 2.0
+
+                    if price and price > 0:
+                        result[tk] = price
+                        _spot_cache[tk] = (price, time.time())
+            finally:
+                for qc in ticker_map:
+                    try:
+                        ib.cancelMktData(qc)
+                    except Exception:
+                        pass
 
         latency = (time.time() - t0) * 1000
         _log_fetch(','.join(need_fetch[:5]), 'IBKR', latency, True)
