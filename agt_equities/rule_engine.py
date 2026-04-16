@@ -18,6 +18,7 @@ from enum import Enum
 from typing import Literal, Optional
 
 from agt_equities.config import MARGIN_ELIGIBLE_ACCOUNTS
+from agt_equities.dates import et_today
 from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 
 logger = logging.getLogger(__name__)
@@ -927,7 +928,7 @@ def evaluate_rule_7(
         )]
 
     results: list[RuleEvaluation] = []
-    today = _date.today()
+    today = et_today()
 
     for ticker in tickers:
         try:
@@ -1085,7 +1086,7 @@ def evaluate_dynamic_exit_candidates(
     # Structural Constraints
     anti_rip_floor = spot * 1.10
     min_yield = 0.10
-    today = date.today()
+    today = et_today()
 
     valid_opts = []
     for opt in chain_slice:
