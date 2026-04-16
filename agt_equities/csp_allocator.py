@@ -538,6 +538,44 @@ def _csp_check_rule_2(hh, candidate, n, vix, extras) -> tuple[bool, str]:
     return (True, "")
 
 
+
+def _csp_check_vix_acceleration(hh, candidate, n, vix, extras) -> tuple[bool, str]:
+    """VIX acceleration veto: block all CSP entries when VIX has risen >20% over 3 sessions.
+
+    extras['vix_history']: list of recent VIX closes, newest-first.
+      Minimum 4 values needed (today + 3 prior sessions).
+      Example: [22.0, 20.5, 19.0, 18.0] → today=22, 3 sessions ago=18.
+
+    Rate of change = (current - 3_sessions_ago) / 3_sessions_ago.
+    Threshold: >20% rise → reject ALL CSP entries.
+
+    Fail-open on missing/insufficient VIX history — the orchestrator
+    is responsible for logging data holes separately.
+    """
+    vix_history = extras.get("vix_history")
+    if not vix_history or len(vix_history) < 4:
+        return (True, "")  # insufficient data → fail-open
+
+    try:
+        vix_current = float(vix_history[0])
+        vix_3_ago = float(vix_history[3])
+    except (TypeError, ValueError, IndexError):
+        return (True, "")  # bad data → fail-open
+
+    if vix_3_ago <= 0:
+        return (True, "")  # nonsensical baseline → fail-open
+
+    vix_roc = (vix_current - vix_3_ago) / vix_3_ago
+    if vix_roc > 0.20:
+        return (
+            False,
+            f"vix_acceleration VIX rose {vix_roc:.1%} over 3 sessions "
+            f"({vix_3_ago:.1f}→{vix_current:.1f}), >20% threshold — "
+            f"all CSP entries blocked",
+        )
+    return (True, "")
+
+
 def _csp_check_rule_3(hh, candidate, n, vix, extras) -> tuple[bool, str]:
     """Rule 3: post-trade household sector count <= 2 per GICS industry group.
 
@@ -655,6 +693,7 @@ def _csp_check_rule_7(hh, candidate, n, vix, extras) -> tuple[bool, str]:
 CSP_GATE_REGISTRY: list[tuple[str, CSPGate]] = [
     ("rule_1_concentration",   _csp_check_rule_1),
     ("rule_2_el_deployment",   _csp_check_rule_2),
+    ("vix_acceleration",       _csp_check_vix_acceleration),
     ("rule_3_sector",          _csp_check_rule_3),
     ("rule_4_correlation",     _csp_check_rule_4),
     ("rule_6_vikram_el_floor", _csp_check_rule_6),
