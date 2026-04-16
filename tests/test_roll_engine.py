@@ -25,6 +25,7 @@ from agt_equities.roll_engine import (
     PortfolioContext,
     Position,
     RollResult,
+    _annualized_roll_yield,
     _find_roll_target,
     _select_roll_candidate,
     evaluate,
@@ -285,6 +286,7 @@ def test_constraints_defaults_wheel6():
     assert cm.max_rolls == 10
     assert cm.harvest_day1_pct == 0.80
     assert cm.harvest_standard_pct == 0.90
+    assert cm.min_annualized_roll_yield == 0.10
     # Legacy fields still present
     assert cm.min_credit_per_contract == 0.01
     assert cm.offense_roll_min_credit == 0.20
@@ -300,4 +302,192 @@ def test_roll_count_in_reason():
         strike=50.0, assigned_basis=55.0, initial_credit=0.0,
         expiry=TODAY + timedelta(days=2), roll_count=3,
     )
- 
+    chain = (_quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55),)
+    m = _market(pos, spot=52.0, current_ask=0.28, chain=chain)
+    result = evaluate(pos, m, CTX)
+    assert isinstance(result, RollResult)
+    assert "rolls=4" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# 1a: Dividend assignment risk gate
+# ---------------------------------------------------------------------------
+
+class TestDividendAssignmentRisk:
+    """Verify CRITICAL alert when ITM CC is near ex-div with low extrinsic."""
+
+    def test_itm_extrinsic_below_dividend_exdiv_tomorrow(self):
+        """ITM CC, ex-div tomorrow, extrinsic $0.05 < dividend $0.50 → CRITICAL."""
+        pos = _pos(
+            strike=50.0, assigned_basis=55.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=5),
+        )
+        chain = (_quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55),)
+        m = _market(
+            pos, spot=52.0, current_ask=2.05,  # intrinsic=2, extrinsic=0.05
+            chain=chain,
+            next_ex_div_date=TODAY + timedelta(days=1),
+            next_div_amount=0.50,
+        )
+        result = evaluate(pos, m, CTX)
+        assert isinstance(result, AlertResult), f"got {type(result).__name__}: {result}"
+        assert result.severity == "CRITICAL"
+        assert "DIVIDEND_ASSIGNMENT_RISK" in result.reason
+        assert result.context["next_div_amount"] == 0.50
+
+    def test_itm_extrinsic_above_dividend_no_alert(self):
+        """ITM CC, ex-div tomorrow, but extrinsic $1.00 > dividend $0.50 → no alert."""
+        pos = _pos(
+            strike=50.0, assigned_basis=55.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=5),
+        )
+        m = _market(
+            pos, spot=52.0, current_ask=3.00,  # intrinsic=2, extrinsic=1.00
+            chain=(),
+            next_ex_div_date=TODAY + timedelta(days=1),
+            next_div_amount=0.50,
+        )
+        result = evaluate(pos, m, CTX)
+        # Should NOT be dividend alert — enough extrinsic to protect
+        assert not (isinstance(result, AlertResult) and "DIVIDEND" in result.reason)
+
+    def test_otm_near_exdiv_no_alert(self):
+        """OTM CC near ex-div → no dividend assignment risk (assignment not rational)."""
+        pos = _pos(
+            strike=55.0, assigned_basis=60.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=5),
+        )
+        m = _market(
+            pos, spot=52.0, current_ask=0.10,
+            chain=(),
+            next_ex_div_date=TODAY + timedelta(days=1),
+            next_div_amount=0.50,
+        )
+        result = evaluate(pos, m, CTX)
+        assert not (isinstance(result, AlertResult) and "DIVIDEND" in result.reason)
+
+    def test_exdiv_far_away_no_alert(self):
+        """ITM CC, but ex-div 10 days away → no alert (time to manage)."""
+        pos = _pos(
+            strike=50.0, assigned_basis=55.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=15),
+        )
+        m = _market(
+            pos, spot=52.0, current_ask=2.05,
+            chain=(),
+            next_ex_div_date=TODAY + timedelta(days=10),
+            next_div_amount=0.50,
+        )
+        result = evaluate(pos, m, CTX)
+        assert not (isinstance(result, AlertResult) and "DIVIDEND" in result.reason)
+
+    def test_exdiv_today_fires(self):
+        """Ex-div is TODAY (days=0) → should fire (≤ 1 day)."""
+        pos = _pos(
+            strike=50.0, assigned_basis=55.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=5),
+        )
+        chain = (_quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55),)
+        m = _market(
+            pos, spot=52.0, current_ask=2.03,  # extrinsic=0.03
+            chain=chain,
+            next_ex_div_date=TODAY,
+            next_div_amount=0.50,
+        )
+        result = evaluate(pos, m, CTX)
+        assert isinstance(result, AlertResult)
+        assert "DIVIDEND_ASSIGNMENT_RISK" in result.reason
+
+    def test_no_div_data_passes_through(self):
+        """No dividend data → check is skipped, normal evaluation continues."""
+        pos = _pos(
+            strike=50.0, assigned_basis=55.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=2),
+        )
+        chain = (_quote(51.0, TODAY + timedelta(days=10), bid=0.50, ask=0.55),)
+        m = _market(
+            pos, spot=52.0, current_ask=2.05,
+            chain=chain,
+            next_ex_div_date=None,
+            next_div_amount=None,
+        )
+        result = evaluate(pos, m, CTX)
+        # Should proceed to normal evaluation (roll in this case)
+        assert not (isinstance(result, AlertResult) and "DIVIDEND" in result.reason)
+
+
+# ---------------------------------------------------------------------------
+# 1c: MIN_ANNUALIZED_ROLL_YIELD gate
+# ---------------------------------------------------------------------------
+
+class TestAnnualizedRollYield:
+    """Verify yield floor rejects micro-credit rolls."""
+
+    def test_annualized_roll_yield_helper(self):
+        """Basic math: $0.50 credit on $50 strike, 7 DTE → ~52.1% ann."""
+        y = _annualized_roll_yield(0.50, 50.0, 7)
+        assert 0.52 < y < 0.53
+
+    def test_annualized_roll_yield_zero_inputs(self):
+        assert _annualized_roll_yield(0.0, 50.0, 7) == 0.0
+        assert _annualized_roll_yield(0.50, 0.0, 7) == 0.0
+        assert _annualized_roll_yield(0.50, 50.0, 0) == 0.0
+        assert _annualized_roll_yield(-0.10, 50.0, 7) == 0.0
+
+    def test_deeply_itm_micro_credit_recommends_assignment(self):
+        """Deeply ITM CC, only roll candidate yields 1.7% ann → assignment recommended."""
+        pos = _pos(
+            strike=40.0, assigned_basis=55.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=2), roll_count=5,
+        )
+        # Roll candidate: strike=41, 7 DTE, bid=0.02 → credit=0.02-0.28=-0.26 (debit)
+        # Actually we need a CREDIT roll that's just too small.
+        # strike=41, bid=0.30, current ask=0.28 → net credit=0.02
+        # ann yield = (0.02/41) * (365/7) = 0.0254 = 2.5% < 10%
+        chain = (_quote(41.0, TODAY + timedelta(days=9), bid=0.30, ask=0.35),)
+        m = _market(pos, spot=52.0, current_ask=0.28, chain=chain)
+        result = evaluate(pos, m, CTX)
+        assert isinstance(result, AlertResult), f"got {type(result).__name__}: {result}"
+        assert "ROLL_YIELD_BELOW_FLOOR" in result.reason
+        assert result.context["ann_yield"] < 0.10
+
+    def test_healthy_credit_roll_proceeds(self):
+        """Roll candidate with healthy yield → RollResult, not blocked."""
+        pos = _pos(
+            strike=50.0, assigned_basis=55.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=2),
+        )
+        # strike=51, bid=0.80, current ask=0.28 → net credit=0.52
+        # ann yield = (0.52/51) * (365/7) = 0.5318 = 53% >> 10%
+        chain = (_quote(51.0, TODAY + timedelta(days=9), bid=0.80, ask=0.85),)
+        m = _market(pos, spot=52.0, current_ask=0.28, chain=chain)
+        result = evaluate(pos, m, CTX)
+        assert isinstance(result, RollResult)
+
+    def test_debit_roll_exempt_from_yield_floor(self):
+        """Below-basis defense debit roll proceeds — yield floor only on credits."""
+        pos = _pos(
+            strike=50.0, assigned_basis=55.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=2),
+        )
+        # strike=51, bid=0.20, current ask=0.28 → net credit=-0.08 (debit)
+        # Debit rolls are exempt from yield floor
+        chain = (_quote(51.0, TODAY + timedelta(days=9), bid=0.20, ask=0.25),)
+        m = _market(pos, spot=52.0, current_ask=0.28, chain=chain)
+        result = evaluate(pos, m, CTX)
+        assert isinstance(result, RollResult)
+
+    def test_custom_yield_floor(self):
+        """Custom floor of 25% blocks a roll that passes default 10%."""
+        pos = _pos(
+            strike=50.0, assigned_basis=55.0, initial_credit=0.0,
+            expiry=TODAY + timedelta(days=2),
+        )
+        # strike=51, bid=0.40, current ask=0.28 → net credit=0.12
+        # ann yield = (0.12/51) * (365/7) = 0.1227 = 12.3% — passes 10% but not 25%
+        chain = (_quote(51.0, TODAY + timedelta(days=9), bid=0.40, ask=0.45),)
+        m = _market(pos, spot=52.0, current_ask=0.28, chain=chain)
+        constraints = ConstraintMatrix(min_annualized_roll_yield=0.25)
+        result = evaluate(pos, m, CTX, constraints)
+        assert isinstance(result, AlertResult)
+        assert "ROLL_YIELD_BELOW_FLOOR" in result.reason
