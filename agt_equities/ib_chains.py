@@ -143,6 +143,53 @@ def _build_chain_rows(tickers_data: dict) -> list[dict]:
     return results
 
 
+
+async def _wait_for_tickers(
+    tds,
+    *,
+    timeout: float = 2.0,
+    poll_interval: float = 0.1,
+    check_iv: bool = False,
+) -> None:
+    """Poll until ticker data has at least one valid price, or timeout.
+
+    Replaces fixed ``asyncio.sleep(N)`` after ``reqMktData`` calls so
+    that chain / spot fetches return as soon as data arrives instead of
+    always waiting the full timeout.  On illiquid strikes or after-hours,
+    the full timeout still applies — no behavioral change for worst-case.
+
+    Args:
+        tds: iterable of ib_async Ticker objects (from reqMktData).
+        timeout: maximum seconds to wait.
+        poll_interval: seconds between polls (default 100 ms).
+        check_iv: if True, also require impliedVolatility to be populated
+                  (used by vrp_veto IV fetches; option chain rows don't
+                  need IV to be present before _build_chain_rows runs).
+    """
+    import asyncio
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        all_ready = True
+        for td in tds:
+            # A ticker is "ready" when at least one price field is non-NaN
+            bid = _safe_float(td.bid) if hasattr(td, 'bid') else 0.0
+            ask = _safe_float(td.ask) if hasattr(td, 'ask') else 0.0
+            last = _safe_float(td.last) if hasattr(td, 'last') else 0.0
+            if bid <= 0 and ask <= 0 and last <= 0:
+                all_ready = False
+                break
+            if check_iv:
+                iv = _safe_float(getattr(td, 'impliedVolatility', None))
+                if iv <= 0:
+                    all_ready = False
+                    break
+        if all_ready:
+            return
+        await asyncio.sleep(poll_interval)
+
+
+
 # ── Error classification ──
 
 class IBKRChainError(Exception):
@@ -465,7 +512,7 @@ async def get_chain_for_expiry(
                     td = ib.reqMktData(qc, '', True, False)  # snapshot=True
                     tickers_data[qc.strike] = td
 
-                await asyncio.sleep(2)
+                await _wait_for_tickers(tickers_data.values(), timeout=2.0)
 
                 # C6.2: NaN-safe coercion via _build_chain_rows
                 results.extend(_build_chain_rows(tickers_data))
@@ -540,7 +587,7 @@ async def get_spot(ib, ticker: str) -> float:
             raise IBKRNoDataError(f"Could not qualify {ticker}")
 
         td = ib.reqMktData(qualified[0], '', False, False)
-        await asyncio.sleep(2.0)
+        await _wait_for_tickers([td], timeout=2.0)
 
         # Extract best price (C6.2: NaN-safe via _safe_float)
         price = None
@@ -625,7 +672,10 @@ async def get_spots_batch(ib, tickers: list[str]) -> dict[str, float]:
                     td = ib.reqMktData(qc, '', False, False)
                     ticker_map[qc] = (tk, td)
 
-                await asyncio.sleep(2.5)
+                await _wait_for_tickers(
+                    [td for _, td in ticker_map.values()],
+                    timeout=2.5,
+                )
 
                 # Collect prices (C6.2: NaN-safe via _safe_float)
                 for qc, (tk, td) in ticker_map.items():

@@ -334,11 +334,23 @@ async def fetch_iv_from_ibkr_async(ib, ticker: str) -> dict:
         ib.qualifyContracts(contract)
         ib.reqMarketDataType(4)
         md = ib.reqMktData(contract, genericTickList="106")
-        await asyncio.sleep(4)
-
-        raw_iv = md.impliedVolatility
-        ib.cancelMktData(contract)
-        await asyncio.sleep(1)
+        try:
+            # Poll until IV arrives instead of fixed 4s sleep.
+            # Returns early when impliedVolatility is populated;
+            # worst-case still waits the full 4s for illiquid tickers.
+            deadline = asyncio.get_event_loop().time() + 4.0
+            while asyncio.get_event_loop().time() < deadline:
+                raw_iv = md.impliedVolatility
+                if raw_iv is not None and not math.isnan(raw_iv) and raw_iv >= 0.01:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raw_iv = md.impliedVolatility
+        finally:
+            try:
+                ib.cancelMktData(contract)
+            except Exception:
+                pass
 
         if raw_iv is not None and not math.isnan(raw_iv) and raw_iv >= 0.01:
             iv = round(raw_iv * 100, 1)
