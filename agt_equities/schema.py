@@ -799,16 +799,49 @@ def register_operational_tables(conn) -> None:
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS fill_log (
-            exec_id TEXT PRIMARY KEY, ticker TEXT NOT NULL, action TEXT NOT NULL,
-            quantity REAL, price REAL, premium_delta REAL, account_id TEXT,
+            exec_id TEXT NOT NULL, ticker TEXT NOT NULL, action TEXT NOT NULL,
+            quantity REAL, price REAL, premium_delta REAL,
+            account_id TEXT NOT NULL DEFAULT '',
             household_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            inception_delta REAL
+            inception_delta REAL,
+            PRIMARY KEY (exec_id, account_id)
         )
     """)
 
     fl_cols = {row["name"] for row in conn.execute("PRAGMA table_info(fill_log)").fetchall()}
     if "inception_delta" not in fl_cols:
         conn.execute("ALTER TABLE fill_log ADD COLUMN inception_delta REAL")
+
+    # Sprint B: fill_log composite PK migration (DT Shot 1 §7).
+    # FA Block fills emit N execDetails per child account; composite PK
+    # ensures per-account fill rows are never silently dropped by
+    # INSERT OR IGNORE.  Migration: rebuild table if PK is single-column.
+    _fl_pk = [r for r in conn.execute("PRAGMA table_info(fill_log)").fetchall()
+              if r["pk"] > 0]
+    if len(_fl_pk) == 1:
+        conn.execute("""
+            CREATE TABLE fill_log_b (
+                exec_id TEXT NOT NULL, ticker TEXT NOT NULL,
+                action TEXT NOT NULL, quantity REAL, price REAL,
+                premium_delta REAL,
+                account_id TEXT NOT NULL DEFAULT '',
+                household_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                inception_delta REAL,
+                PRIMARY KEY (exec_id, account_id)
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO fill_log_b
+                (exec_id, ticker, action, quantity, price, premium_delta,
+                 account_id, household_id, created_at, inception_delta)
+            SELECT exec_id, ticker, action, quantity, price, premium_delta,
+                   COALESCE(account_id, ''), household_id, created_at,
+                   inception_delta
+            FROM fill_log
+        """)
+        conn.execute("DROP TABLE fill_log")
+        conn.execute("ALTER TABLE fill_log_b RENAME TO fill_log")
 
     cc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(cc_cycle_log)").fetchall()}
     if "flag" not in cc_cols:
