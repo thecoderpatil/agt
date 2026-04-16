@@ -40,7 +40,8 @@ os.environ.setdefault("READ_FROM_MASTER_LOG", "1")
 def _capture_walker_cycles() -> list[dict]:
     """Capture all active walker cycles with per-account breakdown."""
     from agt_equities import trade_repo
-    from agt_equities.config import ACCOUNT_TO_HOUSEHOLD, ACCOUNT_LABELS
+    from agt_equities.config import ACCOUNT_TO_HOUSEHOLD
+    # ACCOUNT_LABELS removed from config; fall back to acct_id as label.
 
     cycles = trade_repo.get_active_cycles()
     results = []
@@ -69,7 +70,7 @@ def _capture_walker_cycles() -> list[dict]:
                 basis_data, shares = c._paper_basis_by_account.get(acct_id, (None, 0))
 
                 cycle_rec["per_account"][acct_id] = {
-                    "account_label": ACCOUNT_LABELS.get(acct_id, acct_id),
+                    "account_label": acct_id,
                     "household": ACCOUNT_TO_HOUSEHOLD.get(acct_id, "unknown"),
                     "shares": int(shares) if shares else 0,
                     "paper_basis": round(paper, 4) if paper is not None else None,
@@ -283,5 +284,4 @@ def main():
     return 0 if not disagreements else 1
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == "__ma
