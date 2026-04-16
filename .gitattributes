@@ -1,0 +1,17 @@
+# Normalize line endings for cross-platform consistency.
+# API commits (GitLab, CI) produce LF; Windows checkout expects CRLF.
+# Without this, every API-committed file shows as dirty on Windows.
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.cfg text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
