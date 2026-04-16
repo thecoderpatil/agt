@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-circuit_breaker.py — Hard safety checks for the autonomous loop.
+circuit_breaker.py -- Hard safety checks for the autonomous loop.
 
 Called by scheduled tasks before and after operations. Returns a structured
 verdict: {ok: bool, halted: bool, violations: [...], warnings: [...]}.
@@ -21,7 +21,7 @@ os.chdir(Path(__file__).resolve().parent.parent)
 DB_PATH = "agt_desk.db"
 RAILS_PATH = "_SAFETY_RAILS.md"
 
-# Hard-coded limits (mirrors _SAFETY_RAILS.md — code is the enforcer, file is documentation)
+# Hard-coded limits (mirrors _SAFETY_RAILS.md -- code is the enforcer, file is documentation)
 MAX_DAILY_ORDERS = 30
 MAX_DAILY_NOTIONAL = 3_000_000
 VIX_HALT_THRESHOLD = 35
@@ -42,9 +42,14 @@ def check_daily_order_limit() -> dict:
     """Check if today's order count is within limits."""
     conn = _get_conn()
     try:
+        # 'superseded' rows are prior versions of an order after a price
+        # modification (price-chase loop, strike retry). They are NOT new
+        # IB events; counting them inflates the limit. The /report surface
+        # already shows the by-status breakdown -- keep enforcement aligned.
         row = conn.execute(
             "SELECT COUNT(*) as cnt FROM pending_orders "
-            "WHERE date(created_at) = date('now')"
+            "WHERE date(created_at) = date('now') "
+            "AND status != 'superseded'"
         ).fetchone()
         count = row["cnt"] if row else 0
         if count >= MAX_DAILY_ORDERS:
@@ -61,9 +66,14 @@ def check_daily_notional() -> dict:
     """Check if today's total notional is within limits."""
     conn = _get_conn()
     try:
+        # Only count committed capital. cancelled/failed/rejected orders
+        # never committed; superseded rows are prior versions, not new
+        # commitments. Previously counting all rows produced ~12x inflation
+        # (2026-04-16: $2.5M phantom vs $204K real).
         rows = conn.execute(
             "SELECT payload FROM pending_orders "
-            "WHERE date(created_at) = date('now')"
+            "WHERE date(created_at) = date('now') "
+            "AND status IN ('filled', 'processing', 'partially_filled')"
         ).fetchall()
         total = 0.0
         for r in rows:
@@ -105,7 +115,7 @@ def check_consecutive_errors() -> dict:
         if error_count >= MAX_CONSECUTIVE_ERRORS:
             return {
                 "ok": False, "halted": True,
-                "reason": f"{error_count} consecutive task runs with errors — CIRCUIT BREAKER",
+                "reason": f"{error_count} consecutive task runs with errors -- CIRCUIT BREAKER",
             }
         return {"ok": True, "consecutive_errors": error_count}
     finally:
@@ -163,12 +173,12 @@ def check_vix() -> dict:
     """Check CBOE VIX level; halt if >= VIX_HALT_THRESHOLD.
 
     Uses yfinance spot quote on ^VIX. Soft-fails open (ok=True with a
-    warning) on any fetch error — refusing to trade because yfinance is
+    warning) on any fetch error -- refusing to trade because yfinance is
     flaky would be more dangerous than proceeding. The halt branch only
     fires when we have a real number >= threshold.
     """
     try:
-        import yfinance as yf  # local import — circuit_breaker is loaded cheaply
+        import yfinance as yf  # local import -- circuit_breaker is loaded cheaply
         t = yf.Ticker("^VIX")
         # fast_info is the current snapshot; history(period='1d') is a fallback.
         level = None
@@ -206,7 +216,7 @@ def check_directive_freshness() -> dict:
     if age_days > DIRECTIVE_MAX_AGE_DAYS:
         return {
             "ok": True, "has_directive": True, "stale": True,
-            "reason": f"Directive is {age_days} days old (max {DIRECTIVE_MAX_AGE_DAYS}) — IGNORING",
+            "reason": f"Directive is {age_days} days old (max {DIRECTIVE_MAX_AGE_DAYS}) -- IGNORING",
         }
     return {"ok": True, "has_directive": True, "stale": False, "age_days": age_days}
 
@@ -248,10 +258,10 @@ if __name__ == "__main__":
     result = run_all_checks()
     print(json.dumps(result, indent=2, default=str))
     if result["halted"]:
-        print("\n*** CIRCUIT BREAKER TRIPPED — ALL ORDER ACTIVITY HALTED ***")
+        print("\n*** CIRCUIT BREAKER TRIPPED -- ALL ORDER ACTIVITY HALTED ***")
         sys.exit(1)
     elif not result["ok"]:
-        print(f"\n*** {len(result['violations'])} VIOLATIONS — some actions blocked ***")
+        print(f"\n*** {len(result['violations'])} VIOLATIONS -- some actions blocked ***")
         sys.exit(2)
     else:
         print("\n[OK] All checks passed")
