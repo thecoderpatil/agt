@@ -71,7 +71,7 @@ class TestNotionalGate(unittest.TestCase):
     """Gate 2: notional calculation (ceiling removed 2026-04-16)."""
 
     @patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
-    def test_opt_above_ceiling(self, _mock):
+    def test_opt_high_notional_allowed(self, _mock):
         from telegram_bot import _pre_trade_gates
         # 2 contracts * $250 strike * 100 = $50,000
         ok, reason = _run(_pre_trade_gates(
@@ -95,7 +95,7 @@ class TestNotionalGate(unittest.TestCase):
         self.assertTrue(ok)
 
     @patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
-    def test_stk_above_ceiling(self, _mock):
+    def test_stk_high_notional_allowed(self, _mock):
         from telegram_bot import _pre_trade_gates
         # 100 shares * $300 = $30,000
         ok, reason = _run(_pre_trade_gates(
