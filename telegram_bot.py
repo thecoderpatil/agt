@@ -6762,6 +6762,26 @@ async def _place_single_order(
                 limit_price=_round_to_nickel(float(bid)),
                 account_id=acct_id,
             )
+        elif sec_type == "STK":
+            # MR !71: STK support for LIQUIDATE STC shares leg.
+            # MKT orders ignore limit_price; LMT respects it.
+            contract = ib_async.Stock(
+                symbol=ticker,
+                exchange="SMART",
+                currency="USD",
+            )
+            order_type = str(payload.get("order_type", "MKT") or "MKT").upper()
+            if order_type == "MKT":
+                order = ib_async.MarketOrder(action=action, totalQuantity=qty)
+            else:
+                order = ib_async.LimitOrder(
+                    action=action,
+                    totalQuantity=qty,
+                    lmtPrice=_round_to_nickel(float(bid)) if bid else 0.0,
+                )
+            order.account = acct_id
+            order.tif = "DAY"
+            order.transmit = True
         else:
             return False, f"#{db_id} Unsupported sec_type {sec_type}"
 
@@ -6868,6 +6888,12 @@ async def _place_single_order(
             msg = (
                 f"#{db_id} {ticker} BAG x{qty} "
                 f"@ ${abs(float(bid)):.2f} {debit_credit} "
+                f"\u2192 {label} (IB#{ib_order_id})"
+            )
+        elif sec_type == "STK":
+            # MR !71: STK (e.g. LIQUIDATE STC shares leg)
+            msg = (
+                f"#{db_id} {ticker} {action} {qty}sh STK "
                 f"\u2192 {label} (IB#{ib_order_id})"
             )
         else:
@@ -9428,6 +9454,147 @@ async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
 _scheduled_mode1 = _scheduled_cc
 
 
+async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """MR !71: Daily 9:35 AM ET — CSP entry scan + allocator staging.
+
+    Paper (PAPER_MODE + PAPER_AUTO_EXECUTE): auto-executes staged CSP rows
+    via _auto_execute_staged. No /approve gate.
+
+    Live: CSP rows land in /approve queue (allocator seam MR !69 uses
+    Telegram-digest approval_gate — separate ticket).
+
+    Shares plumbing with cmd_scan. Keeps the 6-phase screener + bridge-2
+    extras + CSP_GATE_REGISTRY by invoking the same pipeline helpers.
+    """
+    try:
+        now_et = _datetime.now(ET)
+        if now_et.weekday() >= 5:
+            logger.info("Scheduled CSP scan: skipping weekend")
+            return
+
+        # Use AGT_SCAN_LIVE=0 kill switch to disable auto-staging
+        if os.getenv("AGT_SCAN_LIVE", "1") != "1":
+            logger.info("Scheduled CSP scan disabled (AGT_SCAN_LIVE=0)")
+            return
+
+        from pxo_scanner import _load_scan_universe, scan_csp_candidates
+        from agt_equities.scan_bridge import (
+            adapt_scanner_candidates,
+            build_watchlist_sector_map,
+            make_bridge2_extras_provider,
+        )
+        from agt_equities.csp_allocator import (
+            _fetch_household_buying_power_snapshot,
+            run_csp_allocator,
+        )
+        from agt_equities.scan_extras import (
+            fetch_earnings_map,
+            build_correlation_pairs,
+        )
+
+        watchlist = await asyncio.to_thread(_load_scan_universe)
+        rows = await asyncio.to_thread(scan_csp_candidates, watchlist, 10, 50)
+        if not rows:
+            logger.info("Scheduled CSP scan: no candidates from screener")
+            return
+
+        candidates = adapt_scanner_candidates(rows)
+        if not candidates:
+            logger.info("Scheduled CSP scan: no candidates survived adapter")
+            return
+
+        def _fetch_vix() -> float:
+            try:
+                hist = yf.Ticker("^VIX").history(period="1d")
+                if len(hist) and "Close" in hist.columns:
+                    return float(hist["Close"].iloc[-1])
+            except Exception:
+                pass
+            return 20.0
+        vix = await asyncio.to_thread(_fetch_vix)
+
+        disco = await _discover_positions(None)
+        ib_conn = await ensure_ib_connected()
+        snapshots = await _fetch_household_buying_power_snapshot(ib_conn, disco)
+        if not snapshots:
+            logger.warning("Scheduled CSP scan: household snapshots empty")
+            return
+
+        candidate_tickers = [c.ticker for c in candidates]
+        all_holding_tickers: set[str] = set()
+        for _hh_snap in snapshots.values():
+            all_holding_tickers.update(_hh_snap.get("existing_positions", {}).keys())
+            all_holding_tickers.update(_hh_snap.get("existing_csps", {}).keys())
+
+        earnings_map = await asyncio.to_thread(fetch_earnings_map, candidate_tickers)
+        correlation_pairs = await asyncio.to_thread(
+            build_correlation_pairs, candidate_tickers, sorted(all_holding_tickers),
+        )
+
+        sector_map = build_watchlist_sector_map(watchlist)
+        extras_provider = make_bridge2_extras_provider(
+            sector_map, earnings_map, correlation_pairs,
+        )
+
+        result = run_csp_allocator(
+            ray_candidates=candidates,
+            snapshots=snapshots,
+            vix=vix,
+            extras_provider=extras_provider,
+            staging_callback=append_pending_tickets,
+        )
+
+        staged_n = result.total_staged_contracts
+        digest = "\n".join(result.digest_lines or ["(no allocator output)"])
+        header = (
+            f"\u2501\u2501 scheduled CSP scan {now_et.strftime('%Y-%m-%d %H:%M')} "
+            f"\u2501\u2501\nCandidates: {len(candidates)} \u00b7 VIX: {vix:.1f} "
+            f"\u00b7 Staged: {staged_n}\n"
+        )
+        await context.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text=f"<pre>{html.escape(header + digest)}</pre>",
+            parse_mode="HTML",
+        )
+
+        # Paper autopilot: drain staged rows through IB, no /approve.
+        if PAPER_MODE and PAPER_AUTO_EXECUTE and staged_n:
+            try:
+                ap_placed, ap_failed, ap_lines, ap_status = await _auto_execute_staged()
+                exec_msg = (
+                    f"[PAPER AUTO-EXEC] status={ap_status} "
+                    f"placed={ap_placed} failed={ap_failed}"
+                )
+                if ap_lines:
+                    exec_msg += "\n" + "\n".join(ap_lines[:10])
+                    if len(ap_lines) > 10:
+                        exec_msg += f"\n... ({len(ap_lines) - 10} more)"
+                await context.bot.send_message(
+                    chat_id=AUTHORIZED_USER_ID,
+                    text=f"<pre>{html.escape(exec_msg)}</pre>",
+                    parse_mode="HTML",
+                )
+            except Exception as auto_exc:
+                logger.exception("Scheduled CSP scan auto-execute failed")
+                try:
+                    await context.bot.send_message(
+                        chat_id=AUTHORIZED_USER_ID,
+                        text=f"[PAPER AUTO-EXEC] Failed: {auto_exc}",
+                    )
+                except Exception:
+                    pass
+
+    except Exception as exc:
+        logger.exception("Scheduled CSP scan failed")
+        try:
+            await context.bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=f"Scheduled CSP scan failed: {exc}",
+            )
+        except Exception:
+            logger.exception("Failed to send scheduled CSP scan error notification")
+
+
 # ---------------------------------------------------------------------------
 # WHEEL-4 glue helpers
 # ---------------------------------------------------------------------------
@@ -9914,8 +10081,54 @@ async def _page_critical_event(bot, kind: str, payload: dict) -> None:
                 f"BTC: <code>{contracts}c @ {float(btc):.2f}</code>\n"
                 f"STC: <code>{shares}sh @ MKT (ref ~{float(stc_ref):.2f})</code>\n"
                 f"Net proceeds: <code>{float(net):.2f}/sh</code>\n"
-                f"Reason: <pre>{html.escape(str(reason))}</pre>\n"
-                "STAGE = create pending tickets (transmit=False, /approve to fire).\n"
+                f"Reason: <pre>{html.escape(str(reason))}</pre>"
+            )
+            # MR !71: paper autopilot. Skip the STAGE/REJECT keyboard and
+            # auto-stage + drain via _auto_execute_staged. Live still goes
+            # through the manual keyboard gate for safety.
+            if PAPER_MODE and PAPER_AUTO_EXECUTE:
+                try:
+                    _LIQ_STAGING_BY_TOKEN.pop(token, None)  # token unused in auto path
+                    tickets = _build_liquidate_tickets(payload)
+                    if not tickets:
+                        await bot.send_message(
+                            chat_id=AUTHORIZED_USER_ID,
+                            text=text + "\n\n\u26a0\ufe0f <b>PAPER</b>: no tickets synthesized (0 contracts/0 shares).",
+                            parse_mode="HTML",
+                            disable_notification=False,
+                        )
+                        return
+                    await asyncio.to_thread(append_pending_tickets, tickets)
+                    ap_placed, ap_failed, ap_lines, ap_status = await _auto_execute_staged()
+                    exec_msg = (
+                        f"[PAPER AUTO-EXEC] status={ap_status} "
+                        f"placed={ap_placed} failed={ap_failed}"
+                    )
+                    if ap_lines:
+                        exec_msg += "\n" + "\n".join(ap_lines[:10])
+                        if len(ap_lines) > 10:
+                            exec_msg += f"\n... ({len(ap_lines) - 10} more)"
+                    await bot.send_message(
+                        chat_id=AUTHORIZED_USER_ID,
+                        text=text + f"\n\n\u2705 <b>PAPER AUTO-EXEC</b>\n<pre>{html.escape(exec_msg)}</pre>",
+                        parse_mode="HTML",
+                        disable_notification=False,
+                    )
+                except Exception as exc:
+                    logger.exception("MR !71 LIQUIDATE paper autopilot failed")
+                    try:
+                        await bot.send_message(
+                            chat_id=AUTHORIZED_USER_ID,
+                            text=text + f"\n\n\u274c <b>PAPER AUTO-EXEC FAILED</b>\n<pre>{html.escape(str(exc))}</pre>",
+                            parse_mode="HTML",
+                            disable_notification=False,
+                        )
+                    except Exception:
+                        pass
+                return
+            # Live path: manual STAGE/REJECT keyboard
+            text += (
+                "\nSTAGE = create pending tickets (transmit=False, /approve to fire).\n"
                 "REJECT = drop event, position held."
             )
             await bot.send_message(
@@ -11776,6 +11989,15 @@ def main() -> None:
             name="cc_daily",
         )
         logger.info("Scheduled: cc_daily at 9:45 AM ET (Mon-Fri)")
+        # MR !71: CSP entry scan kicks off before CC so candidates stage
+        # while market is fresh. Paper auto-executes via _auto_execute_staged.
+        jq.run_daily(
+            callback=_scheduled_csp_scan,
+            time=_time(hour=9, minute=35, tzinfo=ET),
+            days=(1, 2, 3, 4, 5),
+            name="csp_scan_daily",
+        )
+        logger.info("Scheduled: csp_scan_daily at 9:35 AM ET (Mon-Fri)")
         jq.run_daily(
             callback=_scheduled_watchdog,
             time=_time(hour=15, minute=30, tzinfo=ET),
