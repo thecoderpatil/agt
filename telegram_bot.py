@@ -7027,6 +7027,109 @@ async def cmd_csp_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ---------------------------------------------------------------------------
+# /daily — unified System 1 scan (CC + roll + CSP harvest in one pass)
+# ---------------------------------------------------------------------------
+
+async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/daily — one-pass scan across all open positions.
+
+    Runs three engines in sequence:
+      1. CC staging (new covered call writes via cc_engine)
+      2. Roll check (open short calls via roll_engine.evaluate)
+      3. CSP harvest (open short puts profit-take)
+
+    Everything lands in the normal /approve queue. No autonomous execution.
+    """
+    if not is_authorized(update):
+        return
+
+    status_msg = await update.message.reply_text(
+        "\u23f3 Running daily scan (CC + rolls + CSP harvest)..."
+    )
+    sections: list[str] = ["\u2501\u2501 Daily Scan \u2501\u2501"]
+
+    try:
+        ib_conn = await ensure_ib_connected()
+    except Exception as exc:
+        logger.exception("cmd_daily: IB connect failed")
+        await status_msg.edit_text(f"\u274c Daily scan failed: IB connect error: {exc}")
+        return
+
+    # --- 1. CC staging ---
+    try:
+        cc_result = await _run_cc_logic(None)
+        cc_text = cc_result.get("main_text", "No CC output.")
+        # Trim to first 15 lines for digest
+        cc_lines = cc_text.strip().splitlines()
+        if len(cc_lines) > 15:
+            cc_summary = "\n".join(cc_lines[:15]) + f"\n... ({len(cc_lines) - 15} more lines)"
+        else:
+            cc_summary = "\n".join(cc_lines)
+        sections.append(f"\n\u25b6 COVERED CALLS\n{cc_summary}")
+    except Exception as exc:
+        logger.exception("cmd_daily: CC scan failed")
+        sections.append(f"\n\u25b6 COVERED CALLS\n\u274c Error: {exc}")
+
+    # --- 2. Roll check ---
+    try:
+        async def _daily_priority_cb(kind: str, payload: dict) -> None:
+            await _page_critical_event(context.bot, kind, payload)
+
+        roll_alerts = await _scan_and_stage_defensive_rolls(
+            ib_conn, priority_cb=_daily_priority_cb,
+        )
+        if roll_alerts:
+            roll_text = "\n".join(roll_alerts)
+        else:
+            roll_text = "No roll actions triggered."
+        sections.append(f"\n\u25b6 ROLL CHECK\n{roll_text}")
+    except Exception as exc:
+        logger.exception("cmd_daily: roll check failed")
+        sections.append(f"\n\u25b6 ROLL CHECK\n\u274c Error: {exc}")
+
+    # --- 3. CSP harvest ---
+    try:
+        from agt_equities.csp_harvest import scan_csp_harvest_candidates
+
+        def _stage_harvest(tickets: list[dict]) -> None:
+            append_pending_tickets(tickets)
+
+        harvest_result = await scan_csp_harvest_candidates(
+            ib_conn, staging_callback=_stage_harvest,
+        )
+        staged = harvest_result.get("staged", [])
+        harvest_alerts = harvest_result.get("alerts", [])
+        if staged or harvest_alerts:
+            harvest_text = f"Staged: {len(staged)}"
+            if harvest_alerts:
+                harvest_text += "\n" + "\n".join(harvest_alerts)
+        else:
+            harvest_text = "No CSP positions met harvest thresholds."
+        sections.append(f"\n\u25b6 CSP HARVEST\n{harvest_text}")
+    except Exception as exc:
+        logger.exception("cmd_daily: CSP harvest failed")
+        sections.append(f"\n\u25b6 CSP HARVEST\n\u274c Error: {exc}")
+
+    # --- Digest ---
+    msg = "\n".join(sections)
+    try:
+        await status_msg.edit_text(
+            f"<pre>{html.escape(msg)}</pre>", parse_mode="HTML",
+        )
+    except Exception:
+        # Message too long — split
+        for i in range(0, len(msg), 4000):
+            chunk = msg[i:i + 4000]
+            if i == 0:
+                await status_msg.edit_text(
+                    f"<pre>{html.escape(chunk)}</pre>", parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    f"<pre>{html.escape(chunk)}</pre>", parse_mode="HTML",
+                )
+
+
 # /cycles TICKER — show CC cycle history from cc_cycle_log
 # ---------------------------------------------------------------------------
 
@@ -11100,6 +11203,7 @@ def main() -> None:
     app.add_handler(CommandHandler("recover_transmitting", cmd_recover_transmitting))
     app.add_handler(CommandHandler("halt",      cmd_halt))
     app.add_handler(CommandHandler("resume",    cmd_resume))
+    app.add_handler(CommandHandler("daily",     cmd_daily))
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve:"))
     app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern=r"^dex:"))
