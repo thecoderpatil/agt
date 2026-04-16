@@ -7286,31 +7286,28 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         sections.append(f"\n[READINESS GATE] Error: {exc}")
 
     # ── 5. Active Cycles (position summary) ──
+    # MR !67: cycles is list[walker.Cycle] (dataclass), not dict. Use attr access.
     try:
         from agt_equities import trade_repo
-        from agt_equities.config import ACTIVE_ACCOUNTS, ACCOUNT_TO_HOUSEHOLD
         cycles = trade_repo.get_active_cycles()
-        # Group by household
         hh_summary: dict[str, dict] = {}
         for c in cycles:
-            hh = c.get("household_id", "unknown")
+            hh = c.household_id or "unknown"
             if hh not in hh_summary:
-                hh_summary[hh] = {"short_puts": 0, "short_calls": 0, "shares": 0, "tickers": set()}
-            hh_summary[hh]["tickers"].add(c.get("ticker", "?"))
-            phase = c.get("phase", "")
-            if "csp" in str(phase).lower() or "short_put" in str(phase).lower():
-                hh_summary[hh]["short_puts"] += 1
-            elif "cc" in str(phase).lower() or "short_call" in str(phase).lower():
-                hh_summary[hh]["short_calls"] += 1
-            if c.get("shares", 0) > 0:
-                hh_summary[hh]["shares"] += c.get("shares", 0)
+                hh_summary[hh] = {"short_puts": 0, "short_calls": 0, "shares": 0.0, "tickers": set()}
+            hh_summary[hh]["tickers"].add(c.ticker or "?")
+            hh_summary[hh]["short_puts"] += int(c.open_short_puts or 0)
+            hh_summary[hh]["short_calls"] += int(c.open_short_calls or 0)
+            shares = float(c.shares_held or 0)
+            if shares > 0:
+                hh_summary[hh]["shares"] += shares
 
         sections.append(f"\n[ACTIVE CYCLES] {len(cycles)} total")
         for hh, s in hh_summary.items():
             sections.append(
                 f"  {hh}: {len(s['tickers'])} tickers, "
                 f"{s['short_puts']} CSP, {s['short_calls']} CC, "
-                f"{s['shares']} shares"
+                f"{s['shares']:.0f} shares"
             )
     except Exception as exc:
         sections.append(f"\n[ACTIVE CYCLES] Error: {exc}")
