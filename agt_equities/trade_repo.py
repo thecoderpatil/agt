@@ -165,6 +165,7 @@ def _load_carryin_events(
 
     events = []
     for r in rows:
+        if r['account_id'] not in ACCOUNT_TO_HOUSEHOLD: continue  # paper mode: skip carryins for accounts not in active map
         raw = dict(r)
         ev = TradeEvent(
             source='INCEPTION_CARRYIN',
