@@ -290,88 +290,6 @@ def check_no_stranded_staged_orders(
     return vios
 
 
-# ---- 6. NO_SILENT_BREAKER_TRIP -------------------------------------------------
-# MR !85: the old haiku-watchdog task was retired in MR !66 (see
-# `project_autonomous_pipeline_launched` memory). Its replacement is the
-# Windows schtask ``AGT_Bot_Liveness_Watchdog`` running
-# ``scripts/bot_liveness_watchdog.ps1`` every ~5 minutes during RTH, which
-# reads ``daemon_heartbeat`` for ``agt_bot`` and writes a BOT_STALE row
-# into ``cross_daemon_alerts`` when the heartbeat goes stale.
-#
-# The invariant migrates from autonomous_session_log (dead source) to a
-# DB-native join between daemon_heartbeat and cross_daemon_alerts:
-#
-#   Silent trip = daemon_heartbeat for 'agt_bot' is observably stale
-#   (> 5 min) AND no BOT_STALE cross_daemon_alerts row exists inside the
-#   watchdog cadence window (10 min = 2x schtask interval).
-#
-# If the heartbeat is stale but a recent BOT_STALE alert exists, the
-# watchdog fired -- the bot drain is responsible for surfacing it to
-# Telegram/Gmail. If the heartbeat is stale AND no alert, the watchdog
-# itself isn't running (schtask disabled, PowerShell policy blocking,
-# sqlite3.exe missing, etc.) and the user will not be notified of the
-# bot outage. That's the "silent breaker trip" failure mode.
-#
-# NO_MISSING_DAEMON_HEARTBEAT already fires on stale heartbeat at the
-# 120s TTL; this invariant is independent and surfaces a different
-# failure mode (detection-pipeline health). They can co-fire.
-_SILENT_TRIP_HEARTBEAT_STALE_S = 300      # 5 min
-_SILENT_TRIP_WATCHDOG_WINDOW_S = 600      # 10 min (schtask 5 min * 2)
-_SILENT_TRIP_MONITORED_DAEMON = "agt_bot"
-
-
-def check_no_silent_breaker_trip(
-    conn: sqlite3.Connection, ctx: CheckContext
-) -> list[Violation]:
-    """AGT_Bot_Liveness_Watchdog must emit BOT_STALE when daemon_heartbeat is stale."""
-    if not _table_exists(conn, "daemon_heartbeat"):
-        return []
-    if not _table_exists(conn, "cross_daemon_alerts"):
-        return []
-    row = conn.execute(
-        "SELECT last_beat_utc FROM daemon_heartbeat WHERE daemon_name=?",
-        (_SILENT_TRIP_MONITORED_DAEMON,),
-    ).fetchone()
-    # No row at all = NO_MISSING_DAEMON_HEARTBEAT's concern, not ours.
-    if row is None:
-        return []
-    last_beat = _parse_dt(row["last_beat_utc"])
-    if last_beat is None:
-        return []
-    age_s = (ctx.now_utc - last_beat).total_seconds()
-    if age_s <= _SILENT_TRIP_HEARTBEAT_STALE_S:
-        return []
-    # Heartbeat stale. Did the watchdog fire recently?
-    now_epoch = ctx.now_utc.timestamp()
-    cutoff_epoch = now_epoch - _SILENT_TRIP_WATCHDOG_WINDOW_S
-    recent_alert = conn.execute(
-        "SELECT id FROM cross_daemon_alerts "
-        "WHERE kind = 'BOT_STALE' "
-        "  AND CAST(created_ts AS REAL) >= ? "
-        "ORDER BY id DESC LIMIT 1",
-        (cutoff_epoch,),
-    ).fetchone()
-    if recent_alert is not None:
-        return []  # watchdog fired within cadence; NOT silent
-    return [Violation(
-        invariant_id="NO_SILENT_BREAKER_TRIP",
-        description=(
-            f"daemon_heartbeat '{_SILENT_TRIP_MONITORED_DAEMON}' stale by "
-            f"{age_s:.0f}s but no BOT_STALE cross_daemon_alert in the last "
-            f"{_SILENT_TRIP_WATCHDOG_WINDOW_S}s watchdog window "
-            "(AGT_Bot_Liveness_Watchdog likely not running)"
-        ),
-        severity="medium",
-        evidence={
-            "daemon_name": _SILENT_TRIP_MONITORED_DAEMON,
-            "stale_seconds": age_s,
-            "watchdog_window_seconds": _SILENT_TRIP_WATCHDOG_WINDOW_S,
-            "last_beat_utc": last_beat.isoformat(),
-        },
-        stable_key=f"NO_SILENT_BREAKER_TRIP:{_SILENT_TRIP_MONITORED_DAEMON}",
-    )]
-
-
 # ---- 7. NO_ZOMBIE_BOT_PROCESS --------------------------------------------------
 def _collapse_venv_launcher_pairs(
     candidates: list[tuple[int, int | None, str]],
@@ -717,7 +635,6 @@ CHECK_REGISTRY: dict[str, Any] = {
     "NO_BELOW_BASIS_CC": check_no_below_basis_cc,
     "NO_ORPHAN_CHILDREN": check_no_orphan_children,
     "NO_STRANDED_STAGED_ORDERS": check_no_stranded_staged_orders,
-    "NO_SILENT_BREAKER_TRIP": check_no_silent_breaker_trip,
     "NO_ZOMBIE_BOT_PROCESS": check_no_zombie_bot_process,
     "NO_STALE_RED_ALERT": check_no_stale_red_alert,
     "NO_STUCK_PROCESSING_ORDER": check_no_stuck_processing_order,

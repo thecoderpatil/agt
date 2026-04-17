@@ -6,8 +6,9 @@ Covers:
   3. NO_STUCK_PROCESSING_ORDER  -- stable_key per pending_order_id (prophylactic)
   4. NO_ZOMBIE_BOT_PROCESS      -- stable_key on both degraded and zombie paths
 
-NO_SILENT_BREAKER_TRIP's rewrite (haiku-watchdog -> AGT_Bot_Liveness_Watchdog)
-is exercised by the updated tests in tests/test_invariants.py.
+(NO_SILENT_BREAKER_TRIP was retired in MR !88 when the watchdog-schtask
+pattern it monitored was replaced with the NSSM service + independent
+external heartbeat_stale_alert.ps1 observer.)
 
 Goal: lock the ``Violation.stable_key`` contract for each of these checks
 so a future refactor that drops the attribute silently reverts to the

@@ -61,14 +61,6 @@ invariants:
     max_consecutive_violations: 1
     severity_floor: high
 
-  - id: NO_SILENT_BREAKER_TRIP
-    description: AGT_Bot_Liveness_Watchdog must emit BOT_STALE when daemon_heartbeat 'agt_bot' is stale.
-    check_fn: check_no_silent_breaker_trip
-    scrutiny_tier: low
-    fix_by_sprint: adr-007-mr85
-    max_consecutive_violations: 1
-    severity_floor: medium
-
   - id: NO_ZOMBIE_BOT_PROCESS
     description: Only one telegram_bot.py process should run at a time.
     check_fn: check_no_zombie_bot_process
