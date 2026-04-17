@@ -19,6 +19,16 @@ Usage:
     python3 scripts/incidents_digest.py --status open --status awaiting_approval
     python3 scripts/incidents_digest.py --since 2026-04-10
     python3 scripts/incidents_digest.py --limit 20
+    python3 scripts/incidents_digest.py --authorable    # ADR-007 Step 7a
+
+With ``--authorable`` the digest is filtered to incidents whose
+``consecutive_breaches`` has reached the manifest threshold
+(``max_consecutive_violations``). Rows below threshold stay visible in
+``/report`` and direct ``list_by_status`` callers; they're dropped only
+from the weekly Opus Author prompt so flappy invariants stop burning
+LLM spend on first detection. A ``## Below threshold`` summary section
+prepends the markdown output with counts per invariant (no row-level
+enumeration -- details live elsewhere).
 
 Exit code:
     0 -- read succeeded (empty queue is NOT an error).
@@ -79,6 +89,28 @@ def _filter_since(rows: list[dict], since: str | None) -> list[dict]:
         if when and when >= since:
             out.append(r)
     return out
+
+
+def _below_threshold_summary_md(below_rows: list[dict]) -> str:
+    """One-line counts per invariant for rows that fell out of the
+    authorable gate. Not enumerated -- details live in /report."""
+    if not below_rows:
+        return ""
+    by_inv: dict[str, int] = {}
+    for r in below_rows:
+        inv = r.get("invariant_id") or "(none)"
+        by_inv[inv] = by_inv.get(inv, 0) + 1
+    lines = ["## Below threshold (not yet authorable)", ""]
+    lines.append(
+        f"_{len(below_rows)} row(s) across {len(by_inv)} invariant(s) -- "
+        "not included in this digest. Use `/report` or direct DB inspection "
+        "for details._"
+    )
+    lines.append("")
+    for inv in sorted(by_inv):
+        lines.append(f"- `{inv}`: {by_inv[inv]}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def _emit_md(rows: list[dict]) -> str:
@@ -156,8 +188,63 @@ def main(argv: list[str] | None = None) -> int:
         "--db-path", default=None,
         help="Override DB path (defaults to agt_desk.db).",
     )
+    p.add_argument(
+        "--authorable", action="store_true", default=False,
+        help=(
+            "ADR-007 Step 7a: restrict output to incidents past their "
+            "manifest max_consecutive_violations threshold. Prepends a "
+            "`## Below threshold` summary with counts per invariant for "
+            "rows that were filtered out. Status defaults shift to "
+            "DEFAULT_AUTHORABLE_STATUSES (open, rejected_once, "
+            "rejected_twice); pass --status explicitly to override."
+        ),
+    )
     ns = p.parse_args(argv)
 
+    if ns.authorable:
+        # Authorable digest: status defaults shift, list_authorable applies
+        # the manifest gate, and we compute the diff for the Below-threshold
+        # summary ourselves (no new API surface).
+        auth_statuses = (
+            ns.status if ns.status
+            else list(incidents_repo.DEFAULT_AUTHORABLE_STATUSES)
+        )
+        try:
+            all_rows = incidents_repo.list_by_status(
+                auth_statuses, limit=ns.limit, db_path=ns.db_path,
+            )
+            authorable_rows = incidents_repo.list_authorable(
+                statuses=auth_statuses, db_path=ns.db_path,
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"incidents_digest: authorable read failed: {exc}\n"
+            )
+            return 2
+
+        # Diff: rows in all_rows but not in authorable_rows = below threshold.
+        auth_ids = {r["id"] for r in authorable_rows}
+        below_rows = [r for r in all_rows if r["id"] not in auth_ids]
+
+        # --since applies to the authorable output (below-threshold summary
+        # is by definition pre-filter, so no --since filtering there).
+        rows = _filter_since(authorable_rows, ns.since)
+
+        if ns.format == "json":
+            payload = {
+                "authorable": rows,
+                "below_threshold_count": len(below_rows),
+                "below_threshold_by_invariant": _group_count_by_inv(below_rows),
+            }
+            sys.stdout.write(json.dumps(payload, indent=2, default=str))
+            sys.stdout.write("\n")
+        else:
+            # Below-threshold summary FIRST (per dispatch), then normal digest.
+            sys.stdout.write(_below_threshold_summary_md(below_rows))
+            sys.stdout.write(_emit_md(rows))
+        return 0
+
+    # Default path: unchanged behavior.
     statuses = ns.status if ns.status else list(DEFAULT_STATUSES)
 
     try:
@@ -176,6 +263,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         sys.stdout.write(_emit_md(rows))
     return 0
+
+
+def _group_count_by_inv(rows: list[dict]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in rows:
+        inv = r.get("invariant_id") or "(none)"
+        out[inv] = out.get(inv, 0) + 1
+    return out
 
 
 if __name__ == "__main__":
