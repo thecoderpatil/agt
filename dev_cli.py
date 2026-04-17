@@ -177,16 +177,17 @@ async def cmd_scan_daily(args):
     # ── 3. CSP harvest (same call as cmd_daily line 7111) ──
     try:
         from agt_equities.csp_harvest import scan_csp_harvest_candidates
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+        import uuid
         ib_conn = await bot.ensure_ib_connected()
-
-        staged_tickets = []
-        def _cli_staging_cb(tickets):
-            staged_tickets.extend(tickets)
-            bot.append_pending_tickets(tickets)
-
-        harvest_result = await scan_csp_harvest_candidates(
-            ib_conn, staging_callback=_cli_staging_cb,
+        ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id=uuid.uuid4().hex,
+            order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
+            decision_sink=NullDecisionSink(),
         )
+        harvest_result = await scan_csp_harvest_candidates(ib_conn, ctx=ctx)
         staged = harvest_result.get("staged", [])
         alerts = harvest_result.get("alerts", [])
         harvest_text = f"Staged: {len(staged)}"

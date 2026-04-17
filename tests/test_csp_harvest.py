@@ -32,6 +32,8 @@ from agt_equities.csp_harvest import (
     _should_harvest_csp,
     scan_csp_harvest_candidates,
 )
+from agt_equities.runtime import RunContext, RunMode
+from agt_equities.sinks import CollectorOrderSink, NullDecisionSink
 
 pytestmark = pytest.mark.sprint_a
 
@@ -281,11 +283,22 @@ def _mock_days_held_lookup(monkeypatch):
     monkeypatch.setattr("agt_equities.csp_harvest._lookup_days_held", lambda *a, **kw: 1)
 
 
+@pytest.fixture
+def _ctx_scanner():
+    """CollectorOrderSink ctx for scanner tests — captures orders without DB writes."""
+    return RunContext(
+        mode=RunMode.LIVE,
+        run_id="test-harvest",
+        order_sink=CollectorOrderSink(),
+        decision_sink=NullDecisionSink(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 10-13. scan_csp_harvest_candidates scanner tests
 # ---------------------------------------------------------------------------
 
-def test_scanner_stages_passing_put():
+def test_scanner_stages_passing_put(_ctx_scanner):
     """A short put with 80%+ profit and dte>=2 stages a BTC ticket."""
     pos = _make_fake_put_position(
         ticker="AAPL", strike=150.0,
@@ -295,7 +308,7 @@ def test_scanner_stages_passing_put():
     md = {"AAPL": SimpleNamespace(ask=0.15)}  # 85% profit
     ib = FakeIB([pos], md)
 
-    out = asyncio.run(scan_csp_harvest_candidates(ib))
+    out = asyncio.run(scan_csp_harvest_candidates(ib, ctx=_ctx_scanner))
 
     assert len(out["staged"]) == 1
     t = out["staged"][0]
@@ -311,7 +324,7 @@ def test_scanner_stages_passing_put():
     assert out["errors"] == []
 
 
-def test_scanner_skips_below_threshold():
+def test_scanner_skips_below_threshold(_ctx_scanner):
     """A short put with only 50% profit is skipped, not staged."""
     pos = _make_fake_put_position(
         ticker="MSFT", strike=400.0,
@@ -320,7 +333,7 @@ def test_scanner_skips_below_threshold():
     md = {"MSFT": SimpleNamespace(ask=1.00)}  # 50% profit
     ib = FakeIB([pos], md)
 
-    out = asyncio.run(scan_csp_harvest_candidates(ib))
+    out = asyncio.run(scan_csp_harvest_candidates(ib, ctx=_ctx_scanner))
 
     assert out["staged"] == []
     assert len(out["skipped"]) == 1
@@ -328,11 +341,9 @@ def test_scanner_skips_below_threshold():
     assert "below_threshold" in out["skipped"][0]["reason"]
 
 
-def test_scanner_invokes_staging_callback_with_ticket():
-    """When staging_callback is provided, the scanner hands the
-    ticket list to it. This is the injection seam that lets
-    telegram_bot.cmd_csp_harvest wire in append_pending_tickets
-    without csp_harvest importing telegram_bot."""
+def test_scanner_stages_via_order_sink(_ctx_scanner):
+    """ctx.order_sink.stage called with ticket; CollectorOrderSink captures the
+    ShadowOrder. Validates engine=csp_harvest, run_id, and all A3 meta keys."""
     pos = _make_fake_put_position(
         ticker="NVDA", strike=800.0,
         expiry="20260420", qty=1, avg_cost=150.0,  # $1.50 credit
@@ -340,28 +351,28 @@ def test_scanner_invokes_staging_callback_with_ticket():
     md = {"NVDA": SimpleNamespace(ask=0.20)}  # ~87% profit
     ib = FakeIB([pos], md)
 
-    captured: list[list[dict]] = []
-
-    def sink(tickets):
-        captured.append(list(tickets))
-
-    out = asyncio.run(scan_csp_harvest_candidates(ib, staging_callback=sink))
+    out = asyncio.run(scan_csp_harvest_candidates(ib, ctx=_ctx_scanner))
 
     assert len(out["staged"]) == 1
-    assert len(captured) == 1
-    assert len(captured[0]) == 1
-    assert captured[0][0]["ticker"] == "NVDA"
-    assert captured[0][0]["mode"] == "CSP_HARVEST"
+    orders = _ctx_scanner.order_sink.peek()
+    assert len(orders) == 1
+    so = orders[0]
+    assert so.engine == "csp_harvest"
+    assert so.run_id == _ctx_scanner.run_id
+    for key in ("account_id", "household", "ticker", "strike", "expiry",
+                "quantity", "limit_price", "days_held", "v2_rationale"):
+        assert key in so.meta, f"meta missing key: {key}"
+    assert so.meta["ticker"] == "NVDA"
 
 
-def test_scanner_handles_reqpositions_failure_gracefully():
+def test_scanner_handles_reqpositions_failure_gracefully(_ctx_scanner):
     """If reqPositionsAsync raises, the scanner returns a structured
     error dict rather than propagating the exception. This is the
     watchdog-safety contract: a flaky IBKR connection must not bring
     down the scheduled 3:30 PM sweep."""
     ib = FakeIB([], {}, raise_on_positions=True)
 
-    out = asyncio.run(scan_csp_harvest_candidates(ib))
+    out = asyncio.run(scan_csp_harvest_candidates(ib, ctx=_ctx_scanner))
 
     assert out["staged"] == []
     assert len(out["errors"]) == 1
@@ -373,7 +384,7 @@ def test_scanner_handles_reqpositions_failure_gracefully():
 # 14-16. days_held integration tests (new -- f4def9f intent, not in 88b1cb6)
 # ---------------------------------------------------------------------------
 
-def test_scanner_day1_80pct_triggers_harvest(monkeypatch):
+def test_scanner_day1_80pct_triggers_harvest(monkeypatch, _ctx_scanner):
     """Position held 1 day, 81.25% profit -> stages BTC ticket with day1_80 reason."""
     pos = _make_fake_put_position(
         ticker="GOOGL", strike=160.0,
@@ -382,7 +393,7 @@ def test_scanner_day1_80pct_triggers_harvest(monkeypatch):
     md = {"GOOGL": SimpleNamespace(ask=0.30)}  # 81.25% profit
     ib = FakeIB([pos], md)
 
-    out = asyncio.run(scan_csp_harvest_candidates(ib))
+    out = asyncio.run(scan_csp_harvest_candidates(ib, ctx=_ctx_scanner))
 
     assert len(out["staged"]) == 1
     t = out["staged"][0]
@@ -390,7 +401,7 @@ def test_scanner_day1_80pct_triggers_harvest(monkeypatch):
     assert t["days_held"] == 1
 
 
-def test_scanner_day2_plus_90pct_triggers_harvest(monkeypatch):
+def test_scanner_day2_plus_90pct_triggers_harvest(monkeypatch, _ctx_scanner):
     """days_held=3: 91% profit stages (standard_90); 85% profit skips."""
     monkeypatch.setattr("agt_equities.csp_harvest._lookup_days_held", lambda *a, **kw: 3)
 
@@ -399,7 +410,7 @@ def test_scanner_day2_plus_90pct_triggers_harvest(monkeypatch):
         expiry="20260515", qty=1, avg_cost=100.0,
     )
     md_hi = {"AMZN": SimpleNamespace(ask=0.09)}  # 91% profit
-    out_hi = asyncio.run(scan_csp_harvest_candidates(FakeIB([pos_hi], md_hi)))
+    out_hi = asyncio.run(scan_csp_harvest_candidates(FakeIB([pos_hi], md_hi), ctx=_ctx_scanner))
     assert len(out_hi["staged"]) == 1
     assert "standard_90" in out_hi["staged"][0]["v2_rationale"]
     assert out_hi["staged"][0]["days_held"] == 3
@@ -409,12 +420,12 @@ def test_scanner_day2_plus_90pct_triggers_harvest(monkeypatch):
         expiry="20260515", qty=1, avg_cost=100.0,
     )
     md_lo = {"AMZN": SimpleNamespace(ask=0.15)}  # 85% profit
-    out_lo = asyncio.run(scan_csp_harvest_candidates(FakeIB([pos_lo], md_lo)))
+    out_lo = asyncio.run(scan_csp_harvest_candidates(FakeIB([pos_lo], md_lo), ctx=_ctx_scanner))
     assert out_lo["staged"] == []
     assert "below_threshold" in out_lo["skipped"][0]["reason"]
 
 
-def test_scanner_days_held_integration_passes_to_threshold(monkeypatch):
+def test_scanner_days_held_integration_passes_to_threshold(monkeypatch, _ctx_scanner):
     """_lookup_days_held=5 is forwarded to _should_harvest_csp as days_held=5."""
     monkeypatch.setattr("agt_equities.csp_harvest._lookup_days_held", lambda *a, **kw: 5)
 
@@ -433,7 +444,7 @@ def test_scanner_days_held_integration_passes_to_threshold(monkeypatch):
         expiry="20260515", qty=1, avg_cost=100.0,
     )
     md = {"META": SimpleNamespace(ask=0.05)}  # 95% profit
-    asyncio.run(scan_csp_harvest_candidates(FakeIB([pos], md)))
+    asyncio.run(scan_csp_harvest_candidates(FakeIB([pos], md), ctx=_ctx_scanner))
 
     assert len(captured_kwargs) == 1
     assert captured_kwargs[0].get("days_held") == 5
