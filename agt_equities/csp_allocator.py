@@ -700,6 +700,32 @@ def _csp_check_rule_3(hh, candidate, n, vix, extras) -> tuple[bool, str]:
     return (True, "")
 
 
+def _csp_check_rule_3b(hh, candidate, n, vix, extras) -> tuple[bool, str]:
+    """Rule 3b: hard-exclude candidates whose sector is in EXCLUDED_SECTORS.
+
+    Airlines/Biotech/Pharma are QUALITY exclusions (C1); REITs/MLPs/BDCs/
+    Trusts/SPACs are STRUCTURAL non-C-corp buckets (C3.6). These never
+    enter the CSP pool regardless of fundamentals, technicals, or RAY.
+
+    Fails CLOSED on missing sector_map entry -- unlike rule_3 (concentration),
+    this is a compliance filter where silent bypass is worse than a false
+    reject on a data hole. If a candidate reaches the allocator without a
+    sector classification, something upstream is broken and we refuse to
+    allocate until it's resolved.
+    """
+    from agt_equities.screener.config import EXCLUDED_SECTORS
+    sector_map = extras.get("sector_map", {}) or {}
+    candidate_sector = sector_map.get(candidate.ticker.upper(), "")
+    excl = {s.lower() for s in EXCLUDED_SECTORS}
+    if (candidate_sector or "").strip().lower() in excl:
+        return (
+            False,
+            f"rule_3b excluded sector '{candidate_sector}' "
+            f"(EXCLUDED_SECTORS hard filter)",
+        )
+    return (True, "")
+
+
 def _csp_check_rule_4(hh, candidate, n, vix, extras) -> tuple[bool, str]:
     """Rule 4: no existing household position with >0.6 6-mo correlation.
 
@@ -785,8 +811,9 @@ CSP_GATE_REGISTRY: list[tuple[str, CSPGate]] = [
     ("rule_1_concentration",   _csp_check_rule_1),
     ("rule_2_el_deployment",   _csp_check_rule_2),
     ("vix_acceleration",       _csp_check_vix_acceleration),
-    ("rule_3_sector",          _csp_check_rule_3),
-    ("rule_4_correlation",     _csp_check_rule_4),
+    ("rule_3_sector",           _csp_check_rule_3),
+    ("rule_3b_excluded_sector", _csp_check_rule_3b),   # hard sector exclusion
+    ("rule_4_correlation",      _csp_check_rule_4),
     ("rule_6_vikram_el_floor", _csp_check_rule_6),
     ("rule_7_csp_procedure",   _csp_check_rule_7),
 ]

@@ -22,6 +22,8 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
+from agt_equities.screener.config import EXCLUDED_SECTORS
+
 logger = logging.getLogger("pxo_scanner")
 
 # ---------------------------------------------------------------------------
@@ -62,7 +64,17 @@ def _load_scan_universe() -> list[dict]:
                    ORDER BY ticker"""
             ).fetchall()
         if rows:
-            return [{"ticker": row["ticker"], "sector": row["sector"]} for row in rows]
+            # C3.6/C1 hard-exclude: drop any industry_group in EXCLUDED_SECTORS.
+            # Case-insensitive. Airlines/Biotechnology/Pharmaceuticals (quality)
+            # + REITs/MLPs/BDCs/Trusts/SPACs (structural non-C-corp buckets)
+            # must never enter the CSP candidate pool. Prior leak path: MRNA +
+            # 12 tickers reached the 2026-04-17 09:35 scan candidate list.
+            excl = {s.lower() for s in EXCLUDED_SECTORS}
+            return [
+                {"ticker": r["ticker"], "sector": r["sector"]}
+                for r in rows
+                if (r["sector"] or "").strip().lower() not in excl
+            ]
     except Exception:
         pass
     return _FALLBACK_WATCHLIST
