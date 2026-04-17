@@ -113,6 +113,54 @@ def _below_threshold_summary_md(below_rows: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _emit_architect_only_md(rows: list[dict]) -> str:
+    """Surface architect-only incidents with a hard-escalation banner.
+
+    ADR-007 Step 7b: these rows are at or past their stability threshold
+    AND carry ``scrutiny_tier=architect_only`` -- the Author/Critic LLM
+    pipeline refuses to autonomously remediate them (see
+    ``author_critic.ARCHITECT_ONLY_TIER`` hard-block). They need Yash's
+    direct attention, so they lead the digest ahead of the authorable
+    section.
+    """
+    if not rows:
+        return ""
+    lines: list[str] = ["## ESCALATE -- architect_only incidents", ""]
+    lines.append(
+        f"**{len(rows)} row(s)** at scrutiny_tier=`architect_only`. "
+        "The Author/Critic pipeline is hard-blocked on these; they "
+        "require direct architect (Yash) action. Do NOT author fixes "
+        "for them autonomously."
+    )
+    lines.append("")
+    by_inv: dict[str, list[dict]] = {}
+    for r in rows:
+        by_inv.setdefault(r.get("invariant_id") or "(none)", []).append(r)
+    for inv in sorted(by_inv):
+        group = by_inv[inv]
+        lines.append(f"### `{inv}` ({len(group)})")
+        group_sorted = sorted(
+            group,
+            key=lambda x: (
+                x.get("last_action_at") or x.get("detected_at") or ""
+            ),
+            reverse=True,
+        )
+        for r in group_sorted:
+            iid = r.get("id")
+            key = r.get("incident_key") or "?"
+            status = r.get("status") or "?"
+            sev = r.get("severity") or "?"
+            last = r.get("last_action_at") or r.get("detected_at") or "?"
+            breaches = r.get("consecutive_breaches") or 1
+            lines.append(
+                f"- **#{iid}** `{key}` -- {status}, {sev}/architect_only, "
+                f"breach x{breaches}, last {last}"
+            )
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _emit_md(rows: list[dict]) -> str:
     """Render the digest as markdown for email / Telegram / Opus prompt."""
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -203,8 +251,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if ns.authorable:
         # Authorable digest: status defaults shift, list_authorable applies
-        # the manifest gate, and we compute the diff for the Below-threshold
-        # summary ourselves (no new API surface).
+        # the manifest gate + tier filter, list_architect_only returns the
+        # complement along the tier axis, and we compute the diff for the
+        # Below-threshold summary ourselves (no new API surface).
+        # ADR-007 Step 7b: architect_only incidents lead the output ahead
+        # of the authorable section so the Opus task cannot miss them.
         auth_statuses = (
             ns.status if ns.status
             else list(incidents_repo.DEFAULT_AUTHORABLE_STATUSES)
@@ -216,22 +267,30 @@ def main(argv: list[str] | None = None) -> int:
             authorable_rows = incidents_repo.list_authorable(
                 statuses=auth_statuses, db_path=ns.db_path,
             )
+            architect_only_rows = incidents_repo.list_architect_only(
+                statuses=auth_statuses, db_path=ns.db_path,
+            )
         except Exception as exc:
             sys.stderr.write(
                 f"incidents_digest: authorable read failed: {exc}\n"
             )
             return 2
 
-        # Diff: rows in all_rows but not in authorable_rows = below threshold.
-        auth_ids = {r["id"] for r in authorable_rows}
-        below_rows = [r for r in all_rows if r["id"] not in auth_ids]
+        # Diff: rows in all_rows but in NEITHER eligible set = below threshold.
+        eligible_ids = (
+            {r["id"] for r in authorable_rows}
+            | {r["id"] for r in architect_only_rows}
+        )
+        below_rows = [r for r in all_rows if r["id"] not in eligible_ids]
 
-        # --since applies to the authorable output (below-threshold summary
+        # --since applies to the eligible outputs (below-threshold summary
         # is by definition pre-filter, so no --since filtering there).
         rows = _filter_since(authorable_rows, ns.since)
+        arch_rows = _filter_since(architect_only_rows, ns.since)
 
         if ns.format == "json":
             payload = {
+                "architect_only": arch_rows,
                 "authorable": rows,
                 "below_threshold_count": len(below_rows),
                 "below_threshold_by_invariant": _group_count_by_inv(below_rows),
@@ -239,7 +298,9 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(json.dumps(payload, indent=2, default=str))
             sys.stdout.write("\n")
         else:
-            # Below-threshold summary FIRST (per dispatch), then normal digest.
+            # Architect-only first (highest urgency), then below-threshold
+            # summary, then the normal authorable digest.
+            sys.stdout.write(_emit_architect_only_md(arch_rows))
             sys.stdout.write(_below_threshold_summary_md(below_rows))
             sys.stdout.write(_emit_md(rows))
         return 0

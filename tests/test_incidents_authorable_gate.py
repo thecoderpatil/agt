@@ -1,9 +1,14 @@
-"""ADR-007 Step 7a: list_authorable() threshold gate.
+"""ADR-007 Step 7a + 7b: list_authorable() gate + tier routing.
 
-Confirms the manifest's `max_consecutive_violations` is finally enforced
-downstream -- flappy invariants (max=3 or 5) no longer burn LLM spend
-on first detection, but stay visible in /report and other read APIs
-that call list_by_status() directly.
+Step 7a: confirms the manifest's `max_consecutive_violations` is enforced
+downstream -- flappy invariants (max=3 or 5) no longer burn LLM spend on
+first detection, but stay visible in /report and other read APIs that
+call list_by_status() directly.
+
+Step 7b: confirms scrutiny-tier routing splits incidents cleanly between
+the Author/Critic pipeline (low/medium/high) and the architect-escalation
+lane (architect_only), so the Author never wastes LLM spend authoring
+fixes that ``author_critic.run_mechanical_critic`` will hard-block.
 
 Fixtures: in-memory sqlite seeded with the canonical incidents DDL
 (mirrors the schema in agt_equities/schema.py:1524+). Manifest is
@@ -259,3 +264,182 @@ def test_degraded_evidence_still_gated(db: str) -> None:
     )
     assert len(rows) == 1
     assert rows[0]["incident_key"] == "FLAPPY:d3-cb3"
+
+
+
+# ---------------------------------------------------------------------------
+# 9. Step 7b: default scrutiny_tiers excludes architect_only
+# ---------------------------------------------------------------------------
+
+def test_default_excludes_architect_only_tier(db: str) -> None:
+    """Default ``scrutiny_tiers`` (low/medium/high) must drop
+    ``architect_only`` rows so the Author/Critic pipeline never wastes
+    LLM spend on incidents ``run_mechanical_critic`` will hard-block."""
+    _insert(db, invariant_id="LOW_INV", consecutive_breaches=1,
+            scrutiny_tier="low", key_suffix="a")
+    _insert(db, invariant_id="MED_INV", consecutive_breaches=1,
+            scrutiny_tier="medium", key_suffix="b")
+    _insert(db, invariant_id="HIGH_INV", consecutive_breaches=1,
+            scrutiny_tier="high", key_suffix="c")
+    _insert(db, invariant_id="ARCH_INV", consecutive_breaches=1,
+            scrutiny_tier="architect_only", key_suffix="d")
+
+    rows = repo.list_authorable(
+        manifest=_manifest(LOW_INV=1, MED_INV=1, HIGH_INV=1, ARCH_INV=1),
+        db_path=db,
+    )
+    got = sorted(r["invariant_id"] for r in rows)
+    assert got == ["HIGH_INV", "LOW_INV", "MED_INV"]
+    # architect_only explicitly absent
+    assert "ARCH_INV" not in got
+
+
+# ---------------------------------------------------------------------------
+# 10. Step 7b: explicit scrutiny_tiers override
+# ---------------------------------------------------------------------------
+
+def test_scrutiny_tiers_override_can_include_architect_only(db: str) -> None:
+    """Callers that want the full set (e.g. /report) can pass the
+    complete ``SCRUTINY_TIERS`` enum and get every tier."""
+    _insert(db, invariant_id="LOW_INV", consecutive_breaches=1,
+            scrutiny_tier="low", key_suffix="a")
+    _insert(db, invariant_id="ARCH_INV", consecutive_breaches=1,
+            scrutiny_tier="architect_only", key_suffix="b")
+
+    rows = repo.list_authorable(
+        scrutiny_tiers=repo.SCRUTINY_TIERS,
+        manifest=_manifest(LOW_INV=1, ARCH_INV=1),
+        db_path=db,
+    )
+    got = sorted(r["invariant_id"] for r in rows)
+    assert got == ["ARCH_INV", "LOW_INV"]
+
+
+# ---------------------------------------------------------------------------
+# 11. Step 7b: unknown / empty tier fails open
+# ---------------------------------------------------------------------------
+
+def test_unknown_scrutiny_tier_fail_open(db: str) -> None:
+    """Rows with an empty or unrecognized ``scrutiny_tier`` are still
+    included by default. A schema skew (manual INSERT, legacy row) must
+    not silently drop incidents out of the Author queue."""
+    # NOTE: register() rejects empty tier at the write path; this models
+    # a legacy/manual row that bypassed register(). Directly INSERTing
+    # here simulates that state.
+    import sqlite3
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO incidents ("
+            "  incident_key, invariant_id, severity, scrutiny_tier, "
+            "  status, detector, detected_at, last_action_at, "
+            "  consecutive_breaches"
+            ") VALUES (?,?,?,?,?,?,?,?,?)",
+            ("EMPTY_TIER:z", "EMPTY_INV", "medium", "",
+             repo.STATUS_OPEN, "test", now, now, 1),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rows = repo.list_authorable(
+        manifest=_manifest(EMPTY_INV=1),
+        db_path=db,
+    )
+    keys = {r["incident_key"] for r in rows}
+    assert "EMPTY_TIER:z" in keys, (
+        "empty scrutiny_tier must fail-open (included) to avoid "
+        "silently dropping legacy rows"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 12. Step 7b: list_architect_only returns only architect_only tier
+# ---------------------------------------------------------------------------
+
+def test_list_architect_only_happy_path(db: str) -> None:
+    _insert(db, invariant_id="LOW_INV", consecutive_breaches=1,
+            scrutiny_tier="low", key_suffix="a")
+    _insert(db, invariant_id="ARCH_INV", consecutive_breaches=1,
+            scrutiny_tier="architect_only", key_suffix="b")
+    _insert(db, invariant_id="ARCH_INV", consecutive_breaches=1,
+            scrutiny_tier="architect_only", key_suffix="c")
+
+    rows = repo.list_architect_only(
+        manifest=_manifest(LOW_INV=1, ARCH_INV=1),
+        db_path=db,
+    )
+    assert len(rows) == 2
+    tiers = {r["scrutiny_tier"] for r in rows}
+    assert tiers == {"architect_only"}
+
+
+# ---------------------------------------------------------------------------
+# 13. Step 7b: list_architect_only respects threshold gate
+# ---------------------------------------------------------------------------
+
+def test_list_architect_only_below_threshold_excluded(db: str) -> None:
+    """Architect-only incidents still honour the manifest threshold --
+    don't wake Yash up for a single blip on a flappy architect-tier
+    invariant (``max_consecutive_violations`` > 1)."""
+    _insert(db, invariant_id="ARCH_FLAPPY", consecutive_breaches=1,
+            scrutiny_tier="architect_only", key_suffix="a")
+    _insert(db, invariant_id="ARCH_FLAPPY", consecutive_breaches=3,
+            scrutiny_tier="architect_only", key_suffix="b")
+
+    rows = repo.list_architect_only(
+        manifest=_manifest(ARCH_FLAPPY=3),
+        db_path=db,
+    )
+    assert len(rows) == 1
+    assert rows[0]["consecutive_breaches"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 14. Step 7b: authorable + architect_only lanes are disjoint
+# ---------------------------------------------------------------------------
+
+def test_authorable_and_architect_only_disjoint(db: str) -> None:
+    """Every eligible row appears in exactly one of the two lanes."""
+    _insert(db, invariant_id="LOW_INV", consecutive_breaches=1,
+            scrutiny_tier="low", key_suffix="a")
+    _insert(db, invariant_id="MED_INV", consecutive_breaches=1,
+            scrutiny_tier="medium", key_suffix="b")
+    _insert(db, invariant_id="HIGH_INV", consecutive_breaches=1,
+            scrutiny_tier="high", key_suffix="c")
+    _insert(db, invariant_id="ARCH_INV", consecutive_breaches=1,
+            scrutiny_tier="architect_only", key_suffix="d")
+
+    auth = repo.list_authorable(
+        manifest=_manifest(LOW_INV=1, MED_INV=1, HIGH_INV=1, ARCH_INV=1),
+        db_path=db,
+    )
+    arch = repo.list_architect_only(
+        manifest=_manifest(LOW_INV=1, MED_INV=1, HIGH_INV=1, ARCH_INV=1),
+        db_path=db,
+    )
+    auth_ids = {r["id"] for r in auth}
+    arch_ids = {r["id"] for r in arch}
+    assert not (auth_ids & arch_ids), "authorable and architect_only must be disjoint"
+    assert auth_ids | arch_ids == {r["id"] for r in auth + arch}
+
+
+# ---------------------------------------------------------------------------
+# 15. Step 7b: tier gate + threshold gate are AND-ed, not OR-ed
+# ---------------------------------------------------------------------------
+
+def test_tier_and_threshold_gates_both_required(db: str) -> None:
+    """A below-threshold low-tier row must drop even though its tier is
+    allowed. Both gates must pass simultaneously."""
+    _insert(db, invariant_id="LOW_FLAPPY", consecutive_breaches=1,
+            scrutiny_tier="low", key_suffix="a")
+    _insert(db, invariant_id="LOW_FLAPPY", consecutive_breaches=5,
+            scrutiny_tier="low", key_suffix="b")
+
+    rows = repo.list_authorable(
+        manifest=_manifest(LOW_FLAPPY=3),
+        db_path=db,
+    )
+    assert len(rows) == 1
+    assert rows[0]["consecutive_breaches"] == 5
