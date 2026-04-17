@@ -78,6 +78,11 @@ try {
 
     # Query heartbeat ages via venv python (no native SQLite in PS 5.1).
     # Outputs one line per target: "<daemon_name>|<age_s_or_MISSING>".
+    # NOTE: writing to a temp .py file then invoking `python <file>` rather
+    # than `python -c "<script>"`. PS 5.1 strips embedded double-quotes when
+    # passing -c args, which mangles the SQLite URI and the f-string. The
+    # same class of quoting bug that bit MR1.5's NSSM Invoke-Nssm -- fix is
+    # the same: avoid the -c path entirely.
     $pyScript = @'
 import sqlite3
 conn = sqlite3.connect("file:C:/AGT_Telegram_Bridge/agt_desk.db?mode=ro", uri=True)
@@ -91,7 +96,13 @@ for name in ("agt_bot", "agt_scheduler"):
     print(f"{name}|{age if age is not None else 'MISSING'}")
 '@
 
-    $queryOut = & $PyPath -c $pyScript 2>&1
+    $pyFile = Join-Path $env:TEMP ('hb_stale_query_{0}.py' -f (Get-Random))
+    Set-Content -Path $pyFile -Value $pyScript -Encoding ASCII
+    try {
+        $queryOut = & $PyPath $pyFile 2>&1
+    } finally {
+        Remove-Item $pyFile -Force -ErrorAction SilentlyContinue
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-AlertLog ('FAIL: python query exit=' + $LASTEXITCODE + ' output=' + ($queryOut -join ' | '))
         exit 4
