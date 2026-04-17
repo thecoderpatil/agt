@@ -6,8 +6,9 @@ Covers:
   3. NO_STUCK_PROCESSING_ORDER  -- stable_key per pending_order_id (prophylactic)
   4. NO_ZOMBIE_BOT_PROCESS      -- stable_key on both degraded and zombie paths
 
-NO_SILENT_BREAKER_TRIP's rewrite (haiku-watchdog -> AGT_Bot_Liveness_Watchdog)
-is exercised by the updated tests in tests/test_invariants.py.
+(NO_SILENT_BREAKER_TRIP was retired in MR !88 when the watchdog-schtask
+pattern it monitored was replaced with the NSSM service + independent
+external heartbeat_stale_alert.ps1 observer.)
 
 Goal: lock the ``Violation.stable_key`` contract for each of these checks
 so a future refactor that drops the attribute silently reverts to the
@@ -20,6 +21,7 @@ import json
 import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -267,3 +269,40 @@ def test_no_local_drift_exempt_registry_still_honored(conn, ctx, monkeypatch, tm
         "agt_equities.invariants.checks.subprocess.run", fake_run
     )
     assert check_no_local_drift(conn, ctx) == []
+
+
+# -----------------------------------------------------------------------------
+# MR !88: static assertions for scripts/heartbeat_stale_alert.ps1 (relocated
+# here instead of a new test file -- keeps the shim covered without touching
+# the .gitlab-ci.yml sprint_a file list, per feedback_sprint_a_ci_file_list.md.)
+# -----------------------------------------------------------------------------
+_HEARTBEAT_STALE_ALERT_PATH = (
+    Path(__file__).resolve().parent.parent / "scripts" / "heartbeat_stale_alert.ps1"
+)
+
+
+@pytest.mark.sprint_a
+def test_heartbeat_stale_alert_script_is_ascii():
+    """ASCII-only (feedback_ps1_ascii_only.md). PS 5.1 has chewed on UTF-8
+    em-dashes in the installer before (MR !87 build 2459913725)."""
+    data = _HEARTBEAT_STALE_ALERT_PATH.read_bytes()
+    offenders = [(i, b) for i, b in enumerate(data) if b > 0x7F]
+    assert offenders == [], (
+        f"non-ASCII bytes at {offenders[:5]}; strip em-dashes/smart quotes"
+    )
+
+
+@pytest.mark.sprint_a
+def test_heartbeat_stale_alert_references_heartbeat_table():
+    """Shim must query the canonical daemon_heartbeat table, not a stale alias."""
+    text = _HEARTBEAT_STALE_ALERT_PATH.read_text(encoding="utf-8")
+    assert "daemon_heartbeat" in text
+
+
+@pytest.mark.sprint_a
+def test_heartbeat_stale_alert_references_telegram_api():
+    """Shim must post directly to api.telegram.org -- bypassing the
+    cross_daemon_alerts bus is the whole point of this external observer
+    (bus drain requires bot alive; we can't assume that here)."""
+    text = _HEARTBEAT_STALE_ALERT_PATH.read_text(encoding="utf-8")
+    assert "api.telegram.org" in text
