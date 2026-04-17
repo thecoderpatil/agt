@@ -77,7 +77,10 @@ __all__ = [
     "list_by_status",
     "list_active_for_invariant",
     "list_authorable",
+    "list_architect_only",
     "DEFAULT_AUTHORABLE_STATUSES",
+    "AUTHORABLE_SCRUTINY_TIERS",
+    "ARCHITECT_ONLY_SCRUTINY_TIERS",
     # Writes
     "register",
     "mark_authoring",
@@ -128,6 +131,17 @@ CLOSED_STATUSES = frozenset({
 
 SEVERITIES = frozenset({"info", "warn", "medium", "high", "crit", "critical"})
 SCRUTINY_TIERS = frozenset({"low", "medium", "high", "architect_only"})
+
+# ADR-007 Step 7b: scrutiny-tier routing for the Author/Critic pipeline.
+# ``AUTHORABLE_SCRUTINY_TIERS`` gates ``list_authorable`` -- the tiers
+# whose incidents are SAFE to hand to the Author/Critic LLM pipeline
+# ("architect_only" is excluded because ``run_mechanical_critic`` hard-
+# blocks it anyway, so authoring them wastes LLM spend + accumulates
+# strikes on a row that can never pass mechanical review).
+# ``ARCHITECT_ONLY_SCRUTINY_TIERS`` is the complement, consumed by
+# ``list_architect_only`` for the escalation lane of the digest.
+AUTHORABLE_SCRUTINY_TIERS: frozenset[str] = frozenset({"low", "medium", "high"})
+ARCHITECT_ONLY_SCRUTINY_TIERS: frozenset[str] = frozenset({"architect_only"})
 
 
 # Map incidents.status → remediation_incidents.status for dual-write.
@@ -381,30 +395,49 @@ def list_by_status(
 def list_authorable(
     *,
     statuses: Iterable[str] = DEFAULT_AUTHORABLE_STATUSES,
+    scrutiny_tiers: Iterable[str] = AUTHORABLE_SCRUTINY_TIERS,
     manifest: list[dict[str, Any]] | None = None,
     db_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Return active incidents that have stabilized past their manifest
-    threshold -- i.e. rows eligible for Author/Critic remediation.
+    threshold AND fall under a scrutiny tier that is safe to autonomously
+    author -- i.e. rows eligible for the Author/Critic LLM pipeline.
 
     An incident is authorable when:
         row["status"] in statuses
         AND row["consecutive_breaches"] >= manifest_entry["max_consecutive_violations"]
+        AND row["scrutiny_tier"] in scrutiny_tiers
 
     Rows whose ``invariant_id`` does not appear in the manifest are
-    fail-open (included). Rationale: the Author consuming the digest
-    should see everything unaccounted-for -- better to generate a spurious
-    author pass than to silently drop an incident that has lost its
-    manifest entry (e.g. mid-rename).
+    fail-open on the *threshold* check (included). Rationale: the Author
+    consuming the digest should see everything unaccounted-for -- better
+    to generate a spurious author pass than to silently drop an incident
+    that has lost its manifest entry (e.g. mid-rename).
 
     Rows with no ``invariant_id`` at all (legacy detectors that don't
-    declare one) are also fail-open for the same reason.
+    declare one) are also fail-open on the threshold check for the same
+    reason.
+
+    The *scrutiny tier* check is ALSO fail-open: a row with an unknown or
+    empty ``scrutiny_tier`` is included, so a schema skew never silently
+    drops an incident. This matches the threshold fail-open rationale.
+
+    ADR-007 Step 7b: by default, ``scrutiny_tiers`` excludes
+    ``"architect_only"`` -- ``author_critic.run_mechanical_critic`` hard-
+    blocks that tier anyway, so authoring them wastes LLM spend and
+    accumulates rejection strikes on rows that can never pass. The
+    escalation lane for those incidents lives in ``list_architect_only``.
 
     Args:
         statuses: status filter. Defaults to
             ``DEFAULT_AUTHORABLE_STATUSES`` (open, rejected_once,
             rejected_twice). Pass a wider tuple to include, e.g.,
             awaiting_approval for read-only inspection.
+        scrutiny_tiers: tier filter. Defaults to
+            ``AUTHORABLE_SCRUTINY_TIERS`` (``low``/``medium``/``high``).
+            Pass ``SCRUTINY_TIERS`` to include every tier, or
+            ``ARCHITECT_ONLY_SCRUTINY_TIERS`` to invert (though
+            ``list_architect_only`` is the ergonomic way).
         manifest: optional injection for tests. Defaults to
             ``agt_equities.invariants.runner.load_invariants()``.
         db_path: override db path.
@@ -429,20 +462,59 @@ def list_authorable(
             # as eligible on first detection (safer than dropping).
             thresholds[inv_id] = 1
 
+    tier_allow: set[str] = {str(t).lower() for t in scrutiny_tiers}
+
     rows = list_by_status(list(statuses), db_path=db_path)
 
     out: list[dict[str, Any]] = []
     for r in rows:
         inv_id = r.get("invariant_id")
         breaches = int(r.get("consecutive_breaches") or 0)
+
+        # Threshold gate (fail-open on missing manifest entry).
         if not inv_id or inv_id not in thresholds:
-            # Fail-open: row has no manifest entry, still include it so
-            # the Author sees everything the digest picked up.
-            out.append(r)
+            threshold_ok = True
+        else:
+            threshold_ok = breaches >= thresholds[inv_id]
+        if not threshold_ok:
             continue
-        if breaches >= thresholds[inv_id]:
-            out.append(r)
+
+        # Scrutiny tier gate (fail-open on missing/unknown tier so a
+        # schema skew never silently drops an incident).
+        row_tier = (r.get("scrutiny_tier") or "").strip().lower()
+        if row_tier and row_tier not in tier_allow:
+            continue
+
+        out.append(r)
     return out
+
+
+def list_architect_only(
+    *,
+    statuses: Iterable[str] = DEFAULT_AUTHORABLE_STATUSES,
+    manifest: list[dict[str, Any]] | None = None,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return stabilized incidents that require human (architect) action.
+
+    The complement of ``list_authorable`` along the scrutiny-tier axis:
+    same threshold + status gating, but filtered to
+    ``ARCHITECT_ONLY_SCRUTINY_TIERS`` -- i.e. tiers whose remediation the
+    Author/Critic pipeline refuses to autonomously approve (compliance
+    rails, live-only behavior, etc.; see the manifest in
+    ``agt_equities/safety_invariants.yaml``).
+
+    Consumed by ``scripts/incidents_digest.py --authorable`` to surface
+    architect-only rows in a distinct "escalate" section of the Opus
+    weekly digest, separate from the rows handed to the Author/Critic
+    pipeline. ADR-007 Step 7b.
+    """
+    return list_authorable(
+        statuses=statuses,
+        scrutiny_tiers=ARCHITECT_ONLY_SCRUTINY_TIERS,
+        manifest=manifest,
+        db_path=db_path,
+    )
 
 
 def list_active_for_invariant(
