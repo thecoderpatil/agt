@@ -38,14 +38,21 @@ def test_sell_helper_delegates_to_option_helper():
                for tv in o.algoParams)
 
 
-def test_roll_combo_preserves_urgent_default():
-    """Roll combo keeps Urgent default — MR !102 will time-gate."""
+def test_roll_combo_patient_default():
+    """Roll combo defaults to Patient after MR !103 urgency routing."""
     o = build_adaptive_roll_combo(1, 0.50, "U12345")
     assert o.algoStrategy == "Adaptive"
-    assert any(tv.tag == "adaptivePriority" and tv.value == "Urgent"
+    assert any(tv.tag == "adaptivePriority" and tv.value == "Patient"
                for tv in o.algoParams)
     assert o.action == "BUY"
     assert o.orderType == "LMT"
+
+
+def test_roll_combo_urgent_override():
+    """Caller can override to urgent (time-gate path)."""
+    o = build_adaptive_roll_combo(1, 0.50, "U12345", urgency="urgent")
+    assert any(tv.tag == "adaptivePriority" and tv.value == "Urgent"
+               for tv in o.algoParams)
 
 
 # ---------------------------------------------------------------------------
