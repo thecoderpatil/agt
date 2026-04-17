@@ -12168,6 +12168,28 @@ def _acquire_singleton_lock() -> None:
 
 
 def main() -> None:
+    # MR !90: evict any zombie telegram_bot.py holding .bot.pid / IBKR clientId=1
+    # before the singleton lock check. NSSM's restart of the outer venv launcher
+    # can leave the inner grandchild python.exe alive; that zombie would
+    # fail the next bot's IBKR connect with a clientId collision. See
+    # agt_equities/zombie_evict.py for the Windows semantics note.
+    from agt_equities.zombie_evict import evict_zombie_daemons
+    _zr = evict_zombie_daemons(
+        cmdline_marker="telegram_bot.py",
+        self_pid=os.getpid(),
+        logger=logger,
+    )
+    if _zr.zombies_survived_sigkill:
+        logger.error(
+            "Zombie eviction incomplete: survivors=%s; refusing to boot",
+            _zr.zombies_survived_sigkill,
+        )
+        # SystemExit(7) rather than sys.exit(7) because this module does not
+        # import `sys` at module top (see note in reports/mr90_zombie_evict_
+        # report.md re: latent NameError swallowed by _pid_is_alive's blanket
+        # except; pre-existing, out of scope for MR !90).
+        raise SystemExit(7)
+
     # MR #1: single-instance enforcement before any IB / Telegram contact
     _acquire_singleton_lock()
     init_db()  # A4: lazy DB init at daemon boot, not import
