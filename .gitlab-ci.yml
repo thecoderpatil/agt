@@ -197,3 +197,4 @@ dep_drift_check:
     - if: $CI_PIPELINE_SOURCE == "push"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
+# ci-retrigger for MR!88 (pipeline 2459986360 used a stale pytest line; forcing fresh eval)
