@@ -36,8 +36,6 @@ stdout for NSSM capture.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 import logging.handlers
 import os
@@ -168,91 +166,26 @@ def build_scheduler() -> "AsyncIOScheduler":
 # register freely here — Step 6 rate-gates downstream.
 # ---------------------------------------------------------------------------
 
-def _evidence_fingerprint(evidence: dict[str, Any] | None) -> str:
-    """Stable short hash of a Violation's ``evidence`` dict.
-
-    Used as the suffix of the ``incidents_repo.register`` ``incident_key``
-    so repeat detections of the same breach collapse onto a single
-    incident row — ``register`` is idempotent keyed on ``incident_key``
-    and bumps ``consecutive_breaches`` rather than inserting a new row.
-    Non-serializable evidence falls back to ``str()`` so we never crash
-    the fingerprint path.
-    """
-    try:
-        blob = json.dumps(evidence or {}, sort_keys=True, default=str)
-    except (TypeError, ValueError):
-        blob = str(evidence)
-    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+# MR !84: both helpers extracted to agt_equities.invariants.tick so the
+# bot's JobQueue can run detection while USE_SCHEDULER_DAEMON=0. Re-export
+# _evidence_fingerprint so tests that pinned it on this module continue
+# to pass without modification. Detector string is stamped by the wrapper
+# below so incident forensics can distinguish daemon-owned vs bot-owned
+# detections during the Sprint A observation window.
+from agt_equities.invariants.tick import (
+    _evidence_fingerprint,
+    check_invariants_tick as _shared_check_invariants_tick,
+)
 
 
 def _check_invariants_tick() -> None:
-    """Run ADR-007 safety invariants once and register any Violations.
+    """Thin wrapper over ``invariants.tick.check_invariants_tick``.
 
-    Called from ``_heartbeat_job`` every 60s. Imports are lazy to keep
-    the module-import side-effect-free invariant intact (``test_import_
-    no_side_effects``). Every Violation maps to one
-    ``incidents_repo.register`` call with:
-
-    - ``incident_key = f"{invariant_id}:{evidence_fingerprint}"``
-    - ``severity``   = YAML ``severity_floor`` (fallback ``medium``)
-    - ``scrutiny_tier`` = YAML ``scrutiny_tier`` (fallback ``medium``)
-    - ``detector``  = ``"agt_scheduler.heartbeat"``
-    - ``observed_state`` = ``{description, evidence, detected_at}``
-
-    The outer try/except makes this a best-effort call — failures log
-    and return. Step 6 will add a rate-limited authoring path; here we
-    just surface the detection into the ``incidents`` table (Step 3).
+    Stamps ``detector='agt_scheduler.heartbeat'`` so incident forensics
+    distinguish daemon-owned detections from bot-owned (which use
+    ``detector='telegram_bot.invariants_tick'``).
     """
-    try:
-        from agt_equities import incidents_repo
-        from agt_equities.invariants import load_invariants, run_all
-    except Exception:
-        logger.exception("invariants import failed; skipping tick")
-        return
-
-    try:
-        manifest = load_invariants()
-        invariant_meta: dict[str, dict[str, Any]] = {
-            entry["id"]: entry for entry in manifest
-        }
-        results = run_all()
-    except Exception:
-        logger.exception("invariants runner failed; skipping tick")
-        return
-
-    for inv_id, violations in results.items():
-        if not violations:
-            continue
-        meta = invariant_meta.get(inv_id, {})
-        severity = str(meta.get("severity_floor", "medium"))
-        scrutiny_tier = str(meta.get("scrutiny_tier", "medium"))
-        for v in violations:
-            try:
-                incident_key = (
-                    f"{inv_id}:{_evidence_fingerprint(getattr(v, 'evidence', {}))}"
-                )
-                detected_at = getattr(v, "detected_at", None)
-                observed_state = {
-                    "description": getattr(v, "description", ""),
-                    "evidence": getattr(v, "evidence", {}),
-                    "detected_at": (
-                        detected_at.isoformat()
-                        if detected_at is not None
-                        else None
-                    ),
-                }
-                incidents_repo.register(
-                    incident_key,
-                    severity=severity,
-                    scrutiny_tier=scrutiny_tier,
-                    detector="agt_scheduler.heartbeat",
-                    invariant_id=inv_id,
-                    observed_state=observed_state,
-                )
-            except Exception:
-                logger.exception(
-                    "incidents_repo.register failed for invariant %s", inv_id
-                )
+    _shared_check_invariants_tick(detector="agt_scheduler.heartbeat")
 
 
 # ---------------------------------------------------------------------------

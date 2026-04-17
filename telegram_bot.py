@@ -11831,6 +11831,24 @@ async def _sweep_attested_ttl_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("attested_sweeper error: %s", exc)
 
 
+async def _check_invariants_tick_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """MR !84: ADR-007 invariant suite tick (60s) owned by the bot when
+    USE_SCHEDULER_DAEMON=0. Mirrors the scheduler's heartbeat tick so
+    the ``incidents`` table is populated regardless of which process owns
+    the gated job set. Detection is cheap, non-idempotent-safe via the
+    incidents_repo key; the authoring/approval rate limit applies
+    downstream per ADR-007 §9.3. Never raises — one unguarded exception
+    in the bot's JobQueue is a live-capital hazard.
+    """
+    if _HALTED:
+        return
+    try:
+        from agt_equities.invariants.tick import check_invariants_tick
+        check_invariants_tick(detector="telegram_bot.invariants_tick")
+    except Exception as exc:
+        logger.error("invariants_tick error: %s", exc)
+
+
 async def _drain_cross_daemon_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """A5d: bot-side consumer for the cross_daemon_alerts bus.
 
@@ -12309,6 +12327,23 @@ def main() -> None:
             name="cross_daemon_alerts_drain",
         )
         logger.info("Scheduled: cross_daemon_alerts_drain every 2s")
+
+        # MR !84: invariants tick — bot owns when USE_SCHEDULER_DAEMON=0,
+        # daemon owns when =1 via its heartbeat. Either way the
+        # ``incidents`` table populates. first=30 lets post_init settle.
+        if not _use_scheduler_daemon():
+            jq.run_repeating(
+                callback=_check_invariants_tick_job,
+                interval=60,
+                first=30,
+                name="invariants_tick",
+            )
+            logger.info("Scheduled: invariants_tick every 60s")
+        else:
+            logger.info(
+                "Skipped invariants_tick registration: USE_SCHEDULER_DAEMON=1 "
+                "(owned by agt_scheduler heartbeat)"
+            )
 
         # A5e: beta_cache_refresh + corporate_intel_refresh -- scheduler daemon
         # owns these when USE_SCHEDULER_DAEMON=1.  Bot retains them as
