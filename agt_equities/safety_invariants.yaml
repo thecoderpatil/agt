@@ -100,3 +100,11 @@ invariants:
     fix_by_sprint: adr-007-mr84
     max_consecutive_violations: 3
     severity_floor: medium
+
+  - id: NO_SHADOW_ON_PROD_DB
+    description: scripts/shadow_scan.py must never run against PROD_DB_PATH; enforces ADR-008 safety belt.
+    check_fn: check_no_shadow_on_prod_db
+    scrutiny_tier: architect_only
+    fix_by_sprint: adr-008-mr1
+    max_consecutive_violations: 1
+    severity_floor: high

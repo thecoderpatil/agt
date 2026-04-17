@@ -628,6 +628,77 @@ def check_no_local_drift(
 
 
 
+
+
+# ---- 12. NO_SHADOW_ON_PROD_DB ---------------------------------------------------
+def check_no_shadow_on_prod_db(
+    conn: sqlite3.Connection, ctx: CheckContext
+) -> list[Violation]:
+    """No ``scripts/shadow_scan.py`` process may run against ``PROD_DB_PATH``.
+
+    Primary enforcement is the runtime assert at entry of
+    ``scripts/shadow_scan.py`` (``NO_SHADOW_ON_PROD_DB`` +
+    ``NO_LIVE_CTX_IN_SHADOW_SCRIPT`` per ADR-008 section 6). This periodic
+    check is a belt-and-suspenders scan of ``psutil.process_iter`` for any
+    Python process whose cmdline references ``scripts/shadow_scan.py`` AND
+    the production DB path.
+
+    Returns a degraded Violation when psutil is unavailable (typical CI
+    container). Returns the empty list when no offending shadow process is
+    running, which is the steady state well over 99% of the time -
+    shadow runs are ephemeral CLI invocations.
+    """
+    try:
+        from agt_equities.runtime import PROD_DB_PATH  # local import: avoids cycle
+    except ImportError:
+        return [Violation(
+            invariant_id="NO_SHADOW_ON_PROD_DB",
+            description="agt_equities.runtime import failed; check degraded",
+            severity="low",
+            evidence={"degraded": True, "reason": "no_runtime_module"},
+            stable_key="NO_SHADOW_ON_PROD_DB:degraded",
+        )]
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return [Violation(
+            invariant_id="NO_SHADOW_ON_PROD_DB",
+            description="psutil unavailable; shadow-scan process scan degraded",
+            severity="low",
+            evidence={"degraded": True, "reason": "no_psutil"},
+            stable_key="NO_SHADOW_ON_PROD_DB:degraded",
+        )]
+    offenders: list[dict[str, Any]] = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmd_parts = proc.info.get("cmdline") or []
+            cmd = " ".join(str(p) for p in cmd_parts)
+            if "shadow_scan.py" not in cmd:
+                continue
+            if PROD_DB_PATH in cmd:
+                offenders.append({
+                    "pid": proc.info["pid"],
+                    "cmdline": cmd[:400],
+                })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if not offenders:
+        return []
+    return [Violation(
+        invariant_id="NO_SHADOW_ON_PROD_DB",
+        description=(
+            f"{len(offenders)} shadow_scan.py process(es) running against "
+            "PROD_DB_PATH; runtime guard was bypassed"
+        ),
+        severity="high",
+        evidence={
+            "offender_count": len(offenders),
+            "offenders": offenders[:10],
+        },
+        stable_key="NO_SHADOW_ON_PROD_DB",
+    )]
+
+
 # ---- Registry ------------------------------------------------------------------
 CHECK_REGISTRY: dict[str, Any] = {
     "NO_LIVE_IN_PAPER": check_no_live_in_paper,
@@ -640,4 +711,5 @@ CHECK_REGISTRY: dict[str, Any] = {
     "NO_STUCK_PROCESSING_ORDER": check_no_stuck_processing_order,
     "NO_MISSING_DAEMON_HEARTBEAT": check_no_missing_daemon_heartbeat,
     "NO_LOCAL_DRIFT": check_no_local_drift,
+    "NO_SHADOW_ON_PROD_DB": check_no_shadow_on_prod_db,
 }
