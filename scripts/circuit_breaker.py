@@ -28,7 +28,8 @@ VIX_HALT_THRESHOLD = 35
 MAX_CONSECUTIVE_ERRORS = 3
 RECONCILIATION_DRIFT_PCT = 0.10  # 10%
 ACCOUNT_NLV_DROP_PCT = 0.08  # 8%
-DIRECTIVE_MAX_AGE_DAYS = 5
+DIRECTIVE_MAX_AGE_DAYS = 5  # kept for the shim alias below; will be removed with legacy table
+INCIDENT_HEARTBEAT_MAX_AGE_HOURS = 8  # ADR-007 Step 5 detector staleness threshold
 
 
 def _get_conn():
@@ -204,21 +205,77 @@ def check_vix() -> dict:
         return {"ok": True, "warning": f"VIX check failed: {exc}"}
 
 
-def check_directive_freshness() -> dict:
-    """Check if _WEEKLY_ARCHITECT_DIRECTIVE.md exists and is fresh enough."""
-    directive_path = Path("_WEEKLY_ARCHITECT_DIRECTIVE.md")
-    if not directive_path.exists():
-        return {"ok": True, "has_directive": False, "reason": "No directive file"}
+def check_incident_detector_heartbeat() -> dict:
+    """Check the ADR-007 incidents-table detector has run recently.
 
-    mtime = datetime.fromtimestamp(directive_path.stat().st_mtime)
-    age_days = (datetime.now() - mtime).days
+    Replaces ``check_directive_freshness`` after Step 5 retired the prose
+    ``_WEEKLY_ARCHITECT_DIRECTIVE.md`` workflow. The invariant suite runs
+    every 60s inside the scheduler heartbeat (Step 4), so the newest
+    ``last_action_at`` on ``incidents`` should never be more than a few
+    minutes stale when the scheduler is alive.
+    ``INCIDENT_HEARTBEAT_MAX_AGE_HOURS`` (default 8h) absorbs planned
+    downtime + WAL bus lag without tripping on a quiet day.
 
-    if age_days > DIRECTIVE_MAX_AGE_DAYS:
+    Never hard-blocks (``ok=True`` always); surfaces ``stale=True`` so the
+    circuit breaker aggregator can log without aborting the scan.
+    """
+    try:
+        from agt_equities.db import get_ro_connection
+        conn = get_ro_connection()
+        try:
+            row = conn.execute(
+                "SELECT MAX(COALESCE(last_action_at, detected_at)) FROM incidents"
+            ).fetchone()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        return {"ok": True, "warning": f"Incident heartbeat check failed: {exc}"}
+
+    latest = (row or (None,))[0]
+    if not latest:
+        # Empty table — fresh install or scheduler has never fired a
+        # detector. Non-blocking; the Step 4 heartbeat writes canary
+        # rows once running.
+        return {"ok": True, "has_incidents": False,
+                "reason": "No incidents on record"}
+
+    try:
+        from datetime import timezone
+        latest_dt = datetime.fromisoformat(str(latest).replace("Z", "+00:00"))
+        if latest_dt.tzinfo is None:
+            latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        age_h = (now - latest_dt).total_seconds() / 3600.0
+    except Exception as exc:
+        return {"ok": True, "has_incidents": True,
+                "warning": f"Unparseable last_action_at {latest!r}: {exc}"}
+
+    if age_h > INCIDENT_HEARTBEAT_MAX_AGE_HOURS:
         return {
-            "ok": True, "has_directive": True, "stale": True,
-            "reason": f"Directive is {age_days} days old (max {DIRECTIVE_MAX_AGE_DAYS}) -- IGNORING",
+            "ok": True, "has_incidents": True, "stale": True,
+            "age_hours": round(age_h, 1),
+            "reason": f"Incident detector last wrote {round(age_h,1)}h ago "
+                      f"(max {INCIDENT_HEARTBEAT_MAX_AGE_HOURS}h) -- scheduler may be dead",
         }
-    return {"ok": True, "has_directive": True, "stale": False, "age_days": age_days}
+    return {"ok": True, "has_incidents": True, "stale": False,
+            "age_hours": round(age_h, 1)}
+
+
+# Back-compat shim — will be removed alongside the legacy
+# remediation_incidents table in a follow-up.
+def check_directive_freshness() -> dict:
+    """DEPRECATED: ADR-007 Step 5 retired the prose directive.
+
+    Delegates to :func:`check_incident_detector_heartbeat`. Retained so
+    any external caller (e.g. a hand-rolled breaker script) keeps
+    working. Will be deleted when the legacy ``remediation_incidents``
+    table drops.
+    """
+    return check_incident_detector_heartbeat()
+
 
 
 def run_all_checks() -> dict:
@@ -229,7 +286,7 @@ def run_all_checks() -> dict:
         "consecutive_errors": check_consecutive_errors(),
         "nlv_drop": check_nlv_drop(),
         "vix": check_vix(),
-        "directive": check_directive_freshness(),
+        "incident_detector": check_incident_detector_heartbeat(),
     }
 
     halted = any(c.get("halted", False) for c in checks.values())
