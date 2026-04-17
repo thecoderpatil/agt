@@ -27,6 +27,7 @@ import socket
 import sqlite3
 import sys
 import time
+import uuid
 from collections import defaultdict
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
@@ -9724,6 +9725,8 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
             _fetch_household_buying_power_snapshot,
             run_csp_allocator,
         )
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
         from agt_equities.scan_extras import (
             fetch_earnings_map,
             build_correlation_pairs,
@@ -9773,12 +9776,22 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
             sector_map, earnings_map, correlation_pairs,
         )
 
+        # ADR-008 MR 2: ctx carries the order sink. Live scheduled scan
+        # wires SQLiteOrderSink so ctx.order_sink.stage(tickets, ...) is
+        # byte-identical to the prior append_pending_tickets(tickets)
+        # staging path.
+        ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id=uuid.uuid4().hex,
+            order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
+            decision_sink=NullDecisionSink(),
+        )
         result = run_csp_allocator(
             ray_candidates=candidates,
             snapshots=snapshots,
             vix=vix,
             extras_provider=extras_provider,
-            staging_callback=append_pending_tickets,
+            ctx=ctx,
         )
 
         staged_n = result.total_staged_contracts
@@ -11472,6 +11485,12 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             _fetch_household_buying_power_snapshot,
             run_csp_allocator,
         )
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import (
+            CollectorOrderSink,
+            NullDecisionSink,
+            SQLiteOrderSink,
+        )
         snapshots = await _fetch_household_buying_power_snapshot(ib_conn, disco)
         if not snapshots:
             await status_msg.edit_text(
@@ -11510,15 +11529,30 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         # B5.c-bridge-2: live staging (default) or dry-run via env flag.
+        # ADR-008 MR 2: dry-run is now an in-memory CollectorOrderSink so
+        # the allocator still sees a real OrderSink contract while no row
+        # lands in pending_orders. Byte-identical to pre-MR-2 behavior
+        # (which set staging_callback=None, skipping staging).
         _scan_live = os.getenv("AGT_SCAN_LIVE", "1") == "1"
-        _staging_cb = append_pending_tickets if _scan_live else None
+        if _scan_live:
+            _csp_order_sink = SQLiteOrderSink(
+                staging_fn=append_pending_tickets,
+            )
+        else:
+            _csp_order_sink = CollectorOrderSink()
+        ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id=uuid.uuid4().hex,
+            order_sink=_csp_order_sink,
+            decision_sink=NullDecisionSink(),
+        )
 
         result = run_csp_allocator(
             ray_candidates=candidates,
             snapshots=snapshots,
             vix=vix,
             extras_provider=extras_provider,
-            staging_callback=_staging_cb,
+            ctx=ctx,
         )
 
         # ── 6. Post digest ──

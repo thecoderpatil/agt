@@ -300,6 +300,9 @@ async def _run_csp_scan_pipeline() -> str:
         _fetch_household_buying_power_snapshot,
         run_csp_allocator,
     )
+    from agt_equities.runtime import RunContext, RunMode
+    from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+    import uuid as _uuid
     from agt_equities.scan_extras import (
         fetch_earnings_map,
         build_correlation_pairs,
@@ -380,15 +383,22 @@ async def _run_csp_scan_pipeline() -> str:
         sector_map, earnings_map, correlation_pairs,
     )
 
-    def _cli_csp_staging_cb(tickets):
-        bot.append_pending_tickets(tickets)
+    # ADR-008 MR 2: live ctx -> SQLiteOrderSink forwards tickets to
+    # bot.append_pending_tickets positionally. Byte-identical to the
+    # prior _cli_csp_staging_cb closure.
+    ctx = RunContext(
+        mode=RunMode.LIVE,
+        run_id=_uuid.uuid4().hex,
+        order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
+        decision_sink=NullDecisionSink(),
+    )
 
     result = run_csp_allocator(
         ray_candidates=candidates,
         snapshots=snapshots,
         vix=vix,
         extras_provider=extras_provider,
-        staging_callback=_cli_csp_staging_cb,
+        ctx=ctx,
     )
 
     # ── 7. Report ──
