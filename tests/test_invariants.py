@@ -31,6 +31,9 @@ from agt_equities.invariants.runner import build_context, load_invariants, run_a
 from agt_equities.invariants.types import CheckContext
 
 
+pytestmark = pytest.mark.sprint_a
+
+
 NOW = datetime(2026, 4, 16, 22, 0, 0, tzinfo=timezone.utc)
 
 
