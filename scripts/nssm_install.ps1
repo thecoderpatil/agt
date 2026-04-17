@@ -407,7 +407,7 @@ function Configure-Service {
     Set-NssmKey -Name $Name -Key "AppRestartDelay" -Values @("30000")
 
     if ($AllowLocalSystem) {
-        # Built-in LocalSystem — no password. NSSM accepts bare 'LocalSystem'
+        # Built-in LocalSystem -- no password. NSSM accepts bare 'LocalSystem'
         # as ObjectName.
         Set-NssmKey -Name $Name -Key "ObjectName" -Values @("LocalSystem")
     } else {
