@@ -10,12 +10,12 @@ Architectural contract (M2, 2026-04-11):
     (_scan_and_stage_defensive_rolls, lines ~8768-8861) but for short
     PUTS instead of short calls, and with CSP-specific thresholds.
   - Dual thresholds:
-       profit_pct >= 0.80  AND  dte >= 1   → stage BTC  (next-day)
-       profit_pct >= 0.90  AND  dte <= 1   → stage BTC  (last-day)
+       profit_pct >= 0.80  AND  dte >= 1   â†’ stage BTC  (next-day)
+       profit_pct >= 0.90  AND  dte <= 1   â†’ stage BTC  (last-day)
     where profit_pct = (initial_credit - current_ask) / initial_credit
     and   initial_credit = abs(pos.avgCost) / 100.0
   - Excludes tickers in EXCLUDED_TICKERS (mirror of the telegram_bot.py
-    blocklist — defined locally to preserve the one-way dependency
+    blocklist â€” defined locally to preserve the one-way dependency
     rule: agt_equities.csp_harvest MUST NOT import telegram_bot).
   - Pure threshold check `_should_harvest_csp` has no IB/DB
     dependencies and is fully unit-testable in isolation.
@@ -60,7 +60,7 @@ CSP_HARVEST_THRESHOLD_LAST_DAY = 0.90   # dte <= 1 (0DTE / 1DTE)
 # Ticker blocklist (mirrored from telegram_bot.py:1463)
 # ---------------------------------------------------------------------------
 # Defined here to preserve the one-way dependency rule: csp_harvest must
-# NOT import telegram_bot. Keep in sync manually — there are only 5 entries
+# NOT import telegram_bot. Keep in sync manually â€” there are only 5 entries
 # and the list changes rarely.
 EXCLUDED_TICKERS: frozenset[str] = frozenset(
     {"IBKR", "TRAW.CVR", "SPX", "SLS", "GTLB"}
@@ -92,9 +92,9 @@ def _should_harvest_csp(
       - dte: days to expiration. Used ONLY for E7 expiry-day let-ride gate.
 
     Decision rules (mirrors roll_engine.py E2/E5):
-      - dte <= 0 → NEVER harvest (E7: let it ride on expiry day)
-      - days_held <= 1 AND profit_pct >= 0.80 → harvest (day-1 80%)
-      - days_held >= 2 AND profit_pct >= 0.90 → harvest (standard 90%)
+      - dte <= 0 â†’ NEVER harvest (E7: let it ride on expiry day)
+      - days_held <= 1 AND profit_pct >= 0.80 â†’ harvest (day-1 80%)
+      - days_held >= 2 AND profit_pct >= 0.90 â†’ harvest (standard 90%)
       - If days_held == -1 (unknown), falls back to days_held=2 (the
         more conservative 90% path). This is safe: over-harvesting at 90%
         is conservative vs. the alternative of firing 80% on old positions.
@@ -119,13 +119,13 @@ def _should_harvest_csp(
 
     profit_pct = (ic - ca) / ic
 
-    # E7 fix (2026-04-15): expiry day — let it ride to expiration.
+    # E7 fix (2026-04-15): expiry day â€” let it ride to expiration.
     # Paying the ask spread to close a position expiring worthless is
     # negative EV. Canonical: "on expiry day itself, let it ride."
     if dte <= 0:
         return False, f"expiry_day_let_ride:profit_pct={profit_pct:.3f}"
 
-    # Resolve days_held: -1 means unknown → default to 2 (conservative 90% path)
+    # Resolve days_held: -1 means unknown â†’ default to 2 (conservative 90% path)
     effective_days_held = days_held if days_held >= 0 else 2
 
     # Day-1 rule (80%): position held <= 1 calendar day AND >= 80% profit.
@@ -143,6 +143,10 @@ def _should_harvest_csp(
 
 # ---------------------------------------------------------------------------
 # days_held lookup helper
+# TODO(#10): _lookup_days_held SQL column bugs -- pending_orders query uses bare
+# account_id (should be json_extract(payload,'$.account_id')); master_log_trades
+# uses t.ticker/t.asset_class/t.action (should be t.symbol/t.asset_category/
+# t.buy_sell). Helper always returns -1 until fixed. Tracked as backlog ticket #10.
 # ---------------------------------------------------------------------------
 
 def _lookup_days_held(
@@ -212,7 +216,7 @@ def _lookup_days_held(
     except Exception as exc:
         logger.debug("_lookup_days_held failed for %s/%s: %s", account_id, ticker, exc)
 
-    return -1  # Unknown — _should_harvest_csp will use conservative 90% path
+    return -1  # Unknown â€” _should_harvest_csp will use conservative 90% path
 
 
 # ---------------------------------------------------------------------------
@@ -233,25 +237,25 @@ async def scan_csp_harvest_candidates(
         cancelMktData, reqMarketDataType).
     staging_callback :
         Optional callable invoked with a list of ticket dicts. If
-        None, tickets are NOT persisted — only collected in the
+        None, tickets are NOT persisted â€” only collected in the
         returned `staged` list. Real callers (telegram_bot.cmd_csp_harvest)
         inject a wrapper around append_pending_tickets.
 
     Returns
     -------
     dict with keys:
-        staged  : list[dict]  — BTC tickets that were staged
-        skipped : list[dict]  — positions that did NOT meet threshold
+        staged  : list[dict]  â€” BTC tickets that were staged
+        skipped : list[dict]  â€” positions that did NOT meet threshold
                                 (includes reason)
-        errors  : list[dict]  — positions that raised during probe
-        alerts  : list[str]   — human-readable status lines
+        errors  : list[dict]  â€” positions that raised during probe
+        alerts  : list[str]   â€” human-readable status lines
 
     Mirrors telegram_bot.py _scan_and_stage_defensive_rolls STATE_2
     HARVEST flow (lines 8768-8869) with these adjustments:
       - Filters for short PUTS (right == "P") not calls
       - Uses _should_harvest_csp thresholds instead of pnl_pct >= 0.85
       - mode="CSP_HARVEST" tags the ticket for execution-gate routing
-      - No spot fetch, no Greeks, no ledger — pure profit-take
+      - No spot fetch, no Greeks, no ledger â€” pure profit-take
     """
     result: dict[str, list] = {
         "staged": [],
@@ -291,4 +295,115 @@ async def scan_csp_harvest_candidates(
         ticker = pos.contract.symbol.upper()
         strike = float(pos.contract.strike)
         qty = abs(int(pos.position))
- 
+        acct_id = getattr(pos, "account", "")
+        household = ACCOUNT_TO_HOUSEHOLD.get(acct_id, "")
+
+        # DTE
+        exp_fmt = str(pos.contract.lastTradeDateOrContractMonth)
+        try:
+            exp_date = _date(int(exp_fmt[:4]), int(exp_fmt[4:6]), int(exp_fmt[6:8]))
+            dte = (exp_date - today).days
+        except (ValueError, TypeError):
+            result["skipped"].append({
+                "ticker": ticker, "account_id": acct_id,
+                "reason": f"bad_expiry:{exp_fmt}",
+            })
+            continue
+        if dte < 0:
+            result["skipped"].append({
+                "ticker": ticker, "account_id": acct_id,
+                "reason": f"expired:dte={dte}",
+            })
+            continue
+
+        days_held = _lookup_days_held(acct_id, ticker, strike, exp_fmt, today)
+        # Qualify + market data probe
+        try:
+            qual_contracts = await ib_conn.qualifyContractsAsync(pos.contract)
+        except Exception as qexc:
+            logger.warning("csp_harvest: qualifyContractsAsync(%s) failed: %s", ticker, qexc)
+            result["errors"].append({"ticker": ticker, "account_id": acct_id, "error": str(qexc)})
+            continue
+        if not qual_contracts:
+            result["skipped"].append({
+                "ticker": ticker, "account_id": acct_id,
+                "reason": "qualify_empty",
+            })
+            continue
+
+        try:
+            ticker_data = ib_conn.reqMktData(qual_contracts[0], "", False, False)
+            await asyncio.sleep(2)  # Linear wait acceptable for EOD watchdog (<10 positions)
+            ask = getattr(ticker_data, "ask", getattr(ticker_data, "delayedAsk", None))
+            try:
+                ib_conn.cancelMktData(qual_contracts[0])
+            except Exception:
+                pass
+        except Exception as mdexc:
+            logger.warning("csp_harvest: reqMktData(%s) failed: %s", ticker, mdexc)
+            result["errors"].append({"ticker": ticker, "account_id": acct_id, "error": str(mdexc)})
+            continue
+
+        if ask is None or (isinstance(ask, float) and math.isnan(ask)):
+            result["skipped"].append({
+                "ticker": ticker, "account_id": acct_id,
+                "reason": "ask_unavailable",
+            })
+            continue
+
+        initial_credit = abs(float(getattr(pos, "avgCost", 0.0) or 0.0)) / 100.0
+        should, reason = _should_harvest_csp(initial_credit, float(ask), dte, days_held=days_held)
+
+        if not should:
+            result["skipped"].append({
+                "ticker": ticker, "account_id": acct_id,
+                "strike": strike, "dte": dte,
+                "initial_credit": initial_credit, "ask": float(ask),
+                "reason": reason,
+            })
+            continue
+
+        ticket = {
+            "timestamp": _datetime.now().isoformat(),
+            "account_id": acct_id,
+            "household": household,
+            "ticker": ticker,
+            "sec_type": "OPT",
+            "action": "BUY",
+            "order_type": "LMT",
+            "right": "P",
+            "strike": strike,
+            "expiry": exp_fmt,
+            "quantity": qty,
+            "limit_price": round(float(ask), 2),
+            "status": "staged",
+            "transmit": True,
+            "strategy": "CSP Harvest BTC",
+            "mode": "CSP_HARVEST",
+            "origin": "csp_harvest",
+            "days_held": days_held,
+            "v2_rationale": (
+                f"{reason} initial_credit={initial_credit:.2f} "
+                f"ask={float(ask):.2f} dte={dte}"
+            ),
+        }
+
+        if staging_callback is not None:
+            try:
+                maybe = staging_callback([ticket])
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            except Exception as sexc:
+                logger.warning("csp_harvest: staging_callback(%s) failed: %s", ticker, sexc)
+                result["errors"].append({
+                    "ticker": ticker, "account_id": acct_id, "error": str(sexc),
+                })
+                continue
+
+        result["staged"].append(ticket)
+        result["alerts"].append(
+            f"[CSP HARVEST] {ticker} -{qty}p ${strike:.0f} "
+            f"{exp_fmt} ({dte}d) | {reason}"
+        )
+
+    return result
