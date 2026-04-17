@@ -94,6 +94,12 @@ The Linux sandbox and Windows working tree fight over `.git/index.lock`.
    `GET /projects/:id/repository/files/:path/raw?ref=main`
 3. Apply the patch to a `/tmp/` copy of the raw bytes
 4. Verify: `wc -l`, `ast.parse`, sentinel `grep`, byte-length check
+4a. Before POST /repository/commits — run precommit_loc_gate:
+    python scripts/precommit_loc_gate.py \
+      --dispatch reports/<topic>_dispatch_<date>.md \
+      --staged /tmp/<file1>,/tmp/<file2>,...
+    Halts if actual delta diverges from declared expectation
+    without a `shrinking:` clause. NO BYPASS.
 5. `POST /projects/:id/repository/commits` with `actions: [{action:update,
    file_path, content, encoding:base64}]`
 6. Open MR: `POST /merge_requests` with target=main, source=feature-branch,
