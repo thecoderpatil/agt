@@ -66,3 +66,23 @@ Portfolio_Risk_Rulebook_v8.md
 
 # ADR-007: prose directive retired, machine-readable incidents table replaces it
 _WEEKLY_ARCHITECT_DIRECTIVE.md
+
+# MR !84: hygiene expansion so NO_LOCAL_DRIFT does not fire on operational noise.
+# Reports are transient; pre-commit scaffolding scripts are temporary.
+reports/
+scripts/_*.py
+scripts/_*.txt
+scripts/_*.sh
+*.diff
+*.patch
+.coverage
+coverage.xml
+htmlcov/
+
+# Windows operator scratch
+bot_output.txt
+bot_output_*.log
+*.log.tmp
+
+# Transcripts / local notes
+.claude-cowork-notes.md.bak

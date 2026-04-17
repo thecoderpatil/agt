@@ -18,6 +18,7 @@ import pytest
 from agt_equities.invariants.checks import (
     check_no_below_basis_cc,
     check_no_live_in_paper,
+    check_no_local_drift,
     check_no_missing_daemon_heartbeat,
     check_no_orphan_children,
     check_no_silent_breaker_trip,
@@ -366,6 +367,107 @@ def test_no_missing_heartbeat_pass_fresh(conn, ctx):
         (fresh,),
     )
     assert check_no_missing_daemon_heartbeat(conn, ctx) == []
+
+
+# --- 11. NO_LOCAL_DRIFT ----------------------------------------------------------
+def test_no_local_drift_no_git_repo_returns_empty(conn, ctx, monkeypatch, tmp_path):
+    """When AGT_REPO_PATH points at a non-git dir, check returns [] cleanly."""
+    monkeypatch.setenv("AGT_REPO_PATH", str(tmp_path))
+    assert check_no_local_drift(conn, ctx) == []
+
+
+def test_no_local_drift_clean_tree_returns_empty(conn, ctx, monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setenv("AGT_REPO_PATH", str(tmp_path))
+    import agt_equities.invariants.checks as checks_mod
+
+    class _R:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(*a, **kw):
+        return _R()
+
+    monkeypatch.setattr(checks_mod.subprocess, "run", fake_run)
+    assert check_no_local_drift(conn, ctx) == []
+
+
+def test_no_local_drift_exempt_files_filtered(conn, ctx, monkeypatch, tmp_path):
+    """All 4 TRIPWIRE_EXEMPT_REGISTRY paths + ignored prefixes must NOT trip."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setenv("AGT_REPO_PATH", str(tmp_path))
+    import agt_equities.invariants.checks as checks_mod
+
+    stdout = (
+        " M boot_desk.bat\n"
+        " M cure_lifecycle.html\n"
+        " M cure_smart_friction.html\n"
+        " M tests/test_command_prune.py\n"
+        "?? reports/foo.log\n"
+        "?? tmp/scratch.txt\n"
+    )
+
+    class _R:
+        returncode = 0
+        stderr = ""
+
+    r = _R()
+    r.stdout = stdout
+
+    monkeypatch.setattr(checks_mod.subprocess, "run", lambda *a, **kw: r)
+    assert check_no_local_drift(conn, ctx) == []
+
+
+def test_no_local_drift_unexempt_file_trips(conn, ctx, monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setenv("AGT_REPO_PATH", str(tmp_path))
+    import agt_equities.invariants.checks as checks_mod
+
+    class _R:
+        returncode = 0
+        stdout = " M agt_equities/trade_repo.py\n"
+        stderr = ""
+
+    monkeypatch.setattr(checks_mod.subprocess, "run", lambda *a, **kw: _R())
+    vios = check_no_local_drift(conn, ctx)
+    assert len(vios) == 1
+    assert vios[0].invariant_id == "NO_LOCAL_DRIFT"
+    assert vios[0].evidence["drift_count"] == 1
+    assert vios[0].evidence["drift_sample"][0]["path"] == "agt_equities/trade_repo.py"
+
+
+def test_no_local_drift_subprocess_raises_degraded(conn, ctx, monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setenv("AGT_REPO_PATH", str(tmp_path))
+    import agt_equities.invariants.checks as checks_mod
+    import subprocess as _sp
+
+    def boom(*a, **kw):
+        raise _sp.SubprocessError("git gone")
+
+    monkeypatch.setattr(checks_mod.subprocess, "run", boom)
+    vios = check_no_local_drift(conn, ctx)
+    assert len(vios) == 1
+    assert vios[0].evidence.get("degraded") is True
+    assert vios[0].severity == "low"
+
+
+def test_no_local_drift_nonzero_returncode_degraded(conn, ctx, monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setenv("AGT_REPO_PATH", str(tmp_path))
+    import agt_equities.invariants.checks as checks_mod
+
+    class _R:
+        returncode = 128
+        stdout = ""
+        stderr = "fatal: not a git repository"
+
+    monkeypatch.setattr(checks_mod.subprocess, "run", lambda *a, **kw: _R())
+    vios = check_no_local_drift(conn, ctx)
+    assert len(vios) == 1
+    assert vios[0].evidence.get("degraded") is True
+    assert "fatal" in vios[0].evidence.get("stderr", "")
 
 
 # --- Runner + manifest integration ---------------------------------------------

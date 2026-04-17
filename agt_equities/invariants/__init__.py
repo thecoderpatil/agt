@@ -6,12 +6,14 @@ Public surface:
     CHECK_REGISTRY - id -> function map
 """
 from .runner import build_context, load_invariants, run_all
+from .tick import check_invariants_tick
 from .types import CheckContext, Violation
 
 __all__ = [
     "CheckContext",
     "Violation",
     "build_context",
+    "check_invariants_tick",
     "load_invariants",
     "run_all",
 ]
