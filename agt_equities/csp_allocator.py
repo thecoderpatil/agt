@@ -53,6 +53,7 @@ from agt_equities.fa_block_margin import (
     format_allocation_digest,
 )
 from agt_equities.runtime import RunContext
+from agt_equities import csp_decisions_repo
 
 logger = logging.getLogger(__name__)
 
@@ -819,6 +820,19 @@ CSP_GATE_REGISTRY: list[tuple[str, CSPGate]] = [
 ]
 
 
+def _candidate_evidence(candidate) -> dict:
+    """Snapshot candidate's decision-relevant inputs for audit trail."""
+    return {
+        "ticker": getattr(candidate, "ticker", None),
+        "sector": getattr(candidate, "sector", None),
+        "delta": getattr(candidate, "delta", None),
+        "ivr": getattr(candidate, "ivr", None),
+        "dte": getattr(candidate, "dte", None),
+        "strike": getattr(candidate, "strike", None),
+        "premium": getattr(candidate, "premium", None),
+        "earnings_date": getattr(candidate, "earnings_date", None),
+    }
+
 
 # ---------------------------------------------------------------------------
 # M1.4: run_csp_allocator orchestrator + AllocatorResult
@@ -1195,9 +1209,22 @@ def _process_one(
     # Gate check uses n=1 as a feasibility probe; real sizing is below.
     # This keeps gate semantics "can this household take ANY contracts"
     # rather than "can it take N specific contracts."
+    verdicts: list[dict] = []
     for gate_name, gate_fn in CSP_GATE_REGISTRY:
         passed, reason = gate_fn(hh, candidate, 1, vix, extras)
+        verdicts.append({"gate": gate_name, "ok": passed, "reason": reason})
         if not passed:
+            csp_decisions_repo.record_decision(
+                run_id=ctx.run_id,
+                household_id=hh_name,
+                ticker=candidate.ticker,
+                final_outcome=f"rejected_by_{gate_name}",
+                gate_verdicts=verdicts,
+                evidence_snapshot=_candidate_evidence(candidate),
+                n_requested=None,
+                n_sized=None,
+                db_path=ctx.db_path,
+            )
             result.skipped.append({
                 "household": hh_name,
                 "ticker": candidate.ticker,
@@ -1281,6 +1308,23 @@ def _process_one(
     result.staged.extend(tickets)
     total_contracts = sum(t["quantity"] for t in tickets)
     _record("staged", "", tickets=len(tickets), contracts=total_contracts)
+
+    # Audit trail for staged candidate (fail-open; record_decision swallows
+    # sqlite errors at WARNING). Enrich ticket payload with gate_verdicts
+    # so pending_orders.payload carries the full decision trace.
+    for t in tickets:
+        t["gate_verdicts"] = verdicts
+    csp_decisions_repo.record_decision(
+        run_id=ctx.run_id,
+        household_id=hh_name,
+        ticker=candidate.ticker,
+        final_outcome="staged",
+        gate_verdicts=verdicts,
+        evidence_snapshot=_candidate_evidence(candidate),
+        n_requested=None,
+        n_sized=n_contracts,
+        db_path=ctx.db_path,
+    )
 
     # Step 6: mutate snapshot to prevent double-booking
     collateral_per_contract = candidate.strike * 100
