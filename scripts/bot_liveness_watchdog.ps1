@@ -1,32 +1,40 @@
 <#
 .SYNOPSIS
-AGT bot liveness watchdog. MR #2.
+AGT bot liveness watchdog. MR #2 + Sprint A MR2 respawn.
 
 .DESCRIPTION
 Reads the most recent 'agt_bot' heartbeat from daemon_heartbeat, computes
-age in seconds. If older than STALE_SECS (default 180), enqueues a crit
+age in seconds. If older than StaleSecs (default 180), enqueues a crit
 alert on cross_daemon_alerts so the bot's own drain loop surfaces it to
 Telegram + Gmail drafts. If the row is missing entirely (age=NULL) the
-watchdog also enqueues.
+watchdog also enqueues. If the alert was enqueued AND no python process
+is running telegram_bot.py, this script then respawns the bot via
+scripts\respawn_bot.ps1 (Sprint A MR2 addition -- was enqueue-only in
+the original MR #2 ship).
 
 Registered by scripts/register_watchdog_schtask.ps1 to run every 5 min
 during RTH. Safe to run outside RTH - the only side effect on a stale
-detection is a row in cross_daemon_alerts, which is cheap.
+detection is a row in cross_daemon_alerts + a headless respawn.
 
 Reads DB read-only. Writes are guarded by a single INSERT with
-busy_timeout=15000 per FU-A convention. Never touches IB. Never touches
-the bot process directly.
+busy_timeout=15000 per FU-A convention. Never touches IB. Respawn is
+guarded by a process-existence check (Get-CimInstance Win32_Process) so
+repeat ticks while init is in flight do not fork a second instance and
+collide on the singleton lockfile.
 
 .NOTES
-- Exit 0: healthy or alert enqueued successfully.
-- Exit 1: could not open DB (disk or path problem - log + return).
-- Exit 2: alert insert failed after DB read succeeded.
+- Exit 0: healthy, or alert+respawn succeeded (or respawn skipped due to
+  live process).
+- Exit 1: could not open DB.
+- Exit 2: alert insert failed after DB read.
+- Exit 3: respawn invocation failed (alert was still enqueued).
 #>
 
 param(
-    [string]$DbPath    = "C:\AGT_Telegram_Bridge\agt_desk.db",
-    [int]   $StaleSecs = 180,
-    [string]$LogFile   = "C:\AGT_Telegram_Bridge\logs\bot_liveness_watchdog.log"
+    [string]$DbPath        = "C:\AGT_Telegram_Bridge\agt_desk.db",
+    [int]   $StaleSecs     = 180,
+    [string]$LogFile       = "C:\AGT_Telegram_Bridge\logs\bot_liveness_watchdog.log",
+    [string]$RespawnScript = "C:\AGT_Telegram_Bridge\scripts\respawn_bot.ps1"
 )
 
 $ErrorActionPreference = "Continue"
@@ -127,12 +135,14 @@ $nowTs      = [int][double]::Parse((Get-Date -UFormat %s))
 
 $insertQ = "INSERT INTO cross_daemon_alerts(created_ts, kind, severity, payload_json, status, attempts) VALUES ($nowTs, 'BOT_STALE', 'crit', '$payloadSql', 'pending', 0);"
 
+$insertFailed = $false
 if ($sqlite) {
     try {
         $null = & $sqlite.Path $DbPath ".timeout 15000" $insertQ 2>$null
+        if ($LASTEXITCODE -ne 0) { $insertFailed = $true }
     } catch {
         Write-Log "ERROR alert_insert sqlite3 $_"
-        exit 2
+        $insertFailed = $true
     }
 } else {
     $pyIns = @"
@@ -150,15 +160,53 @@ except Exception as e:
 "@
     try {
         $out = & py -3 -c $pyIns $DbPath $insertQ 2>$null
+        if ($LASTEXITCODE -ne 0) { $insertFailed = $true }
     } catch {
         try {
             $out = & python -c $pyIns $DbPath $insertQ 2>$null
+            if ($LASTEXITCODE -ne 0) { $insertFailed = $true }
         } catch {
             Write-Log "ERROR alert_insert no_python"
-            exit 2
+            $insertFailed = $true
         }
     }
 }
 
-Write-Log "STALE age_sec=$ageSec -- BOT_STALE crit alert enqueued"
-exit 0
+Write-Log "STALE age_sec=$ageSec -- BOT_STALE crit alert enqueued=$(-not $insertFailed)"
+
+# ---------------------------------------------------------------------------
+# Sprint A MR2: respawn the bot if no python telegram_bot.py is running.
+# Guarded by Get-CimInstance so repeat ticks during init don't fork a
+# second instance (singleton lockfile would abort the dupe anyway, but
+# noisy log spam).
+# ---------------------------------------------------------------------------
+$existing = $null
+try {
+    $existing = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and $_.CommandLine -match 'telegram_bot\.py' }
+} catch {
+    Write-Log "WARN cim_query_failed: $($_.Exception.Message)"
+}
+
+if ($existing) {
+    $procPids = ($existing | ForEach-Object { $_.ProcessId }) -join ','
+    Write-Log "respawn skipped: telegram_bot.py already running pid=$procPids (heartbeat stalled but process live)"
+    exit 0
+}
+
+if (-not (Test-Path $RespawnScript)) {
+    Write-Log "ERROR respawn_script_missing path=$RespawnScript"
+    exit 3
+}
+
+try {
+    Start-Process -FilePath "powershell.exe" `
+        -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File","`"$RespawnScript`"" `
+        -WindowStyle Hidden `
+        -PassThru | Out-Null
+    Write-Log "respawn invoked: $RespawnScript"
+    exit 0
+} catch {
+    Write-Log "ERROR respawn_invoke_failed: $($_.Exception.Message)"
+    exit 3
+}
