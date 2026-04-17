@@ -1,0 +1,59 @@
+# AGT production runtime dependency manifest.
+#
+# MR !84 context: 2026-04-17, after pyyaml 6.0.3 had to be hand-installed
+# into the production venv when the ADR-007 Step 2 `agt_equities/invariants/
+# runner.py::load_invariants` import chain went live. requirements-ci.txt
+# covered it for GitLab CI, but production had no pin record, so the bot
+# silently started logging "invariants import failed; skipping tick" on
+# every heartbeat until the hand-fix. See `feedback_pyyaml_runtime_cascade.md`.
+#
+# RULE: every top-level third-party import in `agt_scheduler.py`,
+# `telegram_bot.py`, or any module reachable from them (agt_equities/**,
+# scripts/* loaded by scheduler tasks) MUST appear in this manifest. The
+# `dep_drift_check` CI job fails when a module can't be imported after
+# installing ONLY this manifest -- that's the blast-door on silent runtime
+# drift.
+#
+# Pin style: loose constraints. Production is a single Windows box running
+# a specific venv; we pin tight in that venv, not here. The manifest's job
+# is to make "the minimum set of things that must resolve" enforceable and
+# diffable, not to reproduce the exact installed set.
+#
+# If you need to add a new runtime dep, add it here FIRST, then pip install
+# it into `C:\AGT_Telegram_Bridge\.venv`, then restart the bot. Skipping
+# this order is how we ended up patching pyyaml in at 2AM.
+
+# --- Core runtime deps reachable from agt_scheduler or telegram_bot ---
+
+# invariants manifest loader
+pyyaml>=6.0
+
+# IBKR async client (agt_scheduler, ib_conn, telegram_bot)
+ib_async>=2.1
+
+# Scheduler runtime
+apscheduler>=3.11
+
+# Bot runtime
+python-telegram-bot>=21
+nest_asyncio>=1.6
+python-dotenv>=1.0
+
+# Anthropic SDK (Opus review, weekly digest, author/critic LLM)
+anthropic>=0.40
+
+# Market data
+finnhub-python>=2.4
+yfinance>=0.2
+pandas>=2.0
+pytz>=2024.1
+
+# Process introspection (check_no_zombie_bot_process)
+psutil>=5.9
+
+# HTTP (GitLab API paths in scripts/)
+requests>=2.31
+
+# Cure Console scaffolding (FastAPI placeholder)
+fastapi>=0.100
+uvicorn>=0.20

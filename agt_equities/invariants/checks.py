@@ -55,11 +55,27 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 
 # ---- 1. NO_LIVE_IN_PAPER -------------------------------------------------------
+# MR !84: exclude terminal-status rows. A pending_orders row whose status is
+# one of (superseded, rejected, cancelled, failed, filled) is a historical
+# artifact, not a live safety hazard -- IBKR rejected/cancelled/superseded
+# paths already resolved without a live account hitting the tape, and a
+# filled paper row doesn't name a live account in the filled state. The
+# invariant exists to catch *stageable* rows still in the execution pipeline.
+# Keep 'partially_filled' in scope since partial fills can still route more.
+_NO_LIVE_IN_PAPER_TERMINAL_STATUSES = (
+    "superseded", "rejected", "cancelled", "failed", "filled",
+)
+
 def check_no_live_in_paper(conn: sqlite3.Connection, ctx: CheckContext) -> list[Violation]:
     """When PAPER_MODE is on, no pending_orders row may name a live account."""
     if not ctx.paper_mode:
         return []
-    rows = conn.execute("SELECT id, payload, created_at FROM pending_orders").fetchall()
+    placeholders = ",".join("?" * len(_NO_LIVE_IN_PAPER_TERMINAL_STATUSES))
+    sql = (
+        f"SELECT id, payload, created_at, status FROM pending_orders "
+        f"WHERE status NOT IN ({placeholders})"
+    )
+    rows = conn.execute(sql, _NO_LIVE_IN_PAPER_TERMINAL_STATUSES).fetchall()
     vios: list[Violation] = []
     for row in rows:
         p = _parse_payload(row["payload"])
@@ -69,13 +85,14 @@ def check_no_live_in_paper(conn: sqlite3.Connection, ctx: CheckContext) -> list[
                 invariant_id="NO_LIVE_IN_PAPER",
                 description=(
                     f"Live account {acct} found in pending_orders row "
-                    f"#{row['id']} under PAPER_MODE"
+                    f"#{row['id']} under PAPER_MODE (status={row['status']})"
                 ),
                 severity="critical",
                 evidence={
                     "pending_order_id": row["id"],
                     "account_id": acct,
                     "ticker": p.get("ticker"),
+                    "status": row["status"],
                     "created_at": row["created_at"],
                 },
             ))
@@ -392,7 +409,15 @@ def check_no_zombie_bot_process(
 def check_no_stale_red_alert(
     conn: sqlite3.Connection, ctx: CheckContext
 ) -> list[Violation]:
-    """red_alert_state=ON for more than 2x the stale TTL without recompute."""
+    """red_alert_state=ON for more than 2x the stale TTL without recompute.
+
+    MR !84: incident_key stabilized to ``NO_STALE_RED_ALERT:<household>`` via
+    ``Violation.stable_key`` so repeated ticks on the same stale alert bump
+    ``consecutive_breaches`` on a single canonical row instead of INSERTing
+    a fresh row every 60s. Pre-fix: ~2 rows/min unbounded growth driven by
+    time-varying ``age_hours`` in the evidence fingerprint. The age info is
+    still carried in the description string for operator readability.
+    """
     if not _table_exists(conn, "red_alert_state"):
         return []
     rows = conn.execute(
@@ -407,19 +432,21 @@ def check_no_stale_red_alert(
             continue
         age_s = (ctx.now_utc - activated).total_seconds()
         if age_s > threshold_s:
+            household = row["household"]
             vios.append(Violation(
                 invariant_id="NO_STALE_RED_ALERT",
                 description=(
-                    f"red_alert_state ON for {row['household']} since "
+                    f"red_alert_state ON for {household} since "
                     f"{row['activated_at']} ({age_s/3600:.0f}h, never recomputed)"
                 ),
                 severity="medium",
                 evidence={
-                    "household": row["household"],
-                    "age_hours": age_s / 3600,
+                    "household": household,
                     "activated_at": row["activated_at"],
+                    "age_hours": age_s / 3600,
                     "last_updated": row["last_updated"],
                 },
+                stable_key=f"NO_STALE_RED_ALERT:{household}",
             ))
     return vios
 
