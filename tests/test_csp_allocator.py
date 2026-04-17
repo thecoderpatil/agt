@@ -1290,20 +1290,21 @@ class TestVixAccelerationGate:
 # Registry structural test
 # ---------------------------------------------------------------------------
 
-def test_registry_contains_all_seven_gates_in_order():
+def test_registry_contains_all_eight_gates_in_order():
     """CSP_GATE_REGISTRY names must match the expected list in order."""
     expected = [
         "rule_1_concentration",
         "rule_2_el_deployment",
         "vix_acceleration",
         "rule_3_sector",
+        "rule_3b_excluded_sector",
         "rule_4_correlation",
         "rule_6_vikram_el_floor",
         "rule_7_csp_procedure",
     ]
     actual = [name for name, _ in CSP_GATE_REGISTRY]
     assert actual == expected
-    assert len(CSP_GATE_REGISTRY) == 7
+    assert len(CSP_GATE_REGISTRY) == 8
     # All entries must be callable with the uniform gate signature
     hh = _fake_hh_snapshot()
     cand = _fake_candidate(ticker="AAPL", strike=150.0)
