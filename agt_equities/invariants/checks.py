@@ -373,6 +373,51 @@ def check_no_silent_breaker_trip(
 
 
 # ---- 7. NO_ZOMBIE_BOT_PROCESS --------------------------------------------------
+def _collapse_venv_launcher_pairs(
+    candidates: list[tuple[int, int | None, str]],
+) -> list[int]:
+    """Drop Windows venv-launcher (parent, child) duplicates from a candidate list.
+
+    On Windows, running ``python.exe telegram_bot.py`` under a ``.venv`` spawns
+    an inner interpreter with an identical command line (the launcher wraps the
+    real process). Both show up in ``psutil.process_iter`` with a parent/child
+    ppid relationship but the SAME cmdline. That is a single logical bot
+    instance, not a singleton-lock violation.
+
+    Algorithm:
+        Build a ``{pid: (ppid, cmdline)}`` map of candidates. A candidate is a
+        launcher child iff its ``ppid`` is also a candidate AND the two
+        cmdlines are byte-equal. Drop the child, keep the parent.
+
+    Evidence trail: MR !84 restart showed PID 5756 (ppid 11292) and PID 4508
+    (ppid 5756) both running the same ``.venv\\Scripts\\python.exe
+    telegram_bot.py`` command; the child was spawned ~70ms after the parent.
+    That pair triggered NO_ZOMBIE_BOT_PROCESS falsely (incident 412).
+
+    Args:
+        candidates: list of ``(pid, ppid, cmdline)`` tuples. ``ppid`` may be
+            ``None`` when psutil could not resolve a parent.
+
+    Returns:
+        List of pids for distinct logical bot instances (parents kept, launcher
+        children dropped). Order preserved from input for stability.
+    """
+    pid_info: dict[int, tuple[int | None, str]] = {
+        pid: (ppid, cmd) for pid, ppid, cmd in candidates
+    }
+    keep: list[int] = []
+    for pid, ppid, cmd in candidates:
+        if (
+            ppid is not None
+            and ppid in pid_info
+            and pid_info[ppid][1] == cmd
+        ):
+            # launcher child of a same-cmdline parent in the candidate set; drop
+            continue
+        keep.append(pid)
+    return keep
+
+
 def check_no_zombie_bot_process(
     conn: sqlite3.Connection, ctx: CheckContext
 ) -> list[Violation]:
@@ -387,14 +432,20 @@ def check_no_zombie_bot_process(
     pids: list[int] = []
     try:
         import psutil  # type: ignore
-        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        candidates: list[tuple[int, int | None, str]] = []
+        for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline"]):
             try:
                 cmd = " ".join(proc.info.get("cmdline") or [])
                 name = (proc.info.get("name") or "").lower()
                 if "python" in name and "telegram_bot.py" in cmd:
-                    pids.append(proc.info["pid"])
+                    candidates.append(
+                        (proc.info["pid"], proc.info.get("ppid"), cmd)
+                    )
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+        # MR !86: collapse Windows venv-launcher (parent, child) duplicates;
+        # they share the same cmdline and represent one logical bot instance.
+        pids = _collapse_venv_launcher_pairs(candidates)
     except ImportError:
         cmd_line = (
             ["tasklist", "/FO", "CSV", "/V"]
