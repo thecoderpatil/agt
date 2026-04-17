@@ -20,14 +20,14 @@ Architectural contract (M2, 2026-04-11):
   - Pure threshold check `_should_harvest_csp` has no IB/DB
     dependencies and is fully unit-testable in isolation.
   - Scanner `scan_csp_harvest_candidates` is an async function that
-    receives the IB connection as a parameter (no module-level
-    singleton) and optionally an injected staging callback so tests
-    can supply a list-append sink instead of the real
-    append_pending_tickets DB writer.
+    receives the IB connection and a RunContext (ctx). ctx.order_sink
+    replaces the former staging_callback; callers construct the
+    appropriate sink (SQLiteOrderSink for live, CollectorOrderSink
+    for shadow mode).
 
 This module does NOT import from telegram_bot.py. The /csp_harvest
-handler in telegram_bot.py is a thin shim that imports THIS module
-and passes a staging_callback that wraps append_pending_tickets.
+handler in telegram_bot.py constructs a RunContext with
+SQLiteOrderSink(staging_fn=append_pending_tickets) and passes ctx=ctx.
 """
 from __future__ import annotations
 
@@ -36,10 +36,11 @@ import logging
 import math
 from datetime import date as _date
 from datetime import datetime as _datetime
-from typing import Any, Callable
+from typing import Any
 
 from agt_equities.config import ACCOUNT_TO_HOUSEHOLD
 from agt_equities.dates import et_today
+from agt_equities.runtime import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +226,8 @@ def _lookup_days_held(
 
 async def scan_csp_harvest_candidates(
     ib_conn: Any,
-    staging_callback: Callable[[list[dict]], Any] | None = None,
+    *,
+    ctx: RunContext,
 ) -> dict:
     """Scan open short puts across all accounts and stage BTC tickets.
 
@@ -235,11 +237,10 @@ async def scan_csp_harvest_candidates(
         An active ib_async IB connection (duck-typed: needs
         reqPositionsAsync, qualifyContractsAsync, reqMktData,
         cancelMktData, reqMarketDataType).
-    staging_callback :
-        Optional callable invoked with a list of ticket dicts. If
-        None, tickets are NOT persisted â€” only collected in the
-        returned `staged` list. Real callers (telegram_bot.cmd_csp_harvest)
-        inject a wrapper around append_pending_tickets.
+    ctx :
+        RunContext carrying the order_sink. ctx.order_sink.stage() is
+        called for each qualifying position. Use SQLiteOrderSink for
+        live execution, CollectorOrderSink for shadow-mode dry runs.
 
     Returns
     -------
@@ -388,18 +389,22 @@ async def scan_csp_harvest_candidates(
             ),
         }
 
-        if staging_callback is not None:
-            try:
-                maybe = staging_callback([ticket])
-                if asyncio.iscoroutine(maybe):
-                    await maybe
-            except Exception as sexc:
-                logger.warning("csp_harvest: staging_callback(%s) failed: %s", ticker, sexc)
-                result["errors"].append({
-                    "ticker": ticker, "account_id": acct_id, "error": str(sexc),
-                })
-                continue
-
+        ctx.order_sink.stage(
+            [ticket],
+            engine="csp_harvest",
+            run_id=ctx.run_id,
+            meta={
+                "account_id":   ticket["account_id"],
+                "household":    ticket["household"],
+                "ticker":       ticket["ticker"],
+                "strike":       ticket["strike"],
+                "expiry":       ticket["expiry"],
+                "quantity":     ticket["quantity"],
+                "limit_price":  ticket["limit_price"],
+                "days_held":    ticket["days_held"],
+                "v2_rationale": ticket["v2_rationale"],
+            },
+        )
         result["staged"].append(ticket)
         result["alerts"].append(
             f"[CSP HARVEST] {ticker} -{qty}p ${strike:.0f} "

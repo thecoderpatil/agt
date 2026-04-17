@@ -194,6 +194,43 @@ def _run_csp_engine(ctx: RunContext) -> None:
     )
 
 
+
+def _run_harvest_engine(ctx: RunContext) -> None:
+    """Invoke ``scan_csp_harvest_candidates`` under the shadow ctx.
+
+    MR 3 scope: exercise the ctx seam mechanically. Passes empty
+    positions so the scan short-circuits without touching IB.
+    Full IB-connect + positions fetch deferred to pipeline extraction MR.
+    """
+    import asyncio
+    try:
+        from agt_equities.csp_harvest import scan_csp_harvest_candidates
+    except ImportError as exc:  # pragma: no cover - defensive
+        sys.stderr.write(
+            f"[shadow_scan] csp_harvest import failed: {exc}\n"
+        )
+        return
+
+    class _EmptyIB:
+        async def reqPositionsAsync(self): return []
+
+    try:
+        result = asyncio.run(
+            scan_csp_harvest_candidates(_EmptyIB(), ctx=ctx)
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[shadow_scan] scan_csp_harvest_candidates raised: {exc}\n"
+        )
+        return
+
+    n_staged = len(result.get("staged", []))
+    sys.stdout.write(
+        f"[shadow_scan] harvest: scan completed ctx.run_id={ctx.run_id} "
+        f"staged={n_staged} "
+        "(empty-positions invocation; full IB pipeline follow-up scope)\n"
+    )
+
 def run_engines_stub(ctx: RunContext, engine: str) -> None:
     """Dispatch to per-engine shadow branches.
 
@@ -202,6 +239,7 @@ def run_engines_stub(ctx: RunContext, engine: str) -> None:
     """
     wired: dict[str, callable] = {
         "csp": _run_csp_engine,
+        "harvest": _run_harvest_engine,
     }
 
     def _stub(_ctx: RunContext, engine_name: str) -> None:
