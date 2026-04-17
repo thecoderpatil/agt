@@ -1,0 +1,102 @@
+# ADR-007 Self-Healing Loop - canonical invariant manifest.
+#
+# Replaces the prose "_WEEKLY_ARCHITECT_DIRECTIVE.md" deleted in commit
+# 30ea993a. Every invariant has a Python check function registered in
+# agt_equities.invariants.checks.CHECK_REGISTRY. The runner
+# (agt_equities.invariants.runner.run_all) loads this manifest, dispatches
+# to each check, and collects Violations.
+#
+# SCRUTINY TIERS (consumed by the Author/Critic layer in Step 5+):
+#   low             - paper-only blast radius; auto-merge on CI green
+#   medium          - shared paper+live code; auto-merge with expanded Critic
+#   high            - affects order placement / fills / DB schema; review
+#   architect_only  - live-only behavior or compliance rails; never auto-merge
+#
+# MAX_CONSECUTIVE_VIOLATIONS:
+#   1 -> alert on first detection (hard rail; e.g. live in paper)
+#   3 -> alert after three back-to-back detections (flappy but consequential)
+#   5 -> alert after five (routine ops anomaly)
+
+version: 1
+generated_at: "2026-04-16"
+
+invariants:
+  - id: NO_LIVE_IN_PAPER
+    description: Under PAPER_MODE, no pending_orders row may carry a live account_id.
+    check_fn: check_no_live_in_paper
+    scrutiny_tier: architect_only
+    fix_by_sprint: existing
+    max_consecutive_violations: 1
+    severity_floor: critical
+
+  - id: NO_UNAPPROVED_LIVE_CSP
+    description: Live CSP orders must carry payload.approval_ref from the Telegram gate.
+    check_fn: check_no_unapproved_live_csp
+    scrutiny_tier: architect_only
+    fix_by_sprint: csp-allocator-live
+    max_consecutive_violations: 1
+    severity_floor: critical
+
+  - id: NO_BELOW_BASIS_CC
+    description: Covered calls must be struck at or above per-account paper basis.
+    check_fn: check_no_below_basis_cc
+    scrutiny_tier: low
+    fix_by_sprint: wheel-hardening
+    max_consecutive_violations: 1
+    severity_floor: high
+
+  - id: NO_ORPHAN_CHILDREN
+    description: Child orders must settle when their parent fills or is superseded.
+    check_fn: check_no_orphan_children
+    scrutiny_tier: medium
+    fix_by_sprint: fa-block-hardening
+    max_consecutive_violations: 1
+    severity_floor: high
+
+  - id: NO_STRANDED_STAGED_ORDERS
+    description: pending_orders.status='staged' older than the stranded TTL.
+    check_fn: check_no_stranded_staged_orders
+    scrutiny_tier: low
+    fix_by_sprint: adr-007-step2
+    max_consecutive_violations: 1
+    severity_floor: high
+
+  - id: NO_SILENT_BREAKER_TRIP
+    description: haiku-watchdog daily_orders flags must emit a cross_daemon_alerts row.
+    check_fn: check_no_silent_breaker_trip
+    scrutiny_tier: low
+    fix_by_sprint: adr-007-step2
+    max_consecutive_violations: 1
+    severity_floor: medium
+
+  - id: NO_ZOMBIE_BOT_PROCESS
+    description: Only one telegram_bot.py process should run at a time.
+    check_fn: check_no_zombie_bot_process
+    scrutiny_tier: medium
+    fix_by_sprint: singleton-hardening
+    max_consecutive_violations: 3
+    severity_floor: high
+
+  - id: NO_STALE_RED_ALERT
+    description: red_alert_state=ON for more than 48h without recompute.
+    check_fn: check_no_stale_red_alert
+    scrutiny_tier: low
+    fix_by_sprint: red-alert-ttl
+    max_consecutive_violations: 1
+    severity_floor: medium
+
+  - id: NO_STUCK_PROCESSING_ORDER
+    description: pending_orders.status='processing' older than the stuck TTL.
+    check_fn: check_no_stuck_processing_order
+    scrutiny_tier: medium
+    fix_by_sprint: reconciliation-hardening
+    max_consecutive_violations: 1
+    severity_floor: high
+
+  - id: NO_MISSING_DAEMON_HEARTBEAT
+    description: Every expected daemon must be heartbeating within TTL.
+    check_fn: check_no_missing_daemon_heartbeat
+    scrutiny_tier: medium
+    fix_by_sprint: scheduler-extraction
+    max_consecutive_violations: 3
+    severity_floor: high
