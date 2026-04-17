@@ -47,6 +47,12 @@ import yfinance as yf
 from agt_equities.execution_gate import assert_execution_enabled, ExecutionDisabledError
 from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 from agt_equities import roll_engine
+from agt_equities.ib_order_builder import (
+    build_adaptive_option_order,
+    build_adaptive_sell_order,
+    build_adaptive_roll_combo,
+    build_adaptive_stk_order,
+)
 from agt_equities.cc_engine import (
     CCPickerInput, CCWrite, CCStandDown, ChainStrike, pick_cc_strike,
 )
@@ -6337,7 +6343,7 @@ async def handle_dex_callback(
         # Followup #20: route to originating account (fail-closed on NULL)
         account_id = row["originating_account_id"]
         limit_for_order = _round_to_nickel(row['limit_price']) if action_type == "CC" else row['limit_price']
-        order = _build_adaptive_sell_order(qty, limit_for_order, account_id)
+        order = build_adaptive_sell_order(qty, limit_for_order, account_id)
         order.orderRef = audit_id  # Followup #17: cryptographic 1:1 link for orphan recovery
 
         # Sprint 1A: unified pre-trade gate (defense-in-depth)
@@ -6604,66 +6610,6 @@ def _round_to_nickel(price: float) -> float:
     return round(round(price / increment) * increment, 2)
 
 
-def _build_adaptive_option_order(
-    action: str,
-    qty: int,
-    limit_price: float,
-    account_id: str,
-    priority: str = "Patient",
-) -> ib_async.Order:
-    """Build a single-leg adaptive option order."""
-    order = ib_async.Order()
-    order.action = str(action or "SELL").upper()
-    order.totalQuantity = qty
-    order.orderType = "LMT"
-    order.lmtPrice = round(limit_price, 2)
-    order.algoStrategy = "Adaptive"
-    order.algoParams = [ib_async.TagValue("adaptivePriority", priority)]
-    order.tif = "DAY"
-    order.account = account_id
-    order.transmit = True
-    return order
-
-
-def _build_adaptive_sell_order(
-    qty: int,
-    limit_price: float,
-    account_id: str,
-    priority: str = "Patient",
-) -> ib_async.Order:
-    """Builds a single-leg adaptive order."""
-    return _build_adaptive_option_order(
-        action="SELL",
-        qty=qty,
-        limit_price=limit_price,
-        account_id=account_id,
-        priority=priority,
-    )
-
-
-def _build_adaptive_roll_combo(
-    qty: int,
-    limit_price: float,
-    account_id: str,
-    priority: str = "Urgent",
-) -> ib_async.Order:
-    """
-    Builds an IBKR BAG combo order for a Roll.
-    Action = BUY executes the legs exactly as defined (Buy 1, Sell 1).
-    Positive limit = net debit. Negative limit = net credit.
-    """
-    order = ib_async.Order()
-    order.action = "BUY"
-    order.totalQuantity = qty
-    order.orderType = "LMT"
-    order.lmtPrice = round(limit_price, 2)
-    order.algoStrategy = "Adaptive"
-    order.algoParams = [ib_async.TagValue("adaptivePriority", priority)]
-    order.tif = "DAY"
-    order.account = account_id
-    order.transmit = True
-    return order
-
 
 async def _place_single_order(
     payload: dict,
@@ -6766,7 +6712,7 @@ async def _place_single_order(
                     exchange=leg_data["exchange"],
                 ))
             contract.comboLegs = combo_legs
-            order = _build_adaptive_roll_combo(qty, float(bid), acct_id, priority="Urgent")
+            order = build_adaptive_roll_combo(qty, float(bid), acct_id, priority="Urgent")
         elif sec_type == "OPT":
             contract = ib_async.Option(
                 symbol=ticker,
@@ -6775,7 +6721,7 @@ async def _place_single_order(
                 right=right,
                 exchange="SMART",
             )
-            order = _build_adaptive_option_order(
+            order = build_adaptive_option_order(
                 action=action,
                 qty=qty,
                 limit_price=_round_to_nickel(float(bid)),
@@ -6791,15 +6737,14 @@ async def _place_single_order(
             )
             order_type = str(payload.get("order_type", "MKT") or "MKT").upper()
             if order_type == "MKT":
-                order = ib_async.MarketOrder(action=action, totalQuantity=qty)
+                order = build_adaptive_stk_order(action, qty, order_type="MKT")
             else:
-                order = ib_async.LimitOrder(
-                    action=action,
-                    totalQuantity=qty,
-                    lmtPrice=_round_to_nickel(float(bid)) if bid else 0.0,
+                order = build_adaptive_stk_order(
+                    action, qty,
+                    order_type="LMT",
+                    limit_price=_round_to_nickel(float(bid)) if bid else 0.0,
                 )
             order.account = acct_id
-            order.tif = "DAY"
             order.transmit = True
         else:
             return False, f"#{db_id} Unsupported sec_type {sec_type}"
