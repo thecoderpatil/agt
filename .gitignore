@@ -63,3 +63,6 @@ files.zip
 Portfolio_Risk_Rulebook_v6.md
 Portfolio_Risk_Rulebook_v7.md
 Portfolio_Risk_Rulebook_v8.md
+
+# ADR-007: prose directive retired, machine-readable incidents table replaces it
+_WEEKLY_ARCHITECT_DIRECTIVE.md
