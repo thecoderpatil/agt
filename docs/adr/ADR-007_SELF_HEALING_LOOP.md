@@ -203,7 +203,7 @@ Ordered MRs, each self-contained:
 2. **`safety_invariants.yaml` + `scripts/check_invariants.py` + `tests/test_invariants.py`** — codify the 3 known rails (NO_LIVE_IN_PAPER, NO_BELOW_BASIS_CC, NO_ORPHAN_CHILDREN). CLI: `python3 scripts/check_invariants.py [--json]`. Test against current DB asserts zero violations for existing-good state.
 3. **`incidents` table schema + CRUD module** — `agt_equities/incidents.py` parallels `remediation_incidents` but generalizes. Migration in `schema.py`. Deprecates `remediation_incidents` (keep both for one sprint, dual-write, drop after validation).
 4. **Invariant-triggered incident writes** — `scripts/check_invariants.py` inserts `incidents` rows on violation. Wire into scheduler heartbeat (currently 60s).
-5. **Retire `_WEEKLY_ARCHITECT_DIRECTIVE.md`** — Opus task prompt updated to skip writing it. Opus output becomes: incident-table query + weekly summary email + `readiness_gate` updates. No prose directive.
+5. **Retire `_WEEKLY_ARCHITECT_DIRECTIVE.md`** — DONE. Opus task prompt consumes `scripts/incidents_digest.py` (markdown or JSON) instead of parsing the prose file. `/list_rem`, `/approve_rem`, `/reject_rem` redirected off `remediation_incidents` onto `incidents_repo.list_by_status` / `get_by_key(active_only=True)`; args accept numeric id or ALL_CAPS key. `scripts/circuit_breaker.py::check_directive_freshness` renamed to `check_incident_detector_heartbeat` (8h threshold against `MAX(last_action_at)`). Legacy `remediation_incidents` table kept dual-written for one more sprint (see section 8 below).
 6. **Author/Critic split in remediation task prompt** — two LLM calls per incident. Confidence tokens captured in `incidents.confidence`.
 7. **Scrutiny tiers + error budget** — each invariant has a `scrutiny_tier`; `scripts/error_budget.py` computes monthly burn + gates `low`-tier auto-merge. Dashboard row in `/report`.
 8. **ddiff generator** — `scripts/gen_ddiff.py` + static HTML template, served from FastAPI. `/list_rem` and Telegram messages link to ddiff URL instead of GitLab raw.
@@ -232,7 +232,7 @@ Primary sources:
 - Where does `safety_invariants.yaml` live in the repo — next to `walker.py` (read by many consumers) or in `config/` (less coupling)?
 - Should the ddiff generator be a skill-skill (Cowork-local) or a real repo artifact? Real artifact wins on audit trail but adds maintenance.
 - How do we codify "order-sizing logic" as an invariant? SQL won't reach it. Likely needs a Python-callable invariant kind in addition to `sql_must_return_zero`.
-- Do we keep `remediation_incidents` or fully replace with `incidents`? Proposal: dual-write for 2 sprints, drop `remediation_incidents` after.
+- ~~Do we keep `remediation_incidents` or fully replace with `incidents`?~~ RESOLVED Step 5 (2026-04-16). Dual-write continues for one more sprint so the existing weekly remediation pipeline and any ad-hoc scripts that still read the legacy table keep working. Retirement MR will: (a) archive remaining `new` / `authoring` / `awaiting_approval` rows into `incidents` via a one-shot migration script, (b) drop `_mirror_register` + `_mirror_update_status` from `agt_equities/incidents_repo.py`, (c) drop `remediation_incidents` DDL from `agt_equities/schema.py`, (d) remove the back-compat `check_directive_freshness` shim.
 
 ---
 

@@ -1,8 +1,26 @@
 """Remediation registry + GitLab merge/close helpers.
 
+ADR-007 Step 5 status (2026-04-16)
+----------------------------------
+The state-machine helpers in this module (``get_state``, ``list_awaiting``,
+``register_incident``, ``mark_awaiting``, ``mark_merged``, ``mark_rejected``,
+``mark_architect``, ``record_nudge``, ``extract_incidents_from_directive``)
+are DEPRECATED. New callers should use ``agt_equities.incidents_repo``,
+which writes the structured ``incidents`` table and dual-writes to
+``remediation_incidents`` for one sprint of compatibility.
+
+The GitLab API helpers (``gitlab_get_mr``, ``gitlab_lower_approval_rule``,
+``gitlab_merge_mr``, ``gitlab_close_mr``) are schema-agnostic and remain
+the canonical GitLab surface — do NOT duplicate these elsewhere.
+
+This module is retired in lockstep with the legacy ``remediation_incidents``
+table (follow-up ticket, not this sprint).
+
 Consumed by:
-- scripts/rem_incidents.py (CLI used by the agt-remediation-weekly task)
-- telegram_bot.py /approve_rem /reject_rem /list_rem handlers
+- scripts/rem_incidents.py (legacy CLI; agt-remediation-weekly task)
+- telegram_bot.py /approve_rem /reject_rem /list_rem handlers use ONLY
+  the GitLab helpers here; state reads/writes now go through
+  ``agt_equities.incidents_repo`` (ADR-007 Step 5)
 
 Data model (remediation_incidents, created by schema.py):
 
@@ -97,13 +115,24 @@ _INCIDENT_ITEM_RE = re.compile(
 
 
 def extract_incidents_from_directive(directive_path: str | Path) -> list[dict[str, str]]:
-    """Parse a weekly directive markdown and return critical incidents.
+    """DEPRECATED: ADR-007 Step 5 retired the prose directive workflow.
 
-    Each returned dict has keys: ``incident_id`` (ALL_CAPS), ``summary`` (first
-    line of the item), ``body`` (full item text including summary).
+    Parses a weekly directive markdown and returns critical incidents.
+    Still imported by ``scripts/rem_incidents.py extract`` for backward
+    compatibility with the legacy ``agt-remediation-weekly`` task prompt.
+    Returns ``[]`` if the directive path does not exist — which will be
+    the common case now that ``_WEEKLY_ARCHITECT_DIRECTIVE.md`` is gone
+    from origin/main (commit 30ea993a).
 
-    Returns [] and swallows I/O errors — the caller decides whether an empty
-    directive should be treated as a no-op or a failure.
+    New tooling should consume ``agt_equities.incidents_repo`` directly
+    or ``scripts/incidents_digest.py`` for markdown rollups. This helper
+    will be removed together with the legacy ``remediation_incidents``
+    table in a follow-up sprint.
+
+    Each returned dict has keys: ``incident_id`` (ALL_CAPS), ``summary``
+    (first line of the item), ``body`` (full item text including
+    summary). Returns [] and swallows I/O errors — the caller decides
+    whether an empty directive is a no-op or a failure.
     """
     try:
         text = Path(directive_path).read_text(encoding="utf-8")

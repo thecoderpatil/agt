@@ -7475,39 +7475,46 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as exc:
         sections.append(f"\n[SESSION LOG] Error: {exc}")
 
-    # ── 9. Weekly Directive Status ──
+    # ── 9. Incident Queue (ADR-007 Step 5) ──
+    # Replaces the legacy [DIRECTIVE] block. Prose _WEEKLY_ARCHITECT_DIRECTIVE.md
+    # was retired in commit 30ea993a; the structured `incidents` table authored
+    # by the Step 4 heartbeat runner is now the source of truth.
     try:
-        from pathlib import Path as _Path
-        directive_path = _Path(__file__).parent / "_WEEKLY_ARCHITECT_DIRECTIVE.md"
-        if directive_path.exists():
-            content = directive_path.read_text(encoding="utf-8")
-            # Extract key fields
-            lines = content.splitlines()
-            status_line = next((l for l in lines if l.startswith("## Status:")), None)
-            expires_line = next((l for l in lines if l.startswith("**Expires:")), None)
-            focus_start = None
-            focus_lines = []
-            for i, l in enumerate(lines):
-                if "## Current Focus" in l:
-                    focus_start = i
-                elif focus_start and l.startswith("## ") and i > focus_start:
-                    break
-                elif focus_start and l.strip().startswith("- "):
-                    focus_lines.append(l.strip())
-
-            sections.append(f"\n[DIRECTIVE]")
-            if status_line:
-                sections.append(f"  {status_line.replace('## ', '')}")
-            if expires_line:
-                sections.append(f"  {expires_line.replace('**', '')}")
-            if focus_lines:
-                sections.append("  Focus:")
-                for fl in focus_lines[:6]:
-                    sections.append(f"    {fl}")
+        from agt_equities import incidents_repo as _ir
+        active_rows = _ir.list_by_status([
+            _ir.STATUS_OPEN, _ir.STATUS_AUTHORING, _ir.STATUS_AWAITING,
+            _ir.STATUS_ARCHITECT, _ir.STATUS_REJECTED_ONCE,
+            _ir.STATUS_REJECTED_TWICE,
+        ])
+        sections.append("\n[INCIDENTS]")
+        if not active_rows:
+            sections.append("  No active incidents.")
         else:
-            sections.append("\n[DIRECTIVE] No _WEEKLY_ARCHITECT_DIRECTIVE.md found")
+            counts: dict[str, int] = {}
+            for r in active_rows:
+                s = r.get("status") or "?"
+                counts[s] = counts.get(s, 0) + 1
+            parts = [f"{s}={n}" for s, n in sorted(counts.items())]
+            sections.append(f"  Active: {', '.join(parts)}  (total {len(active_rows)})")
+            rows_sorted = sorted(
+                active_rows,
+                key=lambda r: (r.get("last_action_at") or r.get("detected_at") or ""),
+                reverse=True,
+            )
+            for r in rows_sorted[:5]:
+                iid = r.get("id")
+                key = (r.get("incident_key") or "?")[:40]
+                inv = (r.get("invariant_id") or "-")[:20]
+                status = r.get("status") or "?"
+                when = (r.get("last_action_at") or r.get("detected_at") or "-")[:16]
+                mr = r.get("mr_iid")
+                mr_str = f" MR!{mr}" if mr else ""
+                sections.append(
+                    f"  #{iid} {key}  inv={inv}  {status}  {when}{mr_str}"
+                )
+            sections.append("  /list_rem  /approve_rem <id>  /reject_rem <id> <reason>")
     except Exception as exc:
-        sections.append(f"\n[DIRECTIVE] Error: {exc}")
+        sections.append(f"\n[INCIDENTS] Error: {exc}")
 
     # ── 10. Safety Rails Summary ──
     try:
@@ -9253,78 +9260,119 @@ async def _scheduled_flex_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# feat(remediation): /approve_rem /reject_rem /list_rem  — weekly remediation
+# feat(remediation): /approve_rem /reject_rem /list_rem  — incidents queue
 # ---------------------------------------------------------------------------
-# These handlers gate the `agt-remediation-weekly` scheduled task's MRs.
-# See agt_equities/remediation.py for the state machine and GitLab API
-# helpers. Yash replies `/approve_rem <id>` or `/reject_rem <id> <reason>` in
-# Telegram; we merge or close the MR via API and advance the state row.
+# ADR-007 Step 5 (2026-04-16): these handlers now read/write the structured
+# `incidents` table via agt_equities.incidents_repo. The legacy
+# remediation_incidents table is still dual-written by incidents_repo for
+# one more sprint, so in-flight rows remain reachable. The GitLab API
+# helpers (gitlab_lower_approval_rule, gitlab_merge_mr, gitlab_close_mr)
+# are re-used from agt_equities.remediation — they're schema-agnostic.
+#
+# Argument shape:
+#   /approve_rem <arg>           arg = numeric incidents.id OR legacy
+#   /reject_rem  <arg> <reason>  ALL_CAPS incident_key (back-compat).
+#
+# Per Yash's go on the Step 5 plan, both id forms are accepted for one
+# sprint; numeric id is preferred (leading # is tolerated).
+
+
+def _resolve_incident_arg(arg: str) -> dict | None:
+    """Resolve a /approve_rem or /reject_rem arg to an incidents row.
+
+    Accepts numeric `incidents.id` (with optional leading '#') or the
+    legacy ALL_CAPS `incident_key`. Numeric path is preferred; if the
+    arg is all-digits it routes to `incidents_repo.get(id)`. Otherwise
+    it routes to `get_by_key(key, active_only=True)`, which returns the
+    most recent non-closed row for that key — matching legacy
+    remediation_incidents single-row-per-id semantics.
+
+    Returns the row dict or None if unknown. Exceptions propagate so
+    the handler can surface them to Telegram.
+    """
+    from agt_equities import incidents_repo as _ir
+    s = (arg or "").strip().lstrip("#")
+    if not s:
+        return None
+    if s.isdigit():
+        return _ir.get(int(s))
+    return _ir.get_by_key(s, active_only=True)
 
 
 async def cmd_list_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/list_rem — show remediation MRs currently awaiting Yash approval."""
+    """/list_rem — show incidents currently awaiting Yash approval."""
     if not is_authorized(update):
         return
     try:
-        from agt_equities import remediation as _rem
-        rows = await asyncio.to_thread(_rem.list_awaiting)
+        from agt_equities import incidents_repo as _ir
+        rows = await asyncio.to_thread(
+            _ir.list_by_status, [_ir.STATUS_AWAITING],
+        )
     except Exception as exc:
-        logger.exception("/list_rem: list_awaiting failed")
+        logger.exception("/list_rem: list_by_status failed")
         await update.message.reply_text(f"/list_rem error: {exc}")
         return
 
     if not rows:
-        await update.message.reply_text("No remediation MRs awaiting approval.")
+        await update.message.reply_text("No incidents awaiting approval.")
         return
 
     lines = ["\u2501\u2501 Awaiting Approval \u2501\u2501"]
     for r in rows:
-        iid = r.get("incident_id")
-        mr = r.get("mr_iid")
-        authored = r.get("fix_authored_at") or "—"
-        last_nudge = r.get("last_nudged_at") or "—"
+        iid = r.get("id")
+        key = r.get("incident_key") or "?"
+        inv = r.get("invariant_id") or "-"
+        mr = r.get("mr_iid") or "-"
+        last = (r.get("last_action_at") or r.get("detected_at") or "-")[:16]
         lines.append(
-            f"{iid}  |  MR !{mr}  |  authored {authored}  |  last nudge {last_nudge}"
+            f"#{iid}  {key}  |  inv {inv}  |  MR !{mr}  |  {last}"
         )
     lines.append("")
     lines.append("/approve_rem <id>    /reject_rem <id> <reason>")
+    lines.append("(id = numeric #N or legacy ALL_CAPS key)")
     await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_approve_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/approve_rem <incident_id> — lower approvals, merge MR, flip row."""
+    """/approve_rem <id-or-key> — lower approvals, merge MR, flip incident row.
+
+    Argument accepts numeric incidents.id (with optional leading '#') or
+    the legacy ALL_CAPS incident_key for in-flight rows carried over
+    from the remediation_incidents era.
+    """
     if not is_authorized(update):
         return
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "Usage: /approve_rem <incident_id>   (see /list_rem)"
+            "Usage: /approve_rem <id-or-key>   (see /list_rem)"
         )
         return
-    incident_id = args[0].strip()
+    arg = args[0].strip()
 
     try:
-        from agt_equities import remediation as _rem
-        row = await asyncio.to_thread(_rem.get_state, incident_id)
+        from agt_equities import incidents_repo as _ir
+        from agt_equities import remediation as _rem  # GitLab API helpers only
+        row = await asyncio.to_thread(_resolve_incident_arg, arg)
     except Exception as exc:
-        logger.exception("/approve_rem: state lookup failed")
+        logger.exception("/approve_rem: lookup failed")
         await update.message.reply_text(f"/approve_rem error: {exc}")
         return
 
     if row is None:
-        await update.message.reply_text(f"Unknown incident: {incident_id}")
+        await update.message.reply_text(f"Unknown incident: {arg}")
         return
-    if row.get("status") != _rem.STATUS_AWAITING:
+    if row.get("status") != _ir.STATUS_AWAITING:
         await update.message.reply_text(
-            f"{incident_id} is in state '{row.get('status')}' — "
-            f"only 'awaiting_approval' can be merged."
+            f"#{row.get('id')} {row.get('incident_key')} is in state "
+            f"'{row.get('status')}' -- only 'awaiting_approval' can be merged."
         )
         return
 
     mr_iid = row.get("mr_iid")
     if not mr_iid:
         await update.message.reply_text(
-            f"{incident_id} has no MR iid on record — cannot merge."
+            f"#{row.get('id')} has no MR iid on record -- cannot merge."
         )
         return
 
@@ -9335,7 +9383,7 @@ async def cmd_approve_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.exception("/approve_rem: GitLab merge failed")
         await update.message.reply_text(
             f"Merge failed for MR !{mr_iid}: {exc}\n"
-            f"Row left at 'awaiting_approval' — retry or merge manually."
+            f"Row left at 'awaiting_approval' -- retry or merge manually."
         )
         return
 
@@ -9348,46 +9396,53 @@ async def cmd_approve_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     try:
-        await asyncio.to_thread(_rem.mark_merged, incident_id)
+        await asyncio.to_thread(_ir.mark_merged, int(row["id"]))
     except Exception as exc:
-        logger.exception("/approve_rem: DB mark_merged failed after merge")
+        logger.exception("/approve_rem: incidents_repo.mark_merged failed")
         await update.message.reply_text(
             f"MR !{mr_iid} merged, but DB update failed: {exc}\n"
-            f"Fix the row manually: status='merged'."
+            f"Fix manually: UPDATE incidents SET status='merged' "
+            f"WHERE id={row['id']}."
         )
         return
 
     await update.message.reply_text(
-        f"\u2705 Merged {incident_id} (MR !{mr_iid})."
+        f"\u2705 Merged #{row['id']} {row.get('incident_key')} (MR !{mr_iid})."
     )
 
 
 async def cmd_reject_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/reject_rem <incident_id> <reason...> — close MR, advance reject state."""
+    """/reject_rem <id-or-key> <reason...> — close MR, advance reject state.
+
+    Argument accepts numeric incidents.id or legacy ALL_CAPS incident_key.
+    Reason is appended to incidents.rejection_history (ADR-007 Sec4.7) so
+    the Author/Critic loop in Step 6 can feed it forward.
+    """
     if not is_authorized(update):
         return
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text(
-            "Usage: /reject_rem <incident_id> <reason...>"
+            "Usage: /reject_rem <id-or-key> <reason...>"
         )
         return
-    incident_id = args[0].strip()
+    arg = args[0].strip()
     reason = " ".join(args[1:]).strip()
     if not reason:
-        await update.message.reply_text("Reason required — be specific.")
+        await update.message.reply_text("Reason required -- be specific.")
         return
 
     try:
-        from agt_equities import remediation as _rem
-        row = await asyncio.to_thread(_rem.get_state, incident_id)
+        from agt_equities import incidents_repo as _ir
+        from agt_equities import remediation as _rem  # GitLab API helpers only
+        row = await asyncio.to_thread(_resolve_incident_arg, arg)
     except Exception as exc:
-        logger.exception("/reject_rem: state lookup failed")
+        logger.exception("/reject_rem: lookup failed")
         await update.message.reply_text(f"/reject_rem error: {exc}")
         return
 
     if row is None:
-        await update.message.reply_text(f"Unknown incident: {incident_id}")
+        await update.message.reply_text(f"Unknown incident: {arg}")
         return
 
     mr_iid = row.get("mr_iid")
@@ -9395,13 +9450,14 @@ async def cmd_reject_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             await asyncio.to_thread(_rem.gitlab_close_mr, int(mr_iid))
         except Exception as exc:
+            # Non-fatal: still advance the state machine so the next
+            # authoring cycle sees the rejection. Yash can close the
+            # stale MR manually.
             logger.warning("/reject_rem: gitlab_close_mr failed: %s", exc)
-            # Non-fatal: still advance the state machine so next run sees the
-            # rejection. Yash can close the stale MR manually.
 
     try:
         updated = await asyncio.to_thread(
-            _rem.mark_rejected, incident_id, reason,
+            _ir.mark_rejected, int(row["id"]), reason,
         )
     except Exception as exc:
         logger.exception("/reject_rem: mark_rejected failed")
@@ -9409,8 +9465,8 @@ async def cmd_reject_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await update.message.reply_text(
-        f"\u274c Rejected {incident_id} -> {updated.get('status')} "
-        f"(MR !{mr_iid or '—'} closed).\n"
+        f"\u274c Rejected #{row['id']} {row.get('incident_key')} -> "
+        f"{updated.get('status')} (MR !{mr_iid or '-'} closed).\n"
         f"Reason logged: {reason}"
     )
 
