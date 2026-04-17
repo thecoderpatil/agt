@@ -36,13 +36,15 @@ stdout for NSSM capture.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import logging.handlers
 import os
 import signal
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from agt_equities.ib_conn import IBConnConfig, IBConnector
 
@@ -153,6 +155,107 @@ def build_scheduler() -> "AsyncIOScheduler":
 
 
 # ---------------------------------------------------------------------------
+# ADR-007 Step 4 — invariant detection on every scheduler heartbeat tick.
+#
+# The runner itself (``agt_equities.invariants.runner.run_all``) catches per-
+# check exceptions and records a ``degraded`` Violation, so a bug in one
+# check function cannot abort the batch. The outer try/except here guards
+# YAML load, DB connection open, and ``incidents_repo`` IO — belt and
+# suspenders, because the scheduler owns ``clientId=2`` and one unguarded
+# exception in a 60s loop takes down the whole process.
+#
+# ADR-007 §9.3 rate limit (5/hr) applies to AUTHORING, not detection;
+# register freely here — Step 6 rate-gates downstream.
+# ---------------------------------------------------------------------------
+
+def _evidence_fingerprint(evidence: dict[str, Any] | None) -> str:
+    """Stable short hash of a Violation's ``evidence`` dict.
+
+    Used as the suffix of the ``incidents_repo.register`` ``incident_key``
+    so repeat detections of the same breach collapse onto a single
+    incident row — ``register`` is idempotent keyed on ``incident_key``
+    and bumps ``consecutive_breaches`` rather than inserting a new row.
+    Non-serializable evidence falls back to ``str()`` so we never crash
+    the fingerprint path.
+    """
+    try:
+        blob = json.dumps(evidence or {}, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        blob = str(evidence)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def _check_invariants_tick() -> None:
+    """Run ADR-007 safety invariants once and register any Violations.
+
+    Called from ``_heartbeat_job`` every 60s. Imports are lazy to keep
+    the module-import side-effect-free invariant intact (``test_import_
+    no_side_effects``). Every Violation maps to one
+    ``incidents_repo.register`` call with:
+
+    - ``incident_key = f"{invariant_id}:{evidence_fingerprint}"``
+    - ``severity``   = YAML ``severity_floor`` (fallback ``medium``)
+    - ``scrutiny_tier`` = YAML ``scrutiny_tier`` (fallback ``medium``)
+    - ``detector``  = ``"agt_scheduler.heartbeat"``
+    - ``observed_state`` = ``{description, evidence, detected_at}``
+
+    The outer try/except makes this a best-effort call — failures log
+    and return. Step 6 will add a rate-limited authoring path; here we
+    just surface the detection into the ``incidents`` table (Step 3).
+    """
+    try:
+        from agt_equities import incidents_repo
+        from agt_equities.invariants import load_invariants, run_all
+    except Exception:
+        logger.exception("invariants import failed; skipping tick")
+        return
+
+    try:
+        manifest = load_invariants()
+        invariant_meta: dict[str, dict[str, Any]] = {
+            entry["id"]: entry for entry in manifest
+        }
+        results = run_all()
+    except Exception:
+        logger.exception("invariants runner failed; skipping tick")
+        return
+
+    for inv_id, violations in results.items():
+        if not violations:
+            continue
+        meta = invariant_meta.get(inv_id, {})
+        severity = str(meta.get("severity_floor", "medium"))
+        scrutiny_tier = str(meta.get("scrutiny_tier", "medium"))
+        for v in violations:
+            try:
+                incident_key = (
+                    f"{inv_id}:{_evidence_fingerprint(getattr(v, 'evidence', {}))}"
+                )
+                detected_at = getattr(v, "detected_at", None)
+                observed_state = {
+                    "description": getattr(v, "description", ""),
+                    "evidence": getattr(v, "evidence", {}),
+                    "detected_at": (
+                        detected_at.isoformat()
+                        if detected_at is not None
+                        else None
+                    ),
+                }
+                incidents_repo.register(
+                    incident_key,
+                    severity=severity,
+                    scrutiny_tier=scrutiny_tier,
+                    detector="agt_scheduler.heartbeat",
+                    invariant_id=inv_id,
+                    observed_state=observed_state,
+                )
+            except Exception:
+                logger.exception(
+                    "incidents_repo.register failed for invariant %s", inv_id
+                )
+
+
+# ---------------------------------------------------------------------------
 # Job registry — intentionally empty until Unit A5.
 # ---------------------------------------------------------------------------
 
@@ -179,6 +282,14 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
             client_id=client_id,
             notes="ok",
         )
+        # ADR-007 Step 4: run safety invariants once per 60s tick and
+        # register any Violations as incidents. Isolated from the
+        # heartbeat write above so an invariant-path bug cannot
+        # block the liveness signal. Live capital.
+        try:
+            _check_invariants_tick()
+        except Exception:
+            logger.exception("invariant heartbeat tick failed")
 
     scheduler.add_job(
         _heartbeat_job,
