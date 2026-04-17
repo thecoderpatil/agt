@@ -1061,6 +1061,23 @@ async def ensure_ib_connected() -> ib_async.IB:
                 except Exception as evt_exc:
                     logger.warning("Failed to register fill events: %s", evt_exc)
 
+                # Hydrate ib_async in-memory trades list so IB resumes pushing
+                # orderStatus/openOrder events for pre-existing live orders
+                # after a (re)connect. Without this, orders placed before a
+                # transient disconnect become "ghost" rows in pending_orders:
+                # live+Submitted at IB but invisible to our event handlers
+                # (ib_perm_id stays 0, last_ib_status stuck at 'sent').
+                try:
+                    await candidate.reqAllOpenOrdersAsync()
+                    logger.info(
+                        "reqAllOpenOrdersAsync: trades list hydrated on (re)connect"
+                    )
+                except Exception as hydrate_exc:
+                    logger.warning(
+                        "reqAllOpenOrdersAsync on (re)connect failed: %s",
+                        hydrate_exc,
+                    )
+
                 # F23: IBKR error event listener for 1100/1101/1102 differentiation
                 try:
                     candidate.errorEvent += _on_ib_error
