@@ -1512,6 +1512,55 @@ def _register_autonomous_tables(conn) -> None:
         CREATE INDEX IF NOT EXISTS idx_remediation_incidents_mr_iid
         ON remediation_incidents(mr_iid)
     """)
+
+    # ── ADR-007 Step 3: structured `incidents` queue ──
+    # Supersedes remediation_incidents as the machine-readable SoT for the
+    # self-healing loop. Dual-written with remediation_incidents for two
+    # sprints so the existing weekly remediation pipeline is not orphaned.
+    # Schema follows ADR-007 §4.2 plus operational state-machine columns
+    # (closed_at, consecutive_breaches, last_action_at) from the Step 3
+    # kickoff. See agt_equities/incidents_repo.py for CRUD.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS incidents (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_key         TEXT NOT NULL,
+            invariant_id         TEXT,
+            severity             TEXT NOT NULL,
+            scrutiny_tier        TEXT NOT NULL,
+            status               TEXT NOT NULL DEFAULT 'open',
+            detector             TEXT NOT NULL,
+            detected_at          TEXT NOT NULL,
+            closed_at            TEXT,
+            last_action_at       TEXT,
+            consecutive_breaches INTEGER NOT NULL DEFAULT 1,
+            observed_state       TEXT,
+            desired_state        TEXT,
+            confidence           REAL,
+            mr_iid               INTEGER,
+            ddiff_url            TEXT,
+            rejection_history    TEXT
+        )
+    """)
+    # Partial unique index: only one active row per incident_key.
+    # Closed rows (merged/resolved/rejected_permanently) do not block a
+    # future reopen under the same key.
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_active_key
+        ON incidents(incident_key)
+        WHERE status NOT IN ('merged','resolved','rejected_permanently')
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_incidents_status
+        ON incidents(status)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_incidents_invariant_id
+        ON incidents(invariant_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_incidents_mr_iid
+        ON incidents(mr_iid)
+    """)
     conn.commit()
 
 
