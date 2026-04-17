@@ -60,20 +60,36 @@ def _fake_candidate(ticker: str = "AAPL", strike: float = 150.0) -> Any:
 
 
 def _fake_hh_snapshot() -> dict:
-    """Minimal household snapshot that passes all 7 CSP gates for AAPL 150P."""
+    """Minimal household snapshot that passes rule_1/rule_2 for small-notional
+    candidates. Mirrors the canonical ``_fake_hh_snapshot`` in
+    ``tests/test_csp_allocator.py``: hh_nlv=$261K (20% ceiling = $52.2K),
+    hh_margin_nlv == hh_margin_el = $109K (zero prior margin usage →
+    margin_budget = $54.5K at VIX 18). All other gates fail-open when
+    ``extras`` is empty (sector_map / correlations / delta absent) and
+    Rule 6 only applies to Vikram_Household.
+    """
     return {
         "household": "Yash_Household",
-        "hh_nlv": 200_000.0,
-        "hh_margin_nlv": 100_000.0,
-        "hh_margin_el": 40_000.0,
+        "hh_nlv": 261_000.0,
+        "hh_margin_nlv": 109_000.0,
+        "hh_margin_el": 109_000.0,
         "accounts": {
-            "U00000001": {
-                "account_id": "U00000001",
-                "nlv": 100_000.0,
-                "el": 40_000.0,
-                "buying_power": 80_000.0,
-                "cash_available": 80_000.0,
+            "U21971297": {
+                "account_id": "U21971297",
+                "nlv": 109_000.0,
+                "el": 109_000.0,
+                "buying_power": 200_000.0,
+                "cash_available": 200_000.0,
                 "margin_eligible": True,
+                "mode": "PEACETIME",
+            },
+            "U22076329": {
+                "account_id": "U22076329",
+                "nlv": 152_000.0,
+                "el": 0.0,
+                "buying_power": 0.0,
+                "cash_available": 152_000.0,
+                "margin_eligible": False,
                 "mode": "PEACETIME",
             },
         },
