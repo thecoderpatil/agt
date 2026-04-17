@@ -27,14 +27,28 @@ class Violation:
         description: One-line human-readable explanation.
         evidence: Structured data proving the breach (row ids, counts, etc.).
                   Used by downstream Author/Critic steps to synthesize a fix.
+                  Must be stable per-breach; any time-varying value here
+                  (age_hours, last_updated, etc.) will bust the tick's
+                  dedup fingerprint and INSERT a fresh incident row every
+                  60s. Prefer natural keys (pending_order_id, household,
+                  activated_at) and describe time-varying quantities in
+                  ``description`` instead, OR set ``stable_key`` below.
         severity: low | medium | high | critical.
         detected_at: UTC timestamp when the violation was detected.
+        stable_key: Optional override for ``incidents_repo`` incident_key
+                    generation. When set, the tick layer uses this string
+                    verbatim as the incident_key instead of hashing the
+                    evidence dict. Use when evidence naturally contains
+                    time-varying fields that are worth surfacing in the
+                    incident body but must not bust dedup. Example:
+                    ``stable_key=f"NO_STALE_RED_ALERT:{household}"``.
     """
     invariant_id: str
     description: str
     evidence: dict[str, Any] = field(default_factory=dict)
     severity: str = "medium"
     detected_at: datetime = field(default_factory=_utcnow)
+    stable_key: str | None = None
 
 
 @dataclass

@@ -85,9 +85,19 @@ def check_invariants_tick(detector: str = "adr_007.invariants.tick") -> int:
         scrutiny_tier = str(meta.get("scrutiny_tier", "medium"))
         for v in violations:
             try:
-                incident_key = (
-                    f"{inv_id}:{_evidence_fingerprint(getattr(v, 'evidence', {}))}"
-                )
+                # MR !84: prefer Violation.stable_key if the check author set
+                # one (e.g. NO_STALE_RED_ALERT keys on household) so
+                # repeated ticks bump consecutive_breaches instead of
+                # INSERTing a new row when evidence carries time-varying
+                # fields like age_hours. Falls back to evidence fingerprint
+                # for checks whose evidence is naturally stable.
+                stable = getattr(v, "stable_key", None)
+                if stable:
+                    incident_key = stable
+                else:
+                    incident_key = (
+                        f"{inv_id}:{_evidence_fingerprint(getattr(v, 'evidence', {}))}"
+                    )
                 detected_at = getattr(v, "detected_at", None)
                 observed_state = {
                     "description": getattr(v, "description", ""),

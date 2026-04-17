@@ -86,3 +86,29 @@ bot_output_*.log
 
 # Transcripts / local notes
 .claude-cowork-notes.md.bak
+
+# MR !84: Cowork / session / ops scratch that NO_LOCAL_DRIFT shouldn't fire on.
+# These accumulate during active desk work and must stay uncommitted
+# (secrets, session state, one-shot debug runners). Do not commit any of
+# these; add new patterns here if NO_LOCAL_DRIFT flags ops noise.
+
+# Windows bot lifecycle / pid files
+.bot.pid
+
+# Session notes (live + agent scratch)
+.claude-cowork-notes.md
+desk_state.md
+
+# Secrets outside .env (token + recovery codes).
+.gitlab-token
+gitlab-recovery-codes.txt
+
+# Local caches / experiment dirs
+agt_desk_cache/
+hardening/
+
+# Repo-root scratch docs from agent sessions
+/_*.md
+
+# Transient test sentinel
+test_write.tmp
