@@ -76,6 +76,8 @@ __all__ = [
     "get_by_key",
     "list_by_status",
     "list_active_for_invariant",
+    "list_authorable",
+    "DEFAULT_AUTHORABLE_STATUSES",
     # Writes
     "register",
     "mark_authoring",
@@ -112,6 +114,13 @@ ACTIVE_STATUSES = frozenset({
     STATUS_OPEN, STATUS_AUTHORING, STATUS_AWAITING, STATUS_ARCHITECT,
     STATUS_REJECTED_ONCE, STATUS_REJECTED_TWICE,
 })
+
+# ADR-007 Step 7a: subset of ACTIVE_STATUSES that are eligible for the
+# Author LLM to pick up. Excludes AUTHORING/AWAITING/ARCHITECT which are
+# already past the Author-kickoff gate.
+DEFAULT_AUTHORABLE_STATUSES: tuple[str, ...] = (
+    STATUS_OPEN, STATUS_REJECTED_ONCE, STATUS_REJECTED_TWICE,
+)
 
 CLOSED_STATUSES = frozenset({
     STATUS_MERGED, STATUS_RESOLVED, STATUS_REJECTED_PERM,
@@ -367,6 +376,73 @@ def list_by_status(
             conn.close()
         except Exception:
             pass
+
+
+def list_authorable(
+    *,
+    statuses: Iterable[str] = DEFAULT_AUTHORABLE_STATUSES,
+    manifest: list[dict[str, Any]] | None = None,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return active incidents that have stabilized past their manifest
+    threshold -- i.e. rows eligible for Author/Critic remediation.
+
+    An incident is authorable when:
+        row["status"] in statuses
+        AND row["consecutive_breaches"] >= manifest_entry["max_consecutive_violations"]
+
+    Rows whose ``invariant_id`` does not appear in the manifest are
+    fail-open (included). Rationale: the Author consuming the digest
+    should see everything unaccounted-for -- better to generate a spurious
+    author pass than to silently drop an incident that has lost its
+    manifest entry (e.g. mid-rename).
+
+    Rows with no ``invariant_id`` at all (legacy detectors that don't
+    declare one) are also fail-open for the same reason.
+
+    Args:
+        statuses: status filter. Defaults to
+            ``DEFAULT_AUTHORABLE_STATUSES`` (open, rejected_once,
+            rejected_twice). Pass a wider tuple to include, e.g.,
+            awaiting_approval for read-only inspection.
+        manifest: optional injection for tests. Defaults to
+            ``agt_equities.invariants.runner.load_invariants()``.
+        db_path: override db path.
+
+    Returns:
+        List of row dicts (same shape as ``list_by_status``), in the
+        same ascending-last_action_at order, filtered to authorable rows.
+    """
+    if manifest is None:
+        from agt_equities.invariants.runner import load_invariants
+        manifest = load_invariants()
+
+    thresholds: dict[str, int] = {}
+    for entry in manifest:
+        inv_id = entry.get("id")
+        if not inv_id:
+            continue
+        try:
+            thresholds[inv_id] = int(entry.get("max_consecutive_violations", 1))
+        except (TypeError, ValueError):
+            # Bad manifest entry -- fall back to 1 so the row is treated
+            # as eligible on first detection (safer than dropping).
+            thresholds[inv_id] = 1
+
+    rows = list_by_status(list(statuses), db_path=db_path)
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        inv_id = r.get("invariant_id")
+        breaches = int(r.get("consecutive_breaches") or 0)
+        if not inv_id or inv_id not in thresholds:
+            # Fail-open: row has no manifest entry, still include it so
+            # the Author sees everything the digest picked up.
+            out.append(r)
+            continue
+        if breaches >= thresholds[inv_id]:
+            out.append(r)
+    return out
 
 
 def list_active_for_invariant(
