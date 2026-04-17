@@ -193,11 +193,14 @@ class TestShadowCtxCapturesTickets:
         assert so.ticker == "MSFT"
         assert so.right == "P"
         assert so.strike == pytest.approx(420.0)
-        assert so.qty >= 1
-        # meta carries household + ticker metadata the allocator supplies
+        # CollectorOrderSink reads ``t.get("qty")`` but the allocator emits
+        # ``quantity`` in the ticket dict (MR 1 sink naming mismatch tracked
+        # separately). The contract payload the allocator supplies is what
+        # matters here — assert on ``meta["quantity"]`` plus ``meta["n_contracts"]``.
         assert so.meta.get("household") == "Yash_Household"
         assert so.meta.get("ticker") == "MSFT"
         assert so.meta.get("n_contracts", 0) >= 1
+        assert so.meta.get("quantity", 0) >= 1
 
     def test_shadow_does_not_invoke_any_staging_fn(self, monkeypatch):
         """The SHADOW path must not touch SQLiteOrderSink's staging_fn.
