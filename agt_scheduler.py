@@ -768,6 +768,24 @@ async def _run() -> int:
         os.getpid(), scheduler_client_id(), SCHEDULER_THREADPOOL_MAX_WORKERS,
     )
 
+    # MR !90: evict any zombie agt_scheduler.py holding IBKR clientId=2
+    # before opening a new IB connection. NSSM's restart of the outer
+    # venv launcher can leave the inner grandchild alive; that zombie would
+    # fail this scheduler's IBKR connect with a clientId collision. See
+    # agt_equities/zombie_evict.py for the Windows semantics note.
+    from agt_equities.zombie_evict import evict_zombie_daemons
+    _zr = evict_zombie_daemons(
+        cmdline_marker="agt_scheduler.py",
+        self_pid=os.getpid(),
+        logger=logger,
+    )
+    if _zr.zombies_survived_sigkill:
+        logger.error(
+            "Zombie eviction incomplete: survivors=%s; refusing to boot",
+            _zr.zombies_survived_sigkill,
+        )
+        return 7
+
     cfg = IBConnConfig(client_id=scheduler_client_id())
     ib_conn = IBConnector(config=cfg)
 
