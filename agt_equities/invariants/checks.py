@@ -505,6 +505,90 @@ def check_no_missing_daemon_heartbeat(
     return vios
 
 
+# ---- 11. NO_LOCAL_DRIFT --------------------------------------------------------
+def check_no_local_drift(
+    conn: sqlite3.Connection, ctx: CheckContext
+) -> list[Violation]:
+    """Working tree must be clean modulo the TRIPWIRE_EXEMPT_REGISTRY.
+
+    Any tracked file that appears in ``git status --porcelain`` output and
+    is not on the exempt list is a drift incident. Severity is medium
+    (hygiene, not a safety rail) and consecutive_violations=3 in the YAML
+    to tolerate the brief mid-edit window.
+
+    Repo path resolves from ``AGT_REPO_PATH`` env var, default
+    ``C:\\AGT_Telegram_Bridge`` (Windows production box). On Linux CI the
+    env is unset and the ``.git`` probe fails cleanly -> returns [].
+    """
+    import os
+    repo_path = os.environ.get("AGT_REPO_PATH", r"C:\AGT_Telegram_Bridge")
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        return []  # no git repo here; degraded-not-violating
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_path, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        return [Violation(
+            invariant_id="NO_LOCAL_DRIFT",
+            description=f"git status failed; check degraded: {exc}",
+            severity="low",
+            evidence={"degraded": True, "error": str(exc)},
+        )]
+    if result.returncode != 0:
+        return [Violation(
+            invariant_id="NO_LOCAL_DRIFT",
+            description=f"git status returned {result.returncode}",
+            severity="low",
+            evidence={
+                "degraded": True,
+                "stderr": (result.stderr or "")[:400],
+            },
+        )]
+    # TRIPWIRE_EXEMPT_REGISTRY active drift allowlist (4 files per v23 handoff).
+    exempt_paths = frozenset({
+        "boot_desk.bat",
+        "cure_lifecycle.html",
+        "cure_smart_friction.html",
+        "tests/test_command_prune.py",
+    })
+    ignored_prefixes = ("reports/", "tmp/", ".venv/", "__pycache__/")
+    drift_lines: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        if len(line) < 3:
+            continue
+        status = line[:2]
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        if path in exempt_paths:
+            continue
+        if any(path.startswith(p) for p in ignored_prefixes):
+            continue
+        drift_lines.append({"status": status, "path": path})
+    if not drift_lines:
+        return []
+    return [Violation(
+        invariant_id="NO_LOCAL_DRIFT",
+        description=(
+            f"Working tree has {len(drift_lines)} drifted file(s) "
+            "beyond the exempt registry"
+        ),
+        severity="medium",
+        evidence={
+            "drift_count": len(drift_lines),
+            "drift_sample": drift_lines[:10],
+            "repo_path": repo_path,
+        },
+    )]
+
+
+
 # ---- Registry ------------------------------------------------------------------
 CHECK_REGISTRY: dict[str, Any] = {
     "NO_LIVE_IN_PAPER": check_no_live_in_paper,
@@ -517,4 +601,5 @@ CHECK_REGISTRY: dict[str, Any] = {
     "NO_STALE_RED_ALERT": check_no_stale_red_alert,
     "NO_STUCK_PROCESSING_ORDER": check_no_stuck_processing_order,
     "NO_MISSING_DAEMON_HEARTBEAT": check_no_missing_daemon_heartbeat,
+    "NO_LOCAL_DRIFT": check_no_local_drift,
 }
