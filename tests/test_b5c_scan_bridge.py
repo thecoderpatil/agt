@@ -27,6 +27,33 @@ from agt_equities.scan_bridge import (
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# ADR-008 MR 2: live ctx helper for tests.
+# Wraps the caller's staging_fn in a SQLiteOrderSink so we preserve
+# "staging_fn(tickets)" semantics without rewriting every assertion.
+# ---------------------------------------------------------------------------
+
+
+def _live_ctx(staging_fn=None):
+    """Build a LIVE RunContext whose order_sink forwards tickets to
+    ``staging_fn``. ``staging_fn=None`` produces a no-op sink (MR 1
+    SQLiteOrderSink.stage early-returns on empty tickets; for non-empty
+    it still calls the provided fn, so we default to a discard lambda).
+    """
+    import uuid as _uuid
+    from agt_equities.runtime import RunContext, RunMode
+    from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+    fn = staging_fn if staging_fn is not None else (lambda tickets: None)
+    return RunContext(
+        mode=RunMode.LIVE,
+        run_id=_uuid.uuid4().hex,
+        order_sink=SQLiteOrderSink(staging_fn=fn),
+        decision_sink=NullDecisionSink(),
+    )
+
+
+
+
 def _scanner_row(**overrides):
     base = {
         "ticker": "AAPL",
@@ -202,7 +229,7 @@ class TestE2EDigestDryRun:
             snapshots=snapshots,
             vix=18.0,
             extras_provider=provider,
-            staging_callback=None,
+            ctx=_live_ctx(None),
         )
         assert result.staged == []
         assert result.errors == []
@@ -235,7 +262,7 @@ class TestE2EDigestDryRun:
             snapshots=snapshots,
             vix=18.0,
             extras_provider=provider,
-            staging_callback=None,
+            ctx=_live_ctx(None),
         )
         assert calls == []  # never called (we didn't pass it)
         assert isinstance(result.digest_lines, list)
@@ -328,7 +355,7 @@ class TestBridge2StagingCallback(unittest.TestCase):
             snapshots=snapshots,
             vix=18.0,
             extras_provider=provider,
-            staging_callback=_capture_callback,
+            ctx=_live_ctx(_capture_callback),
         )
 
         # Allocator should have called our callback with any staged tickets
@@ -359,7 +386,7 @@ class TestBridge2StagingCallback(unittest.TestCase):
             snapshots=snapshots,
             vix=18.0,
             extras_provider=provider,
-            staging_callback=None,
+            ctx=_live_ctx(None),
         )
         assert isinstance(result.digest_lines, list)
 
@@ -407,7 +434,7 @@ class TestBridge2StagingCallback(unittest.TestCase):
             snapshots=snapshots,
             vix=18.0,
             extras_provider=provider,
-            staging_callback=lambda t: staged_tickets.extend(t),
+            ctx=_live_ctx(lambda t: staged_tickets.extend(t)),
         )
 
         if staged_tickets:

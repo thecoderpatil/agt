@@ -55,6 +55,33 @@ from agt_equities.csp_allocator import (
 )
 
 
+# ---------------------------------------------------------------------------
+# ADR-008 MR 2: live ctx helper for tests.
+# Wraps the caller's staging_fn in a SQLiteOrderSink so we preserve
+# "staging_fn(tickets)" semantics without rewriting every assertion.
+# ---------------------------------------------------------------------------
+
+
+def _live_ctx(staging_fn=None):
+    """Build a LIVE RunContext whose order_sink forwards tickets to
+    ``staging_fn``. ``staging_fn=None`` produces a no-op sink (MR 1
+    SQLiteOrderSink.stage early-returns on empty tickets; for non-empty
+    it still calls the provided fn, so we default to a discard lambda).
+    """
+    import uuid as _uuid
+    from agt_equities.runtime import RunContext, RunMode
+    from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+    fn = staging_fn if staging_fn is not None else (lambda tickets: None)
+    return RunContext(
+        mode=RunMode.LIVE,
+        run_id=_uuid.uuid4().hex,
+        order_sink=SQLiteOrderSink(staging_fn=fn),
+        decision_sink=NullDecisionSink(),
+    )
+
+
+
+
 def _run(coro):
     """Sync wrapper for async test bodies — matches project convention."""
     return asyncio.run(coro)
@@ -1319,7 +1346,7 @@ def test_orchestrator_dry_run_no_callback():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
     )
     assert isinstance(result, AllocatorResult)
     assert len(result.staged) >= 1
@@ -1337,7 +1364,7 @@ def test_orchestrator_passes_tickets_to_staging_callback():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=captured.append,
+        ctx=_live_ctx(captured.append),
     )
     assert len(captured) == 1
     assert captured[0] == result.staged
@@ -1365,7 +1392,7 @@ def test_orchestrator_short_circuits_on_first_gate_fail():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=captured.append,
+        ctx=_live_ctx(captured.append),
     )
     assert result.staged == []
     assert captured == []
@@ -1450,7 +1477,7 @@ def test_orchestrator_skips_sub_integer_sizing():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
     )
     assert result.staged == []
     assert len(result.skipped) == 1
@@ -1503,7 +1530,7 @@ def test_orchestrator_mutates_snapshot_between_candidates():
     result = run_csp_allocator(
         [cand_1, cand_2], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
     )
 
     # Group staged by ticker
@@ -1535,7 +1562,7 @@ def test_orchestrator_existing_csps_updated_after_staging():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
     )
     assert len(result.staged) >= 1
     assert "AAPL" in hh["existing_csps"]
@@ -1556,7 +1583,7 @@ def test_orchestrator_catches_staging_callback_exceptions():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=exploding_cb,
+        ctx=_live_ctx(exploding_cb),
     )
     assert result.staged == []
     assert len(result.errors) == 1
@@ -1688,7 +1715,7 @@ def test_approval_gate_default_is_identity():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
     )
     # 1 candidate in → 1 reasoning entry, approved
     assert len(result.candidate_reasoning) == 1
@@ -1716,7 +1743,7 @@ def test_approval_gate_rejects_all_candidates():
     result = run_csp_allocator(
         cands, snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
         approval_gate=reject_all,
     )
     # Gate called exactly once on the full list
@@ -1752,7 +1779,7 @@ def test_approval_gate_selects_subset():
     result = run_csp_allocator(
         [cand_a, cand_b], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
         approval_gate=pick_aapl_only,
     )
     # AAPL should stage; MSFT should only appear in pre-allocation skipped
@@ -1794,7 +1821,7 @@ def test_approval_gate_exception_falls_back_to_identity():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
         approval_gate=broken_gate,
     )
     # Error surfaced
@@ -1825,7 +1852,7 @@ def test_candidate_reasoning_carries_upstream_payload():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
     )
     entry = result.candidate_reasoning[0]
     assert entry["upstream_reasoning"]["rank"] == 1
@@ -1859,7 +1886,7 @@ def test_candidate_reasoning_records_per_household_outcome():
     result = run_csp_allocator(
         [cand], snapshots, vix=18.0,
         extras_provider=_empty_extras,
-        staging_callback=None,
+        ctx=_live_ctx(None),
     )
     entry = result.candidate_reasoning[0]
     by_hh = {h["household"]: h for h in entry["households"]}

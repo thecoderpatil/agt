@@ -52,6 +52,7 @@ from agt_equities.fa_block_margin import (
     allocate_csp,
     format_allocation_digest,
 )
+from agt_equities.runtime import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -797,18 +798,16 @@ CSP_GATE_REGISTRY: list[tuple[str, CSPGate]] = [
 # ---------------------------------------------------------------------------
 #
 # Pure orchestrator. Consumes RAY candidates + household snapshots and
-# iterates candidates × households, running CSP_GATE_REGISTRY, sizing,
-# and routing. Stages via an INJECTED staging_callback so the module
-# stays pure of telegram_bot dependencies. Per-run data (sector_map,
-# correlations, delta, etc.) is provided via an injected extras_provider
-# for the same reason.
+# iterates candidates x households, running CSP_GATE_REGISTRY, sizing,
+# and routing. Staging flows through ``ctx.order_sink.stage`` (ADR-008).
+# Live callers wire a SQLiteOrderSink whose staging_fn is
+# append_pending_tickets; shadow_scan wires a CollectorOrderSink. Per-run
+# data (sector_map, correlations, delta, etc.) is provided via an
+# injected extras_provider, keeping the module free of
+# yfinance/DB/correlation-fetch dependencies.
 #
 # In-memory snapshot mutation between candidates prevents double-booking
 # cash when multiple candidates land on the same household.
-#
-# No IB, no DB, no cmd_scan integration. M1.5 will wire cmd_scan ->
-# run_csp_allocator with concrete extras_provider and staging_callback
-# implementations.
 # ---------------------------------------------------------------------------
 
 from dataclasses import dataclass, field
@@ -875,8 +874,8 @@ def run_csp_allocator(
     snapshots: dict[str, dict],
     vix: float,
     extras_provider: Callable[[dict, Any], dict],
-    staging_callback: Callable[[list[dict]], None] | None = None,
     *,
+    ctx: RunContext,
     approval_gate: Callable[[list], list] | None = None,
 ) -> AllocatorResult:
     """Run the CSP allocator over a set of candidates.
@@ -896,8 +895,10 @@ def run_csp_allocator(
          at 10% target → skip.
       4. Route via _csp_route_to_accounts. Partial allocation allowed.
          Empty routing result → skip.
-      5. Stage tickets via staging_callback if provided (None means
-         dry-run: compute everything but do not persist).
+      5. Stage tickets via ctx.order_sink.stage. Live mode wires a
+         SQLiteOrderSink that forwards to append_pending_tickets; shadow
+         mode wires a CollectorOrderSink that captures in memory with
+         zero DB writes. See ADR-008 Shadow Scan.
       6. Mutate the in-memory snapshot to reduce buying power /
          cash_available on the affected accounts so the next
          candidate sees the reduced capacity.
@@ -919,8 +920,11 @@ def run_csp_allocator(
             extras dict. Injecting this keeps the orchestrator pure
             of yfinance / DB / correlation-fetch dependencies — the
             caller (cmd_scan in M1.5) supplies a concrete provider.
-        staging_callback: Optional. Called with each list of tickets
-            that passed gates+sizing+routing. None = dry-run.
+        ctx: Keyword-only. RunContext carrying the OrderSink and run_id.
+            Every staged ticket batch is forwarded to
+            ``ctx.order_sink.stage(tickets, engine='csp_allocator',
+            run_id=ctx.run_id, meta=...)``. Live callers wire a
+            SQLiteOrderSink; shadow_scan wires a CollectorOrderSink.
         approval_gate: Keyword-only. Optional pluggable gate called
             ONCE on the full candidate list before allocation. Must
             return a list (subset of input). Default = identity
@@ -990,7 +994,7 @@ def run_csp_allocator(
             try:
                 _process_one(
                     hh, hh_name, candidate, vix,
-                    extras_provider, staging_callback, result,
+                    extras_provider, ctx, result,
                     reasoning=reasoning,
                 )
             except Exception as exc:
@@ -1133,7 +1137,7 @@ def _process_one(
     candidate: Any,
     vix: float,
     extras_provider: Callable,
-    staging_callback: Callable | None,
+    ctx: RunContext,
     result: AllocatorResult,
     *,
     reasoning: dict | None = None,
@@ -1215,22 +1219,34 @@ def _process_one(
         _record("skipped", reason)
         return
 
-    # Step 5: stage (or dry-run)
-    if staging_callback is not None:
-        try:
-            staging_callback(tickets)
-        except Exception as exc:
-            logger.warning(
-                "csp_allocator: staging_callback failed for %s/%s: %s",
-                hh_name, candidate.ticker, exc,
-            )
-            result.errors.append({
+    # Step 5: stage via ctx.order_sink.
+    # Live mode: SQLiteOrderSink.stage forwards ``tickets`` to
+    # append_pending_tickets positionally - byte-identical to the prior
+    # direct callback path. Shadow mode: CollectorOrderSink.stage buffers
+    # ShadowOrder entries in memory and never touches pending_orders.
+    try:
+        ctx.order_sink.stage(
+            tickets,
+            engine="csp_allocator",
+            run_id=ctx.run_id,
+            meta={
                 "household": hh_name,
-                "ticker": candidate.ticker,
-                "error": f"staging failed: {exc}",
-            })
-            _record("error", f"staging failed: {exc}")
-            return
+                "ticker": candidate.ticker.upper(),
+                "n_contracts": sum(t.get("quantity", 0) for t in tickets),
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "csp_allocator: order_sink.stage failed for %s/%s: %s",
+            hh_name, candidate.ticker, exc,
+        )
+        result.errors.append({
+            "household": hh_name,
+            "ticker": candidate.ticker,
+            "error": f"staging failed: {exc}",
+        })
+        _record("error", f"staging failed: {exc}")
+        return
 
     # Attach the allocator digest to each ticket for _format_digest.
     for t in tickets:
