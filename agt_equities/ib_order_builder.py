@@ -5,8 +5,8 @@ Lifted from telegram_bot.py local helpers (previously at lines
 Behavior-preserving move for existing call sites; adds one new helper
 for STK orders (was raw MarketOrder/LimitOrder).
 
-Default priority is Patient for CSP/DEX/STK flows. Rolls default to
-Urgent (matches prior behavior; MR !102 will time-gate this).
+Default urgency is Patient for all flows. Roll urgency is time-gated
+by urgency_policy.decide_roll_urgency at the call site (MR !103).
 """
 from __future__ import annotations
 
@@ -40,19 +40,16 @@ def build_adaptive_option_order(
     qty: int,
     limit_price: float,
     account_id: str,
-    priority: str = "Patient",
+    urgency: Urgency = "patient",
 ) -> ib_async.Order:
-    """Build a single-leg adaptive option order.
-
-    Lifted verbatim from telegram_bot._build_adaptive_option_order.
-    """
+    """Build a single-leg adaptive option order."""
     order = ib_async.Order()
     order.action = str(action or "SELL").upper()
     order.totalQuantity = qty
     order.orderType = "LMT"
     order.lmtPrice = round(limit_price, 2)
     order.algoStrategy = "Adaptive"
-    order.algoParams = [ib_async.TagValue("adaptivePriority", priority)]
+    order.algoParams = _adaptive_params(urgency)
     order.tif = "DAY"
     order.account = account_id
     order.transmit = True
@@ -63,18 +60,15 @@ def build_adaptive_sell_order(
     qty: int,
     limit_price: float,
     account_id: str,
-    priority: str = "Patient",
+    urgency: Urgency = "patient",
 ) -> ib_async.Order:
-    """Single-leg adaptive SELL order.
-
-    Lifted verbatim from telegram_bot._build_adaptive_sell_order.
-    """
+    """Single-leg adaptive SELL order."""
     return build_adaptive_option_order(
         action="SELL",
         qty=qty,
         limit_price=limit_price,
         account_id=account_id,
-        priority=priority,
+        urgency=urgency,
     )
 
 
@@ -82,14 +76,13 @@ def build_adaptive_roll_combo(
     qty: int,
     limit_price: float,
     account_id: str,
-    priority: str = "Urgent",
+    urgency: Urgency = "patient",
 ) -> ib_async.Order:
     """IBKR BAG combo order for a Roll.
 
-    Lifted verbatim from telegram_bot._build_adaptive_roll_combo.
     Action = BUY executes the legs exactly as defined (Buy 1, Sell 1).
     Positive limit = net debit. Negative limit = net credit.
-    KEEP Urgent default — MR !102 will time-gate roll urgency to expiry-window-only.
+    Urgency is time-gated by the caller via urgency_policy.decide_roll_urgency.
     """
     order = ib_async.Order()
     order.action = "BUY"
@@ -97,7 +90,7 @@ def build_adaptive_roll_combo(
     order.orderType = "LMT"
     order.lmtPrice = round(limit_price, 2)
     order.algoStrategy = "Adaptive"
-    order.algoParams = [ib_async.TagValue("adaptivePriority", priority)]
+    order.algoParams = _adaptive_params(urgency)
     order.tif = "DAY"
     order.account = account_id
     order.transmit = True
