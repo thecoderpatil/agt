@@ -53,6 +53,7 @@ from agt_equities.ib_order_builder import (
     build_adaptive_roll_combo,
     build_adaptive_stk_order,
 )
+from agt_equities.urgency_policy import decide_roll_urgency
 from agt_equities.cc_engine import (
     CCPickerInput, CCWrite, CCStandDown, ChainStrike, pick_cc_strike,
 )
@@ -6712,7 +6713,18 @@ async def _place_single_order(
                     exchange=leg_data["exchange"],
                 ))
             contract.comboLegs = combo_legs
-            order = build_adaptive_roll_combo(qty, float(bid), acct_id, priority="Urgent")
+            _short_exp = payload.get("short_expiry") or payload.get("expiry", "")
+            _roll_urgency = "patient"
+            if _short_exp and len(_short_exp) == 8:
+                try:
+                    _expiry_dt = _datetime(
+                        int(_short_exp[:4]), int(_short_exp[4:6]), int(_short_exp[6:8]),
+                        20, 0, tzinfo=_timezone.utc,
+                    )
+                    _roll_urgency = decide_roll_urgency(_expiry_dt)
+                except Exception:
+                    _roll_urgency = "urgent"
+            order = build_adaptive_roll_combo(qty, float(bid), acct_id, urgency=_roll_urgency)
         elif sec_type == "OPT":
             contract = ib_async.Option(
                 symbol=ticker,
@@ -6726,6 +6738,7 @@ async def _place_single_order(
                 qty=qty,
                 limit_price=_round_to_nickel(float(bid)),
                 account_id=acct_id,
+                urgency=payload.get("urgency", "patient"),
             )
         elif sec_type == "STK":
             # MR !71: STK support for LIQUIDATE STC shares leg.
@@ -6735,14 +6748,16 @@ async def _place_single_order(
                 exchange="SMART",
                 currency="USD",
             )
+            _stk_urgency = payload.get("urgency", "patient")
             order_type = str(payload.get("order_type", "MKT") or "MKT").upper()
             if order_type == "MKT":
-                order = build_adaptive_stk_order(action, qty, order_type="MKT")
+                order = build_adaptive_stk_order(action, qty, order_type="MKT", urgency=_stk_urgency)
             else:
                 order = build_adaptive_stk_order(
                     action, qty,
                     order_type="LMT",
                     limit_price=_round_to_nickel(float(bid)) if bid else 0.0,
+                    urgency=_stk_urgency,
                 )
             order.account = acct_id
             order.transmit = True
@@ -10476,6 +10491,7 @@ def _dispatch_eval_result(
             "v2_rationale": result.reason,
             "strike": result.new_strike,
             "expiry": result.new_expiry.strftime("%Y%m%d") if result.new_expiry else None,
+            "short_expiry": exp_fmt,
             "right": "C",
             # combo_legs filled in by caller (needs ib_conn.qualifyContractsAsync)
             "_roll_result": result,  # marker for caller
