@@ -26,7 +26,28 @@ Modifiers:
   -Autostart  Set Start=SERVICE_AUTO_START on -Install/-Update. Default is manual.
   -DryRun     Echo every nssm.exe command; execute nothing.
   -User       Windows user to run services as. Default: current user.
-              Must NOT be LocalSystem (.env / C:\AGT_Telegram_Bridge perms).
+              LocalSystem is supported (see -AllowLocalSystem); the -User
+              path requires -Password (SecureString). On MR1.5 verification
+              we confirmed codebase cleanliness for SYSTEM: no *.py refs to
+              user-profile / OneDrive paths, and .env + .gitlab-token grant
+              NT AUTHORITY\SYSTEM Full Control.
+  -Password   SecureString password for -User. Required on -Install/-Update
+              because NSSM refuses to set ObjectName without a password.
+              If omitted, the script prompts via Read-Host -AsSecureString.
+              NSSM won't accept a one-arg ObjectName for any non-built-in
+              account (rc=6 "requires both a username and password").
+              Note: Windows 10+ Microsoft-account-linked local accounts may
+              be rejected by ChangeServiceConfig even when LogonUser accepts
+              the same credential (local MSA cache drift). If -User auth
+              fails on such an account, fall back to -AllowLocalSystem or
+              refresh the local cache by signing back in with the online
+              MSA password.
+  -AllowLocalSystem
+              Opt-in to install services as built-in LocalSystem. Bypasses
+              the Assert-User-NotLocalSystem guard, forces ObjectName to
+              "LocalSystem", and skips the -Password resolver entirely.
+              Used for MR1.5 cutover on this box after MSA credentials
+              blocked the -User path.
   -RepoRoot   Default C:\AGT_Telegram_Bridge.
   -PythonExe  Override python.exe path.
 
@@ -75,10 +96,17 @@ param(
     [string]$RepoRoot = "C:\AGT_Telegram_Bridge",
     [string]$PythonExe = "",
     [string]$User = $env:USERNAME,
+    [SecureString]$Password,
+    [switch]$AllowLocalSystem,
 
     [string]$BotServiceName = "agt-telegram-bot",
     [string]$SchedulerServiceName = "agt-scheduler"
 )
+
+# Populated lazily from $Password (or Read-Host) inside Invoke-Main when we
+# know we need it. Kept as a plaintext string because NSSM is invoked via
+# Start-Process + ArgumentList, which requires plain args. Zeroed on exit.
+$script:PlainPassword = $null
 
 $ErrorActionPreference = "Stop"
 
@@ -137,12 +165,67 @@ function Assert-NssmOnPath {
 }
 
 function Assert-User-NotLocalSystem {
-    if ($User -eq "LocalSystem" -or $User -eq "NT AUTHORITY\SYSTEM") {
-        Write-Err "Refusing to run services as LocalSystem."
-        Write-Err "Pass -User <domain\user>. Default is current user."
+    $isLocalSystem = ($User -eq "LocalSystem" -or $User -eq "NT AUTHORITY\SYSTEM")
+    if ($AllowLocalSystem) {
+        if (-not $isLocalSystem) {
+            $script:User = 'LocalSystem'
+        }
+        Write-Warn "service account: LocalSystem (AllowLocalSystem opt-in)"
+        Write-Warn "  Skips ObjectName password step (built-in account). Verified"
+        Write-Warn "  codebase-clean for MR1.5: no user-profile / OneDrive refs in"
+        Write-Warn "  *.py; .env + .gitlab-token grant SYSTEM Full Control."
+        return
+    }
+    if ($isLocalSystem) {
+        Write-Err "Refusing to run services as LocalSystem without -AllowLocalSystem opt-in."
+        Write-Err "Pass -User <domain\user> + -Password, or pass -AllowLocalSystem."
         exit 5
     }
     Write-Info ("service account: {0}" -f $User)
+}
+
+function Resolve-Password {
+    # Populates $script:PlainPassword from the $Password SecureString param,
+    # or prompts interactively if not supplied. Plaintext lives only for the
+    # duration of the Install/Update run and is zeroed in the finally block
+    # of Invoke-Main.
+    if ($AllowLocalSystem) {
+        $script:PlainPassword = $null
+        Write-Info "password: not required (LocalSystem)"
+        return
+    }
+    if ($DryRun) {
+        $script:PlainPassword = "<REDACTED-DRYRUN>"
+        Write-Info "password: <REDACTED-DRYRUN> (DryRun mode)"
+        return
+    }
+    $sec = $Password
+    if (-not $sec) {
+        Write-Info ("password: prompting for {0}" -f $User)
+        $sec = Read-Host -Prompt ("Password for {0}" -f $User) -AsSecureString
+    }
+    if (-not $sec -or $sec.Length -eq 0) {
+        Write-Err "Password required on -Install/-Update (NSSM rc=6 on one-arg ObjectName)."
+        exit 9
+    }
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+    try {
+        $script:PlainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+    Write-Info ("password: captured ({0} chars)" -f $script:PlainPassword.Length)
+}
+
+function Clear-Password {
+    if ($null -ne $script:PlainPassword) {
+        # Best-effort overwrite before releasing the reference. .NET strings
+        # are immutable so a previous copy may linger in GC; this is the
+        # tightest we can do in a script context.
+        $script:PlainPassword = ("X" * $script:PlainPassword.Length)
+        $script:PlainPassword = $null
+        [System.GC]::Collect()
+    }
 }
 
 function Resolve-PythonExe {
@@ -175,25 +258,83 @@ function Ensure-LogsDir {
     }
 }
 
+function ConvertTo-Win32Arg {
+    # Escapes a single arg per CommandLineToArgvW rules so that CreateProcess
+    # hands the child the exact intended string. Required because
+    # Start-Process -ArgumentList in Windows PowerShell 5.1 naively joins the
+    # array with spaces and does not quote args containing spaces/quotes.
+    # That mangled the password arg on -Install, producing NSSM rc=6
+    # "account name is invalid or password is invalid".
+    param([string]$Arg)
+    if ($null -eq $Arg) { return '""' }
+    if ($Arg -eq '')    { return '""' }
+    if ($Arg -notmatch '[\s"]') { return $Arg }
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.Append('"')
+    $i = 0
+    while ($i -lt $Arg.Length) {
+        $nBs = 0
+        while ($i -lt $Arg.Length -and $Arg[$i] -eq '\') {
+            $nBs++; $i++
+        }
+        if ($i -eq $Arg.Length) {
+            [void]$sb.Append('\' * ($nBs * 2))
+        } elseif ($Arg[$i] -eq '"') {
+            [void]$sb.Append('\' * ($nBs * 2 + 1))
+            [void]$sb.Append('"')
+            $i++
+        } else {
+            [void]$sb.Append('\' * $nBs)
+            [void]$sb.Append($Arg[$i])
+            $i++
+        }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
 function Invoke-Nssm {
     param([string[]]$NssmArgs)
+
+    # Redact the password arg for any log output. ObjectName is followed by
+    # User then Password; redact the 2nd arg after "ObjectName".
+    $displayArgs = @($NssmArgs)
+    for ($i = 0; $i -lt $displayArgs.Count; $i++) {
+        if ($displayArgs[$i] -eq 'ObjectName' -and $i + 2 -lt $displayArgs.Count) {
+            $displayArgs[$i + 2] = '<REDACTED>'
+        }
+    }
+
     if ($DryRun) {
-        Write-Host ("    DRYRUN> nssm {0}" -f ($NssmArgs -join " "))
+        Write-Host ("    DRYRUN> nssm {0}" -f ($displayArgs -join " "))
         return 0
     }
-    $tempOut = Join-Path $env:TEMP ("nssm_stdout_{0}.txt" -f (Get-Random))
-    $tempErr = Join-Path $env:TEMP ("nssm_stderr_{0}.txt" -f (Get-Random))
-    $proc = Start-Process -FilePath "nssm.exe" `
-        -ArgumentList $NssmArgs `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $tempOut `
-        -RedirectStandardError  $tempErr
-    $out = Get-Content $tempOut -Raw -ErrorAction SilentlyContinue
-    $err = Get-Content $tempErr -Raw -ErrorAction SilentlyContinue
+
+    # Build a properly Win32-escaped single command-line string and feed it
+    # through System.Diagnostics.Process (not Start-Process, which re-joins
+    # the array naively in PS 5.1).
+    $escaped = $NssmArgs | ForEach-Object { ConvertTo-Win32Arg $_ }
+    $cmdLine = ($escaped -join ' ')
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'nssm.exe'
+    $psi.Arguments = $cmdLine
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow = $true
+
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    [void]$p.Start()
+    $out = $p.StandardOutput.ReadToEnd()
+    $err = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+
     if ($out) { Write-Host ("    {0}" -f $out.TrimEnd()) }
     if ($err) { Write-Host ("    {0}" -f $err.TrimEnd()) -ForegroundColor Yellow }
-    Remove-Item $tempOut, $tempErr -ErrorAction SilentlyContinue
-    return $proc.ExitCode
+    return $p.ExitCode
 }
 
 function Service-Exists {
@@ -265,7 +406,17 @@ function Configure-Service {
     Set-NssmKey -Name $Name -Key "AppExit"         -Values @("Default", "Restart")
     Set-NssmKey -Name $Name -Key "AppRestartDelay" -Values @("30000")
 
-    Set-NssmKey -Name $Name -Key "ObjectName" -Values @($User)
+    if ($AllowLocalSystem) {
+        # Built-in LocalSystem -- no password. NSSM accepts bare 'LocalSystem'
+        # as ObjectName.
+        Set-NssmKey -Name $Name -Key "ObjectName" -Values @("LocalSystem")
+    } else {
+        if (-not $script:PlainPassword) {
+            Write-Err "Configure-Service called without a resolved password; this is a bug."
+            exit 8
+        }
+        Set-NssmKey -Name $Name -Key "ObjectName" -Values @($User, $script:PlainPassword)
+    }
 
     if ($EnvExtra -and $EnvExtra.Count -gt 0) {
         $lines = @()
@@ -372,6 +523,7 @@ function Invoke-Main {
     }
 
     Assert-User-NotLocalSystem
+    Resolve-Password
     $py = Resolve-PythonExe
     Write-Info ("python: {0}" -f $py)
     Ensure-LogsDir
@@ -420,4 +572,6 @@ try {
 } catch {
     Write-Err ("fatal: {0}" -f $_.Exception.Message)
     exit 1
+} finally {
+    Clear-Password
 }
