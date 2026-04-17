@@ -62,10 +62,10 @@ invariants:
     severity_floor: high
 
   - id: NO_SILENT_BREAKER_TRIP
-    description: haiku-watchdog daily_orders flags must emit a cross_daemon_alerts row.
+    description: AGT_Bot_Liveness_Watchdog must emit BOT_STALE when daemon_heartbeat 'agt_bot' is stale.
     check_fn: check_no_silent_breaker_trip
     scrutiny_tier: low
-    fix_by_sprint: adr-007-step2
+    fix_by_sprint: adr-007-mr85
     max_consecutive_violations: 1
     severity_floor: medium
 
