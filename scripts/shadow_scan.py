@@ -2,11 +2,19 @@
 
 See ``docs/adr/ADR-008_SHADOW_SCAN.md`` for the full architecture.
 
-MR 1 scope: plumbing skeleton. Builds a shadow ``RunContext``, calls a
-stubbed "no engines yet" path, drains the collector sinks, writes an
-empty JSON artifact to ``reports/shadow_scan_<run_id>.json``, and prints
-an empty digest to stdout. No engine is wired to ctx yet - that happens
-in MR 2 (CSP allocator), MR 3 (harvest), MR 4 (roll), MR 5 (CC split).
+MR 1 scope: plumbing skeleton.
+MR 2 scope: CSP allocator wired. ``--engine csp`` threads the shadow
+``RunContext`` into ``run_csp_allocator`` so ``CollectorOrderSink``
+captures staged tickets instead of writing ``pending_orders``.
+
+Full candidate generation (RAY scan + yfinance extras + per-household
+snapshot reconstruction) still lives inside ``telegram_bot.py`` /
+``scan_csp_setups``. Extracting that pipeline behind a shared entry
+point is follow-up scope (MR 2.x). Until then the CLI exercises the
+ctx seam by invoking the allocator against an empty candidate list -
+enough to prove the signature + sink wiring are reachable from outside
+the bot stack without pulling ``ib_async`` or ``yfinance`` into the
+CLI's import graph.
 
 Runtime guards (never relaxable):
     1. ``ctx.mode is RunMode.SHADOW`` immediately after construction
@@ -70,7 +78,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--engine",
         choices=("csp", "harvest", "roll", "cc", "all"),
         default="all",
-        help="Which engine(s) to shadow. MR 1: no engines wired yet.",
+        help=(
+            "Which engine(s) to shadow. MR 2: 'csp' wired via ctx seam "
+            "(empty-candidate invocation); others still stubbed."
+        ),
     )
     p.add_argument(
         "--gateway",
@@ -133,17 +144,86 @@ def build_shadow_ctx(db_clone_path: str) -> RunContext:
     return ctx
 
 
-def run_engines_stub(ctx: RunContext, engine: str) -> None:
-    """MR 1 placeholder - no engine is wired to ctx yet.
+def _run_csp_engine(ctx: RunContext) -> None:
+    """Invoke ``run_csp_allocator`` under the shadow ctx.
 
-    MR 2 will replace this with ``run_csp_allocator(..., ctx=ctx)`` etc.
-    Kept as a separate function so the harness can unit-test the
-    surrounding plumbing without a real engine import.
+    MR 2 scope: exercise the ctx seam mechanically. We pass an empty
+    candidate list because the full candidate pipeline (RAY screen +
+    yfinance extras + snapshot load) still lives inside the bot stack.
+    That pipeline is extracted in follow-up scope (tracked as MR 2.x).
+
+    Even with zero candidates, this invocation proves three things:
+      1. ``run_csp_allocator`` imports cleanly against the MR 2 signature
+         (``ctx: RunContext`` required keyword-only).
+      2. The allocator short-circuits on an empty candidate list without
+         touching the ctx's order_sink (recorded in the digest).
+      3. Follow-up MR 2.x can drop real candidates in and the ctx seam
+         will carry staged tickets to ``CollectorOrderSink`` unchanged.
     """
+    try:
+        from agt_equities.csp_allocator import run_csp_allocator
+    except ImportError as exc:  # pragma: no cover - defensive
+        sys.stderr.write(
+            f"[shadow_scan] csp_allocator import failed: {exc}\n"
+        )
+        return
+
+    def _empty_extras_provider(snapshot: dict, candidate) -> dict:
+        return {}
+
+    try:
+        result = run_csp_allocator(
+            ray_candidates=[],
+            snapshots={},
+            vix=0.0,
+            extras_provider=_empty_extras_provider,
+            ctx=ctx,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[shadow_scan] run_csp_allocator raised: {exc}\n"
+        )
+        return
+
+    n_allocations = len(getattr(result, "allocations", []) or [])
+    n_errors = len(getattr(result, "errors", []) or [])
     sys.stdout.write(
-        f"[shadow_scan] run_engines_stub: engine={engine} "
-        f"ctx.run_id={ctx.run_id} - no engines wired yet (MR 1 plumbing).\n"
+        f"[shadow_scan] csp: allocator completed ctx.run_id={ctx.run_id} "
+        f"allocations={n_allocations} errors={n_errors} "
+        "(empty-candidate invocation; full RAY pipeline follow-up scope)\n"
     )
+
+
+def run_engines_stub(ctx: RunContext, engine: str) -> None:
+    """Dispatch to per-engine shadow branches.
+
+    MR 1 landed as a single placeholder. MR 2 wires ``csp``. Harvest /
+    roll / cc land in MRs 3-5. ``all`` runs every wired engine in order.
+    """
+    wired: dict[str, callable] = {
+        "csp": _run_csp_engine,
+    }
+
+    def _stub(_ctx: RunContext, engine_name: str) -> None:
+        sys.stdout.write(
+            f"[shadow_scan] {engine_name}: not wired yet "
+            f"(ctx.run_id={_ctx.run_id}) - will land in a future MR.\n"
+        )
+
+    if engine == "all":
+        for name in ("csp", "harvest", "roll", "cc"):
+            fn = wired.get(name)
+            if fn is None:
+                _stub(ctx, name)
+            else:
+                fn(ctx)
+        return
+
+    fn = wired.get(engine)
+    if fn is None:
+        _stub(ctx, engine)
+    else:
+        fn(ctx)
 
 
 def render_digest(
