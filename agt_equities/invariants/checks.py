@@ -252,7 +252,14 @@ def check_no_orphan_children(
 def check_no_stranded_staged_orders(
     conn: sqlite3.Connection, ctx: CheckContext
 ) -> list[Violation]:
-    """Orders stuck in status='staged' longer than the stranded TTL."""
+    """Orders stuck in status='staged' longer than the stranded TTL.
+
+    MR !85: incident_key stabilized to ``NO_STRANDED_STAGED_ORDERS:<id>`` so
+    repeated ticks on the same stranded order bump ``consecutive_breaches``
+    on one canonical row instead of INSERTing a fresh row every 60s when
+    the time-varying ``age_hours`` field bumps the evidence fingerprint.
+    Latent bug; no rows tripping today but prophylactic.
+    """
     rows = conn.execute(
         "SELECT id, payload, created_at FROM pending_orders WHERE status='staged'"
     ).fetchall()
@@ -278,78 +285,91 @@ def check_no_stranded_staged_orders(
                     "mode": p.get("mode"),
                     "account_id": p.get("account_id"),
                 },
+                stable_key=f"NO_STRANDED_STAGED_ORDERS:{row['id']}",
             ))
     return vios
 
 
 # ---- 6. NO_SILENT_BREAKER_TRIP -------------------------------------------------
+# MR !85: the old haiku-watchdog task was retired in MR !66 (see
+# `project_autonomous_pipeline_launched` memory). Its replacement is the
+# Windows schtask ``AGT_Bot_Liveness_Watchdog`` running
+# ``scripts/bot_liveness_watchdog.ps1`` every ~5 minutes during RTH, which
+# reads ``daemon_heartbeat`` for ``agt_bot`` and writes a BOT_STALE row
+# into ``cross_daemon_alerts`` when the heartbeat goes stale.
+#
+# The invariant migrates from autonomous_session_log (dead source) to a
+# DB-native join between daemon_heartbeat and cross_daemon_alerts:
+#
+#   Silent trip = daemon_heartbeat for 'agt_bot' is observably stale
+#   (> 5 min) AND no BOT_STALE cross_daemon_alerts row exists inside the
+#   watchdog cadence window (10 min = 2x schtask interval).
+#
+# If the heartbeat is stale but a recent BOT_STALE alert exists, the
+# watchdog fired -- the bot drain is responsible for surfacing it to
+# Telegram/Gmail. If the heartbeat is stale AND no alert, the watchdog
+# itself isn't running (schtask disabled, PowerShell policy blocking,
+# sqlite3.exe missing, etc.) and the user will not be notified of the
+# bot outage. That's the "silent breaker trip" failure mode.
+#
+# NO_MISSING_DAEMON_HEARTBEAT already fires on stale heartbeat at the
+# 120s TTL; this invariant is independent and surfaces a different
+# failure mode (detection-pipeline health). They can co-fire.
+_SILENT_TRIP_HEARTBEAT_STALE_S = 300      # 5 min
+_SILENT_TRIP_WATCHDOG_WINDOW_S = 600      # 10 min (schtask 5 min * 2)
+_SILENT_TRIP_MONITORED_DAEMON = "agt_bot"
+
+
 def check_no_silent_breaker_trip(
     conn: sqlite3.Connection, ctx: CheckContext
 ) -> list[Violation]:
-    """haiku-watchdog daily_orders flags must emit a cross_daemon_alerts row.
-
-    Checks last 24h of watchdog runs; any run flagging 'daily_orders' without
-    a correlated breaker/limit alert in the +/- 1h window is a silent trip.
-    """
-    if not _table_exists(conn, "autonomous_session_log"):
+    """AGT_Bot_Liveness_Watchdog must emit BOT_STALE when daemon_heartbeat is stale."""
+    if not _table_exists(conn, "daemon_heartbeat"):
         return []
     if not _table_exists(conn, "cross_daemon_alerts"):
         return []
-    # Pull candidate watchdog runs; do the 24h filter in Python so ISO
-    # timestamps with '+00:00' suffix don't break SQLite datetime().
-    watchdog_runs = conn.execute(
-        """
-        SELECT id, run_at, errors FROM autonomous_session_log
-        WHERE task_name = 'haiku-watchdog'
-          AND errors IS NOT NULL AND errors != '' AND errors != '[]'
-        """
-    ).fetchall()
-    # Pull all breaker/limit/daily_orders alerts once; filter window in Python.
-    alert_rows = conn.execute(
-        """
-        SELECT id, created_ts, kind FROM cross_daemon_alerts
-        WHERE kind LIKE '%breaker%'
-           OR kind LIKE '%limit%'
-           OR kind LIKE '%daily_orders%'
-        """
-    ).fetchall()
-    alert_dts: list[datetime] = []
-    for a in alert_rows:
-        a_dt = _parse_dt(a["created_ts"])
-        if a_dt is not None:
-            alert_dts.append(a_dt)
-    lookback = ctx.now_utc - timedelta(hours=24)
-    window = timedelta(hours=1)
-    vios: list[Violation] = []
-    for run in watchdog_runs:
-        errors_raw = run["errors"] or ""
-        if ("daily_orders" not in errors_raw
-                and "Daily order limit" not in errors_raw):
-            continue
-        run_dt = _parse_dt(run["run_at"])
-        if run_dt is None:
-            continue
-        if run_dt < lookback:
-            continue
-        has_correlated = any(
-            abs((alert_dt - run_dt).total_seconds()) <= window.total_seconds()
-            for alert_dt in alert_dts
-        )
-        if not has_correlated:
-            vios.append(Violation(
-                invariant_id="NO_SILENT_BREAKER_TRIP",
-                description=(
-                    f"haiku-watchdog flagged daily_orders at {run['run_at']} "
-                    "with no cross_daemon_alert emitted"
-                ),
-                severity="medium",
-                evidence={
-                    "watchdog_run_id": run["id"],
-                    "run_at": run["run_at"],
-                    "errors_excerpt": errors_raw[:200],
-                },
-            ))
-    return vios
+    row = conn.execute(
+        "SELECT last_beat_utc FROM daemon_heartbeat WHERE daemon_name=?",
+        (_SILENT_TRIP_MONITORED_DAEMON,),
+    ).fetchone()
+    # No row at all = NO_MISSING_DAEMON_HEARTBEAT's concern, not ours.
+    if row is None:
+        return []
+    last_beat = _parse_dt(row["last_beat_utc"])
+    if last_beat is None:
+        return []
+    age_s = (ctx.now_utc - last_beat).total_seconds()
+    if age_s <= _SILENT_TRIP_HEARTBEAT_STALE_S:
+        return []
+    # Heartbeat stale. Did the watchdog fire recently?
+    now_epoch = ctx.now_utc.timestamp()
+    cutoff_epoch = now_epoch - _SILENT_TRIP_WATCHDOG_WINDOW_S
+    recent_alert = conn.execute(
+        "SELECT id FROM cross_daemon_alerts "
+        "WHERE kind = 'BOT_STALE' "
+        "  AND CAST(created_ts AS REAL) >= ? "
+        "ORDER BY id DESC LIMIT 1",
+        (cutoff_epoch,),
+    ).fetchone()
+    if recent_alert is not None:
+        return []  # watchdog fired within cadence; NOT silent
+    return [Violation(
+        invariant_id="NO_SILENT_BREAKER_TRIP",
+        description=(
+            f"daemon_heartbeat '{_SILENT_TRIP_MONITORED_DAEMON}' stale by "
+            f"{age_s:.0f}s but no BOT_STALE cross_daemon_alert in the last "
+            f"{_SILENT_TRIP_WATCHDOG_WINDOW_S}s watchdog window "
+            "(AGT_Bot_Liveness_Watchdog likely not running)"
+        ),
+        severity="medium",
+        evidence={
+            "daemon_name": _SILENT_TRIP_MONITORED_DAEMON,
+            "stale_seconds": age_s,
+            "watchdog_window_seconds": _SILENT_TRIP_WATCHDOG_WINDOW_S,
+            "last_beat_utc": last_beat.isoformat(),
+        },
+        stable_key=f"NO_SILENT_BREAKER_TRIP:{_SILENT_TRIP_MONITORED_DAEMON}",
+    )]
 
 
 # ---- 7. NO_ZOMBIE_BOT_PROCESS --------------------------------------------------
@@ -360,6 +380,9 @@ def check_no_zombie_bot_process(
 
     Uses psutil when available; falls back to tasklist/ps. Returns a single
     degraded Violation when process enumeration is unavailable (typical CI).
+
+    MR !85: stable_key added so repeat ticks on the same host condition
+    (zombie OR degraded) bump consecutive_breaches on one canonical row.
     """
     pids: list[int] = []
     try:
@@ -388,6 +411,7 @@ def check_no_zombie_bot_process(
                 description="process enumeration unavailable; check degraded",
                 severity="low",
                 evidence={"degraded": True, "reason": "no_psutil_no_ps"},
+                stable_key="NO_ZOMBIE_BOT_PROCESS:degraded",
             )]
         for line in out.splitlines():
             if "telegram_bot.py" in line:
@@ -401,6 +425,7 @@ def check_no_zombie_bot_process(
             ),
             severity="high",
             evidence={"pid_count": len(pids), "pids": pids[:10]},
+            stable_key="NO_ZOMBIE_BOT_PROCESS",
         )]
     return []
 
@@ -455,7 +480,13 @@ def check_no_stale_red_alert(
 def check_no_stuck_processing_order(
     conn: sqlite3.Connection, ctx: CheckContext
 ) -> list[Violation]:
-    """Orders in status='processing' past the stuck TTL (default 2h)."""
+    """Orders in status='processing' past the stuck TTL (default 2h).
+
+    MR !85: incident_key stabilized to ``NO_STUCK_PROCESSING_ORDER:<id>``
+    so repeated ticks on the same stuck order bump ``consecutive_breaches``
+    on one canonical row. age_hours churn would otherwise INSERT a new
+    row every 60s. Latent bug; prophylactic fix.
+    """
     rows = conn.execute(
         "SELECT id, payload, created_at, ib_order_id FROM pending_orders "
         "WHERE status = 'processing'"
@@ -482,6 +513,7 @@ def check_no_stuck_processing_order(
                     "account_id": p.get("account_id"),
                     "ib_order_id": row["ib_order_id"],
                 },
+                stable_key=f"NO_STUCK_PROCESSING_ORDER:{row['id']}",
             ))
     return vios
 
@@ -546,6 +578,14 @@ def check_no_local_drift(
     Repo path resolves from ``AGT_REPO_PATH`` env var, default
     ``C:\\AGT_Telegram_Bridge`` (Windows production box). On Linux CI the
     env is unset and the ``.git`` probe fails cleanly -> returns [].
+
+    MR !85: stable_key="NO_LOCAL_DRIFT" (singleton). Pre-fix, the
+    drift_sample list mutated on every mtime bump -> evidence fingerprint
+    churned -> new incident row every 60s. Post-fix one canonical row
+    UPDATEs consecutive_breaches; drift_sample still observable for
+    operator triage but no longer busts dedup. Degraded paths share
+    a sibling key ``NO_LOCAL_DRIFT:degraded`` so the real-drift row and
+    the degraded row don't alias.
     """
     import os
     repo_path = os.environ.get("AGT_REPO_PATH", r"C:\AGT_Telegram_Bridge")
@@ -564,6 +604,7 @@ def check_no_local_drift(
             description=f"git status failed; check degraded: {exc}",
             severity="low",
             evidence={"degraded": True, "error": str(exc)},
+            stable_key="NO_LOCAL_DRIFT:degraded",
         )]
     if result.returncode != 0:
         return [Violation(
@@ -574,6 +615,7 @@ def check_no_local_drift(
                 "degraded": True,
                 "stderr": (result.stderr or "")[:400],
             },
+            stable_key="NO_LOCAL_DRIFT:degraded",
         )]
     # TRIPWIRE_EXEMPT_REGISTRY active drift allowlist (4 files per v23 handoff).
     exempt_paths = frozenset({
@@ -612,6 +654,7 @@ def check_no_local_drift(
             "drift_sample": drift_lines[:10],
             "repo_path": repo_path,
         },
+        stable_key="NO_LOCAL_DRIFT",
     )]
 
 

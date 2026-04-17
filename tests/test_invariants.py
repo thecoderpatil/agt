@@ -237,41 +237,83 @@ def test_no_stranded_staged_ignores_other_statuses(conn, ctx):
 
 
 # --- 6. NO_SILENT_BREAKER_TRIP --------------------------------------------------
+# MR !85: rewrite. Old semantic keyed on autonomous_session_log.task_name=
+# 'haiku-watchdog'; that task was retired in MR !66. New semantic: detect
+# stale daemon_heartbeat for 'agt_bot' without a correlated BOT_STALE
+# cross_daemon_alerts row inside the AGT_Bot_Liveness_Watchdog schtask
+# cadence window (10 min = 2x the 5-min cadence).
 def test_no_silent_breaker_trip_trip(conn, ctx):
+    """Heartbeat stale by 15 min, no BOT_STALE alert -> silent watchdog trip."""
+    stale = (NOW - timedelta(minutes=15)).isoformat()
     conn.execute(
-        "INSERT INTO autonomous_session_log (id, task_name, run_at, errors) "
-        "VALUES (1, 'haiku-watchdog', ?, ?)",
-        (
-            NOW.isoformat(),
-            '[{"check":"daily_orders","ok":false,'
-            '"reason":"Daily order limit reached: 35/30"}]',
-        ),
+        "INSERT INTO daemon_heartbeat (daemon_name, last_beat_utc, pid) "
+        "VALUES ('agt_bot', ?, 1234)",
+        (stale,),
     )
     vios = check_no_silent_breaker_trip(conn, ctx)
     assert len(vios) == 1
+    assert vios[0].stable_key == "NO_SILENT_BREAKER_TRIP:agt_bot"
+    assert vios[0].evidence["stale_seconds"] > 600
 
 
 def test_no_silent_breaker_trip_pass_with_alert(conn, ctx):
+    """Heartbeat stale but recent BOT_STALE alert -> watchdog fired; NOT silent."""
+    stale = (NOW - timedelta(minutes=15)).isoformat()
     conn.execute(
-        "INSERT INTO autonomous_session_log (id, task_name, run_at, errors) "
-        "VALUES (1, 'haiku-watchdog', ?, ?)",
-        (NOW.isoformat(), '[{"check":"daily_orders","ok":false}]'),
+        "INSERT INTO daemon_heartbeat (daemon_name, last_beat_utc, pid) "
+        "VALUES ('agt_bot', ?, 1234)",
+        (stale,),
     )
+    recent_ts = (NOW - timedelta(minutes=3)).timestamp()
     conn.execute(
         "INSERT INTO cross_daemon_alerts "
-        "(id, created_ts, kind, severity, payload_json, status) "
-        "VALUES (1, ?, 'breaker_trip_daily_orders', 'high', '{}', 'sent')",
-        (NOW.isoformat(),),
+        "(id, created_ts, kind, severity, payload_json, status, attempts) "
+        "VALUES (1, ?, 'BOT_STALE', 'crit', '{}', 'pending', 0)",
+        (str(recent_ts),),
     )
     assert check_no_silent_breaker_trip(conn, ctx) == []
 
 
 def test_no_silent_breaker_trip_ignores_clean_watchdog(conn, ctx):
+    """Fresh heartbeat -> invariant does not fire (no silent trip condition)."""
     conn.execute(
-        "INSERT INTO autonomous_session_log (id, task_name, run_at, errors) "
-        "VALUES (1, 'haiku-watchdog', ?, '[]')",
+        "INSERT INTO daemon_heartbeat (daemon_name, last_beat_utc, pid) "
+        "VALUES ('agt_bot', ?, 1234)",
         (NOW.isoformat(),),
     )
+    assert check_no_silent_breaker_trip(conn, ctx) == []
+
+
+def test_no_silent_breaker_trip_stale_alert_outside_window(conn, ctx):
+    """Heartbeat stale, only-old BOT_STALE alert (> 10 min) -> still silent trip."""
+    stale = (NOW - timedelta(minutes=15)).isoformat()
+    conn.execute(
+        "INSERT INTO daemon_heartbeat (daemon_name, last_beat_utc, pid) "
+        "VALUES ('agt_bot', ?, 1234)",
+        (stale,),
+    )
+    old_ts = (NOW - timedelta(minutes=30)).timestamp()
+    conn.execute(
+        "INSERT INTO cross_daemon_alerts "
+        "(id, created_ts, kind, severity, payload_json, status, attempts) "
+        "VALUES (1, ?, 'BOT_STALE', 'crit', '{}', 'sent', 1)",
+        (str(old_ts),),
+    )
+    vios = check_no_silent_breaker_trip(conn, ctx)
+    assert len(vios) == 1
+    assert vios[0].stable_key == "NO_SILENT_BREAKER_TRIP:agt_bot"
+
+
+def test_no_silent_breaker_trip_degrades_on_missing_tables(ctx):
+    """No daemon_heartbeat / cross_daemon_alerts tables -> returns [] (not degraded)."""
+    import sqlite3 as _sqlite3
+    empty = _sqlite3.connect(":memory:")
+    empty.row_factory = _sqlite3.Row
+    assert check_no_silent_breaker_trip(empty, ctx) == []
+
+
+def test_no_silent_breaker_trip_skips_when_heartbeat_row_missing(conn, ctx):
+    """No agt_bot row in daemon_heartbeat -> NO_MISSING_DAEMON_HEARTBEAT's job, not ours."""
     assert check_no_silent_breaker_trip(conn, ctx) == []
 
 
