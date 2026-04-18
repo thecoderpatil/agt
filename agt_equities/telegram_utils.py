@@ -72,3 +72,43 @@ def send_telegram_digest(
         if i < len(messages) - 1:
             time.sleep(0.3)
     return results
+
+
+def send_telegram_message_with_keyboard(
+    text: str,
+    keyboard: list,
+    *,
+    chat_id: str | None = None,
+    parse_mode: str | None = "HTML",
+    bot_token: str | None = None,
+    timeout: float = 10.0,
+) -> dict:
+    """Send a message with an inline keyboard. Fail-open: never raises.
+
+    ``keyboard`` must be a list-of-list-of-dicts in Telegram InlineKeyboardMarkup
+    format, e.g. [[{"text": "OK", "callback_data": "ok"}]].
+    Returns Telegram API response dict, or {"ok": False, "error": ...} on failure.
+    """
+    token = bot_token or os.environ.get(_DEFAULT_BOT_TOKEN_ENV, "")
+    cid = chat_id or os.environ.get(_DEFAULT_CHAT_ID_ENV, "")
+    if not token or not cid:
+        msg = "TELEGRAM_BOT_TOKEN or TELEGRAM_USER_ID not configured"
+        logger.warning("send_telegram_message_with_keyboard: %s", msg)
+        return {"ok": False, "error": msg}
+    url = f"{_TELEGRAM_API_BASE}/bot{token}/sendMessage"
+    payload: dict = {
+        "chat_id": cid,
+        "text": text,
+        "reply_markup": {"inline_keyboard": keyboard},
+    }
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        body = resp.json()
+        if not body.get("ok"):
+            logger.warning("send_telegram_message_with_keyboard: API error: %s", body)
+        return body
+    except Exception as exc:
+        logger.warning("send_telegram_message_with_keyboard: request failed: %s", exc)
+        return {"ok": False, "error": str(exc)}

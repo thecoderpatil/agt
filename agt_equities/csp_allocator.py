@@ -1037,6 +1037,22 @@ def run_csp_allocator(
     """
     result = AllocatorResult()
 
+    # Q5 (ADR-010 §3.1 #4): WARTIME pre-check.
+    # If ALL household accounts are in WARTIME mode, fa_block_margin will veto
+    # every candidate at Step 4 anyway. Suppress the approval gate entirely so
+    # the operator is never shown a digest for zero-allocation candidates.
+    _any_non_wartime = snapshots and any(
+        acct.get("mode", "PEACETIME") != "WARTIME"
+        for hh in snapshots.values()
+        for acct in hh.get("accounts", {}).values()
+    )
+    if snapshots and not _any_non_wartime:
+        logger.info(
+            "csp_allocator: all household accounts in WARTIME — "
+            "suppressing approval gate, returning empty result"
+        )
+        return result
+
     # ── Stage 0: approval gate ──
     # Called once on the full list. Identity default for paper; live
     # mode wires a Telegram digest gate. A broken gate degrades to
