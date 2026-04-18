@@ -10,12 +10,12 @@ Architectural contract (M2, 2026-04-11):
     (_scan_and_stage_defensive_rolls, lines ~8768-8861) but for short
     PUTS instead of short calls, and with CSP-specific thresholds.
   - Dual thresholds:
-       profit_pct >= 0.80  AND  dte >= 1   â†’ stage BTC  (next-day)
-       profit_pct >= 0.90  AND  dte <= 1   â†’ stage BTC  (last-day)
+       profit_pct >= 0.80  AND  dte >= 1   -> stage BTC  (next-day)
+       profit_pct >= 0.90  AND  dte <= 1   -> stage BTC  (last-day)
     where profit_pct = (initial_credit - current_ask) / initial_credit
     and   initial_credit = abs(pos.avgCost) / 100.0
   - Excludes tickers in EXCLUDED_TICKERS (mirror of the telegram_bot.py
-    blocklist â€” defined locally to preserve the one-way dependency
+    blocklist -- defined locally to preserve the one-way dependency
     rule: agt_equities.csp_harvest MUST NOT import telegram_bot).
   - Pure threshold check `_should_harvest_csp` has no IB/DB
     dependencies and is fully unit-testable in isolation.
@@ -83,9 +83,9 @@ def _should_harvest_csp(
       - dte: days to expiration. Used ONLY for E7 expiry-day let-ride gate.
 
     Decision rules (mirrors roll_engine.py E2/E5):
-      - dte <= 0 â†’ NEVER harvest (E7: let it ride on expiry day)
-      - days_held <= 1 AND profit_pct >= 0.80 â†’ harvest (day-1 80%)
-      - days_held >= 2 AND profit_pct >= 0.90 â†’ harvest (standard 90%)
+      - dte <= 0 -> NEVER harvest (E7: let it ride on expiry day)
+      - days_held <= 1 AND profit_pct >= 0.80 -> harvest (day-1 80%)
+      - days_held >= 2 AND profit_pct >= 0.90 -> harvest (standard 90%)
       - If days_held == -1 (unknown), falls back to days_held=2 (the
         more conservative 90% path). This is safe: over-harvesting at 90%
         is conservative vs. the alternative of firing 80% on old positions.
@@ -110,13 +110,13 @@ def _should_harvest_csp(
 
     profit_pct = (ic - ca) / ic
 
-    # E7 fix (2026-04-15): expiry day â€” let it ride to expiration.
+    # E7 fix (2026-04-15): expiry day -- let it ride to expiration.
     # Paying the ask spread to close a position expiring worthless is
     # negative EV. Canonical: "on expiry day itself, let it ride."
     if dte <= 0:
         return False, f"expiry_day_let_ride:profit_pct={profit_pct:.3f}"
 
-    # Resolve days_held: -1 means unknown â†’ default to 2 (conservative 90% path)
+    # Resolve days_held: -1 means unknown -> default to 2 (conservative 90% path)
     effective_days_held = days_held if days_held >= 0 else 2
 
     # Day-1 rule (80%): position held <= 1 calendar day AND >= 80% profit.
@@ -238,18 +238,18 @@ async def scan_csp_harvest_candidates(
     Returns
     -------
     dict with keys:
-        staged  : list[dict]  â€” BTC tickets that were staged
-        skipped : list[dict]  â€” positions that did NOT meet threshold
+        staged  : list[dict]  -- BTC tickets that were staged
+        skipped : list[dict]  -- positions that did NOT meet threshold
                                 (includes reason)
-        errors  : list[dict]  â€” positions that raised during probe
-        alerts  : list[str]   â€” human-readable status lines
+        errors  : list[dict]  -- positions that raised during probe
+        alerts  : list[str]   -- human-readable status lines
 
     Mirrors telegram_bot.py _scan_and_stage_defensive_rolls STATE_2
     HARVEST flow (lines 8768-8869) with these adjustments:
       - Filters for short PUTS (right == "P") not calls
       - Uses _should_harvest_csp thresholds instead of pnl_pct >= 0.85
       - mode="CSP_HARVEST" tags the ticket for execution-gate routing
-      - No spot fetch, no Greeks, no ledger â€” pure profit-take
+      - No spot fetch, no Greeks, no ledger -- pure profit-take
     """
     result: dict[str, list] = {
         "staged": [],
