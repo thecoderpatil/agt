@@ -160,8 +160,8 @@ def _lookup_days_held(
     """Best-effort lookup for when a short put was opened.
 
     Queries pending_orders for the original CSP SELL order. Falls back to
-    master_log_trades via trade_repo. Returns -1 if unknown (triggers
-    conservative 90% path in _should_harvest_csp).
+    master_log_trades. Returns -1 if unknown (triggers conservative 90%
+    path in _should_harvest_csp).
 
     Pure read-only. No writes, no side effects beyond logging.
     """
@@ -170,17 +170,18 @@ def _lookup_days_held(
         from contextlib import closing
 
         with closing(get_ro_connection()) as conn:
-            # Try pending_orders first (most recent CSP sells)
+            # Try pending_orders first (most recent CSP sells).
+            # account_id is inside the JSON payload -- must use json_extract.
             row = conn.execute(
                 """
-                SELECT MIN(created_at) as opened_at
+                SELECT MIN(created_at) AS opened_at
                 FROM pending_orders
-                WHERE account_id = ?
+                WHERE json_extract(payload, '$.account_id') = ?
                   AND json_extract(payload, '$.ticker') = ?
                   AND json_extract(payload, '$.right') = 'P'
                   AND json_extract(payload, '$.action') = 'SELL'
                   AND json_extract(payload, '$.strike') = ?
-                  AND status IN ('executed', 'filled', 'processing')
+                  AND status IN ('filled', 'executed', 'processing')
                 """,
                 (account_id, ticker, strike),
             ).fetchone()
@@ -192,17 +193,19 @@ def _lookup_days_held(
                 except (ValueError, TypeError):
                     pass
 
-            # Fallback: master_log_trades (walker source of truth)
+            # Fallback: master_log_trades (Flex/Walker source of truth).
+            # Correct columns: symbol (not ticker), asset_category (not
+            # asset_class), buy_sell (not action).
             row2 = conn.execute(
                 """
-                SELECT MIN(t.trade_date) as opened_at
+                SELECT MIN(t.trade_date) AS opened_at
                 FROM master_log_trades t
                 WHERE t.account_id = ?
-                  AND t.ticker = ?
-                  AND t.asset_class = 'OPT'
+                  AND t.symbol = ?
+                  AND t.asset_category = 'OPT'
                   AND t.put_call = 'P'
                   AND t.strike = ?
-                  AND t.action = 'SELL'
+                  AND t.buy_sell = 'SELL'
                 """,
                 (account_id, ticker, strike),
             ).fetchone()
@@ -217,7 +220,7 @@ def _lookup_days_held(
     except Exception as exc:
         logger.debug("_lookup_days_held failed for %s/%s: %s", account_id, ticker, exc)
 
-    return -1  # Unknown â€” _should_harvest_csp will use conservative 90% path
+    return -1
 
 
 # ---------------------------------------------------------------------------
