@@ -1453,6 +1453,8 @@ ib: ib_async.IB | None = None
 
 _ib_connect_lock = asyncio.Lock()
 
+_reconnect_lock = asyncio.Lock()
+
 _reconnect_task: asyncio.Task | None = None
 
 _shutdown_started = False
@@ -1885,9 +1887,17 @@ async def _handle_1101_data_lost() -> None:
 
         from ib_async.objects import ExecutionFilter
 
-        await ib.reqAllOpenOrdersAsync()
+        await asyncio.wait_for(
 
-        await ib.reqExecutionsAsync(ExecutionFilter())
+            ib.reqAllOpenOrdersAsync(), timeout=30.0
+
+        )
+
+        await asyncio.wait_for(
+
+            ib.reqExecutionsAsync(ExecutionFilter()), timeout=30.0
+
+        )
 
         from telegram import Bot
 
@@ -1898,6 +1908,14 @@ async def _handle_1101_data_lost() -> None:
         await _alert_telegram(
 
             "\u2705 1101 recovery complete. Orphan scan finished."
+
+        )
+
+    except asyncio.TimeoutError:
+
+        logger.warning(
+
+            "_handle_1101_data_lost: reqAllOpenOrdersAsync/reqExecutionsAsync timed out after 30s"
 
         )
 
@@ -1921,7 +1939,7 @@ async def _handle_1101_data_lost() -> None:
 
 
 
-async def _auto_reconnect():
+async def _do_auto_reconnect():
 
     logger.warning("IB disconnected — retrying in 60s…")
 
@@ -1957,17 +1975,33 @@ async def _auto_reconnect():
 
             try:
 
-                await ib_conn.reqAllOpenOrdersAsync()
+                await asyncio.wait_for(
+
+                    ib_conn.reqAllOpenOrdersAsync(), timeout=30.0
+
+                )
 
                 from ib_async.objects import ExecutionFilter
 
-                await ib_conn.reqExecutionsAsync(ExecutionFilter())
+                await asyncio.wait_for(
+
+                    ib_conn.reqExecutionsAsync(ExecutionFilter()), timeout=30.0
+
+                )
 
                 from telegram import Bot
 
                 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
                 await _scan_orphaned_transmitting_rows(ib_conn, bot)
+
+            except asyncio.TimeoutError:
+
+                logger.warning(
+
+                    "_do_auto_reconnect: reqAllOpenOrdersAsync/reqExecutionsAsync timed out after 30s"
+
+                )
 
             except Exception as scan_exc:
 
@@ -2025,6 +2059,23 @@ async def _auto_reconnect():
 
 
 
+
+
+async def _auto_reconnect():
+
+    if _reconnect_lock.locked():
+
+        logger.warning(
+
+            "_auto_reconnect: lock contended — another reconnect is in progress, skipping"
+
+        )
+
+        return
+
+    async with _reconnect_lock:
+
+        await _do_auto_reconnect()
 
 
 def _schedule_reconnect() -> None:
@@ -2159,11 +2210,23 @@ async def ensure_ib_connected() -> ib_async.IB:
 
                 try:
 
-                    await candidate.reqAllOpenOrdersAsync()
+                    await asyncio.wait_for(
+
+                        candidate.reqAllOpenOrdersAsync(), timeout=30.0
+
+                    )
 
                     logger.info(
 
                         "reqAllOpenOrdersAsync: trades list hydrated on (re)connect"
+
+                    )
+
+                except asyncio.TimeoutError:
+
+                    logger.warning(
+
+                        "ensure_ib_connected: reqAllOpenOrdersAsync timed out after 30s — skipping hydration"
 
                     )
 
