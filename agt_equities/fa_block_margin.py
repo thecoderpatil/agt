@@ -49,10 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
-# Mode string constants — match agt_equities.mode_engine vocabulary.
-MODE_PEACETIME = "PEACETIME"
-MODE_AMBER = "AMBER"
-MODE_WARTIME = "WARTIME"
+from agt_equities.mode_engine import MODE_PEACETIME, MODE_AMBER, MODE_WARTIME
 
 # Margin-check outcome codes persisted to pending_order_children by B5.c
 # and rendered by format_allocation_digest today.
