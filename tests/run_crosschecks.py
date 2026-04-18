@@ -22,10 +22,10 @@ from agt_equities import trade_repo
 from agt_equities.walker import walk_cycles, UnknownEventError
 
 try:
-    from agt_equities.trade_repo import EXCLUDED_TICKERS
+    from agt_equities.trade_repo import INDEX_UNDERLYINGS
 except ImportError:
-    logging.warning("Could not import EXCLUDED_TICKERS from trade_repo, using empty set")
-    EXCLUDED_TICKERS = frozenset()
+    logging.warning("Could not import INDEX_UNDERLYINGS from trade_repo, using empty set")
+    INDEX_UNDERLYINGS = frozenset()
 
 import csv
 
@@ -151,7 +151,7 @@ def crosscheck_a(conn, all_cycles, frozen):
     excluded_ibkr = {}
     for key in sorted(ibkr_realized.keys()):
         hh, tk = key
-        if tk in EXCLUDED_TICKERS:
+        if tk in INDEX_UNDERLYINGS:
             excluded_ibkr[key] = ibkr_realized[key]
 
     if excluded_ibkr:
@@ -166,7 +166,7 @@ def crosscheck_a(conn, all_cycles, frozen):
         hh, tk = key
         if key in frozen:
             continue
-        if tk in EXCLUDED_TICKERS:
+        if tk in INDEX_UNDERLYINGS:
             continue
         w = walker_realized.get(key, 0.0)
         i = ibkr_realized.get(key, 0.0)
