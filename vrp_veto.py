@@ -24,6 +24,7 @@ import pandas as pd
 import pytz
 import requests
 import yfinance as yf
+from agt_equities.config import EXCLUDED_TICKERS
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -40,7 +41,6 @@ TELEGRAM_USER_ID = os.environ.get("TELEGRAM_USER_ID", "")
 
 _VRP_DB_PATH = _BASE_DIR / "vrp_analytics.db"
 
-EXCLUDED_TICKERS = {"IBKR", "TRAW.CVR", "SPX", "SLS", "GTLB"}
 
 # VRP thresholds
 VRP_OK_THRESHOLD = 5.0        # > 5.0 → OK to sell

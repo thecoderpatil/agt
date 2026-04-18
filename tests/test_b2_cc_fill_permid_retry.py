@@ -44,7 +44,7 @@ def _make_trade_fill(perm_id: int = 12345, order_id: int = 111, account: str = "
 
 def test_first_try_success_no_sleep(bot_module, monkeypatch):
     monkeypatch.setitem(bot_module.ACCOUNT_TO_HOUSEHOLD, "U21971297", "Yash_Household")
-    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", set())
+    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", frozenset())
 
     sleeps = []
     monkeypatch.setattr(bot_module.time, "sleep", lambda s: sleeps.append(s))
@@ -66,7 +66,7 @@ def test_first_try_success_no_sleep(bot_module, monkeypatch):
 
 def test_transient_miss_then_hit(bot_module, monkeypatch):
     monkeypatch.setitem(bot_module.ACCOUNT_TO_HOUSEHOLD, "U21971297", "Yash_Household")
-    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", set())
+    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", frozenset())
 
     sleeps = []
     monkeypatch.setattr(bot_module.time, "sleep", lambda s: sleeps.append(s))
@@ -91,7 +91,7 @@ def test_transient_miss_then_hit(bot_module, monkeypatch):
 
 def test_persistent_miss_exhausts_retries(bot_module, monkeypatch, caplog):
     monkeypatch.setitem(bot_module.ACCOUNT_TO_HOUSEHOLD, "U21971297", "Yash_Household")
-    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", set())
+    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", frozenset())
 
     sleeps = []
     monkeypatch.setattr(bot_module.time, "sleep", lambda s: sleeps.append(s))
@@ -129,7 +129,7 @@ def test_persistent_miss_exhausts_retries(bot_module, monkeypatch, caplog):
 def test_retry_guard_does_not_break_non_sell_call(bot_module, monkeypatch):
     """Bail-out guards (non-SELL, non-OPT, non-C) must fire before retry loop."""
     monkeypatch.setitem(bot_module.ACCOUNT_TO_HOUSEHOLD, "U21971297", "Yash_Household")
-    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", set())
+    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", frozenset())
 
     sleeps = []
     monkeypatch.setattr(bot_module.time, "sleep", lambda s: sleeps.append(s))

@@ -194,7 +194,7 @@ from agt_equities.config import (  # noqa: E402
 
     PAPER_MODE, HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, ACTIVE_ACCOUNTS,
 
-    MARGIN_ACCOUNTS,
+    MARGIN_ACCOUNTS, EXCLUDED_TICKERS,
 
 )
 
@@ -3044,7 +3044,6 @@ _SECTOR_MAP_FALLBACK: dict[str, str] = {
 
 }
 
-EXCLUDED_TICKERS = {"IBKR", "TRAW.CVR", "SPX", "SLS", "GTLB"}
 
 
 
