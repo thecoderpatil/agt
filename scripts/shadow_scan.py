@@ -232,18 +232,19 @@ def _run_harvest_engine(ctx: RunContext) -> None:
     )
 
 def _run_roll_engine(ctx: RunContext) -> None:
-    """Invoke ``_scan_and_stage_defensive_rolls`` under the shadow ctx.
+    """Invoke scan_and_stage_defensive_rolls under the shadow ctx.
 
-    MR 4 scope: exercise the ctx seam mechanically. Passes empty
+    MR 4b scope: exercise the module boundary mechanically. Passes empty
     positions so the scan short-circuits without touching IB.
-    Full IB-connect + positions fetch deferred to pipeline extraction MR.
+    All 7 injectable deps provided as no-op stubs.
     """
     import asyncio
+    from unittest.mock import AsyncMock, MagicMock
     try:
-        import telegram_bot
+        from agt_equities import roll_scanner
     except ImportError as exc:  # pragma: no cover - defensive
         sys.stderr.write(
-            f"[shadow_scan] telegram_bot import failed: {exc}\n"
+            f"[shadow_scan] roll_scanner import failed: {exc}\n"
         )
         return
 
@@ -256,11 +257,21 @@ def _run_roll_engine(ctx: RunContext) -> None:
 
     try:
         result = asyncio.run(
-            telegram_bot._scan_and_stage_defensive_rolls(_EmptyIB(), ctx=ctx)
+            roll_scanner.scan_and_stage_defensive_rolls(
+                _EmptyIB(),
+                ctx=ctx,
+                ibkr_get_spot=AsyncMock(return_value=100.0),
+                load_premium_ledger=MagicMock(return_value=None),
+                get_desk_mode=MagicMock(return_value="PEACETIME"),
+                ibkr_get_expirations=AsyncMock(return_value=[]),
+                ibkr_get_chain=AsyncMock(return_value=[]),
+                account_labels={},
+                is_halted=False,
+            )
         )
     except Exception as exc:
         sys.stderr.write(
-            f"[shadow_scan] _scan_and_stage_defensive_rolls raised: {exc}\n"
+            f"[shadow_scan] scan_and_stage_defensive_rolls raised: {exc}\n"
         )
         return
 
