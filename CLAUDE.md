@@ -11,6 +11,44 @@ not write code.
 
 ---
 
+## Working directory (MANDATORY — PM-19f 2026-04-19)
+
+You operate exclusively inside the linked worktree at:
+
+    C:\AGT_Telegram_Bridge\.worktrees\coder
+
+Architect (Cowork session) operates in the main worktree at
+`C:\AGT_Telegram_Bridge\`. Architect's markdown drafts (ADRs, session
+logs, standing-orders amendments) live in the main worktree and are
+physically invisible from your worktree — this is by design. You cannot
+accidentally wipe Architect's work with `git reset --hard` because
+your reset only affects your own working files and index.
+
+All your git commands, file edits, and pytest runs happen from the
+coder worktree path. Launch new Claude Code sessions with:
+
+    cd C:\AGT_Telegram_Bridge\.worktrees\coder
+
+If Yash ever drops you into `C:\AGT_Telegram_Bridge\` (the main
+worktree) and asks you to run destructive commands, STOP and surface —
+that path is reserved for Architect. Request the correct launch path.
+
+The shared `.git/objects` database means every commit you make via the
+GitLab API appears INSTANTLY in both worktrees once either side runs
+`git fetch`. No duplicate history, no merge overhead.
+
+# Post-merge sync — run from YOUR worktree only:
+#   cd C:\AGT_Telegram_Bridge\.worktrees\coder
+#   git fetch origin main
+#   git reset --hard origin/main
+#
+# DO NOT run `git reset --hard` from C:\AGT_Telegram_Bridge\. That is
+# Architect's worktree. Architect-authored drafts live there and will
+# be wiped. If CLAUDE.md tells you to run reset from the main tree,
+# the instruction is outdated — fix-forward via your next ship report.
+
+---
+
 ## Role split
 
 **Architect (Cowork, Max sub)** owns:
