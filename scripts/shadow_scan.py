@@ -28,6 +28,7 @@ Both guards are plain ``if ... raise RuntimeError`` so they survive
 from __future__ import annotations
 
 import argparse
+import html as _html
 import json
 import shutil
 import sys
@@ -50,6 +51,7 @@ try:
         ShadowDecision,
         ShadowOrder,
     )
+    from agt_equities.telegram_utils import send_telegram_digest
 except ImportError as exc:  # pragma: no cover - defensive
     sys.stderr.write(
         f"agt_equities import failed; cannot run shadow scan: {exc}\n"
@@ -355,6 +357,64 @@ def run_engines_stub(ctx: RunContext, engine: str) -> None:
         fn(ctx)
 
 
+
+def _render_telegram_digest(
+    orders: list[ShadowOrder],
+    decisions: list[ShadowDecision],
+    ctx: RunContext,
+) -> list[str]:
+    """Render Telegram-formatted digest messages, one per engine.
+
+    Splits at bullet boundaries when a message would exceed Telegram's
+    4096-char limit. Returns a single stub message when no engines
+    produced any orders or decisions.
+    """
+    from collections import defaultdict
+
+    TELEGRAM_MAX = 4096
+
+    if not orders and not decisions:
+        return [
+            f"<b>shadow_scan {ctx.run_id}</b> — no engines produced orders or decisions."
+        ]
+
+    by_engine: dict[str, list[ShadowOrder]] = defaultdict(list)
+    for so in orders:
+        by_engine[so.engine].append(so)
+
+    all_messages: list[str] = []
+    for engine in sorted(by_engine.keys()):
+        engine_orders = sorted(by_engine[engine], key=lambda o: o.ticker)
+        bullets: list[str] = []
+        for so in engine_orders:
+            household = str(so.meta.get("household", "?")) if so.meta else "?"
+            limit_str = "MKT" if so.limit is None else f"{so.limit:.2f}"
+            bullet = (
+                f"<b>{_html.escape(so.engine)}</b> — "
+                f"{_html.escape(so.ticker)} {so.right} "
+                f"${so.strike:.2f} x{so.qty} @ ${limit_str}"
+                f"  [{_html.escape(household)}]\n"
+                f"  decided_at: {so.decided_at}"
+            )
+            bullets.append(bullet)
+
+        current_msg = ""
+        for bullet in bullets:
+            separator = "\n\n" if current_msg else ""
+            candidate = current_msg + separator + bullet
+            if len(candidate) > TELEGRAM_MAX and current_msg:
+                all_messages.append(current_msg)
+                current_msg = bullet
+            else:
+                current_msg = candidate
+        if current_msg:
+            all_messages.append(current_msg)
+
+    return all_messages or [
+        f"<b>shadow_scan {ctx.run_id}</b> — no engines produced orders or decisions."
+    ]
+
+
 def render_digest(
     orders: list[ShadowOrder],
     decisions: list[ShadowDecision],
@@ -470,13 +530,17 @@ def main(argv: list[str] | None = None) -> int:
             else []
         )
 
-    if args.emit == "json":
-        artifact = write_json_artifact(ctx, orders, decisions)
-        sys.stdout.write(f"[shadow_scan] wrote {artifact}\n")
-    elif args.emit == "telegram":  # pragma: no cover - MR 6 scope
-        sys.stdout.write(
-            "[shadow_scan] telegram emit is MR 6 scope - not wired yet.\n"
-        )
+    artifact = write_json_artifact(ctx, orders, decisions)
+    sys.stdout.write(f"[shadow_scan] wrote {artifact}\n")
+
+    if args.emit == "telegram":
+        messages = _render_telegram_digest(orders, decisions, ctx)
+        results = send_telegram_digest(messages)
+        for i, r in enumerate(results):
+            status = "ok" if r.get("ok") else f"err {r.get('error')}"
+            sys.stdout.write(
+                f"[shadow_scan] telegram msg {i + 1}/{len(messages)}: {status}\n"
+            )
 
     sys.stdout.write(render_digest(orders, decisions, ctx))
 
