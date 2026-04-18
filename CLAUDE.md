@@ -105,6 +105,19 @@ The Linux sandbox and Windows working tree fight over `.git/index.lock`.
 6. Open MR: `POST /merge_requests` with target=main, source=feature-branch,
    remove_source_branch=true, squash=true
 7. Wait for CI green (match expected passed-count delta from dispatch)
+
+   **MR-tier poll policy** — classify by files in `commit.actions[]`:
+
+   | Tier     | Condition (all files match)           | Action |
+   |----------|---------------------------------------|--------|
+   | TRIVIAL  | `docs/**`, `**/*.md`, `reports/**`    | Skip poll. Log "TRIVIAL — poll skipped." |
+   | STANDARD | `tests/**`, `scripts/**`, `*.toml`, `.gitlab-ci.yml` | Poll once. If CI still running after window, log "CI pending — not blocking" and proceed. |
+   | CRITICAL | `agt_equities/**`, `telegram_bot.py`, `pxo_scanner.py`, `dev_cli.py`, `scripts/migrate_*.py`, `.env*` | Poll mandatory. Retry up to 3×. Block merge until green. |
+
+   Escalation rule: a **single file** that matches a higher-tier glob
+   overrides the whole MR. Mixed `.md` + `.py` → CRITICAL.
+
+   If tier is ambiguous (see ADR edge cases), default to CRITICAL.
 8. Architect says "merge yes" â†’ `PUT /merge_requests/:iid/merge?squash=true`
    (approval rules retired 2026-04-17; no per-MR approval steps)
 
