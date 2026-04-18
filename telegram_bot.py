@@ -23589,6 +23589,32 @@ async def _pin_mode_on_startup(ib_conn=None) -> str | None:
 
 async def post_init(app) -> None:
 
+    # Heartbeat registration must precede all failable init steps, including
+    # IB connect. The heartbeat IS the init-success signal for observers;
+    # gating it behind ensure_ib_connected() inverts the semantic and makes
+    # the bot invisible during IB outages -- exactly when the heartbeat
+    # signal matters most.
+
+    try:
+
+        from agt_equities.heartbeat import register_bot_heartbeat
+
+        jq_hb = app.job_queue
+
+        if jq_hb is not None:
+
+            register_bot_heartbeat(jq_hb)
+
+        else:
+
+            logger.warning("post_init: JobQueue missing — bot_heartbeat not registered")
+
+    except Exception as exc:
+
+        logger.error("post_init: register_bot_heartbeat failed: %s", exc)
+
+
+
     try:
 
         ib_conn = await ensure_ib_connected()
@@ -23646,26 +23672,6 @@ async def post_init(app) -> None:
         logger.error("Cold-start wartime pin alert failed: %s — continuing", exc)
 
 
-
-    # MR #2: 30s bot heartbeat writer (daemon_heartbeat table). DT Q3 ruling.
-
-    try:
-
-        from agt_equities.heartbeat import register_bot_heartbeat
-
-        jq_hb = app.job_queue
-
-        if jq_hb is not None:
-
-            register_bot_heartbeat(jq_hb)
-
-        else:
-
-            logger.warning("post_init: JobQueue missing — bot_heartbeat not registered")
-
-    except Exception as exc:
-
-        logger.error("post_init: register_bot_heartbeat failed: %s", exc)
 
 # ---------------------------------------------------------------------------
 
