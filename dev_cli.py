@@ -40,6 +40,7 @@ load_dotenv()
 # main() in Decoupling Sprint A).  We import it as a library module and call
 # init_db() ourselves before touching the DB.
 import telegram_bot as bot
+from agt_equities import roll_scanner
 
 # Shared DB helpers (same ones telegram_bot uses internally)
 from agt_equities.db import get_db_connection, get_ro_connection, tx_immediate
@@ -176,8 +177,16 @@ async def cmd_scan_daily(args):
             order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
             decision_sink=NullDecisionSink(),
         )
-        roll_alerts = await bot._scan_and_stage_defensive_rolls(
-            ib_conn, ctx=_cli_roll_ctx,
+        roll_alerts = await roll_scanner.scan_and_stage_defensive_rolls(
+            ib_conn,
+            ctx=_cli_roll_ctx,
+            ibkr_get_spot=bot._ibkr_get_spot,
+            load_premium_ledger=bot._load_premium_ledger_snapshot,
+            get_desk_mode=bot._get_current_desk_mode,
+            ibkr_get_expirations=bot._ibkr_get_expirations,
+            ibkr_get_chain=bot._ibkr_get_chain,
+            account_labels=bot.ACCOUNT_LABELS,
+            is_halted=bot._HALTED,
         )
         roll_text = "\n".join(roll_alerts) if roll_alerts else "No roll actions triggered."
         sections.append(("ROLL CHECK", roll_text))
