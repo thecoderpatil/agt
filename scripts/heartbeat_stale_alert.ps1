@@ -32,6 +32,9 @@ $LogPath = 'C:\AGT_Telegram_Bridge\logs\heartbeat_stale_alert.log'
 $EnvPath = 'C:\AGT_Telegram_Bridge\.env'
 $PyPath  = 'C:\AGT_Telegram_Bridge\.venv\Scripts\python.exe'
 $StaleThresholdSec = 300
+$StatePath = 'C:\AGT_Telegram_Bridge\state\heartbeat_observer_state.json'
+$StateTmpPath = $StatePath + '.tmp'
+$SuppressSeconds = 21600
 
 function Write-AlertLog {
     param([string]$Message)
@@ -109,25 +112,96 @@ for name in ("agt_bot", "agt_scheduler"):
     }
     Write-AlertLog ('query: ' + ($queryOut -join ' ; '))
 
+    $queryPath = Join-Path $env:TEMP ('hb_stale_rows_{0}.txt' -f (Get-Random))
+    Set-Content -Path $queryPath -Value $queryOut -Encoding ASCII
+    $dedupPy = @'
+import datetime as dt
+import json
+import pathlib
+import sys
+
+sp = pathlib.Path(sys.argv[1])
+rp = pathlib.Path(sys.argv[2])
+thr = int(sys.argv[3])
+sup = int(sys.argv[4])
+now = dt.datetime.now(dt.timezone.utc)
+now_s = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+state = {}
+if sp.exists():
+    try:
+        raw = json.loads(sp.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            state = {str(k): str(v) for k, v in raw.items()}
+    except Exception:
+        state = {}
+alerts = []
+for line in rp.read_text(encoding="utf-8").splitlines():
+    p = line.split("|", 1)
+    if len(p) != 2:
+        continue
+    d = p[0].strip()
+    a = p[1].strip()
+    stale = False
+    msg = ""
+    if a == "MISSING":
+        stale = True
+        msg = f"HEARTBEAT_MISSING daemon={d}"
+    else:
+        try:
+            n = int(a)
+            stale = n > thr
+            msg = f"HEARTBEAT_STALE daemon={d} age={n}s"
+        except Exception:
+            continue
+    if stale:
+        last = state.get(d)
+        if last:
+            try:
+                last_dt = dt.datetime.fromisoformat(last.replace("Z", "+00:00"))
+                if (now - last_dt).total_seconds() < sup:
+                    continue
+            except Exception:
+                pass
+        alerts.append(msg)
+        state[d] = now_s
+    elif d in state:
+        del state[d]
+print("STATE_JSON|" + json.dumps(state, separators=(",", ":"), sort_keys=True))
+for a in alerts:
+    print("ALERT|" + a)
+'@
+    $dedupFile = Join-Path $env:TEMP ('hb_stale_dedup_{0}.py' -f (Get-Random))
+    Set-Content -Path $dedupFile -Value $dedupPy -Encoding ASCII
+    try {
+        $dedupOut = & $PyPath $dedupFile $StatePath $queryPath $StaleThresholdSec $SuppressSeconds 2>&1
+    } finally {
+        Remove-Item $dedupFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $queryPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-AlertLog ('FAIL: dedup python exit=' + $LASTEXITCODE + ' output=' + ($dedupOut -join ' | '))
+        exit 6
+    }
+    $stateJson = '{}'
     $alerts = @()
-    foreach ($rawRow in $queryOut) {
-        $parts = ([string]$rawRow) -split '\|', 2
-        if ($parts.Count -ne 2) { continue }
-        $daemon = $parts[0].Trim()
-        $ageRaw = $parts[1].Trim()
-        if ($ageRaw -eq 'MISSING') {
-            $alerts += ('HEARTBEAT_MISSING daemon=' + $daemon)
+    foreach ($row in $dedupOut) {
+        $line = [string]$row
+        if ($line.StartsWith('STATE_JSON|')) {
+            $stateJson = $line.Substring(11)
             continue
         }
-        [int]$ageInt = 0
-        if (-not [int]::TryParse($ageRaw, [ref]$ageInt)) { continue }
-        if ($ageInt -gt $StaleThresholdSec) {
-            $alerts += ('HEARTBEAT_STALE daemon=' + $daemon + ' age=' + $ageInt + 's')
+        if ($line.StartsWith('ALERT|')) {
+            $alerts += $line.Substring(6)
         }
     }
+    $stateDir = Split-Path $StatePath -Parent
+    New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+    Set-Content -Path $StateTmpPath -Value $stateJson -Encoding ASCII
+    Move-Item -Force -Path $StateTmpPath -Destination $StatePath
+    Write-AlertLog ('state: ' + $stateJson)
 
     if ($alerts.Count -eq 0) {
-        Write-AlertLog 'ok: all heartbeats within threshold'
+        Write-AlertLog 'ok: stale dedup suppressed or all heartbeats within threshold'
         exit 0
     }
 
