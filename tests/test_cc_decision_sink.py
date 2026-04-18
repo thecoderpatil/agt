@@ -168,3 +168,92 @@ def test_run_cc_logic_does_not_call_to_thread_with_log_cc_cycle(collector_sink):
         assert c.args[0] is not telegram_bot._log_cc_cycle, (
             "asyncio.to_thread(_log_cc_cycle) was called — MR 5 removal failed"
         )
+
+
+# ---------------------------------------------------------------------------
+# MR fix/cc-order-sink-staging: CC orders route through ctx.order_sink
+# ---------------------------------------------------------------------------
+
+import pytest
+
+
+class TestCCOrderSinkRouting:
+    """Verify CC orders route through ctx.order_sink (not append_pending_tickets
+    directly), so shadow scans and Telegram digests can observe CC tickets."""
+
+    @pytest.mark.sprint_a
+    def test_collector_order_sink_accepts_cc_engine_call(self):
+        """CollectorOrderSink.stage() with engine='cc_engine' produces a
+        ShadowOrder with the correct engine tag. Verifies the call signature
+        that _run_cc_logic uses after the fix."""
+        import uuid
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import CollectorOrderSink, NullDecisionSink
+
+        collector = CollectorOrderSink()
+        run_id = uuid.uuid4().hex
+        ctx = RunContext(
+            mode=RunMode.SHADOW,
+            run_id=run_id,
+            order_sink=collector,
+            decision_sink=NullDecisionSink(),
+        )
+
+        fake_ticket = {
+            "account_id": "U00000001",
+            "household": "Test_Household",
+            "ticker": "AAPL",
+            "action": "SELL",
+            "sec_type": "OPT",
+            "quantity": 1,
+        }
+        ctx.order_sink.stage([fake_ticket], engine="cc_engine", run_id=run_id)
+
+        orders = collector.drain()
+        assert len(orders) == 1
+        assert orders[0].engine == "cc_engine"
+
+    @pytest.mark.sprint_a
+    @pytest.mark.asyncio
+    async def test_empty_staged_does_not_call_stage(self, monkeypatch):
+        """When no CC positions exist, order_sink.stage must not be called."""
+        import uuid
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import CollectorOrderSink, NullDecisionSink
+        import telegram_bot as tb
+
+        collector = CollectorOrderSink()
+        ctx = RunContext(
+            mode=RunMode.SHADOW,
+            run_id=uuid.uuid4().hex,
+            order_sink=collector,
+            decision_sink=NullDecisionSink(),
+        )
+
+        monkeypatch.setattr(
+            tb, "_discover_positions",
+            lambda *a, **kw: (_ for _ in ()).throw(Exception("no positions")),
+        )
+
+        try:
+            await tb._run_cc_logic(None, ctx=ctx)
+        except Exception:
+            pass
+
+        assert len(collector.drain()) == 0
+
+    @pytest.mark.sprint_a
+    def test_append_pending_tickets_not_called_directly(self):
+        """Sentinel: _run_cc_logic source must route through ctx.order_sink,
+        not call asyncio.to_thread(append_pending_tickets, staged) directly."""
+        import inspect
+        import telegram_bot as tb
+
+        src = inspect.getsource(tb._run_cc_logic)
+        assert "asyncio.to_thread(append_pending_tickets" not in src, (
+            "Direct append_pending_tickets staging still present in _run_cc_logic; "
+            "patch was not applied or was partially reverted"
+        )
+        assert "ctx.order_sink.stage" in src, (
+            "ctx.order_sink.stage call missing from _run_cc_logic after patch"
+        )

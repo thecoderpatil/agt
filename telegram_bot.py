@@ -99,7 +99,7 @@ from agt_equities import roll_scanner
 
 from agt_equities.runtime import RunContext, RunMode
 
-from agt_equities.sinks import CollectorOrderSink, SQLiteDecisionSink
+from agt_equities.sinks import CollectorOrderSink, SQLiteDecisionSink, SQLiteOrderSink
 
 from agt_equities.ib_order_builder import (
 
@@ -10628,7 +10628,7 @@ async def cmd_cc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             run_id=uuid.uuid4().hex,
 
-            order_sink=CollectorOrderSink(),
+            order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
 
             decision_sink=SQLiteDecisionSink(_log_cc_cycle, _write_dynamic_exit_rows),
 
@@ -14523,7 +14523,7 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             run_id=uuid.uuid4().hex,
 
-            order_sink=CollectorOrderSink(),
+            order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
 
             decision_sink=SQLiteDecisionSink(_log_cc_cycle, _write_dynamic_exit_rows),
 
@@ -18570,7 +18570,7 @@ async def _run_cc_logic(household_filter: str | None = None, *, ctx: "RunContext
 
                     )
 
-            await asyncio.to_thread(append_pending_tickets, staged)
+            ctx.order_sink.stage(staged, engine="cc_engine", run_id=ctx.run_id)
 
 
 
@@ -19566,7 +19566,7 @@ async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             run_id=uuid.uuid4().hex,
 
-            order_sink=CollectorOrderSink(),
+            order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
 
             decision_sink=SQLiteDecisionSink(_log_cc_cycle, _write_dynamic_exit_rows),
 
