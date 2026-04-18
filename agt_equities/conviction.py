@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
+from agt_equities.config import EXCLUDED_TICKERS
 from agt_equities.db import get_db_connection, tx_immediate
 
 logger = logging.getLogger("agt_bridge.conviction")
@@ -33,10 +34,6 @@ CONVICTION_TIERS: dict[str, float] = {
 
 CONVICTION_OVERRIDE_EXPIRY_DAYS = 90
 
-# Tickers excluded from conviction refresh (non-equity / internal).
-EXCLUDED_TICKERS: frozenset[str] = frozenset(
-    {"IBKR", "TRAW.CVR", "SPX", "SLS", "GTLB"}
-)
 
 _LEGACY_OVERRIDE_TZ = ZoneInfo("America/New_York")
 

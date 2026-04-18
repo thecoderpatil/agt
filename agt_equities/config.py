@@ -78,3 +78,7 @@ MARGIN_ELIGIBLE_ACCOUNTS: Dict[str, List[str]] = (
 MARGIN_ACCOUNTS: frozenset = frozenset(
     acct for accts in MARGIN_ELIGIBLE_ACCOUNTS.values() for acct in accts
 )
+
+# Strategy blacklist (wheel strategy ticker exclusions).
+# Distinct from trade_repo.EXCLUDED_TICKERS (Walker index filter: SPX/VIX/NDX/RUT/XSP).
+EXCLUDED_TICKERS: frozenset[str] = frozenset({"IBKR", "TRAW.CVR", "SPX", "SLS", "GTLB"})
