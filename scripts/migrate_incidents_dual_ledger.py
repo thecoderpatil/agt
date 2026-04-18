@@ -8,6 +8,7 @@ Idempotent. Safe to re-run.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from pathlib import Path
 
 from agt_equities.db import get_db_connection
@@ -51,7 +52,7 @@ def _column_exists(conn, col: str) -> bool:
 
 def run(db_path: str | Path | None = None) -> dict:
     stats = {"alters_applied": 0, "rows_backfilled": 0}
-    with get_db_connection(db_path=db_path) as conn:
+    with closing(get_db_connection(db_path=db_path)) as conn:
         for col, stmt in ALTER_STMTS:
             if not _column_exists(conn, col):
                 conn.execute(stmt)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,10 @@ def tmp_db_with_incidents() -> Path:
         )
         conn.commit()
     yield p
-    p.unlink(missing_ok=True)
+    try:
+        p.unlink(missing_ok=True)
+    except PermissionError:
+        pass
 
 
 def _migrate(db_path: Path) -> dict:
@@ -50,7 +54,7 @@ def _migrate(db_path: Path) -> dict:
 @pytest.mark.sprint_a
 def test_alters_add_columns(tmp_db_with_incidents):
     _migrate(tmp_db_with_incidents)
-    with sqlite3.connect(tmp_db_with_incidents) as conn:
+    with closing(sqlite3.connect(tmp_db_with_incidents)) as conn:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(incidents)").fetchall()]
     for c in ("fault_source", "severity_tier", "burn_weight"):
         assert c in cols
@@ -67,7 +71,7 @@ def test_migration_idempotent(tmp_db_with_incidents):
 @pytest.mark.sprint_a
 def test_backfill_classifies_external_faults(tmp_db_with_incidents):
     _migrate(tmp_db_with_incidents)
-    with sqlite3.connect(tmp_db_with_incidents) as conn:
+    with closing(sqlite3.connect(tmp_db_with_incidents)) as conn:
         broker = conn.execute(
             "SELECT COUNT(*) FROM incidents WHERE fault_source = 'broker'"
         ).fetchone()[0]
@@ -85,7 +89,7 @@ def test_backfill_classifies_external_faults(tmp_db_with_incidents):
 @pytest.mark.sprint_a
 def test_view_separates_internal_from_external(tmp_db_with_incidents):
     _migrate(tmp_db_with_incidents)
-    with sqlite3.connect(tmp_db_with_incidents) as conn:
+    with closing(sqlite3.connect(tmp_db_with_incidents)) as conn:
         row = conn.execute("SELECT internal_burn, external_burn FROM v_error_budget_72h").fetchone()
     internal_burn, external_burn = row
     # 2 internal incidents × default burn_weight 10 = 20.
