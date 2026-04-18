@@ -69,6 +69,7 @@ class ScanCandidate:
     headline: str = ""
     sector: str = "Unknown"
     delta: float = 0.0
+    household_id: str = ""
 
 
 def adapt_scanner_candidates(rows: list[dict]) -> list[ScanCandidate]:
