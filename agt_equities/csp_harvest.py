@@ -38,7 +38,7 @@ from datetime import date as _date
 from datetime import datetime as _datetime
 from typing import Any
 
-from agt_equities.config import ACCOUNT_TO_HOUSEHOLD
+from agt_equities.config import ACCOUNT_TO_HOUSEHOLD, EXCLUDED_TICKERS
 from agt_equities.dates import et_today
 from agt_equities.runtime import RunContext
 
@@ -56,16 +56,6 @@ logger = logging.getLogger(__name__)
 CSP_HARVEST_THRESHOLD_NEXT_DAY = 0.80   # dte >= 1
 CSP_HARVEST_THRESHOLD_LAST_DAY = 0.90   # dte <= 1 (0DTE / 1DTE)
 
-
-# ---------------------------------------------------------------------------
-# Ticker blocklist (mirrored from telegram_bot.py:1463)
-# ---------------------------------------------------------------------------
-# Defined here to preserve the one-way dependency rule: csp_harvest must
-# NOT import telegram_bot. Keep in sync manually â€” there are only 5 entries
-# and the list changes rarely.
-EXCLUDED_TICKERS: frozenset[str] = frozenset(
-    {"IBKR", "TRAW.CVR", "SPX", "SLS", "GTLB"}
-)
 
 
 # ---------------------------------------------------------------------------

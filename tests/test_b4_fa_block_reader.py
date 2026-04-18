@@ -268,7 +268,7 @@ def _make_csp_trade_fill(perm_id=12345, order_id=111, account="U21971297"):
 
 def test_csp_first_try_success_no_sleep(bot_module, monkeypatch):
     monkeypatch.setitem(bot_module.ACCOUNT_TO_HOUSEHOLD, "U21971297", "Yash_Household")
-    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", set())
+    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", frozenset())
 
     sleeps = []
     monkeypatch.setattr(bot_module.time, "sleep", lambda s: sleeps.append(s))
@@ -297,7 +297,7 @@ def test_csp_first_try_success_no_sleep(bot_module, monkeypatch):
 
 def test_csp_transient_miss_then_hit(bot_module, monkeypatch):
     monkeypatch.setitem(bot_module.ACCOUNT_TO_HOUSEHOLD, "U21971297", "Yash_Household")
-    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", set())
+    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", frozenset())
 
     sleeps = []
     monkeypatch.setattr(bot_module.time, "sleep", lambda s: sleeps.append(s))
@@ -328,7 +328,7 @@ def test_csp_persistent_miss_exhausts_and_enqueues_alert(bot_module, monkeypatch
     caplog.set_level(_lg.WARNING)
     import logging
     monkeypatch.setitem(bot_module.ACCOUNT_TO_HOUSEHOLD, "U21971297", "Yash_Household")
-    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", set())
+    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", frozenset())
 
     monkeypatch.setattr(bot_module.time, "sleep", lambda s: None)
     monkeypatch.setattr(
@@ -360,7 +360,7 @@ def test_csp_persistent_miss_exhausts_and_enqueues_alert(bot_module, monkeypatch
 def test_cc_persistent_miss_also_enqueues_alert(bot_module, monkeypatch):
     """Regression: confirm the B4 miss-alert push is wired in _on_cc_fill too."""
     monkeypatch.setitem(bot_module.ACCOUNT_TO_HOUSEHOLD, "U21971297", "Yash_Household")
-    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", set())
+    monkeypatch.setattr(bot_module, "EXCLUDED_TICKERS", frozenset())
     monkeypatch.setattr(bot_module.time, "sleep", lambda s: None)
     monkeypatch.setattr(
         bot_module, "_lookup_inception_delta_from_payload",
