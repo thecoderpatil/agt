@@ -112,3 +112,8 @@ hardening/
 
 # Transient test sentinel
 test_write.tmp
+
+# Multi-agent sync architecture — 2026-04-19 PM-19f
+# Coder runs in a linked worktree at .worktrees/coder.
+# Architect runs in the main worktree. Do not track worktree directories.
+.worktrees/
