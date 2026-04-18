@@ -2,7 +2,7 @@
 
 Idempotent. Safe to re-run.
 - Adds columns fault_source, severity_tier, burn_weight (defaults match v1 semantics).
-- Backfills known external-fault incidents by invariant_name pattern.
+- Backfills known external-fault incidents by invariant_id pattern.
 - Creates view v_error_budget_72h.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ ALTER_STMTS = [
     ("burn_weight", "ALTER TABLE incidents ADD COLUMN burn_weight REAL NOT NULL DEFAULT 10"),
 ]
 
-# Backfill rules: invariant_name LIKE pattern -> (fault_source, severity_tier, burn_weight)
+# Backfill rules: invariant_id LIKE pattern -> (fault_source, severity_tier, burn_weight)
 BACKFILL_RULES = [
     # Known broker-side issues observed pre-v2.
     ("UNKNOWN_ACCT%", "broker", 1, 10),
@@ -60,7 +60,7 @@ def run(db_path: str | Path | None = None) -> dict:
             cur = conn.execute(
                 """UPDATE incidents
                    SET fault_source = ?, severity_tier = ?, burn_weight = ?
-                   WHERE invariant_name LIKE ? AND fault_source = 'internal'""",
+                   WHERE invariant_id LIKE ? AND fault_source = 'internal'""",
                 (source, tier, weight, pattern),
             )
             stats["rows_backfilled"] += cur.rowcount
