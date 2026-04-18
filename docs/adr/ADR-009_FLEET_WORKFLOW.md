@@ -66,6 +66,26 @@ Codex ≈ 20% of Claude compute on ChatGPT Pro. Pair speedup is 1.2-1.3× steady
 
 Single throwaway MR before pair goes live. Unambiguously in-lane dispatch (docstring expansion or parametrize add). Codex consumes the dispatch markdown via `codex exec`, applies the diff, pushes via GitLab REST, opens MR. Green CI + clean byte-match = pair live. Failure (wrong bytes, mutex surprise, API auth issue, can't parse dispatch) = shelve the pair entirely, stay at 1 Claude Coder.
 
+### 3.1 Spike outcome — 2026-04-18
+
+Spike landed as **MR !113** (squash merged 2026-04-18, main tip `55718d58`). `tests/test_urgency_policy.py` +6 LOC; post-merge main ~836 passed (+1 vs baseline). Codex parsed the dispatch, re-verified tip via `git ls-remote origin main`, applied the exact diff, pushed via GitLab REST, landed green CI, merged via `PUT /merge?squash=true`, branch auto-deleted. All verification sentinels cleared.
+
+**§3 gate: PASSED. Pair viability: deferred.**
+
+Single-datapoint operational characteristics:
+
+- 13–15 min wall clock prompt-to-merge.
+- 3 attempts. Attempts 1–2 failed on PowerShell authoring bugs (string-interp `$branch:` drive-qualifier; Int32 overflow on GitLab pipeline IDs). Codex self-detected both pre-execution (zero remote side effects) and self-corrected on retry.
+- ~450-line PS orchestration script for a 6-line Python append — ~10–15× scope inflation vs. a minimal Option A harness.
+
+Next trivially-codex-shaped backlog ticket is the real viability test. Constraints on the next `SLOT: codex` dispatch:
+
+- Target language: `bash` or `py -3 -c` only. PowerShell proved fragile on Codex-authored Windows orchestration.
+- Script budget: ≤60 lines. Enforced by explicit dispatch header.
+- Human-approval gate count: ≤1.
+
+Default routing remains `SLOT: claude-coder` until a second Codex run validates the constraints. If the second run also takes 10+ min or needs multiple self-corrections, shelve the pair and stay at 1 Claude Coder.
+
 ## 4. Consequences
 
 **Positive.** Codex absorbs the mechanical tail that would stall in Claude's queue. Claude's warm context stays loaded for high-judgment work. Rate-limit distribution across Anthropic + OpenAI. No new infra surface to maintain.
