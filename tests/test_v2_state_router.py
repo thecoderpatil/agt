@@ -64,7 +64,15 @@ class TestV2StateRouter(unittest.TestCase):
 
         ib_conn.qualifyContractsAsync = AsyncMock(side_effect=_qualify)
 
-        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn))
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+        _test_ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id="v2-router-test",
+            order_sink=SQLiteOrderSink(staging_fn=telegram_bot.append_pending_tickets),
+            decision_sink=NullDecisionSink(),
+        )
+        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn, ctx=_test_ctx))
 
         self.assertNotIn(
             "[ASSIGN] PYPL Extrinsic exhausted. Parity breached. Defense standing down.",
@@ -129,7 +137,15 @@ class TestV2StateRouter(unittest.TestCase):
 
         ib_conn.qualifyContractsAsync = AsyncMock(side_effect=_qualify)
 
-        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn))
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+        _test_ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id="v2-router-test",
+            order_sink=SQLiteOrderSink(staging_fn=telegram_bot.append_pending_tickets),
+            decision_sink=NullDecisionSink(),
+        )
+        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn, ctx=_test_ctx))
 
         self.assertEqual(
             alerts,
@@ -195,7 +211,15 @@ class TestV2StateRouter(unittest.TestCase):
 
         ib_conn.qualifyContractsAsync = AsyncMock(side_effect=_qualify)
 
-        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn))
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+        _test_ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id="v2-router-test",
+            order_sink=SQLiteOrderSink(staging_fn=telegram_bot.append_pending_tickets),
+            decision_sink=NullDecisionSink(),
+        )
+        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn, ctx=_test_ctx))
 
         self.assertEqual(
             alerts,
@@ -271,7 +295,15 @@ class TestV2StateRouter(unittest.TestCase):
 
         ib_conn.qualifyContractsAsync = AsyncMock(side_effect=_qualify)
 
-        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn))
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+        _test_ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id="v2-router-test",
+            order_sink=SQLiteOrderSink(staging_fn=telegram_bot.append_pending_tickets),
+            decision_sink=NullDecisionSink(),
+        )
+        alerts = _run(telegram_bot._scan_and_stage_defensive_rolls(ib_conn, ctx=_test_ctx))
 
         self.assertEqual(
             alerts,

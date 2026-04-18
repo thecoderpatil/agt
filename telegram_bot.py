@@ -14060,10 +14060,18 @@ async def cmd_rollcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+        _rollcheck_ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id=uuid.uuid4().hex,
+            order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
+            decision_sink=NullDecisionSink(),
+        )
         alerts = await _scan_and_stage_defensive_rolls(
-
-            ib_conn, priority_cb=_rollcheck_priority_cb,
-
+            ib_conn,
+            ctx=_rollcheck_ctx,
+            priority_cb=_rollcheck_priority_cb,
         )
 
 
@@ -14331,10 +14339,18 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+        _daily_roll_ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id=uuid.uuid4().hex,
+            order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
+            decision_sink=NullDecisionSink(),
+        )
         roll_alerts = await _scan_and_stage_defensive_rolls(
-
-            ib_conn, priority_cb=_daily_priority_cb,
-
+            ib_conn,
+            ctx=_daily_roll_ctx,
+            priority_cb=_daily_priority_cb,
         )
 
         if roll_alerts:
@@ -21052,7 +21068,12 @@ def _dispatch_eval_result(
 
 
 
-async def _scan_and_stage_defensive_rolls(ib_conn, priority_cb=None) -> list[str]:
+async def _scan_and_stage_defensive_rolls(
+    ib_conn,
+    *,
+    ctx: "RunContext",
+    priority_cb=None,
+) -> list[str]:
 
     """
 
@@ -21288,7 +21309,7 @@ async def _scan_and_stage_defensive_rolls(ib_conn, priority_cb=None) -> list[str
 
             )
 
-            ctx = ctx_cache.setdefault(
+            port_ctx = ctx_cache.setdefault(
 
                 household, _build_portfolio_context_for_evaluator(household),
 
@@ -21300,7 +21321,7 @@ async def _scan_and_stage_defensive_rolls(ib_conn, priority_cb=None) -> list[str
 
             try:
 
-                result = roll_engine.evaluate(eval_pos, market, ctx)
+                result = roll_engine.evaluate(eval_pos, market, port_ctx)
 
             except Exception as eval_exc:
 
@@ -21466,12 +21487,17 @@ async def _scan_and_stage_defensive_rolls(ib_conn, priority_cb=None) -> list[str
 
                 try:
 
-                    await asyncio.to_thread(append_pending_tickets, finalized_tickets)
-
+                    await asyncio.to_thread(
+                        ctx.order_sink.stage,
+                        finalized_tickets,
+                        engine="roll_engine",
+                        run_id=ctx.run_id,
+                    )
                 except Exception as stage_exc:
-
-                    logger.warning("WHEEL-4: append_pending_tickets failed for %s: %s", ticker, stage_exc)
-
+                    logger.warning(
+                        "WHEEL-4: ctx.order_sink.stage failed for %s: %s",
+                        ticker, stage_exc,
+                    )
                     alerts.append(f"[WARN] {ticker} ticket staging failed: {stage_exc!r}")
 
 
@@ -22105,10 +22131,18 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+            from agt_equities.runtime import RunContext, RunMode
+            from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+            _watchdog_roll_ctx = RunContext(
+                mode=RunMode.LIVE,
+                run_id=uuid.uuid4().hex,
+                order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
+                decision_sink=NullDecisionSink(),
+            )
             roll_alerts = await _scan_and_stage_defensive_rolls(
-
-                ib_conn, priority_cb=_watchdog_priority_cb,
-
+                ib_conn,
+                ctx=_watchdog_roll_ctx,
+                priority_cb=_watchdog_priority_cb,
             )
 
             alerts.extend(roll_alerts)
