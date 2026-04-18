@@ -514,6 +514,7 @@ def check_no_missing_daemon_heartbeat(
                 description=f"Expected daemon '{daemon}' has no heartbeat row",
                 severity="high",
                 evidence={"daemon_name": daemon, "reason": "missing"},
+                stable_key=f"NO_MISSING_DAEMON_HEARTBEAT:{daemon}",
             ))
             continue
         age_s = (ctx.now_utc - beat).total_seconds()
@@ -529,6 +530,7 @@ def check_no_missing_daemon_heartbeat(
                     "stale_seconds": age_s,
                     "last_beat_utc": beat.isoformat(),
                 },
+                stable_key=f"NO_MISSING_DAEMON_HEARTBEAT:{daemon}",
             ))
     return vios
 
