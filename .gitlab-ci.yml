@@ -1,4 +1,4 @@
-# GitLab CI for AGT Equities Ã¢â‚¬â€ Decoupling Sprint A targeted runner.
+# GitLab CI for AGT Equities â€” Decoupling Sprint A targeted runner.
 
 #
 
@@ -68,11 +68,11 @@
 
 #     these files takes the decorator and nothing else); the file list
 
-#     scopes collection so unrelated tests/*.py files Ã¢â‚¬â€ which pull heavy
+#     scopes collection so unrelated tests/*.py files â€” which pull heavy
 
 #     deps (telegram, fastapi, full project stack) that are NOT in
 
-#     requirements-ci.txt Ã¢â‚¬â€ don't bomb import-time collection. Adding a
+#     requirements-ci.txt â€” don't bomb import-time collection. Adding a
 
 #     new Sprint A *file* = one-line CI edit; adding a new Sprint A
 
@@ -82,13 +82,13 @@
 
 # -------------------------------------------------------------------
 
-# Compute-minute discipline Ã¢â‚¬â€ workflow:rules
+# Compute-minute discipline â€” workflow:rules
 
 # -------------------------------------------------------------------
 
 # Problem (observed 2026-04-16): 337 pipelines in 6 days burned the free
 
-# tier 400-minute quota. 26% of runs were duplicates Ã¢â‚¬â€ a branch push with
+# tier 400-minute quota. 26% of runs were duplicates â€” a branch push with
 
 # an open MR triggered BOTH a branch pipeline AND a merge_request_event
 
@@ -98,11 +98,11 @@
 
 # Fix: only run ONE pipeline per code state.
 
-#   - If an MR is open for the branch Ã¢â€ â€™ MR event pipeline runs, branch
+#   - If an MR is open for the branch â†’ MR event pipeline runs, branch
 
 #     push pipeline is skipped (dedup).
 
-#   - If no MR is open yet Ã¢â€ â€™ branch push pipeline runs (lets pre-MR smoke
+#   - If no MR is open yet â†’ branch push pipeline runs (lets pre-MR smoke
 
 #     tests still run on feature branches).
 
@@ -112,7 +112,7 @@
 
 # Also: commits with `[skip ci]` in the message are honored by GitLab and
 
-# consume zero minutes Ã¢â‚¬â€ use for docs/notes/memory-only changes.
+# consume zero minutes â€” use for docs/notes/memory-only changes.
 
 workflow:
 
@@ -166,7 +166,7 @@ variables:
 
   # telegram_bot.py reads these at import time. Fakes are sufficient for
 
-  # test collection + live-import Ã¢â‚¬â€ no network calls occur in sprint_a tests.
+  # test collection + live-import â€” no network calls occur in sprint_a tests.
 
   TELEGRAM_BOT_TOKEN: "ci_fake_bot_token_not_used"
 
@@ -221,3 +221,4 @@ sprint_a_unit_tests:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
     - if: $CI_COMMIT_BRANCH == "main"
+
