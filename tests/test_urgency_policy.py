@@ -56,3 +56,9 @@ def test_defaults_to_now_when_now_dt_none():
     """No crash with default now_dt; 30-day-out expiry is patient."""
     expiry = datetime.now(timezone.utc) + timedelta(days=30)
     assert decide_roll_urgency(expiry) == "patient"
+
+def test_mixed_tzinfo_naive_expiry_aware_now_is_urgent():
+    """Mixed tzinfo: aware now_dt + naive expiry_dt — both normalized to UTC."""
+    now = datetime(2026, 4, 17, 14, 0, tzinfo=timezone.utc)
+    expiry = datetime(2026, 4, 17, 16, 0)  # naive; becomes UTC
+    assert decide_roll_urgency(expiry, now_dt=now) == "urgent"
