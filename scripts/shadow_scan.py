@@ -231,6 +231,47 @@ def _run_harvest_engine(ctx: RunContext) -> None:
         "(empty-positions invocation; full IB pipeline follow-up scope)\n"
     )
 
+def _run_roll_engine(ctx: RunContext) -> None:
+    """Invoke ``_scan_and_stage_defensive_rolls`` under the shadow ctx.
+
+    MR 4 scope: exercise the ctx seam mechanically. Passes empty
+    positions so the scan short-circuits without touching IB.
+    Full IB-connect + positions fetch deferred to pipeline extraction MR.
+    """
+    import asyncio
+    try:
+        import telegram_bot
+    except ImportError as exc:  # pragma: no cover - defensive
+        sys.stderr.write(
+            f"[shadow_scan] telegram_bot import failed: {exc}\n"
+        )
+        return
+
+    class _EmptyIB:
+        async def reqPositionsAsync(self): return []
+        def reqMarketDataType(self, t): return None
+        async def qualifyContractsAsync(self, c): return []
+        def reqMktData(self, c, *a, **kw): return None
+        def cancelMktData(self, c): return None
+
+    try:
+        result = asyncio.run(
+            telegram_bot._scan_and_stage_defensive_rolls(_EmptyIB(), ctx=ctx)
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[shadow_scan] _scan_and_stage_defensive_rolls raised: {exc}\n"
+        )
+        return
+
+    n_staged = len(result) if result else 0
+    sys.stdout.write(
+        f"[shadow_scan] roll: scan completed ctx.run_id={ctx.run_id} "
+        f"alerts={n_staged} "
+        "(empty-positions invocation; full IB pipeline follow-up scope)\n"
+    )
+
+
 def run_engines_stub(ctx: RunContext, engine: str) -> None:
     """Dispatch to per-engine shadow branches.
 
@@ -240,6 +281,7 @@ def run_engines_stub(ctx: RunContext, engine: str) -> None:
     wired: dict[str, callable] = {
         "csp": _run_csp_engine,
         "harvest": _run_harvest_engine,
+        "roll": _run_roll_engine,
     }
 
     def _stub(_ctx: RunContext, engine_name: str) -> None:
