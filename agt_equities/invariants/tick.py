@@ -77,8 +77,10 @@ def check_invariants_tick(detector: str = "adr_007.invariants.tick") -> int:
         logger.exception("invariants runner failed; skipping tick")
         return 0
 
+    cleared_invariants: list[str] = []
     for inv_id, violations in results.items():
         if not violations:
+            cleared_invariants.append(inv_id)
             continue
         meta = invariant_meta.get(inv_id, {})
         severity = str(meta.get("severity_floor", "medium"))
@@ -120,5 +122,37 @@ def check_invariants_tick(detector: str = "adr_007.invariants.tick") -> int:
             except Exception:
                 logger.exception(
                     "incidents_repo.register failed for invariant %s", inv_id
+                )
+    # MR !110: post-check auto-resolve sweep. For any invariant that produced
+    # zero Violations this tick AND whose scrutiny_tier is not architect_only,
+    # bulk-resolve all open incidents. Prevents stale incident pile-up when a
+    # condition clears between ticks (54-row backlog observed 2026-04-18;
+    # recon: reports/stranded_incident_recon_20260418.md).
+    #
+    # architect_only incidents never auto-resolve — require architect review.
+    for inv_id in cleared_invariants:
+        meta = invariant_meta.get(inv_id, {})
+        scrutiny_tier = str(meta.get("scrutiny_tier", "medium"))
+        if scrutiny_tier == "architect_only":
+            continue
+        try:
+            open_rows = [
+                r for r in incidents_repo.list_by_status(
+                    [incidents_repo.STATUS_OPEN]
+                )
+                if r.get("invariant_id") == inv_id
+            ]
+        except Exception:
+            logger.exception(
+                "auto-resolve sweep: list_by_status failed for %s", inv_id,
+            )
+            continue
+        for row in open_rows:
+            try:
+                incidents_repo.mark_resolved(row["id"])
+            except Exception:
+                logger.exception(
+                    "auto-resolve sweep: mark_resolved failed for incident %s",
+                    row["id"],
                 )
     return registered
