@@ -12100,6 +12100,135 @@ def _revert_transmitting_to_cancelled(audit_id: str, reason: str) -> int:
 
 
 
+
+async def handle_csp_approval_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """ADR-010 Phase 1: handle CSP approval digest button taps.
+
+    callback_data format:
+      csp_approve:<row_id>:<idx>  -- add candidate idx to approved set
+      csp_skip:<row_id>:<idx>     -- remove candidate idx from approved set
+      csp_submit:<row_id>         -- commit selection, flip status='approved'
+
+    CAS guard: approve/skip update uses WHERE id=? AND status='pending'.
+    Submit uses same guard -- double-submit is a no-op.
+    All operations are idempotent.
+    """
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    user_id = query.from_user.id if query.from_user else None
+    if user_id != AUTHORIZED_USER_ID:
+        await query.answer("Unauthorized.", show_alert=True)
+        return
+
+    parts = query.data.split(":")
+    action = parts[0]  # csp_approve | csp_skip | csp_submit
+
+    try:
+        row_id = int(parts[1])
+    except (IndexError, ValueError):
+        await query.answer("Bad callback data.", show_alert=True)
+        return
+
+    try:
+        with closing(_get_db_connection()) as conn:
+            row = conn.execute(
+                "SELECT status, approved_indices_json, candidates_json "
+                "FROM csp_pending_approval WHERE id=?",
+                (row_id,),
+            ).fetchone()
+    except Exception:
+        logger.exception("handle_csp_approval_callback: DB read error row=%d", row_id)
+        await query.answer("DB error.", show_alert=True)
+        return
+
+    if row is None:
+        await query.answer("Row not found.", show_alert=True)
+        return
+    if row[0] != "pending":
+        await query.answer(f"Already {row[0]}.", show_alert=True)
+        return
+
+    try:
+        approved_indices: list[int] = json.loads(row[1] or "[]")
+        n_candidates: int = len(json.loads(row[2] or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        approved_indices = []
+        n_candidates = 0
+
+    now_str = _datetime.now(_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if action in ("csp_approve", "csp_skip"):
+        try:
+            idx = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("Bad index.", show_alert=True)
+            return
+
+        if action == "csp_approve":
+            if 0 <= idx < n_candidates and idx not in approved_indices:
+                approved_indices.append(idx)
+            label = "\u2705 Added"
+        else:  # csp_skip
+            approved_indices = [i for i in approved_indices if i != idx]
+            label = "\u23ed Removed"
+
+        new_json = json.dumps(sorted(approved_indices))
+        try:
+            with closing(_get_db_connection()) as conn:
+                conn.execute(
+                    "UPDATE csp_pending_approval "
+                    "SET approved_indices_json=? "
+                    "WHERE id=? AND status='pending'",
+                    (new_json, row_id),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception(
+                "handle_csp_approval_callback: %s update error row=%d", action, row_id
+            )
+        await query.answer(label, show_alert=False)
+
+    elif action == "csp_submit":
+        new_json = json.dumps(sorted(approved_indices))
+        try:
+            with closing(_get_db_connection()) as conn:
+                conn.execute(
+                    """
+                    UPDATE csp_pending_approval
+                    SET status='approved',
+                        approved_indices_json=?,
+                        resolved_at_utc=?,
+                        resolved_by='yash'
+                    WHERE id=? AND status='pending'
+                    """,
+                    (new_json, now_str, row_id),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception(
+                "handle_csp_approval_callback: submit error row=%d", row_id
+            )
+            await query.answer("DB error on submit.", show_alert=True)
+            return
+
+        display_time = now_str[:16].replace("T", " ")
+        try:
+            await query.edit_message_text(
+                f"\u2705 Submitted {display_time} UTC \u2014 "
+                f"{len(approved_indices)} candidate(s) approved."
+            )
+        except Exception:
+            pass  # Non-critical: edit may fail on old messages
+        await query.answer("Submitted.", show_alert=False)
+
+    else:
+        await query.answer("Unknown action.", show_alert=True)
+
+
 async def handle_dex_callback(
 
     update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -23482,6 +23611,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_dex_callback, pattern=r"^dex:"))
 
     app.add_handler(CallbackQueryHandler(handle_liq_callback, pattern=r"^liq:"))
+    app.add_handler(CallbackQueryHandler(handle_csp_approval_callback, pattern=r"^csp_(?:approve|skip|submit):"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
