@@ -283,6 +283,43 @@ def _run_roll_engine(ctx: RunContext) -> None:
     )
 
 
+
+def _run_cc_engine(ctx: RunContext) -> None:
+    """Invoke ``_run_cc_logic`` under the shadow ctx (ADR-008 MR 5).
+
+    Passes a shadow ctx with CollectorDecisionSink. Requires IB for
+    real positions; without IB the scan returns quickly with empty output.
+    Confirms the ctx seam is reachable from outside the bot stack.
+    """
+    import asyncio
+    try:
+        import telegram_bot
+    except ImportError as exc:  # pragma: no cover - defensive
+        sys.stderr.write(
+            f"[shadow_scan] telegram_bot import failed: {exc}\n"
+        )
+        return
+
+    try:
+        result = asyncio.run(
+            telegram_bot._run_cc_logic(household_filter=None, ctx=ctx)
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[shadow_scan] _run_cc_logic raised: {exc}\n"
+        )
+        return
+
+    decisions = ctx.decision_sink.peek() if hasattr(ctx.decision_sink, "peek") else []
+    n_decisions = len(decisions)
+    main_text = result.get("main_text", "") if isinstance(result, dict) else ""
+    sys.stdout.write(
+        f"[shadow_scan] cc: logic completed ctx.run_id={ctx.run_id} "
+        f"decisions={n_decisions} "
+        "(IB required for real CC output; seam verified)\n"
+    )
+
+
 def run_engines_stub(ctx: RunContext, engine: str) -> None:
     """Dispatch to per-engine shadow branches.
 
@@ -293,6 +330,7 @@ def run_engines_stub(ctx: RunContext, engine: str) -> None:
         "csp": _run_csp_engine,
         "harvest": _run_harvest_engine,
         "roll": _run_roll_engine,
+        "cc": _run_cc_engine,
     }
 
     def _stub(_ctx: RunContext, engine_name: str) -> None:

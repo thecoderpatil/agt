@@ -97,6 +97,10 @@ from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 from agt_equities import roll_engine
 from agt_equities import roll_scanner
 
+from agt_equities.runtime import RunContext, RunMode
+
+from agt_equities.sinks import CollectorOrderSink, SQLiteDecisionSink
+
 from agt_equities.ib_order_builder import (
 
     build_adaptive_option_order,
@@ -10555,7 +10559,19 @@ async def cmd_cc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # Active Defense Status injection, and pending_orders staging.
 
-        result = await _run_cc_logic(None)
+        _cc_ctx = RunContext(
+
+            mode=RunMode.LIVE,
+
+            run_id=uuid.uuid4().hex,
+
+            order_sink=CollectorOrderSink(),
+
+            decision_sink=SQLiteDecisionSink(_log_cc_cycle, _write_dynamic_exit_rows),
+
+        )
+
+        result = await _run_cc_logic(None, ctx=_cc_ctx)
 
         msg = result["main_text"]
 
@@ -14309,7 +14325,19 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
 
-        cc_result = await _run_cc_logic(None)
+        _cc_ctx = RunContext(
+
+            mode=RunMode.LIVE,
+
+            run_id=uuid.uuid4().hex,
+
+            order_sink=CollectorOrderSink(),
+
+            decision_sink=SQLiteDecisionSink(_log_cc_cycle, _write_dynamic_exit_rows),
+
+        )
+
+        cc_result = await _run_cc_logic(None, ctx=_cc_ctx)
 
         cc_text = cc_result.get("main_text", "No CC output.")
 
@@ -15473,6 +15501,119 @@ def _compute_overweight_scope(
 
 
 
+def _write_dynamic_exit_rows(entries: list[dict]) -> None:
+
+    """Write assembled dynamic-exit row dicts to bucket3_dynamic_exit_log.
+
+    Called by _stage_dynamic_exit_candidate (ctx=None backward-compat path)
+    and by SQLiteDecisionSink.record_dynamic_exit (live sink path).
+    """
+
+    if not entries:
+
+        return
+
+    with closing(_get_db_connection()) as conn:
+
+        with tx_immediate(conn):
+
+            for row in entries:
+
+                conn.execute(
+
+                    "INSERT INTO bucket3_dynamic_exit_log "
+
+                    "(audit_id, trade_date, ticker, household, desk_mode, "
+
+                    " action_type, household_nlv, underlying_spot_at_render, "
+
+                    " gate1_freed_margin, gate1_realized_loss, "
+
+                    " gate1_conviction_tier, gate1_conviction_modifier, "
+
+                    " gate1_ratio, gate2_target_contracts, "
+
+                    " walk_away_pnl_per_share, strike, expiry, "
+
+                    " contracts, shares, limit_price, "
+
+                    " render_ts, staged_ts, final_status, source, "
+
+                    " originating_account_id) "
+
+                    "VALUES (?, ?, ?, ?, ?, "
+
+                    " ?, ?, ?, "
+
+                    " ?, ?, "
+
+                    " ?, ?, "
+
+                    " ?, ?, "
+
+                    " ?, ?, ?, "
+
+                    " ?, ?, ?, "
+
+                    " ?, ?, ?, ?, ?)",
+
+                    (
+
+                        row["audit_id"],
+
+                        row["trade_date"],
+
+                        row["ticker"],
+
+                        row["household"],
+
+                        row["desk_mode"],
+
+                        row["action_type"],
+
+                        row["household_nlv"],
+
+                        row["underlying_spot_at_render"],
+
+                        row["gate1_freed_margin"],
+
+                        row["gate1_realized_loss"],
+
+                        row["gate1_conviction_tier"],
+
+                        row["gate1_conviction_modifier"],
+
+                        row["gate1_ratio"],
+
+                        row["gate2_target_contracts"],
+
+                        row["walk_away_pnl_per_share"],
+
+                        row["strike"],
+
+                        row["expiry"],
+
+                        row["contracts"],
+
+                        row["shares"],
+
+                        row["limit_price"],
+
+                        row["render_ts"],
+
+                        row["staged_ts"],
+
+                        row["final_status"],
+
+                        row["source"],
+
+                        row["originating_account_id"],
+
+                    ),
+
+                )
+
+
 async def _stage_dynamic_exit_candidate(
 
     ticker: str,
@@ -15484,6 +15625,10 @@ async def _stage_dynamic_exit_candidate(
     position: dict,
 
     source: str,
+
+    *,
+
+    ctx: "RunContext | None" = None,
 
 ) -> dict:
 
@@ -15907,105 +16052,101 @@ async def _stage_dynamic_exit_candidate(
 
 
 
+        exit_rows = []
+
         staged_audit_ids = []
+
+        trade_date = date.today().isoformat()
+
+        for account_id, acct_contracts in allocation.items():
+
+            row_audit_id = str(uuid.uuid4())
+
+            scale = acct_contracts / excess_contracts
+
+            row_freed = round(best_freed * scale, 2)
+
+            row_realized = round(total_realized * scale, 2)
+
+            row_shares = acct_contracts * 100
+
+            exit_rows.append({
+
+                "audit_id": row_audit_id,
+
+                "trade_date": trade_date,
+
+                "ticker": ticker,
+
+                "household": hh_name,
+
+                "desk_mode": desk_mode,
+
+                "action_type": "CC",
+
+                "household_nlv": round(hh_nlv, 2),
+
+                "underlying_spot_at_render": round(spot, 4),
+
+                "gate1_freed_margin": row_freed,
+
+                "gate1_realized_loss": row_realized,
+
+                "gate1_conviction_tier": conviction["tier"],
+
+                "gate1_conviction_modifier": round(modifier, 4),
+
+                "gate1_ratio": round(best_ratio, 4),
+
+                "gate2_target_contracts": acct_contracts,
+
+                "walk_away_pnl_per_share": round(best_walk_away_per_share, 4),
+
+                "strike": round(best_strike, 2),
+
+                "expiry": best_exp,
+
+                "contracts": acct_contracts,
+
+                "shares": row_shares,
+
+                "limit_price": round(best_bid, 4),
+
+                "render_ts": now_ts,
+
+                "staged_ts": now_ts,
+
+                "final_status": "STAGED",
+
+                "source": source,
+
+                "originating_account_id": account_id,
+
+            })
+
+            staged_audit_ids.append(row_audit_id)
+
+            logger.info(
+
+                "STAGED: %s %s %dc -> %s (%s)",
+
+                ticker, hh_short, acct_contracts, account_id,
+
+                ACCOUNT_LABELS.get(account_id, account_id),
+
+            )
+
+
 
         try:
 
-            with closing(_get_db_connection()) as conn:
+            if ctx is not None:
 
-                with tx_immediate(conn):
+                ctx.decision_sink.record_dynamic_exit(exit_rows, run_id=ctx.run_id)
 
-                    for account_id, acct_contracts in allocation.items():
+            else:
 
-                        row_audit_id = str(uuid.uuid4())
-
-                        scale = acct_contracts / excess_contracts
-
-                        row_freed = round(best_freed * scale, 2)
-
-                        row_realized = round(total_realized * scale, 2)
-
-                        row_shares = acct_contracts * 100
-
-
-
-                        conn.execute(
-
-                            "INSERT INTO bucket3_dynamic_exit_log "
-
-                            "(audit_id, trade_date, ticker, household, desk_mode, "
-
-                            " action_type, household_nlv, underlying_spot_at_render, "
-
-                            " gate1_freed_margin, gate1_realized_loss, "
-
-                            " gate1_conviction_tier, gate1_conviction_modifier, "
-
-                            " gate1_ratio, gate2_target_contracts, "
-
-                            " walk_away_pnl_per_share, strike, expiry, "
-
-                            " contracts, shares, limit_price, "
-
-                            " render_ts, staged_ts, final_status, source, "
-
-                            " originating_account_id) "
-
-                            "VALUES (?, date('now'), ?, ?, ?, "
-
-                            " 'CC', ?, ?, "
-
-                            " ?, ?, "
-
-                            " ?, ?, "
-
-                            " ?, ?, "
-
-                            " ?, ?, ?, "
-
-                            " ?, ?, ?, "
-
-                            " ?, ?, 'STAGED', ?, ?)",
-
-                            (
-
-                                row_audit_id, ticker, hh_name, desk_mode,
-
-                                round(hh_nlv, 2), round(spot, 4),
-
-                                row_freed, row_realized,
-
-                                conviction["tier"], round(modifier, 4),
-
-                                round(best_ratio, 4), acct_contracts,
-
-                                round(best_walk_away_per_share, 4),
-
-                                round(best_strike, 2), best_exp,
-
-                                acct_contracts, row_shares,
-
-                                round(best_bid, 4),
-
-                                now_ts, now_ts, source,
-
-                                account_id,
-
-                            ),
-
-                        )
-
-                        staged_audit_ids.append(row_audit_id)
-
-                        logger.info(
-
-                            "STAGED: %s %s %dc -> %s (%s)",
-
-                            ticker, hh_short, acct_contracts, account_id,
-
-                            ACCOUNT_LABELS.get(account_id, account_id),
-
-                        )
+                _write_dynamic_exit_rows(exit_rows)
 
         except Exception as db_exc:
 
@@ -17553,7 +17694,7 @@ async def _walk_cc_chain(
 
 
 
-async def _run_cc_logic(household_filter: str | None = None) -> dict:
+async def _run_cc_logic(household_filter: str | None = None, *, ctx: "RunContext") -> dict:
 
     """
 
@@ -17748,6 +17889,8 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
                         p["ticker"], hh_name, hh_data, p,
 
                         source="cc_overweight",
+
+                        ctx=ctx,
 
                     )
 
@@ -18291,7 +18434,7 @@ async def _run_cc_logic(household_filter: str | None = None) -> dict:
 
 
 
-            await asyncio.to_thread(_log_cc_cycle, cycle_log_entries)
+            ctx.decision_sink.record_cc_cycle(cycle_log_entries, run_id=ctx.run_id)
 
         except Exception as db_exc:
 
@@ -19225,7 +19368,19 @@ async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-        result = await _run_cc_logic(household_filter=None)
+        _cc_ctx = RunContext(
+
+            mode=RunMode.LIVE,
+
+            run_id=uuid.uuid4().hex,
+
+            order_sink=CollectorOrderSink(),
+
+            decision_sink=SQLiteDecisionSink(_log_cc_cycle, _write_dynamic_exit_rows),
+
+        )
+
+        result = await _run_cc_logic(household_filter=None, ctx=_cc_ctx)
 
         result_text = result["main_text"]
 
