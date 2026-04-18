@@ -1,8 +1,8 @@
 """
 tests/test_roll_scanner_shadow_mode.py
 
-Shadow-mode contract tests for _scan_and_stage_defensive_rolls after
-ADR-008 MR 4 ctx opt-in. Mirrors tests/test_csp_harvest_shadow_mode.py.
+Shadow-mode contract tests for scan_and_stage_defensive_rolls after
+ADR-008 MR 4b extraction to agt_equities/roll_scanner.py.
 
 7 sprint_a tests:
   1. test_scan_requires_ctx_kwarg
@@ -30,6 +30,40 @@ from agt_equities.sinks import (
 )
 
 pytestmark = pytest.mark.sprint_a
+
+
+# ---------------------------------------------------------------------------
+# Shared stub callables
+# ---------------------------------------------------------------------------
+
+_MOCK_DESK_MODE = MagicMock(return_value="PEACETIME")
+_MOCK_EXPIRATIONS = AsyncMock(return_value=[])
+_MOCK_CHAIN = AsyncMock(return_value=[])
+_ACCOUNT_LABELS = {"U1": "Paper-Yash"}
+
+
+def _make_scanner_kwargs(
+    *,
+    spot: float = 95.0,
+    ledger=None,
+    desk_mode: str = "PEACETIME",
+    account_labels: dict | None = None,
+    is_halted: bool = False,
+):
+    """Return the full set of injected kwarg mocks for scan_and_stage_defensive_rolls."""
+    if account_labels is None:
+        account_labels = _ACCOUNT_LABELS
+    if ledger is None:
+        ledger = {"initial_basis": 120.0, "adjusted_basis": 110.0}
+    return dict(
+        ibkr_get_spot=AsyncMock(return_value=spot),
+        load_premium_ledger=MagicMock(return_value=ledger),
+        get_desk_mode=MagicMock(return_value=desk_mode),
+        ibkr_get_expirations=AsyncMock(return_value=[]),
+        ibkr_get_chain=AsyncMock(return_value=[]),
+        account_labels=account_labels,
+        is_halted=is_halted,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +129,7 @@ class _FakeIB:
 def _no_sleep(monkeypatch):
     async def _fast(*_a, **_kw):
         return None
-    monkeypatch.setattr("telegram_bot.asyncio.sleep", _fast)
+    monkeypatch.setattr("agt_equities.roll_scanner.asyncio.sleep", _fast)
 
 
 @pytest.fixture
@@ -114,25 +148,28 @@ def collector_ctx():
 
 def test_scan_requires_ctx_kwarg():
     """Calling without ctx raises TypeError — the scanner enforces keyword-only."""
-    import telegram_bot
+    from agt_equities import roll_scanner
     ib = _FakeIB()
     with pytest.raises(TypeError, match="ctx"):
-        asyncio.run(telegram_bot._scan_and_stage_defensive_rolls(ib))
+        asyncio.run(roll_scanner.scan_and_stage_defensive_rolls(
+            ib,
+            ibkr_get_spot=AsyncMock(return_value=95.0),
+            load_premium_ledger=MagicMock(return_value=None),
+            get_desk_mode=MagicMock(return_value="PEACETIME"),
+            ibkr_get_expirations=AsyncMock(return_value=[]),
+            ibkr_get_chain=AsyncMock(return_value=[]),
+            account_labels={},
+        ))
 
 
 # ---------------------------------------------------------------------------
 # Test 2 — SQLiteOrderSink live path: staging_fn called with finalized tickets
 # ---------------------------------------------------------------------------
 
-@patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
-@patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
-@patch("telegram_bot._load_premium_ledger_snapshot", return_value={
-    "initial_basis": 120.0, "adjusted_basis": 110.0,
-})
-@patch("telegram_bot._ibkr_get_spot", new_callable=AsyncMock, return_value=95.0)
-def test_scan_live_sink_byte_identical_staging(mock_spot, mock_ledger, mock_mode):
+@patch("agt_equities.roll_scanner.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
+def test_scan_live_sink_byte_identical_staging():
     """SQLiteOrderSink(staging_fn=...) receives the finalized ticket list on a HARVEST."""
-    import telegram_bot
+    from agt_equities import roll_scanner
     staged: list[list[dict]] = []
 
     def _capture(tickets):
@@ -148,10 +185,11 @@ def test_scan_live_sink_byte_identical_staging(mock_spot, mock_ledger, mock_mode
     ib = _FakeIB([pos])
 
     alerts = asyncio.run(
-        telegram_bot._scan_and_stage_defensive_rolls(ib, ctx=ctx)
+        roll_scanner.scan_and_stage_defensive_rolls(
+            ib, ctx=ctx, **_make_scanner_kwargs(),
+        )
     )
 
-    # Scanner reached HARVEST stage and staged a BTC ticket.
     assert any("HARVEST" in line for line in alerts), alerts
     assert len(staged) == 1
     ticket = staged[0][0]
@@ -165,22 +203,17 @@ def test_scan_live_sink_byte_identical_staging(mock_spot, mock_ledger, mock_mode
 # Test 3 — CollectorOrderSink captures ShadowOrder with engine='roll_engine'
 # ---------------------------------------------------------------------------
 
-@patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
-@patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
-@patch("telegram_bot._load_premium_ledger_snapshot", return_value={
-    "initial_basis": 120.0, "adjusted_basis": 110.0,
-})
-@patch("telegram_bot._ibkr_get_spot", new_callable=AsyncMock, return_value=95.0)
-def test_scan_collector_sink_captures_shadow_orders(
-    mock_spot, mock_ledger, mock_mode, collector_ctx,
-):
+@patch("agt_equities.roll_scanner.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
+def test_scan_collector_sink_captures_shadow_orders(collector_ctx):
     """CollectorOrderSink accumulates a ShadowOrder for each staged ticket."""
-    import telegram_bot
+    from agt_equities import roll_scanner
     pos = _make_fake_short_call(ticker="MSFT", strike=100.0, avg_cost=-150.0)
     ib = _FakeIB([pos])
 
     asyncio.run(
-        telegram_bot._scan_and_stage_defensive_rolls(ib, ctx=collector_ctx)
+        roll_scanner.scan_and_stage_defensive_rolls(
+            ib, ctx=collector_ctx, **_make_scanner_kwargs(),
+        )
     )
 
     orders = collector_ctx.order_sink.peek()
@@ -196,17 +229,10 @@ def test_scan_collector_sink_captures_shadow_orders(
 # Test 4 — shadow mode writes nothing to any DB
 # ---------------------------------------------------------------------------
 
-@patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
-@patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
-@patch("telegram_bot._load_premium_ledger_snapshot", return_value={
-    "initial_basis": 120.0, "adjusted_basis": 110.0,
-})
-@patch("telegram_bot._ibkr_get_spot", new_callable=AsyncMock, return_value=95.0)
-def test_scan_shadow_mode_writes_nothing_to_prod_db(
-    mock_spot, mock_ledger, mock_mode, collector_ctx, tmp_path,
-):
+@patch("agt_equities.roll_scanner.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
+def test_scan_shadow_mode_writes_nothing_to_prod_db(collector_ctx, tmp_path):
     """Collector sink does not touch pending_orders in any SQLite file."""
-    import telegram_bot
+    from agt_equities import roll_scanner
     db_path = tmp_path / "shadow_test.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("CREATE TABLE pending_orders (id INTEGER PRIMARY KEY, payload TEXT)")
@@ -217,7 +243,9 @@ def test_scan_shadow_mode_writes_nothing_to_prod_db(
     ib = _FakeIB([pos])
 
     asyncio.run(
-        telegram_bot._scan_and_stage_defensive_rolls(ib, ctx=collector_ctx)
+        roll_scanner.scan_and_stage_defensive_rolls(
+            ib, ctx=collector_ctx, **_make_scanner_kwargs(),
+        )
     )
 
     conn = sqlite3.connect(str(db_path))
@@ -232,10 +260,12 @@ def test_scan_shadow_mode_writes_nothing_to_prod_db(
 
 def test_scan_empty_positions_returns_empty_alerts(collector_ctx):
     """No short calls -> scanner returns [] and sink stays empty."""
-    import telegram_bot
+    from agt_equities import roll_scanner
     ib = _FakeIB([])
     alerts = asyncio.run(
-        telegram_bot._scan_and_stage_defensive_rolls(ib, ctx=collector_ctx)
+        roll_scanner.scan_and_stage_defensive_rolls(
+            ib, ctx=collector_ctx, **_make_scanner_kwargs(),
+        )
     )
     assert alerts == []
     assert collector_ctx.order_sink.peek() == []
@@ -245,22 +275,17 @@ def test_scan_empty_positions_returns_empty_alerts(collector_ctx):
 # Test 6 — ShadowOrder.engine stamped 'roll_engine' (not a generic value)
 # ---------------------------------------------------------------------------
 
-@patch("telegram_bot._get_current_desk_mode", return_value="PEACETIME")
-@patch("telegram_bot.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
-@patch("telegram_bot._load_premium_ledger_snapshot", return_value={
-    "initial_basis": 120.0, "adjusted_basis": 110.0,
-})
-@patch("telegram_bot._ibkr_get_spot", new_callable=AsyncMock, return_value=95.0)
-def test_scan_meta_engine_is_roll_engine(
-    mock_spot, mock_ledger, mock_mode, collector_ctx,
-):
+@patch("agt_equities.roll_scanner.ACCOUNT_TO_HOUSEHOLD", {"U1": "Yash_Household"})
+def test_scan_meta_engine_is_roll_engine(collector_ctx):
     """Every captured ShadowOrder is tagged engine='roll_engine'."""
-    import telegram_bot
+    from agt_equities import roll_scanner
     pos = _make_fake_short_call(ticker="GOOGL", strike=100.0, avg_cost=-150.0)
     ib = _FakeIB([pos])
 
     asyncio.run(
-        telegram_bot._scan_and_stage_defensive_rolls(ib, ctx=collector_ctx)
+        roll_scanner.scan_and_stage_defensive_rolls(
+            ib, ctx=collector_ctx, **_make_scanner_kwargs(),
+        )
     )
 
     orders = collector_ctx.order_sink.peek()
