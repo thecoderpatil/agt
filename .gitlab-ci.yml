@@ -1,4 +1,4 @@
-# GitLab CI for AGT Equities â€” Decoupling Sprint A targeted runner.
+# GitLab CI for AGT Equities Ã¢â‚¬â€ Decoupling Sprint A targeted runner.
 
 #
 
@@ -68,11 +68,11 @@
 
 #     these files takes the decorator and nothing else); the file list
 
-#     scopes collection so unrelated tests/*.py files â€” which pull heavy
+#     scopes collection so unrelated tests/*.py files Ã¢â‚¬â€ which pull heavy
 
 #     deps (telegram, fastapi, full project stack) that are NOT in
 
-#     requirements-ci.txt â€” don't bomb import-time collection. Adding a
+#     requirements-ci.txt Ã¢â‚¬â€ don't bomb import-time collection. Adding a
 
 #     new Sprint A *file* = one-line CI edit; adding a new Sprint A
 
@@ -82,13 +82,13 @@
 
 # -------------------------------------------------------------------
 
-# Compute-minute discipline â€” workflow:rules
+# Compute-minute discipline Ã¢â‚¬â€ workflow:rules
 
 # -------------------------------------------------------------------
 
 # Problem (observed 2026-04-16): 337 pipelines in 6 days burned the free
 
-# tier 400-minute quota. 26% of runs were duplicates â€” a branch push with
+# tier 400-minute quota. 26% of runs were duplicates Ã¢â‚¬â€ a branch push with
 
 # an open MR triggered BOTH a branch pipeline AND a merge_request_event
 
@@ -98,11 +98,11 @@
 
 # Fix: only run ONE pipeline per code state.
 
-#   - If an MR is open for the branch â†’ MR event pipeline runs, branch
+#   - If an MR is open for the branch Ã¢â€ â€™ MR event pipeline runs, branch
 
 #     push pipeline is skipped (dedup).
 
-#   - If no MR is open yet â†’ branch push pipeline runs (lets pre-MR smoke
+#   - If no MR is open yet Ã¢â€ â€™ branch push pipeline runs (lets pre-MR smoke
 
 #     tests still run on feature branches).
 
@@ -112,7 +112,7 @@
 
 # Also: commits with `[skip ci]` in the message are honored by GitLab and
 
-# consume zero minutes â€” use for docs/notes/memory-only changes.
+# consume zero minutes Ã¢â‚¬â€ use for docs/notes/memory-only changes.
 
 workflow:
 
@@ -166,7 +166,7 @@ variables:
 
   # telegram_bot.py reads these at import time. Fakes are sufficient for
 
-  # test collection + live-import â€” no network calls occur in sprint_a tests.
+  # test collection + live-import Ã¢â‚¬â€ no network calls occur in sprint_a tests.
 
   TELEGRAM_BOT_TOKEN: "ci_fake_bot_token_not_used"
 
@@ -212,7 +212,7 @@ sprint_a_unit_tests:
 
   script:
 
-    - pytest -v --tb=short -m sprint_a tests/test_ib_conn.py tests/test_agt_scheduler.py tests/test_health.py tests/test_flex_sync_atomic.py tests/test_a5e_atomic_cutover.py tests/test_b1_pending_order_children_schema.py tests/test_b2_cc_fill_permid_retry.py tests/test_b3_children_writer.py tests/test_b4_fa_block_reader.py tests/test_b5_fa_block_margin.py tests/test_b5b_m1x_integration.py tests/test_b5c_scan_bridge.py tests/test_inception_delta_fill.py tests/test_a4_init_db_lazy.py tests/test_alerts.py tests/test_conviction.py tests/test_a5d_consumer_wired.py tests/test_a5dc_dead_buffer_removed.py tests/test_roll_engine.py tests/test_fill_log_schema.py tests/test_b_fill_log_composite_pk.py tests/test_bridge2_extras.py tests/test_csp_allocator.py tests/test_telegram_ui/ tests/test_breaker_status_filter.py tests/test_paper_auto_execute.py tests/test_invariants.py tests/test_incidents_repo.py tests/test_invariants_heartbeat.py tests/test_invariants_tick.py tests/test_cmd_rem_redirect.py tests/test_incidents_digest.py tests/test_circuit_breaker_heartbeat.py tests/test_author_critic.py tests/test_nssm_install_script.py tests/test_mr84_bundle.py tests/test_requirements_runtime.py tests/test_mr85_invariant_hygiene.py tests/test_mr86_zombie_venv_launcher.py tests/test_incidents_authorable_gate.py tests/test_shadow_scan_telegram_emit.py tests/test_csp_approval_gate.py tests/test_cc_decision_sink.py tests/test_hydrate_timeout.py tests/test_import_sys_singleton_lock.py tests/test_ib_trades_hydrate_on_reconnect.py tests/test_shadow_scan_plumbing.py tests/test_csp_allocator_shadow_mode.py tests/test_excluded_sectors_hardgate.py tests/test_csp_decisions_repo.py tests/test_allocator_writes_csp_decisions.py tests/test_ib_order_builder.py tests/test_urgency_policy.py tests/test_urgency_routing_integration.py tests/test_csp_harvest.py tests/test_precommit_loc_gate.py tests/test_csp_harvest_shadow_mode.py tests/test_csp_allocator_dedup_guard.py tests/test_mr110_autoresolve_sweep.py tests/test_roll_scanner_shadow_mode.py tests/test_roll_scanner_extract.py
+    - pytest -v --tb=short -m sprint_a tests/test_ib_conn.py tests/test_agt_scheduler.py tests/test_health.py tests/test_flex_sync_atomic.py tests/test_a5e_atomic_cutover.py tests/test_b1_pending_order_children_schema.py tests/test_b2_cc_fill_permid_retry.py tests/test_b3_children_writer.py tests/test_b4_fa_block_reader.py tests/test_b5_fa_block_margin.py tests/test_b5b_m1x_integration.py tests/test_b5c_scan_bridge.py tests/test_inception_delta_fill.py tests/test_a4_init_db_lazy.py tests/test_alerts.py tests/test_conviction.py tests/test_a5d_consumer_wired.py tests/test_a5dc_dead_buffer_removed.py tests/test_roll_engine.py tests/test_fill_log_schema.py tests/test_b_fill_log_composite_pk.py tests/test_bridge2_extras.py tests/test_csp_allocator.py tests/test_telegram_ui/ tests/test_breaker_status_filter.py tests/test_paper_auto_execute.py tests/test_invariants.py tests/test_incidents_repo.py tests/test_invariants_heartbeat.py tests/test_invariants_tick.py tests/test_cmd_rem_redirect.py tests/test_incidents_digest.py tests/test_circuit_breaker_heartbeat.py tests/test_author_critic.py tests/test_nssm_install_script.py tests/test_mr84_bundle.py tests/test_requirements_runtime.py tests/test_mr85_invariant_hygiene.py tests/test_mr86_zombie_venv_launcher.py tests/test_incidents_authorable_gate.py tests/test_shadow_scan_telegram_emit.py tests/test_csp_approval_gate.py tests/test_cc_decision_sink.py tests/test_hydrate_timeout.py tests/test_import_sys_singleton_lock.py tests/test_ib_trades_hydrate_on_reconnect.py tests/test_shadow_scan_plumbing.py tests/test_csp_allocator_shadow_mode.py tests/test_excluded_sectors_hardgate.py tests/test_csp_decisions_repo.py tests/test_allocator_writes_csp_decisions.py tests/test_ib_order_builder.py tests/test_urgency_policy.py tests/test_urgency_routing_integration.py tests/test_csp_harvest.py tests/test_precommit_loc_gate.py tests/test_csp_harvest_shadow_mode.py tests/test_csp_allocator_dedup_guard.py tests/test_mr110_autoresolve_sweep.py tests/test_roll_scanner_shadow_mode.py tests/test_roll_scanner_extract.py tests/test_incidents_dual_ledger.py tests/test_decisions_repo.py
 
   rules:
 
@@ -221,4 +221,3 @@ sprint_a_unit_tests:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
     - if: $CI_COMMIT_BRANCH == "main"
-
