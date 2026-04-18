@@ -1293,6 +1293,10 @@ async def scan_and_stage_defensive_rolls(
                         finalized_tickets,
                         engine="roll_engine",
                         run_id=ctx.run_id,
+                        meta={
+                            "household": household,
+                            "ticker": ticker,
+                        },
                     )
                 except Exception as stage_exc:
                     logger.warning(
