@@ -20,7 +20,7 @@ def tmp_db_with_incidents() -> Path:
         conn.execute("""
             CREATE TABLE incidents (
                 incident_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                invariant_name TEXT NOT NULL,
+                invariant_id TEXT NOT NULL,
                 detected_at TIMESTAMP NOT NULL,
                 last_action_at TIMESTAMP,
                 status TEXT NOT NULL DEFAULT 'open',
@@ -28,7 +28,7 @@ def tmp_db_with_incidents() -> Path:
             )
         """)
         conn.executemany(
-            "INSERT INTO incidents (invariant_name, detected_at, status) VALUES (?, datetime('now'), 'open')",
+            "INSERT INTO incidents (invariant_id, detected_at, status) VALUES (?, datetime('now'), 'open')",
             [
                 ("NO_PHANTOM_FILLS",),                  # internal default
                 ("UNKNOWN_ACCT_1190",),                 # backfill → broker
