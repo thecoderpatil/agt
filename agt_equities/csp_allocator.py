@@ -375,6 +375,57 @@ async def _fetch_household_buying_power_snapshot(
             if pos.get("has_staged_order"):
                 staged_tickers.add(ticker)
 
+        # MR !108: direct pending_orders guard against dead-flag reliance
+        # pos.get('has_staged_order') is a test-fixture-only flag.
+        # _discover_positions never sets it in production, so Rule 7
+        # would fire on an always-empty set. Query pending_orders directly
+        # for ACTIVE CSP put orders on accounts in this household and fold
+        # their tickers into staged_tickers alongside the legacy flag path.
+        #
+        # Status filter: staged/processing/sent/transmitting/partially_filled.
+        # Terminal (filled/cancelled/rejected/superseded/failed) excluded.
+        try:
+            import json as _json
+            from agt_equities.db import get_ro_connection as _get_ro
+            _ACTIVE_CSP_STATUSES = (
+                "staged", "processing", "sent",
+                "transmitting", "partially_filled",
+            )
+            _acct_set = set(acct_ids)
+            _ph = ",".join("?" * len(_ACTIVE_CSP_STATUSES))
+            _conn = _get_ro()
+            try:
+                _rows = _conn.execute(
+                    f"SELECT payload, status FROM pending_orders "
+                    f"WHERE status IN ({_ph})",
+                    _ACTIVE_CSP_STATUSES,
+                ).fetchall()
+            finally:
+                _conn.close()
+            for _row in _rows:
+                try:
+                    _p = _json.loads(_row["payload"] or "{}")
+                except Exception:
+                    continue
+                if (_p.get("account_id") or _p.get("account")) not in _acct_set:
+                    continue
+                # CSP put: right='P' AND action='SELL'
+                if str(_p.get("right", "")).upper() != "P":
+                    continue
+                if str(_p.get("action", "")).upper() != "SELL":
+                    continue
+                _tkr = str(_p.get("ticker") or _p.get("symbol") or "").upper()
+                if not _tkr:
+                    continue
+                staged_tickers.add(_tkr)
+        except Exception as _dedup_exc:
+            # Fail-closed: log and keep whatever the legacy flag-union
+            # built. A DB read hiccup must not widen the dedup gate.
+            logger.warning(
+                "csp_allocator: pending_orders dedup query failed: %s",
+                _dedup_exc,
+            )
+
         # ── Compute cash_available per account ──
         # Margin accounts: use BuyingPower directly (already nets out
         # margin requirements).
