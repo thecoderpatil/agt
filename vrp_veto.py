@@ -714,30 +714,27 @@ def format_single_report(result: dict, ticker: str, is_held: bool) -> str:
 
 def send_telegram(message: str) -> None:
     """Send a message via Telegram Bot API (standalone mode). Tries HTML first."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_USER_ID:
-        logger.error("TELEGRAM_BOT_TOKEN or TELEGRAM_USER_ID not set")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    from agt_equities.telegram_utils import send_telegram_message
+    import re as _re
     chunks = [message[i:i + 4000] for i in range(0, len(message), 4000)]
     for chunk in chunks:
-        try:
-            resp = requests.post(url, json={
-                "chat_id": TELEGRAM_USER_ID,
-                "text": chunk,
-                "parse_mode": "HTML",
-            }, timeout=15)
-            if resp.status_code != 200:
-                # HTML parse may have failed — retry as plain text
-                import re as _re
-                plain = _re.sub(r"<[^>]+>", "", chunk)
-                resp2 = requests.post(url, json={
-                    "chat_id": TELEGRAM_USER_ID,
-                    "text": plain,
-                }, timeout=15)
-                if resp2.status_code != 200:
-                    logger.error("Telegram send failed: %s %s", resp2.status_code, resp2.text)
-        except Exception as exc:
-            logger.error("Telegram send error: %s", exc)
+        result = send_telegram_message(
+            chunk,
+            bot_token=TELEGRAM_BOT_TOKEN,
+            chat_id=TELEGRAM_USER_ID,
+            parse_mode="HTML",
+        )
+        if not result.get("ok"):
+            # HTML parse may have failed — retry as plain text
+            plain = _re.sub(r"<[^>]+>", "", chunk)
+            result2 = send_telegram_message(
+                plain,
+                bot_token=TELEGRAM_BOT_TOKEN,
+                chat_id=TELEGRAM_USER_ID,
+                parse_mode=None,
+            )
+            if not result2.get("ok"):
+                logger.error("Telegram send failed: %s", result2.get("error"))
 
 
 # ---------------------------------------------------------------------------
