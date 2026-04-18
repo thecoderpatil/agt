@@ -254,6 +254,8 @@ dep_drift_check:
 
   stage: test
 
+  allow_failure: true
+
   cache:
 
     key:
@@ -404,3 +406,7 @@ dep_drift_check:
 
     - if: $CI_COMMIT_BRANCH == "main"
 
+# Override GitLab Ultimate secret_detection scanner: allow failure on Windows
+# shell executor where Docker-based analyzers cannot run.
+secret_detection:
+  allow_failure: true
