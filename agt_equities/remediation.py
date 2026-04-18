@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any
 
 from agt_equities.db import get_db_connection, get_ro_connection
+from agt_equities.incidents_repo import STATUS_AWAITING, STATUS_ARCHITECT, STATUS_MERGED, STATUS_REJECTED_ONCE, STATUS_REJECTED_PERM, STATUS_REJECTED_TWICE
 
 __all__ = [
     "extract_incidents_from_directive",
@@ -86,12 +87,6 @@ __all__ = [
 
 # Status constants — one place, fail loud if mis-typed elsewhere.
 STATUS_NEW = "new"
-STATUS_AWAITING = "awaiting_approval"
-STATUS_MERGED = "merged"
-STATUS_REJECTED_ONCE = "rejected_once"
-STATUS_REJECTED_TWICE = "rejected_twice"
-STATUS_REJECTED_PERM = "rejected_permanently"
-STATUS_ARCHITECT = "needs_architect"
 
 _VALID_STATUS = frozenset({
     STATUS_NEW, STATUS_AWAITING, STATUS_MERGED,
