@@ -166,8 +166,19 @@ async def cmd_scan_daily(args):
 
     # ── 2. Roll check (same call as cmd_daily line 7092) ──
     try:
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+        import uuid as _uuid_mr4
         ib_conn = await bot.ensure_ib_connected()
-        roll_alerts = await bot._scan_and_stage_defensive_rolls(ib_conn)
+        _cli_roll_ctx = RunContext(
+            mode=RunMode.LIVE,
+            run_id=_uuid_mr4.uuid4().hex,
+            order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
+            decision_sink=NullDecisionSink(),
+        )
+        roll_alerts = await bot._scan_and_stage_defensive_rolls(
+            ib_conn, ctx=_cli_roll_ctx,
+        )
         roll_text = "\n".join(roll_alerts) if roll_alerts else "No roll actions triggered."
         sections.append(("ROLL CHECK", roll_text))
     except Exception as exc:
