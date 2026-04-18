@@ -21,7 +21,7 @@ from .walker import Cycle, TradeEvent, walk_cycles, UnknownEventError
 logger = logging.getLogger(__name__)
 
 # Tickers excluded from Walker (index options, not wheel candidates)
-EXCLUDED_TICKERS = frozenset({'SPX', 'VIX', 'NDX', 'RUT', 'XSP'})
+INDEX_UNDERLYINGS = frozenset({'SPX', 'VIX', 'NDX', 'RUT', 'XSP'})
 
 # Cache: keyed by as_of_report_date
 _cycle_cache: dict[str, list[Cycle]] = {}
@@ -109,7 +109,7 @@ def _load_trade_events(
         hh = ACCOUNT_TO_HOUSEHOLD[acct]
         # Determine ticker: prefer underlying_symbol, fall back to symbol for STK
         tk = r['underlying_symbol'] or r['symbol']
-        if tk in EXCLUDED_TICKERS:
+        if tk in INDEX_UNDERLYINGS:
             continue
 
         ev = TradeEvent(
@@ -252,7 +252,7 @@ def _load_transfer_events(
         if not tk or tk == '--':
             continue
 
-        if tk in EXCLUDED_TICKERS:
+        if tk in INDEX_UNDERLYINGS:
             continue
 
         direction = r['direction'] or ''
@@ -327,7 +327,7 @@ def _run_walker_for_all(
     for (hh, tk), group_iter in groupby(all_events, key=lambda e: (e.household_id, e.ticker)):
         group = list(group_iter)
         try:
-            cycles = walk_cycles(group, excluded_tickers=EXCLUDED_TICKERS)
+            cycles = walk_cycles(group, excluded_tickers=INDEX_UNDERLYINGS)
             all_cycles.extend(cycles)
         except UnknownEventError as exc:
             logger.error("Walker froze %s/%s: %s", hh, tk, exc)
