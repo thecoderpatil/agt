@@ -142,7 +142,7 @@ class RuleEvaluation:
 # Pure leverage computation (no hysteresis, no mutation)
 # ---------------------------------------------------------------------------
 
-LEVERAGE_LIMIT = 1.50
+from agt_equities.risk import LEVERAGE_LIMIT  # canonical: risk.py (Rule 11 circuit breaker)
 
 def compute_leverage_pure(
     active_cycles: list,
