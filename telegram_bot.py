@@ -19750,6 +19750,8 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         )
 
+        from agt_equities.csp_approval_gate import telegram_approval_gate as _tg_gate
+
         from agt_equities.runtime import RunContext, RunMode
 
         from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
@@ -19872,7 +19874,21 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         )
 
-        result = run_csp_allocator(
+        _require_approval = (
+
+            os.environ.get("AGT_CSP_REQUIRE_APPROVAL", "false").lower() == "true"
+
+        )
+
+        _gate = _tg_gate if _require_approval else None
+
+
+
+        import functools as _functools
+
+        _allocator_call = _functools.partial(
+
+            run_csp_allocator,
 
             ray_candidates=candidates,
 
@@ -19884,7 +19900,11 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             ctx=ctx,
 
+            approval_gate=_gate,
+
         )
+
+        result = await asyncio.to_thread(_allocator_call)
 
 
 

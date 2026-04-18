@@ -144,6 +144,14 @@ stages:
 
 
 
+default:
+
+  tags:
+
+    - agt-windows
+
+
+
 variables:
 
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
