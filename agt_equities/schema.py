@@ -1422,6 +1422,14 @@ def register_master_log_tables(conn) -> None:
     """)
 
 
+def _register_csp_approval_tables(conn) -> None:
+    """ADR-010 Phase 1: csp_pending_approval state table + indexes.
+
+    Idempotent -- safe to call on every boot.
+    """
+    from agt_equities.csp_approval_gate import _ensure_table
+    _ensure_table(conn)
+
 def _register_autonomous_tables(conn) -> None:
     """Autonomous paper-trading session state (cross-run context).
 
@@ -1562,6 +1570,8 @@ def _register_autonomous_tables(conn) -> None:
         ON incidents(mr_iid)
     """)
     conn.commit()
+
+    _register_csp_approval_tables(conn)
 
 
 def _extend_pending_orders(conn) -> None:
