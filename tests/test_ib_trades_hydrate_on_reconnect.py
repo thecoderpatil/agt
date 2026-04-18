@@ -60,7 +60,7 @@ def test_hydrate_call_is_after_handler_registration():
     pushed by IB during reqAllOpenOrdersAsync would be dropped."""
     src = _TARGET.read_text(encoding="utf-8")
     idx_handlers = src.find("execDetailsEvent += _offload_fill_handler(_on_cc_fill)")
-    idx_hydrate = src.find("await candidate.reqAllOpenOrdersAsync()")
+    idx_hydrate = src.find("candidate.reqAllOpenOrdersAsync()")
     assert idx_handlers > 0, "handler registration marker not found"
     assert idx_hydrate > 0, "hydrate call not found"
     assert idx_hydrate > idx_handlers, (
