@@ -49,6 +49,66 @@ GitLab API appears INSTANTLY in both worktrees once either side runs
 
 ---
 
+---
+
+## PreToolUse hook — deterministic destructive-command guardrail (PM-19g 2026-04-19)
+
+`.claude/settings.json` wires a `PreToolUse` hook on the Bash tool that
+runs `.claude/hooks/pre_tool_use.py` against every bash command you
+issue. The hook intercepts destructive git operations before they
+reach the OS.
+
+**Rule enforced by the hook:**
+
+If the command matches a destructive pattern (reset --hard, push
+--force, clean -fd, checkout ., worktree remove, branch -D main,
+filter-branch/repo, update-ref -d), the hook checks your current
+working directory:
+
+- `.worktrees/coder/*` — ALLOW (you're in your own workspace)
+- anywhere else — BLOCK with exit 2 + stderr refusal message
+
+**Why this exists:**
+
+Markdown "standing orders" (this file, dispatch instructions, etc.)
+are probabilistic. LLM context degradation at ~45% fill causes
+rule-forgetting — observed industry-wide in 2026 agentic-coding
+incident reports, and directly in this project twice on 2026-04-19
+(wiped CLAUDE.md amendments + near-lost ADR drafts). The hook is the
+physical enforcement of the worktree isolation invariant.
+
+**If the hook blocks you:**
+
+The stderr message tells you the matched pattern and your cwd. Usually
+the fix is `cd C:\AGT_Telegram_Bridge\.worktrees\coder` and re-issue.
+If you believe the block is incorrect, STOP and surface to Architect
+— do NOT bypass by renaming, moving, or deleting the hook. The hook
+IS the rule; circumventing it is a PM-19g violation.
+
+**Audit log:**
+
+Every block event is appended to `.claude/hooks/audit.jsonl` (local
+only, gitignored). Review with: `cat .claude/hooks/audit.jsonl |
+python -m json.tool`.
+
+**Allowed destructive operations (because you're in the coder
+worktree):**
+
+- `git fetch origin main && git reset --hard origin/main` — post-merge sync
+- `git push --force` on feature branches (never main)
+- `git clean -fd /tmp/` — within tmp is fine
+- `git worktree remove` — if explicitly dispatched (rare)
+
+**The hook does NOT touch:**
+
+- GitLab REST API commits (the normal commit flow)
+- Local pytest runs
+- Python / Python-based scripts
+- Non-destructive git commands (status, log, diff, fetch, pull
+  --ff-only, show, branch listing, etc.)
+- Any tool other than Bash (Read, Edit, Write, Grep, Glob, etc.
+  are not intercepted)
+
 ## Role split
 
 **Architect (Cowork, Max sub)** owns:
