@@ -54,7 +54,7 @@ def test_clean_state_returns_empty(tmp_path, monkeypatch):
     now = datetime(2026, 4, 19, 20, 0, tzinfo=timezone.utc)
     _seed_heartbeat_db(seeded, (now - timedelta(seconds=30)).isoformat())
     monkeypatch.setattr(
-        "agt_equities.invariants.checks.PROD_DB_PATH", str(seeded), raising=False
+        "agt_equities.runtime.PROD_DB_PATH", str(seeded), raising=False
     )
     import agt_equities.db as agt_db
     monkeypatch.setattr(agt_db, "DB_PATH", seeded, raising=False)
@@ -83,7 +83,7 @@ def test_stale_heartbeat_violates(tmp_path, monkeypatch):
     now = datetime(2026, 4, 19, 20, 0, tzinfo=timezone.utc)
     _seed_heartbeat_db(seeded, (now - timedelta(seconds=500)).isoformat())
     monkeypatch.setattr(
-        "agt_equities.invariants.checks.PROD_DB_PATH", str(seeded), raising=False
+        "agt_equities.runtime.PROD_DB_PATH", str(seeded), raising=False
     )
     import agt_equities.db as agt_db
     monkeypatch.setattr(agt_db, "DB_PATH", seeded, raising=False)
@@ -101,7 +101,7 @@ def test_empty_heartbeat_table_violates(tmp_path, monkeypatch):
     c.execute("CREATE TABLE daemon_heartbeat (daemon TEXT, last_heartbeat_at TEXT)")
     c.commit(); c.close()
     monkeypatch.setattr(
-        "agt_equities.invariants.checks.PROD_DB_PATH", str(seeded), raising=False
+        "agt_equities.runtime.PROD_DB_PATH", str(seeded), raising=False
     )
     import agt_equities.db as agt_db
     monkeypatch.setattr(agt_db, "DB_PATH", seeded, raising=False)
