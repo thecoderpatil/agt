@@ -31,7 +31,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Cache root — repo-relative, mirrors agt_desk_cache/corporate_intel layout
-CACHE_ROOT = Path(__file__).resolve().parent.parent.parent / "agt_desk_cache" / "screener"
+_DEFAULT_CACHE_ROOT = Path(__file__).resolve().parent.parent.parent / "agt_desk_cache" / "screener"
+CACHE_ROOT = Path(os.environ.get("AGT_SCREENER_CACHE_ROOT", str(_DEFAULT_CACHE_ROOT)))
 
 
 def _safe_key(key: str) -> str:
