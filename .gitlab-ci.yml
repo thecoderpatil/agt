@@ -354,6 +354,14 @@ variables:
 
 
 
+  # Canonical prod DB path — so Obs.1 bootstrap assertion passes on runner.
+
+
+
+  AGT_DB_PATH: "C:\AGT_Telegram_Bridge\agt_desk.db"
+
+
+
 
 
 
