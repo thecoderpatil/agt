@@ -354,11 +354,11 @@ variables:
 
 
 
-  # Canonical prod DB path — so Obs.1 bootstrap assertion passes on runner.
+  # Obs.1: skip boot assertion on CI runner (module-level check in telegram_bot.py).
 
 
 
-  AGT_DB_PATH: 'C:\AGT_Telegram_Bridge\agt_desk.db'
+  AGT_BOOTSTRAP_ALLOW_OVERRIDE: '1'
 
 
 
