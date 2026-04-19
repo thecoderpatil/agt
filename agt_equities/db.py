@@ -32,6 +32,7 @@ Migration history:
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -39,7 +40,7 @@ from typing import Iterator
 
 # Canonical DB path. All callers resolve through this.
 _BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = _BASE_DIR / "agt_desk.db"
+DB_PATH = Path(os.environ.get("AGT_DB_PATH", str(_BASE_DIR / "agt_desk.db")))
 
 # Connection-level lock wait. 15 seconds covers the worst-case Flex sync
 # contention window observed in production (two-daemon WAL contention).
