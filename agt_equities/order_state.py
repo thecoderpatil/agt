@@ -10,12 +10,10 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
 
 
 class OrderStatus(str, Enum):
