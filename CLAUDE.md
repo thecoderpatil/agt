@@ -37,6 +37,13 @@ The shared `.git/objects` database means every commit you make via the
 GitLab API appears INSTANTLY in both worktrees once either side runs
 `git fetch`. No duplicate history, no merge overhead.
 
+A second peer worktree exists at `C:\AGT_Telegram_Bridge\.worktrees\codex`
+for Codex-class mechanical-diff work. That path is NOT yours — if Yash
+drops you into it, STOP and surface, same as you would for the main
+worktree. The PreToolUse hook allows destructive git commands in both
+`.worktrees/coder` and `.worktrees/codex`, but the operational rule is
+unchanged: you only edit, commit, and reset from `.worktrees/coder`.
+
 # Post-merge sync — run from YOUR worktree only:
 #   cd C:\AGT_Telegram_Bridge\.worktrees\coder
 #   git fetch origin main

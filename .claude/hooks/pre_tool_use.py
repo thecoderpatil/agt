@@ -52,7 +52,13 @@ DESTRUCTIVE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bgit\s+filter-(branch|repo)\b", re.IGNORECASE),
 ]
 
-CODER_WORKTREE_MARKER = "/.worktrees/coder"  # path substring that signals safe zone
+# Path substrings that signal safe zones for destructive git commands.
+# Each entry is matched as a substring against the normalized (lowercase,
+# forward-slash) cwd. Adding a new agent worktree = append a new marker here.
+ALLOWED_WORKTREE_MARKERS: tuple[str, ...] = (
+    "/.worktrees/coder",
+    "/.worktrees/codex",
+)
 AUDIT_PATH = Path(__file__).parent / "audit.jsonl"
 
 
@@ -109,7 +115,7 @@ def main() -> int:
     for pattern in DESTRUCTIVE_PATTERNS:
         if pattern.search(command):
             cwd_norm = _normalize(cwd)
-            if CODER_WORKTREE_MARKER in cwd_norm:
+            if any(marker in cwd_norm for marker in ALLOWED_WORKTREE_MARKERS):
                 # Safe zone — allow
                 return 0
             # Blocked zone — refuse and surface
@@ -119,7 +125,7 @@ def main() -> int:
                 "outside the Coder worktree.\n"
                 f"  Command: {command}\n"
                 f"  Current working directory: {cwd}\n"
-                f"  Required worktree: C:\\AGT_Telegram_Bridge\\.worktrees\\coder\n"
+                f"  Allowed worktrees: C:\\AGT_Telegram_Bridge\\.worktrees\\coder, C:\\AGT_Telegram_Bridge\\.worktrees\\codex\n"
                 f"  Matched pattern: {pattern.pattern}\n"
                 "\n"
                 "Why this is blocked:\n"
@@ -129,7 +135,7 @@ def main() -> int:
                 "  is the only safe place for reset --hard, push --force, etc.\n"
                 "\n"
                 "To fix:\n"
-                "  cd C:\\AGT_Telegram_Bridge\\.worktrees\\coder\n"
+                "  cd C:\\AGT_Telegram_Bridge\\.worktrees\\coder   # or \\codex\n"
                 "  # then re-issue the command\n"
                 "\n"
                 "If you're already in the coder worktree and seeing this, the hook\n"
