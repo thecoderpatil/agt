@@ -1,46 +1,56 @@
-# ADR-011 promotion gate thresholds + canary ramp + kill switch config.
-# Threshold changes are an ADR-011 amendment, not a config push.
-#
-# Source: docs/adr/ADR-011_LIVE_EXECUTION_PROMOTION.md §2, §4, §5.
-version: 1
+# ADR-011 §2 -- Promotion Gate Thresholds
+# Changes to any threshold require an ADR-011 amendment; this is not a routine config push.
+# Paper baseline Python module: agt_equities/paper_baseline.py
 
 gates:
-  g1_shadow_divergence:
-    description: "Shadow-vs-live decision divergence in bps of staged-order notional."
-    mean_bps_max: 3.0
-    p99_bps_max: 5.0
-  g2_zero_trip_dry_run:
-    description: "Consecutive trading days with zero Tier-0/1 invariant trips."
+
+  G1:
+    description: Shadow-vs-live decision divergence
+    mean_bps_threshold: 3
+    p99_bps_threshold: 5
     window_days: 14
-    tier0_max: 0
-    tier1_max: 0
-  g3_sample_size:
-    description: "Staged decisions in window. Novel engine = no prior live history."
-    min_decisions: 60
-    min_decisions_novel: 120
-  g4_broker_rejection_rate:
-    description: "IB rejection rate on staged paper orders."
-    max_rate: 0.001
-  g5_operator_override_variance:
-    description: "One-sided t-test: operator overrides do not beat engine. Entry-only."
+    implemented: false
+    blocked_by: "ADR-008 shadow_scan JSON bps-per-ticket persistence not yet shipped"
+
+  G2:
+    description: Zero Tier-0/Tier-1 internal invariant trips
+    max_internal_tier01_trips: 0
+    window_days: 14
+    implemented: true
+    source_table: incidents
+    filter: "severity_tier <= 1 AND fault_source = 'internal'"
+
+  G3:
+    description: Minimum staged-decision sample size
+    min_staged_decisions: 60
+    min_staged_novel_engine: 120
+    window_days: 14
+    implemented: false
+    blocked_by: "pending_orders missing engine column -- SQLiteOrderSink drops engine kwarg"
+
+  G4:
+    description: Broker rejection rate
+    max_rejection_rate_pct: 0.1
+    window_days: 14
+    implemented: false
+    blocked_by: "same as G3"
+
+  G5:
+    description: Operator override counterfactual P&L variance
     alpha: 0.05
+    t_stat_threshold: 1.645
+    min_settled_decisions: 30
+    min_overrides_for_test: 5
+    window_days: 14
+    implemented: true
+    source_table: decisions
+    no_gate_engines:
+      - cc_exit
+      - roll_engine
+      - csp_harvest
 
-canary_ramp:
-  c1: { equity_cap_pct: 0.05, min_sessions: 5 }
-  c2: { equity_cap_pct: 0.15, min_sessions: 5 }
-  c3: { equity_cap_pct: 0.50, min_sessions: 10 }
-  c4: { equity_cap_pct: 1.00, min_sessions: null }  # permanent; no advance beyond C4
-
-kill_switches:
-  k1_session_drawdown_pct: 0.05
-  k2_consecutive_broker_rejections:
-    count: 3
-    window_seconds: 60
-  k3_latency_p95_ms: 500
-  k4_correlation_drift_floor: 0.95
-
-engines:
-  exit:    { sequence_order: 1, g5_applicable: false }
-  roll:    { sequence_order: 2, g5_applicable: false }
-  harvest: { sequence_order: 3, g5_applicable: false }
-  entry:   { sequence_order: 4, g5_applicable: true }
+canary_phases:
+  C1: {equity_cap_pct: 5,  bake_sessions: 5}
+  C2: {equity_cap_pct: 15, bake_sessions: 5}
+  C3: {equity_cap_pct: 50, bake_sessions: 10}
+  C4: {equity_cap_pct: 100, bake_sessions: null}  # permanent
