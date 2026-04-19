@@ -11,6 +11,7 @@ override via ``load_config(path)`` for tests.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -19,7 +20,8 @@ import yaml
 
 Engine = Literal["exit", "roll", "harvest", "entry"]
 
-_DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "promotion_gates.yaml"
+_CONFIG_ANCHOR = Path(__file__).resolve().parent.parent / "config" / "promotion_gates.yaml"
+_DEFAULT_CONFIG_PATH = Path(os.environ.get("AGT_PROMOTION_GATES_CONFIG", str(_CONFIG_ANCHOR)))
 
 
 @dataclass(frozen=True)
