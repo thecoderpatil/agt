@@ -50,6 +50,7 @@ State transitions:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import urllib.error
@@ -401,8 +402,12 @@ _PROJECT_ID = "81096827"
 
 
 def _gitlab_token() -> str:
-    repo_root = Path(__file__).resolve().parent.parent
-    token_path = repo_root / ".gitlab-token"
+    override = os.environ.get("AGT_GITLAB_TOKEN_PATH")
+    if override:
+        token_path = Path(override)
+    else:
+        repo_root = Path(__file__).resolve().parent.parent
+        token_path = repo_root / ".gitlab-token"
     try:
         return token_path.read_text(encoding="utf-8").strip()
     except FileNotFoundError as exc:
