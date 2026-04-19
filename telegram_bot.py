@@ -19750,6 +19750,95 @@ async def _nightly_integration_smoke(context: ContextTypes.DEFAULT_TYPE) -> None
 nightly_integration_smoke = _nightly_integration_smoke
 
 
+async def _premarket_shadow_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+
+    """F.5 -- daily 08:30 ET premarket shadow scan.
+
+    Runs shadow_scan.main inside the bot process so the NSSM-inherited
+    env is available. Offloads to a thread so the PTB event loop stays free.
+    """
+
+    import asyncio
+
+    import logging
+
+    logger_local = logging.getLogger(__name__)
+
+    try:
+
+        from scripts import shadow_scan
+
+    except ImportError as exc:
+
+        logger_local.exception("F.5 premarket shadow scan import failed")
+
+        try:
+
+            await _alert_telegram(
+
+                f"AGT F.5 premarket shadow scan IMPORT FAILED: {exc}"
+
+            )
+
+        except Exception:
+
+            pass
+
+        return
+
+    def _run() -> int:
+
+        try:
+
+            return shadow_scan.main(["--emit", "telegram"])
+
+        except SystemExit as exc:
+
+            return int(getattr(exc, "code", 1) or 1)
+
+        except Exception:
+
+            logger_local.exception("F.5 shadow_scan.main raised")
+
+            return 99
+
+    try:
+
+        rc = await asyncio.to_thread(_run)
+
+    except Exception as exc:
+
+        logger_local.exception("F.5 asyncio.to_thread failed")
+
+        try:
+
+            await _alert_telegram(
+
+                f"AGT F.5 premarket shadow scan thread failed: {exc}"
+
+            )
+
+        except Exception:
+
+            pass
+
+        return
+
+    if rc != 0:
+
+        try:
+
+            await _alert_telegram(
+
+                f"AGT F.5 premarket shadow scan exited non-zero: rc={rc}"
+
+            )
+
+        except Exception:
+
+            logger_local.exception("F.5 alert send failed")
+
+
 async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     """MR !71: Daily 9:35 AM ET — CSP entry scan + allocator staging.
@@ -23766,6 +23855,20 @@ def main() -> None:
         )
 
         logger.info("Scheduled: nightly_integration_smoke at 2:00 AM ET (daily)")
+
+        jq.run_daily(
+
+            callback=_premarket_shadow_scan,
+
+            time=_time(hour=8, minute=30, tzinfo=ET),
+
+            days=(1, 2, 3, 4, 5),
+
+            name="premarket_shadow_scan",
+
+        )
+
+        logger.info("Scheduled: premarket_shadow_scan at 8:30 AM ET (Mon-Fri)")
 
         if not _use_scheduler_daemon():
 
