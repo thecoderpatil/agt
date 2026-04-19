@@ -42,12 +42,21 @@ GitLab API appears INSTANTLY in both worktrees once either side runs
 #   git fetch origin main
 #   git reset --hard origin/main
 #
+# Then deploy to live services (Phase 2 airgap, shipped 2026-04-19):
+#   powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1 `
+#     -SourcePath C:\AGT_Telegram_Bridge\.worktrees\coder
+#
+# deploy.ps1 handles: VACUUM INTO pre-flight backup, robocopy to bridge-staging,
+# nssm stop, atomic 3-slot rotation, nssm start. Rollback via:
+#   powershell -ExecutionPolicy Bypass -File scripts\deploy\rollback.ps1
+#
 # DO NOT run `git reset --hard` from C:\AGT_Telegram_Bridge\. That is
 # Architect's worktree. Architect-authored drafts live there and will
 # be wiped. If CLAUDE.md tells you to run reset from the main tree,
 # the instruction is outdated — fix-forward via your next ship report.
-
----
+#
+# LOCAL_SYNC: block in ship report must now include deploy.ps1 exit
+# code + bridge-current timestamp + first heartbeat post-restart.
 
 ---
 
