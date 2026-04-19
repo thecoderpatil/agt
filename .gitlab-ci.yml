@@ -358,7 +358,7 @@ variables:
 
 
 
-  AGT_DB_PATH: "C:\AGT_Telegram_Bridge\agt_desk.db"
+  AGT_DB_PATH: 'C:\AGT_Telegram_Bridge\agt_desk.db'
 
 
 
