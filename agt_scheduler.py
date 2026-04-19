@@ -840,6 +840,10 @@ def main() -> int:
             "Set USE_SCHEDULER_DAEMON=1 to run.\n"
         )
         return 0
+    # ADR-007 Addendum §2.1 — halt if DB path is not canonical.
+    from agt_equities.invariants.bootstrap import assert_canonical_db_path
+    from agt_equities import db as agt_db
+    assert_canonical_db_path(resolved_path=agt_db.DB_PATH)
     return asyncio.run(_run())
 
 

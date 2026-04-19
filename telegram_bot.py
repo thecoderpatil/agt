@@ -170,6 +170,15 @@ _env_path = BASE_DIR / ".env"
 load_dotenv(_env_path, override=True)
 
 
+# ADR-007 Addendum §2.1 — halt if DB path is not canonical.
+from agt_equities.invariants.bootstrap import assert_canonical_db_path as _assert_canonical_db_path
+from agt_equities import db as _agt_db
+_assert_canonical_db_path(
+    resolved_path=_agt_db.DB_PATH,
+    allow_override=bool(os.environ.get("AGT_BOOTSTRAP_ALLOW_OVERRIDE")),
+)
+
+
 
 TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
 
