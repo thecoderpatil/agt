@@ -19681,7 +19681,64 @@ async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
 _scheduled_mode1 = _scheduled_cc
 
 
+async def _nightly_integration_smoke(context: ContextTypes.DEFAULT_TYPE) -> None:
 
+    """F.6: 02:00 AM ET smoke — clone prod DB, assert heartbeats + schema."""
+
+    import shutil
+
+    from pathlib import Path
+
+    from agt_equities.runtime import PROD_DB_PATH, clone_sqlite_db_with_wal
+
+    from agt_equities.smoke import run_nightly_smoke_checks
+
+    clone_dir: "Path | None" = None
+
+    try:
+
+        clone_path = clone_sqlite_db_with_wal(PROD_DB_PATH)
+
+        clone_dir = Path(clone_path).parent
+
+        failures = run_nightly_smoke_checks(clone_path)
+
+    except Exception as exc:
+
+        failures = [f"smoke setup exception: {exc}"]
+
+    finally:
+
+        if clone_dir is not None:
+
+            shutil.rmtree(clone_dir, ignore_errors=True)
+
+    if failures:
+
+        summary = "\n".join(f"\u2022 {f}" for f in failures)
+
+        alert_text = (
+
+            f"<b>\U0001f6a8 Nightly Integration Smoke FAILED</b>\n\n{summary}"
+
+        )
+
+        logger.error("nightly_smoke FAILED: %s", failures)
+
+        try:
+
+            await _alert_telegram(alert_text)
+
+        except Exception as exc:
+
+            logger.error("nightly_smoke: failed to send alert: %s", exc)
+
+    else:
+
+        logger.info("nightly_smoke OK")
+
+
+nightly_integration_smoke = _nightly_integration_smoke
 
 
 async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -23688,6 +23745,18 @@ def main() -> None:
         )
 
         logger.info("Scheduled: watchdog_daily at 3:30 PM ET (Mon-Fri)")
+
+        jq.run_daily(
+
+            callback=_nightly_integration_smoke,
+
+            time=_time(hour=2, minute=0, tzinfo=ET),
+
+            name="nightly_integration_smoke",
+
+        )
+
+        logger.info("Scheduled: nightly_integration_smoke at 2:00 AM ET (daily)")
 
         if not _use_scheduler_daemon():
 
