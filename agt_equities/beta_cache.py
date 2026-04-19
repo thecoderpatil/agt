@@ -17,11 +17,9 @@ import logging
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
 
 _STALE_DAYS = 14  # warn if beta older than this
 

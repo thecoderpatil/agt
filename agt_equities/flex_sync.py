@@ -34,7 +34,8 @@ FLEX_POLL_DELAY_SECONDS = 25
 FLEX_MAX_POLL_RETRIES = 6
 FLEX_INCEPTION_FROM_DATE = "20250901"
 
-DB_PATH = Path(__file__).resolve().parent.parent / "agt_desk.db"
+_BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = Path(os.environ.get("AGT_DB_PATH", str(_BASE_DIR / "agt_desk.db")))
 
 
 def _get_db() -> sqlite3.Connection:
