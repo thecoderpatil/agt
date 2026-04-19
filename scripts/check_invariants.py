@@ -33,7 +33,23 @@ def main() -> int:
                     help="Emit machine-readable JSON to stdout")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="Print every violation and all evidence")
+    ap.add_argument(
+        "--allow-override-db-path",
+        action="store_true",
+        help=(
+            "Bypass the canonical DB path assertion (for dev clones). "
+            "Production CLI invocations MUST omit this flag."
+        ),
+    )
     args = ap.parse_args()
+
+    from agt_equities.invariants.bootstrap import assert_canonical_db_path
+    from agt_equities import db as agt_db
+    target_db_path = args.db or str(agt_db.DB_PATH)
+    assert_canonical_db_path(
+        resolved_path=target_db_path,
+        allow_override=args.allow_override_db_path,
+    )
 
     kwargs = {}
     if args.yaml:
