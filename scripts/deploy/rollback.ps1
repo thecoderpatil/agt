@@ -13,8 +13,8 @@ if (-not (Test-Path $previous)) { throw "No previous deploy at $previous — can
 if (-not (Test-Path $current))  { throw "No current deploy at $current — abnormal state, surface to Architect." }
 
 if (-not $SkipServiceRestart) {
-    nssm stop telegram_bot | Out-Null
-    nssm stop agt_scheduler | Out-Null
+    nssm stop agt-telegram-bot | Out-Null
+    nssm stop agt-scheduler | Out-Null
     Start-Sleep -Seconds 3
 }
 
@@ -22,9 +22,9 @@ Move-Item $current $quarantine
 Move-Item $previous $current
 
 if (-not $SkipServiceRestart) {
-    nssm start agt_scheduler | Out-Null
+    nssm start agt-scheduler | Out-Null
     Start-Sleep -Seconds 2
-    nssm start telegram_bot | Out-Null
+    nssm start agt-telegram-bot | Out-Null
 }
 
 Write-Host "Rollback complete. Failed deploy quarantined at $quarantine. Investigate before next deploy."

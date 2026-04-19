@@ -46,8 +46,8 @@ if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE)" }
 
 # 3. Stop services (telegram_bot first — it reads scheduler state)
 if (-not $SkipServiceRestart) {
-    nssm stop telegram_bot | Out-Null
-    nssm stop agt_scheduler | Out-Null
+    nssm stop agt-telegram-bot | Out-Null
+    nssm stop agt-scheduler | Out-Null
     Start-Sleep -Seconds 3
 }
 
@@ -58,9 +58,9 @@ Move-Item $staging $current
 
 # 5. Start services (scheduler first — telegram_bot depends on scheduler heartbeat)
 if (-not $SkipServiceRestart) {
-    nssm start agt_scheduler | Out-Null
+    nssm start agt-scheduler | Out-Null
     Start-Sleep -Seconds 2
-    nssm start telegram_bot | Out-Null
+    nssm start agt-telegram-bot | Out-Null
 }
 
 Write-Host "Deploy complete at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'). Rollback target: $previous"
