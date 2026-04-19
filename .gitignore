@@ -117,3 +117,6 @@ test_write.tmp
 # Coder runs in a linked worktree at .worktrees/coder.
 # Architect runs in the main worktree. Do not track worktree directories.
 .worktrees/
+
+# PM-19g hook audit log — local-only, do not track
+.claude/hooks/audit.jsonl
