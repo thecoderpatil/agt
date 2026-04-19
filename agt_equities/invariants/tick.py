@@ -85,6 +85,33 @@ def check_invariants_tick(detector: str = "adr_007.invariants.tick") -> int:
         meta = invariant_meta.get(inv_id, {})
         severity = str(meta.get("severity_floor", "medium"))
         scrutiny_tier = str(meta.get("scrutiny_tier", "medium"))
+        if inv_id == "SELF_HEALING_WRITE_PATH_CANONICAL":
+            # ADR-007 Addendum §2.3 — out-of-band page.
+            # DO NOT call incidents write surface here: the whole point
+            # of this invariant is to catch the case where the incidents
+            # table is the wrong table.
+            for v in violations:
+                try:
+                    from agt_equities.telegram_utils import send_telegram_message
+                    send_telegram_message(
+                        (
+                            f"SELF_HEALING_WRITE_PATH_CANONICAL VIOLATED\n"
+                            f"{getattr(v, 'description', '')}\n"
+                            f"evidence: {getattr(v, 'evidence', {})}"
+                        ),
+                        parse_mode=None,
+                    )
+                except Exception:
+                    logger.exception(
+                        "out-of-band page failed for "
+                        "SELF_HEALING_WRITE_PATH_CANONICAL"
+                    )
+                logger.critical(
+                    "SELF_HEALING_WRITE_PATH_CANONICAL violated | evidence=%s",
+                    getattr(v, "evidence", {}),
+                )
+                registered += 1
+            continue
         for v in violations:
             try:
                 # MR !84: prefer Violation.stable_key if the check author set
