@@ -27,3 +27,4 @@ uvicorn
 tiktoken
 requests
 pyyaml
+scipy
