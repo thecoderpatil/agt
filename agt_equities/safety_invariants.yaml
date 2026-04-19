@@ -108,3 +108,16 @@ invariants:
     fix_by_sprint: adr-008-mr1
     max_consecutive_violations: 1
     severity_floor: high
+  - id: SELF_HEALING_WRITE_PATH_CANONICAL
+    description: |
+      ADR-007 Addendum §2.2. The invariants tick write path
+      (agt_equities.db.DB_PATH) resolves to runtime.PROD_DB_PATH
+      AND a daemon_heartbeat row has been committed through that
+      write path within the last 180 seconds.
+      Detects split-brain where invariant reads hit the canonical DB
+      but writes silently land in an orphan.
+    check_fn: check_self_healing_write_path_canonical
+    severity_floor: crit
+    scrutiny_tier: architect_only
+    fix_by_sprint: immediate
+    max_consecutive_violations: 1

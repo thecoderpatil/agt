@@ -702,6 +702,82 @@ def check_no_shadow_on_prod_db(
 
 
 # ---- Registry ------------------------------------------------------------------
+
+def check_self_healing_write_path_canonical(
+    conn: sqlite3.Connection, ctx: CheckContext,
+) -> list[Violation]:
+    """ADR-007 Addendum §2.2 — audit the incidents write path.
+
+    Two conditions must both hold for a clean return:
+      (a) Path(agt_equities.db.DB_PATH).resolve() == Path(PROD_DB_PATH).resolve()
+      (b) A daemon_heartbeat row exists within _STALE_HEARTBEAT_S seconds
+          when read through a FRESH connection opened via db.get_ro_connection()
+          (NOT via `conn`, which was opened by the runner against the
+          canonical read path).
+    """
+    from contextlib import closing
+    from pathlib import Path
+
+    from agt_equities import db as agt_db
+    from agt_equities.runtime import PROD_DB_PATH
+
+    _STALE_HEARTBEAT_S = 180
+
+    write_path = Path(agt_db.DB_PATH).resolve()
+    canonical = Path(PROD_DB_PATH).resolve()
+    if write_path != canonical:
+        return [Violation(
+            invariant_id="SELF_HEALING_WRITE_PATH_CANONICAL",
+            description=(
+                f"Incident write path {write_path} != canonical {canonical}"
+            ),
+            severity="crit",
+            evidence={
+                "write_path": str(write_path),
+                "canonical": str(canonical),
+            },
+        )]
+
+    try:
+        with closing(agt_db.get_ro_connection()) as wconn:
+            row = wconn.execute(
+                "SELECT MAX(last_heartbeat_at) AS ts FROM daemon_heartbeat"
+            ).fetchone()
+    except Exception as exc:
+        return [Violation(
+            invariant_id="SELF_HEALING_WRITE_PATH_CANONICAL",
+            description=f"Write-path heartbeat query failed: {exc}",
+            severity="crit",
+            evidence={"write_path": str(write_path), "error": str(exc)},
+        )]
+
+    last_ts = _parse_dt(row["ts"] if row else None)
+    if last_ts is None:
+        return [Violation(
+            invariant_id="SELF_HEALING_WRITE_PATH_CANONICAL",
+            description="Write-path daemon_heartbeat table is empty or unparseable",
+            severity="crit",
+            evidence={"write_path": str(write_path), "last_ts": None},
+        )]
+
+    age_s = (ctx.now_utc - last_ts).total_seconds()
+    if age_s > _STALE_HEARTBEAT_S:
+        return [Violation(
+            invariant_id="SELF_HEALING_WRITE_PATH_CANONICAL",
+            description=(
+                f"Write-path daemon_heartbeat stale: {age_s:.0f}s > "
+                f"{_STALE_HEARTBEAT_S}s threshold"
+            ),
+            severity="crit",
+            evidence={
+                "write_path": str(write_path),
+                "age_seconds": round(age_s, 1),
+                "last_heartbeat_at": row["ts"],
+            },
+        )]
+
+    return []
+
 CHECK_REGISTRY: dict[str, Any] = {
     "NO_LIVE_IN_PAPER": check_no_live_in_paper,
     "NO_UNAPPROVED_LIVE_CSP": check_no_unapproved_live_csp,
@@ -714,4 +790,5 @@ CHECK_REGISTRY: dict[str, Any] = {
     "NO_MISSING_DAEMON_HEARTBEAT": check_no_missing_daemon_heartbeat,
     "NO_LOCAL_DRIFT": check_no_local_drift,
     "NO_SHADOW_ON_PROD_DB": check_no_shadow_on_prod_db,
+    "SELF_HEALING_WRITE_PATH_CANONICAL": check_self_healing_write_path_canonical,
 }
