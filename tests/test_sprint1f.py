@@ -191,37 +191,6 @@ class TestSeedBaselinesDedupe(unittest.TestCase):
         self.assertEqual(count1, count2, "Re-seeding should not create duplicates")
 
 
-# ── Fix 10: Mode transition idempotency ────────────────────────────────
-
-class TestModeTransitionIdempotency(unittest.TestCase):
-    """Fix 10: log_mode_transition no-ops when old == new."""
-
-    def setUp(self):
-        self.conn = sqlite3.connect(":memory:")
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("""
-            CREATE TABLE mode_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, old_mode TEXT NOT NULL, new_mode TEXT NOT NULL,
-                trigger_rule TEXT, trigger_household TEXT, trigger_value REAL, notes TEXT
-            )
-        """)
-
-    def tearDown(self):
-        self.conn.close()
-
-    def test_same_mode_noop(self):
-        from agt_equities.mode_engine import log_mode_transition
-        log_mode_transition(self.conn, "PEACETIME", "PEACETIME")
-        count = self.conn.execute("SELECT COUNT(*) FROM mode_history").fetchone()[0]
-        self.assertEqual(count, 0, "Same mode should not create a row")
-
-    def test_different_mode_creates_row(self):
-        from agt_equities.mode_engine import log_mode_transition
-        log_mode_transition(self.conn, "PEACETIME", "WARTIME", trigger_rule="manual")
-        count = self.conn.execute("SELECT COUNT(*) FROM mode_history").fetchone()[0]
-        self.assertEqual(count, 1)
-
 
 # ── Sprint C1: build_state() + DeskSnapshot tests ────────────────────
 

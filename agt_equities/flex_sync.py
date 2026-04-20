@@ -786,8 +786,7 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
         # Phase 3A: Regenerate desk_state.md after successful sync
         try:
             from agt_deck.desk_state_writer import write_desk_state_atomic, generate_desk_state
-            from agt_equities.mode_engine import get_current_mode
-            mode_now = get_current_mode(conn)
+            mode_now = ""  # ADR-014: mode engine retired
             content = generate_desk_state(
                 mode=mode_now, household_data={}, rule_evaluations=[],
                 glide_paths=[], walker_warning_count=0,

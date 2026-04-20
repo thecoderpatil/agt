@@ -8,9 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from agt_equities.rule_engine import (
     PortfolioState, CorrelationData, AccountELSnapshot, evaluate_all,
 )
-from agt_equities.mode_engine import (
-    compute_mode, evaluate_glide_path, load_glide_paths,
-)
+from agt_equities.glide_path import evaluate_glide_path, load_glide_paths
 from agt_equities.data_provider import IBKRProvider, DataProviderError
 
 from agt_equities.config import ACCOUNT_TO_HOUSEHOLD as HOUSEHOLD_MAP  # acct→hh
@@ -173,12 +171,6 @@ def main():
         else:
             softened.append(ev)
 
-    # 10. Compute mode
-    mode, trigger_rule, trigger_hh, trigger_val = compute_mode(softened)
-    print(f"\n=== OVERALL MODE: {mode} ===")
-    if trigger_rule:
-        print(f"  Trigger: {trigger_rule} ({trigger_hh}) = {trigger_val}")
-
     print("\n=== Post-softening non-GREEN/non-PENDING ===")
     found_non_green = False
     for ev in softened:
@@ -189,10 +181,8 @@ def main():
         print("  (all GREEN or PENDING)")
 
     print()
-    if mode == 'PEACETIME':
-        print("DAY 1 BASELINE: PEACETIME -- PASS")
-    else:
-        print(f"DAY 1 BASELINE: {mode} -- HARD STOP")
+    # ADR-014: mode state machine retired
+    print("DAY 1 BASELINE: N/A post-ADR-014 (mode engine retired)")
 
 if __name__ == '__main__':
     main()

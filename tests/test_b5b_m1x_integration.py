@@ -60,12 +60,10 @@ class TestBuildCspProposal:
             "U_IRA": {
                 "account_id": "U_IRA", "margin_eligible": False,
                 "cash_available": 10_000.0, "buying_power": 0.0,
-                "mode": "PEACETIME",
             },
             "U_M1": {
                 "account_id": "U_M1", "margin_eligible": True,
                 "cash_available": 0.0, "buying_power": 100_000.0,
-                "mode": "PEACETIME",
             },
         })
         candidate = _make_candidate(ticker="abc", strike=50.0, mid=1.25)
@@ -75,21 +73,21 @@ class TestBuildCspProposal:
         assert proposal.ticker == "ABC"           # uppercase canonicalization
         assert proposal.expiry == "20260516"      # YYYYMMDD conversion
         assert proposal.contracts_requested == 3
-        assert proposal.mode_gate_accounts == {"U_IRA": "PEACETIME", "U_M1": "PEACETIME"}
+        assert set(proposal.account_ids) == {"U_IRA", "U_M1"}
         assert proposal.margin_eligible == {"U_IRA": False, "U_M1": True}
         assert proposal.limit_price == 1.25
         assert proposal.annualized_yield == 42.0
 
-    def test_mode_default_peacetime_when_missing(self):
-        """Account without 'mode' key defaults to PEACETIME."""
+    def test_account_ids_list_populated(self):
+        """account_ids list carries all account keys from snapshot."""
         hh = _hh_snapshot({
-            "U_NO_MODE": {
-                "account_id": "U_NO_MODE", "margin_eligible": True,
+            "U_A": {
+                "account_id": "U_A", "margin_eligible": True,
                 "cash_available": 0.0, "buying_power": 50_000.0,
             },
         })
         proposal = _build_csp_proposal(1, hh, _make_candidate())
-        assert proposal.mode_gate_accounts["U_NO_MODE"] == "PEACETIME"
+        assert "U_A" in proposal.account_ids
 
 
 class TestBuildAndAllocate:
@@ -99,17 +97,14 @@ class TestBuildAndAllocate:
             "U_IRA": {
                 "account_id": "U_IRA", "margin_eligible": False,
                 "cash_available": 10_000.0, "buying_power": 0.0,
-                "mode": "PEACETIME",
             },
             "U_M1": {
                 "account_id": "U_M1", "margin_eligible": True,
                 "cash_available": 0.0, "buying_power": 100_000.0,
-                "mode": "PEACETIME",
             },
             "U_M2": {
                 "account_id": "U_M2", "margin_eligible": True,
                 "cash_available": 0.0, "buying_power": 100_000.0,
-                "mode": "PEACETIME",
             },
         })
         candidate = _make_candidate(strike=50.0)  # $5k per contract
@@ -133,25 +128,24 @@ class TestBuildAndAllocate:
         assert by_acct["U_M2"].contracts_allocated == 2
         assert digest.total_contracts_allocated == 6
 
-    def test_wartime_margin_account_not_forfeited_to_peer(self):
-        """DT Q4 invariant — WARTIME acct doesn't give share to peer."""
+    def test_no_snapshot_account_not_forfeited_to_peer(self):
+        """DT Q4 invariant — no-snapshot acct doesn't give share to peer."""
         hh = _hh_snapshot({
             "U_PRINCIPAL": {
                 "account_id": "U_PRINCIPAL", "margin_eligible": True,
                 "cash_available": 0.0, "buying_power": 100_000.0,
-                "mode": "WARTIME",
             },
             "U_ADVISORY": {
                 "account_id": "U_ADVISORY", "margin_eligible": True,
                 "cash_available": 0.0, "buying_power": 100_000.0,
-                "mode": "PEACETIME",
             },
         })
         candidate = _make_candidate(strike=50.0)
         import agt_equities.fa_block_margin as fam
         orig = fam._fetch_available_nlv
+        # U_PRINCIPAL has no NLV snapshot — should not forfeit share to U_ADVISORY
         fam._fetch_available_nlv = lambda ids, **kw: {
-            "U_PRINCIPAL": 100_000.0, "U_ADVISORY": 100_000.0,
+            "U_ADVISORY": 100_000.0,
         }
         try:
             digest = _build_and_allocate(4, hh, candidate)
@@ -159,7 +153,7 @@ class TestBuildAndAllocate:
             fam._fetch_available_nlv = orig
         by_acct = {a.account_id: a for a in digest.allocations}
         assert by_acct["U_ADVISORY"].contracts_allocated == 2  # 4/2 pro-rata
-        assert digest.total_contracts_allocated == 2           # WARTIME forfeit not redistributed
+        assert digest.total_contracts_allocated == 2           # no-snapshot forfeit not redistributed
 
 
 class TestTicketsFromDigest:
@@ -167,12 +161,13 @@ class TestTicketsFromDigest:
         p = CSPProposal(
             household_id="H1", ticker="ABC", strike=50.0,
             contracts_requested=4, expiry="20260516",
-            mode_gate_accounts={"U_OK": "PEACETIME", "U_DROP": "WARTIME"},
+            account_ids=["U_OK", "U_DROP"],
             margin_eligible={"U_OK": True, "U_DROP": True},
         )
         import agt_equities.fa_block_margin as fam
+        # U_DROP has no NLV snapshot → no_snapshot → 0 contracts, not redistributed
         digest = fam.allocate_csp(
-            p, available_nlv_override={"U_OK": 100_000.0, "U_DROP": 100_000.0},
+            p, available_nlv_override={"U_OK": 100_000.0},
         )
         candidate = _make_candidate(ticker="abc", strike=50.0, mid=1.25,
                                     expiry="2026-05-16", annualized_yield=42.0)
@@ -184,8 +179,8 @@ class TestTicketsFromDigest:
         assert len(tickets) == 1
         t = tickets[0]
         assert t["account_id"] == "U_OK"
-        # U_OK is the only approved, takes pro-rata base_share=2 (4/2=2, 
-        # since WARTIME peer gets 0 not forfeited).
+        # U_OK is the only approved, takes pro-rata base_share=2 (4/2=2,
+        # since no-snapshot peer gets 0, not forfeited).
         assert t["quantity"] == 2
         assert t["ticker"] == "ABC"
         assert t["strike"] == 50.0
@@ -201,7 +196,7 @@ class TestTicketsFromDigest:
         p = CSPProposal(
             household_id="H1", ticker="ABC", strike=50.0,
             contracts_requested=0, expiry="20260516",
-            mode_gate_accounts={},
+            account_ids=[],
         )
         import agt_equities.fa_block_margin as fam
         digest = fam.allocate_csp(p)

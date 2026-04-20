@@ -277,12 +277,8 @@ def build_top_strip(conn, db_path: "str | None" = None) -> dict:
 
 
 def _get_desk_mode(conn) -> str:
-    """Read current desk mode, defaulting to PEACETIME."""
-    try:
-        from agt_equities.mode_engine import get_current_mode
-        return get_current_mode(conn)
-    except Exception:
-        return "PEACETIME"
+    """ADR-014: mode engine retired. Returns empty string."""
+    return ""
 
 
 # ── Build cycles table data ──────────────────────────────────────
@@ -494,9 +490,8 @@ def _build_household_el(top: dict, hh_nlv: dict) -> dict:
 def _build_cure_data(conn, db_path: "str | None" = None) -> dict:
     """Assemble Cure Console data from rule engine + glide paths."""
     from agt_equities.rule_engine import PortfolioState, evaluate_all, compute_leverage_pure
-    from agt_equities.mode_engine import (
-        get_current_mode, load_glide_paths, evaluate_glide_path,
-        get_recent_transitions,
+    from agt_equities.glide_path import (
+        load_glide_paths, evaluate_glide_path,
     )
     from datetime import date as _date
 
@@ -638,8 +633,8 @@ def _build_cure_data(conn, db_path: "str | None" = None) -> dict:
             "pause_reason": pause_reason,
         })
 
-    mode = get_current_mode(conn)
-    transitions = get_recent_transitions(conn)
+    mode = ""  # ADR-014: mode engine retired
+    transitions = []  # ADR-014: mode transitions retired
 
     try:
         staged_exits = queries.get_staged_dynamic_exits(conn)

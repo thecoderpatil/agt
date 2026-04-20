@@ -10,12 +10,13 @@ KILLED_COMMANDS = [
     "scan", "rollcheck", "declare_wartime", "sync_universe",
     "cleanup_blotter", "status_orders", "stop", "dynamic_exit",
     "override", "override_earnings", "reconcile", "clear_quarantine",
+    "declare_peacetime", "mode",
 ]
 
 KEPT_COMMANDS = [
     "start", "status", "cure", "approve", "reject", "reconnect",
     "recover_transmitting", "budget", "think", "deep", "clear", "vrp",
-    "orders", "declare_peacetime", "halt",
+    "orders", "halt",
 ]
 
 

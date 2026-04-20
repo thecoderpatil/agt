@@ -1163,10 +1163,6 @@ def _build_csp_proposal(
     margin_eligible flag comes straight from hh_snapshot.accounts.
     """
     accounts = hh_snapshot.get("accounts", {})
-    mode_gate = {
-        acct_id: acct.get("mode", "PEACETIME")
-        for acct_id, acct in accounts.items()
-    }
     margin_eligible = {
         acct_id: bool(acct.get("margin_eligible", True))
         for acct_id, acct in accounts.items()
@@ -1177,7 +1173,7 @@ def _build_csp_proposal(
         strike=float(candidate.strike),
         contracts_requested=n_contracts,
         expiry=candidate.expiry.replace("-", ""),  # YYYYMMDD
-        mode_gate_accounts=mode_gate,
+        account_ids=list(accounts.keys()),
         margin_eligible=margin_eligible,
         limit_price=float(getattr(candidate, "mid", 0.0)),
         annualized_yield=float(getattr(candidate, "annualized_yield", 0.0)),

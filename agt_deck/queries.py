@@ -422,10 +422,8 @@ def get_health_strip_data(conn: sqlite3.Connection) -> dict:
     # inference conflates IB disconnected vs writer job crashed vs bot down.
     """
     import time
-    from agt_equities.mode_engine import get_current_mode
-
     now = time.time()
-    mode = get_current_mode(conn)
+    mode = ""  # ADR-014: mode engine retired
 
     # Sprint 1E: derive from shared maps instead of third hardcoded list
     account_configs = [
