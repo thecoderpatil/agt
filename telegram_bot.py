@@ -213,9 +213,10 @@ from agt_equities.config import (  # noqa: E402
 
     PAPER_MODE, HOUSEHOLD_MAP, ACCOUNT_TO_HOUSEHOLD, ACTIVE_ACCOUNTS,
 
-    MARGIN_ACCOUNTS, EXCLUDED_TICKERS,
+    MARGIN_ACCOUNTS, EXCLUDED_TICKERS, ACCOUNT_LABELS,
 
 )
+import agt_equities.position_discovery as position_discovery  # noqa: E402
 
 
 
@@ -2936,25 +2937,6 @@ async def parse_and_stage_order(text: str) -> str:
 
 
 
-_LIVE_ACCOUNT_LABELS = {
-
-    "U21971297": "Individual",
-
-    "U22076329": "Roth IRA",
-
-    "U22388499": "Vikram",
-
-}
-
-if PAPER_MODE:
-
-    ACCOUNT_LABELS = {acct: f"Paper-{hh.replace('_Household', '')}"
-
-                      for acct, hh in ACCOUNT_TO_HOUSEHOLD.items()}
-
-else:
-
-    ACCOUNT_LABELS = _LIVE_ACCOUNT_LABELS
 
 
 
@@ -17864,16 +17846,15 @@ async def _run_cc_logic(household_filter: str | None = None, *, ctx: "RunContext
     """
 
     # Retry discovery once on IB failure
-
-    disco = await _discover_positions(household_filter)
-
+    _ib = await ensure_ib_connected()
+    _mstats = await _query_margin_stats()
+    disco = await position_discovery.discover_positions(_ib, _mstats, household_filter)
     if disco.get("error") and "connect" in str(disco["error"]).lower():
-
         logger.warning("IB connection issue, retrying discovery in 5s...")
-
         await asyncio.sleep(5)
-
-        disco = await _discover_positions(household_filter)
+        _ib = await ensure_ib_connected()
+        _mstats = await _query_margin_stats()
+        disco = await position_discovery.discover_positions(_ib, _mstats, household_filter)
 
     if disco.get("error"):
 
@@ -19790,10 +19771,9 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-        disco = await _discover_positions(None)
-
         ib_conn = await ensure_ib_connected()
-
+        _mstats = await _query_margin_stats()
+        disco = await position_discovery.discover_positions(ib_conn, _mstats, None)
         snapshots = await _fetch_household_buying_power_snapshot(ib_conn, disco)
 
         if not snapshots:
@@ -20777,7 +20757,9 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         try:
 
-            disco = await _discover_positions(None)
+            _ib_w = await ensure_ib_connected()
+            _mstats_w = await _query_margin_stats()
+            disco = await position_discovery.discover_positions(_ib_w, _mstats_w, None)
 
             with closing(_get_db_connection()) as conn:
 
@@ -21978,15 +21960,12 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # ── 4. Discover positions + build per-household snapshots ──
 
-        disco = await _discover_positions(None)
-
-        if disco.get("error"):
-
-            logger.warning("cmd_scan: _discover_positions warning: %s", disco["error"])
-
-
-
         ib_conn = await ensure_ib_connected()
+        disco = await position_discovery.discover_positions(
+            ib_conn, await _query_margin_stats(), None
+        )
+        if disco.get("error"):
+            logger.warning("cmd_scan: discover_positions warning: %s", disco["error"])
 
         from agt_equities.csp_allocator import (
 
