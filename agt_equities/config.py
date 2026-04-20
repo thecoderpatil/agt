@@ -167,3 +167,18 @@ MARGIN_ACCOUNTS: frozenset = frozenset(
 
 EXCLUDED_TICKERS: frozenset[str] = frozenset({"IBKR", "TRAW.CVR", "SPX", "SLS", "GTLB"})
 
+# -- Account display labels (MR 2.5: migrated from telegram_bot.py) --
+# Used by position_discovery.py and telegram_bot.py display paths.
+# ACCOUNT_NAMES (IB subscription routing) stays in telegram_bot.py.
+_LIVE_ACCOUNT_LABELS: dict[str, str] = {
+    "U21971297": "Individual",
+    "U22076329": "Roth IRA",
+    "U22388499": "Vikram",
+}
+
+ACCOUNT_LABELS: dict[str, str] = (
+    {acct: f"Paper-{hh.replace('_Household', '')}"
+     for acct, hh in ACCOUNT_TO_HOUSEHOLD.items()}
+    if PAPER_MODE
+    else _LIVE_ACCOUNT_LABELS
+)
