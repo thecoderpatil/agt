@@ -23339,6 +23339,8 @@ def main() -> None:
 
     app.add_handler(CommandHandler("daily",     cmd_daily))
 
+    app.add_handler(CommandHandler("scan",      cmd_scan))
+
     app.add_handler(CommandHandler("report",    cmd_report))
 
     app.add_handler(CommandHandler("list_rem",    cmd_list_rem))
