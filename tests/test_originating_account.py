@@ -87,7 +87,6 @@ CREATE TABLE bucket3_dynamic_exit_log (
     trade_date TEXT NOT NULL,
     ticker TEXT NOT NULL,
     household TEXT NOT NULL,
-    desk_mode TEXT NOT NULL,
     action_type TEXT NOT NULL,
     household_nlv REAL NOT NULL,
     underlying_spot_at_render REAL NOT NULL,
@@ -151,11 +150,11 @@ class TestMultiRowStaging(unittest.TestCase):
         for account_id, acct_contracts in allocation.items():
             conn.execute(
                 "INSERT INTO bucket3_dynamic_exit_log "
-                "(audit_id, trade_date, ticker, household, desk_mode, "
+                "(audit_id, trade_date, ticker, household, "
                 " action_type, household_nlv, underlying_spot_at_render, "
                 " contracts, shares, final_status, originating_account_id, "
                 " staged_ts, render_ts, source) "
-                "VALUES (?, '2026-04-08', 'UBER', 'Yash_Household', 'PEACETIME', "
+                "VALUES (?, '2026-04-08', 'UBER', 'Yash_Household', "
                 " 'CC', 200000, 55.0, ?, ?, 'STAGED', ?, ?, ?, 'manual_inspection')",
                 (str(uuid.uuid4()), acct_contracts, acct_contracts * 100,
                  account_id, now_ts, now_ts),
@@ -187,11 +186,11 @@ class TestMultiRowStaging(unittest.TestCase):
             with conn:
                 conn.execute(
                     "INSERT INTO bucket3_dynamic_exit_log "
-                    "(audit_id, trade_date, ticker, household, desk_mode, "
+                    "(audit_id, trade_date, ticker, household, "
                     " action_type, household_nlv, underlying_spot_at_render, "
                     " contracts, shares, final_status, originating_account_id, "
                     " staged_ts, render_ts, source) "
-                    "VALUES (?, '2026-04-08', 'UBER', 'Yash_Household', 'PEACETIME', "
+                    "VALUES (?, '2026-04-08', 'UBER', 'Yash_Household', "
                     " 'CC', 200000, 55.0, 2, 200, 'STAGED', 'U21971297', ?, ?, "
                     " 'manual_inspection')",
                     (audit1, now_ts, now_ts),
@@ -199,11 +198,11 @@ class TestMultiRowStaging(unittest.TestCase):
                 # This should fail: duplicate PK
                 conn.execute(
                     "INSERT INTO bucket3_dynamic_exit_log "
-                    "(audit_id, trade_date, ticker, household, desk_mode, "
+                    "(audit_id, trade_date, ticker, household, "
                     " action_type, household_nlv, underlying_spot_at_render, "
                     " contracts, shares, final_status, originating_account_id, "
                     " staged_ts, render_ts, source) "
-                    "VALUES (?, '2026-04-08', 'UBER', 'Yash_Household', 'PEACETIME', "
+                    "VALUES (?, '2026-04-08', 'UBER', 'Yash_Household', "
                     " 'CC', 200000, 55.0, 1, 100, 'STAGED', 'U22076329', ?, ?, "
                     " 'manual_inspection')",
                     (audit2, now_ts, now_ts),
@@ -229,11 +228,11 @@ class TestTransmitRouting(unittest.TestCase):
         conn = _make_db()
         conn.execute(
             "INSERT INTO bucket3_dynamic_exit_log "
-            "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+            "(audit_id, trade_date, ticker, household, action_type, "
             " household_nlv, underlying_spot_at_render, strike, expiry, "
             " contracts, shares, limit_price, final_status, "
             " originating_account_id, staged_ts, render_ts, source) "
-            "VALUES ('roth-test-1', '2026-04-08', 'UBER', 'Yash_Household', 'PEACETIME', "
+            "VALUES ('roth-test-1', '2026-04-08', 'UBER', 'Yash_Household', "
             " 'CC', 200000, 55.0, 60.0, '20260425', 1, 100, 2.50, 'ATTESTED', "
             " 'U22076329', 0, 0, 'manual_inspection')"
         )
@@ -251,11 +250,11 @@ class TestTransmitRouting(unittest.TestCase):
         conn = _make_db()
         conn.execute(
             "INSERT INTO bucket3_dynamic_exit_log "
-            "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+            "(audit_id, trade_date, ticker, household, action_type, "
             " household_nlv, underlying_spot_at_render, strike, expiry, "
             " contracts, shares, limit_price, final_status, "
             " originating_account_id, staged_ts, render_ts, source) "
-            "VALUES ('null-acct-1', '2026-04-08', 'UBER', 'Yash_Household', 'PEACETIME', "
+            "VALUES ('null-acct-1', '2026-04-08', 'UBER', 'Yash_Household', "
             " 'CC', 200000, 55.0, 60.0, '20260425', 1, 100, 2.50, 'ATTESTED', "
             " NULL, 0, 0, 'manual_inspection')"
         )
@@ -286,11 +285,11 @@ class TestTransmitRouting(unittest.TestCase):
         conn = _make_db()
         conn.execute(
             "INSERT INTO bucket3_dynamic_exit_log "
-            "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+            "(audit_id, trade_date, ticker, household, action_type, "
             " household_nlv, underlying_spot_at_render, strike, expiry, "
             " contracts, shares, limit_price, final_status, "
             " originating_account_id, staged_ts, render_ts, source) "
-            "VALUES ('roth-iso-1', '2026-04-08', 'UBER', 'Yash_Household', 'PEACETIME', "
+            "VALUES ('roth-iso-1', '2026-04-08', 'UBER', 'Yash_Household', "
             " 'CC', 200000, 55.0, 60.0, '20260425', 1, 100, 2.50, 'ATTESTED', "
             " 'U22076329', 0, 0, 'manual_inspection')"
         )
@@ -321,11 +320,11 @@ class TestStkSellNullBlock(unittest.TestCase):
         conn = _make_db()
         conn.execute(
             "INSERT INTO bucket3_dynamic_exit_log "
-            "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+            "(audit_id, trade_date, ticker, household, action_type, "
             " household_nlv, underlying_spot_at_render, "
             " shares, limit_price, final_status, exception_type, "
             " originating_account_id, staged_ts, render_ts, source) "
-            "VALUES ('stk-null-1', '2026-04-08', 'ADBE', 'Yash_Household', 'WARTIME', "
+            "VALUES ('stk-null-1', '2026-04-08', 'ADBE', 'Yash_Household', "
             " 'STK_SELL', 200000, 240.0, 50, 230.0, 'ATTESTED', "
             " 'rule_6_forced_liquidation', NULL, 0, 0, 'manual_inspection')"
         )

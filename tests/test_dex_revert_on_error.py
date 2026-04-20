@@ -29,7 +29,6 @@ CREATE TABLE bucket3_dynamic_exit_log (
     trade_date TEXT NOT NULL,
     ticker TEXT NOT NULL,
     household TEXT NOT NULL,
-    desk_mode TEXT NOT NULL CHECK (desk_mode IN ('PEACETIME', 'AMBER', 'WARTIME')),
     action_type TEXT NOT NULL CHECK (action_type IN ('CC', 'STK_SELL')),
     household_nlv REAL NOT NULL,
     underlying_spot_at_render REAL NOT NULL,
@@ -95,12 +94,12 @@ def _insert_attested_row(conn, audit_id, ticker="ADBE",
     now = time.time()
     conn.execute(
         "INSERT INTO bucket3_dynamic_exit_log "
-        "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+        "(audit_id, trade_date, ticker, household, action_type, "
         " household_nlv, underlying_spot_at_render, strike, expiry, contracts, "
         " shares, limit_price, render_ts, staged_ts, final_status, "
         " gate1_conviction_tier, walk_away_pnl_per_share, "
         " originating_account_id, last_updated) "
-        "VALUES (?, date('now'), ?, 'Yash_Household', 'PEACETIME', 'CC', "
+        "VALUES (?, date('now'), ?, 'Yash_Household', 'CC', "
         " 261000.0, 250.0, 260.0, '2026-05-16', 1, 100, 3.00, ?, ?, "
         " 'ATTESTED', 'HIGH', 2.50, ?, CURRENT_TIMESTAMP)",
         (audit_id, ticker, now, now, originating_account_id),

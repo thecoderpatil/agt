@@ -33,7 +33,6 @@ CREATE TABLE bucket3_dynamic_exit_log (
     trade_date TEXT NOT NULL,
     ticker TEXT NOT NULL,
     household TEXT NOT NULL,
-    desk_mode TEXT NOT NULL CHECK (desk_mode IN ('PEACETIME', 'AMBER', 'WARTIME')),
     action_type TEXT NOT NULL CHECK (action_type IN ('CC', 'STK_SELL')),
     household_nlv REAL NOT NULL,
     underlying_spot_at_render REAL NOT NULL,
@@ -93,13 +92,13 @@ def _insert_attested(path, audit_id, re_validation_count=0):
     conn = sqlite3.connect(path)
     conn.execute(
         "INSERT INTO bucket3_dynamic_exit_log "
-        "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+        "(audit_id, trade_date, ticker, household, action_type, "
         " household_nlv, underlying_spot_at_render, "
         " gate1_freed_margin, gate1_realized_loss, gate1_conviction_tier, "
         " gate1_conviction_modifier, gate1_ratio, gate2_target_contracts, "
         " walk_away_pnl_per_share, strike, expiry, contracts, shares, "
         " limit_price, render_ts, staged_ts, final_status, re_validation_count) "
-        "VALUES (?, date('now'), 'AAPL', 'Yash_Household', 'PEACETIME', 'CC', "
+        "VALUES (?, date('now'), 'AAPL', 'Yash_Household', 'CC', "
         " 261000.0, 240.0, "
         " 48000.0, 700.0, 'NEUTRAL', 0.30, 11.14, 2, "
         " -7.0, 240.0, '2026-05-15', 2, 200, "
@@ -116,13 +115,13 @@ def _insert_transmitting(path, audit_id):
     conn = sqlite3.connect(path)
     conn.execute(
         "INSERT INTO bucket3_dynamic_exit_log "
-        "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+        "(audit_id, trade_date, ticker, household, action_type, "
         " household_nlv, underlying_spot_at_render, "
         " gate1_freed_margin, gate1_realized_loss, gate1_conviction_tier, "
         " gate1_conviction_modifier, gate1_ratio, gate2_target_contracts, "
         " walk_away_pnl_per_share, strike, expiry, contracts, shares, "
         " limit_price, render_ts, staged_ts, final_status) "
-        "VALUES (?, date('now'), 'AAPL', 'Yash_Household', 'PEACETIME', 'CC', "
+        "VALUES (?, date('now'), 'AAPL', 'Yash_Household', 'CC', "
         " 261000.0, 240.0, "
         " 48000.0, 700.0, 'NEUTRAL', 0.30, 11.14, 2, "
         " -7.0, 240.0, '2026-05-15', 2, 200, "
