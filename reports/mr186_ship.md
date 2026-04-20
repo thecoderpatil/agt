@@ -60,7 +60,11 @@
 
 ## LOCAL_SYNC
 
-Pending — will run after Yash approves and merge completes.
+  fetch/reset:   done — HEAD 71068e2c (merge commit)
+  pip install:   no new deps (requirements-runtime.txt clean)
+  smoke imports: ok — agt_equities.approval_policy + agt_equities.runtime import clean
+  deploy.ps1:    exit 0 — deploy complete at 2026-04-20 19:44:42 local (-SkipBackup)
+  heartbeats:    agt_bot 23:44:11Z ok | agt_scheduler 23:43:58Z ok
 
 ## Notes
 
