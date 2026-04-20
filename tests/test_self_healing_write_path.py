@@ -41,7 +41,7 @@ def _make_ctx(now=None):
 def _seed_heartbeat_db(path, ts):
     conn = sqlite3.connect(str(path))
     conn.execute(
-        "CREATE TABLE daemon_heartbeat (daemon TEXT, last_heartbeat_at TEXT)"
+        "CREATE TABLE daemon_heartbeat (daemon TEXT, last_beat_utc TEXT)"
     )
     conn.execute("INSERT INTO daemon_heartbeat VALUES ('agt_bot', ?)", (ts,))
     conn.commit()
@@ -98,7 +98,7 @@ def test_empty_heartbeat_table_violates(tmp_path, monkeypatch):
     """Path matches but heartbeat table is empty -> violation."""
     seeded = tmp_path / "canonical.db"
     c = sqlite3.connect(str(seeded))
-    c.execute("CREATE TABLE daemon_heartbeat (daemon TEXT, last_heartbeat_at TEXT)")
+    c.execute("CREATE TABLE daemon_heartbeat (daemon TEXT, last_beat_utc TEXT)")
     c.commit(); c.close()
     monkeypatch.setattr(
         "agt_equities.runtime.PROD_DB_PATH", str(seeded), raising=False

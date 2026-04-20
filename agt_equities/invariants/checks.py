@@ -741,7 +741,7 @@ def check_self_healing_write_path_canonical(
     try:
         with closing(agt_db.get_ro_connection()) as wconn:
             row = wconn.execute(
-                "SELECT MAX(last_heartbeat_at) AS ts FROM daemon_heartbeat"
+                "SELECT MAX(last_beat_utc) AS ts FROM daemon_heartbeat"
             ).fetchone()
     except Exception as exc:
         return [Violation(
@@ -772,7 +772,7 @@ def check_self_healing_write_path_canonical(
             evidence={
                 "write_path": str(write_path),
                 "age_seconds": round(age_s, 1),
-                "last_heartbeat_at": row["ts"],
+                "last_beat_utc": row["ts"],
             },
         )]
 
