@@ -148,6 +148,10 @@ def test_run_cc_logic_empty_discovery_returns_main_text(collector_sink):
     with patch.object(
         _pd, "discover_positions", new_callable=AsyncMock,
         return_value={"households": {}, "error": None},
+    ), patch.object(
+        telegram_bot, "ensure_ib_connected", new_callable=AsyncMock, return_value=None,
+    ), patch.object(
+        telegram_bot, "_query_margin_stats", new_callable=AsyncMock, return_value={},
     ):
         result = asyncio.run(telegram_bot._run_cc_logic(None, ctx=ctx))
 
@@ -163,6 +167,10 @@ def test_run_cc_logic_does_not_call_to_thread_with_log_cc_cycle(collector_sink):
     with patch.object(
         _pd, "discover_positions", new_callable=AsyncMock,
         return_value={"households": {}, "error": None},
+    ), patch.object(
+        telegram_bot, "ensure_ib_connected", new_callable=AsyncMock, return_value=None,
+    ), patch.object(
+        telegram_bot, "_query_margin_stats", new_callable=AsyncMock, return_value={},
     ), patch.object(telegram_bot.asyncio, "to_thread", wraps=asyncio.to_thread) as spy:
         asyncio.run(telegram_bot._run_cc_logic(None, ctx=ctx))
 
