@@ -90,7 +90,12 @@ import pandas as pd
 
 import yfinance as yf
 
-from agt_equities.execution_gate import assert_execution_enabled, ExecutionDisabledError
+from agt_equities.execution_gate import (
+    assert_execution_enabled,
+    assert_execution_enabled_strict,
+    ExecutionDisabledError,
+)
+from agt_equities.exceptions import ControlPlaneUnreadable
 
 from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 
@@ -9255,7 +9260,7 @@ async def handle_orders_callback(
 
                         continue
 
-                    assert_execution_enabled(in_process_halted=_HALTED)
+                    assert_execution_enabled_strict(in_process_halted=_HALTED)
 
                     ib_conn.placeOrder(target_trade.contract, target_trade.order)
 
@@ -9264,6 +9269,12 @@ async def handle_orders_callback(
                 else:
 
                     failed_count += 1
+
+            except ControlPlaneUnreadable as cpe:
+
+                logger.error("CONTROL PLANE UNREADABLE at match_mid placeOrder: %s", cpe)
+
+                raise
 
             except ExecutionDisabledError as exd:
 
@@ -12861,11 +12872,33 @@ async def handle_dex_callback(
 
 
 
-        assert_execution_enabled(in_process_halted=_HALTED)
+        assert_execution_enabled_strict(in_process_halted=_HALTED)
 
         trade = ib_conn.placeOrder(contract, order)
 
         ib_order_id = trade.order.orderId if trade else 0
+
+    except ControlPlaneUnreadable as cpe:
+
+        logger.error("CONTROL PLANE UNREADABLE at placeOrder (dex): %s", cpe)
+
+        _revert_transmitting_to_cancelled(audit_id, f"control_plane_unreadable: {cpe}")
+
+        try:
+
+            await query.edit_message_text(
+                f"🛑 SYSTEM FAILURE: Control plane unreadable — {cpe}"
+            )
+
+        except Exception:
+
+            pass
+
+        await _alert_telegram(f"🛑 Control plane unreadable (dex {ticker}): {cpe}")
+
+        _dispatched_audits.discard(audit_id)
+
+        return
 
     except ExecutionDisabledError as exd:
 
@@ -13715,7 +13748,7 @@ async def _place_single_order(
 
 
 
-        assert_execution_enabled(in_process_halted=_HALTED)
+        assert_execution_enabled_strict(in_process_halted=_HALTED)
 
         trade = ib_conn.placeOrder(contract, order)
 

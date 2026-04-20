@@ -17,6 +17,7 @@ from contextlib import closing
 logger = logging.getLogger(__name__)
 
 from agt_equities.db import get_ro_connection
+from agt_equities.exceptions import ControlPlaneUnreadable
 
 
 class ExecutionDisabledError(RuntimeError):
@@ -64,6 +65,57 @@ def assert_execution_enabled(in_process_halted: bool = False) -> None:
             "/halt is active in-process. Restart or /resume CONFIRM to clear."
         )
     if not _db_enabled():
+        raise ExecutionDisabledError(
+            "execution_state DB row marks execution disabled. "
+            "/resume CONFIRM to clear."
+        )
+
+
+def _db_enabled_strict() -> bool:
+    """Check execution_state DB row. Raises ControlPlaneUnreadable on DB failure.
+
+    Returns:
+        True if execution is enabled (disabled==0 or no row -- fresh install).
+    Raises:
+        ControlPlaneUnreadable: if the DB read itself fails.
+    """
+    try:
+        with closing(get_ro_connection()) as conn:
+            row = conn.execute(
+                "SELECT disabled FROM execution_state WHERE id=1"
+            ).fetchone()
+            if row is None:
+                return True  # no row = not disabled (fresh install pre-schema)
+            return row[0] == 0
+    except (sqlite3.OperationalError, Exception) as exc:
+        raise ControlPlaneUnreadable(
+            f"execution_state read failed -- control plane unreadable: {exc}"
+        ) from exc
+
+
+def assert_execution_enabled_strict(in_process_halted: bool = False) -> None:
+    """Raises if any execution gate is active. Raises ControlPlaneUnreadable on DB failure.
+
+    Use this at all order-driving call sites. Tolerant assert_execution_enabled()
+    is for reporting/UX only.
+
+    Three gates, OR logic -- any one blocks. DB unreadable = fail-closed (raises
+    ControlPlaneUnreadable rather than defaulting to enabled).
+
+    Raises:
+        ExecutionDisabledError: env var gate or in-process halt active.
+        ControlPlaneUnreadable: DB read failed; system state unknown.
+    """
+    if not _env_enabled():
+        raise ExecutionDisabledError(
+            "AGT_EXECUTION_ENABLED env var is not 'true'. "
+            "Deploy-time kill-switch active."
+        )
+    if in_process_halted:
+        raise ExecutionDisabledError(
+            "/halt is active in-process. Restart or /resume CONFIRM to clear."
+        )
+    if not _db_enabled_strict():
         raise ExecutionDisabledError(
             "execution_state DB row marks execution disabled. "
             "/resume CONFIRM to clear."
