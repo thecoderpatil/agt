@@ -240,6 +240,68 @@ Project ID lookup: URL-encode `agt-group2/agt-equities-desk`.
 
 ---
 
+## Post-merge LOCAL_SYNC (MANDATORY)
+
+Merging a MR on GitLab does NOT deploy the code to the running services. The
+NSSM services run from `C:\AGT_Runtime\bridge-current\`, which is an atomic
+snapshot produced by `scripts/deploy.ps1`. After every merge, you MUST run
+the LOCAL_SYNC sequence before declaring the MR shipped.
+
+### LOCAL_SYNC sequence
+
+Run from the Coder worktree after each merge (tier-dependent, see below):
+
+```powershell
+# 1. Sync your worktree to origin/main
+cd C:\AGT_Telegram_Bridge\.worktrees\coder
+git fetch origin main
+git reset --hard origin/main
+
+# 2. Install any new deps (runtime venv)
+C:\AGT_Telegram_Bridge\.venv\Scripts\pip.exe install -r requirements.txt
+
+# 3. Smoke imports against the prod venv
+C:\AGT_Telegram_Bridge\.venv\Scripts\python.exe -c "import agt_scheduler, telegram_bot"
+
+# 4. Atomic-swap bridge-current + NSSM restart
+pwsh C:\AGT_Telegram_Bridge\scripts\deploy.ps1
+
+# 5. Verify heartbeats < 120s post-restart
+sqlite3 C:\AGT_Telegram_Bridge\agt_desk.db "SELECT service, last_beat_utc FROM daemon_heartbeat"
+```
+
+### When LOCAL_SYNC is required
+
+| MR tier  | LOCAL_SYNC required?                                           |
+|----------|----------------------------------------------------------------|
+| TRIVIAL  | No — docs/reports/MEMORY only, nothing imports from that path. |
+| STANDARD | Yes if tests or scripts added that services import at boot.    |
+| CRITICAL | ALWAYS. `agt_equities/**` / `telegram_bot.py` / `.env*` changes MUST redeploy. |
+
+Default to "required" if in doubt. `git fetch+reset` alone is not enough —
+it syncs your worktree but not `bridge-current/`, and the NSSM services read
+from `bridge-current/`.
+
+### LOCAL_SYNC ship-report block
+
+Every ship report (`reports/mr<iid>_ship.md`) MUST contain a `LOCAL_SYNC:`
+block after the `CI:` block, even for TRIVIAL MRs (state "N/A — TRIVIAL
+tier, services unaffected"). Template:
+
+```
+LOCAL_SYNC:
+  fetch/reset:     done | skipped (trivial)
+  pip install:     done | no new deps | skipped (trivial)
+  smoke imports:   ok  | n/a (trivial)
+  deploy.ps1:      exit 0 pid=<new>  | skipped (trivial)
+  heartbeats:      <N>s <N>s         | n/a
+```
+
+Skipping the block or leaving it as a stub without a tier justification =
+the MR is not shipped. Architect will reopen.
+
+---
+
 ## Local pytest
 
 Only run pytest against **new test files** you just wrote, to confirm they
