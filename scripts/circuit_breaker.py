@@ -18,7 +18,7 @@ from pathlib import Path
 # Ensure we're in project root
 os.chdir(Path(__file__).resolve().parent.parent)
 
-DB_PATH = "agt_desk.db"
+DB_PATH = os.environ.get("AGT_DB_PATH") or str(Path(__file__).resolve().parent.parent / "agt_desk.db")
 RAILS_PATH = "_SAFETY_RAILS.md"
 
 # Hard-coded limits (mirrors _SAFETY_RAILS.md -- code is the enforcer, file is documentation)
