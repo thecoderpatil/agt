@@ -20,8 +20,7 @@ Two-phase allocation:
 
   Phase 2 — margin accounts: pro-rata on residual contracts, NLV-desc.
     DT Q4 invariant: each margin account gets contracts_requested / n
-    base share, remainder to NLV-largest. Per-account WARTIME mode gate
-    inline (Act 60 principal vs advisory nuance). Partial allocation
+    base share, remainder to NLV-largest. Partial allocation
     when affordable < pro_rata (no peer forfeit).
 
 DT Q4 ruling invariants encoded here:
@@ -207,21 +206,21 @@ def allocate_csp(
     """Allocate a CSP proposal across cash + margin accounts.
 
     Phase 1 (cash accounts, greedy):
-        Sort by cash_available desc. Mode gate inline. Fill greedily.
-        WARTIME → STATUS_MODE_BLOCKED. Zero cash → STATUS_INSUFFICIENT_CASH.
+        Sort by cash_available desc. Fill greedily.
+        Zero cash → STATUS_INSUFFICIENT_CASH.
 
     Phase 2 (margin accounts, pro-rata):
         Residual = contracts_requested - cash_allocated.
         base_share, remainder = divmod(residual, n_margin_accounts).
         Sort margin accts NLV-desc (no-snapshot sorts last).
         idx=0 gets base+remainder; others get base.
-        Per-account WARTIME → blocked. No view row → no_snapshot.
+        No view row → no_snapshot.
         affordable >= pro_rata → approved. affordable > 0 → partial
         (STATUS_INSUFFICIENT_NLV, take affordable). affordable == 0 →
         insufficient, take 0.
 
     Neither phase redistributes a dropped account's share — DT Q4
-    non-forfeit invariant (WARTIME/missing peer doesn't enlarge survivors).
+    non-forfeit invariant (missing peer doesn't enlarge survivors).
 
     Parameters
     ----------
