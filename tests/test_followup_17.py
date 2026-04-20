@@ -32,7 +32,6 @@ CREATE TABLE bucket3_dynamic_exit_log (
     trade_date TEXT NOT NULL,
     ticker TEXT NOT NULL,
     household TEXT NOT NULL,
-    desk_mode TEXT NOT NULL CHECK (desk_mode IN ('PEACETIME', 'AMBER', 'WARTIME')),
     action_type TEXT NOT NULL CHECK (action_type IN ('CC', 'STK_SELL')),
     household_nlv REAL NOT NULL,
     underlying_spot_at_render REAL NOT NULL,
@@ -104,10 +103,10 @@ def _insert_row(conn, audit_id, final_status="ATTESTED", ticker="ADBE",
     lu = last_updated or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     conn.execute(
         "INSERT INTO bucket3_dynamic_exit_log "
-        "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+        "(audit_id, trade_date, ticker, household, action_type, "
         " household_nlv, underlying_spot_at_render, strike, expiry, contracts, "
         " shares, limit_price, render_ts, staged_ts, final_status, last_updated) "
-        "VALUES (?, date('now'), ?, 'Yash_Household', 'PEACETIME', ?, "
+        "VALUES (?, date('now'), ?, 'Yash_Household', ?, "
         " 261000.0, 250.0, 260.0, '2026-05-16', 1, 100, 3.00, ?, ?, ?, ?)",
         (audit_id, ticker, action_type, now, now, final_status, lu),
     )
@@ -483,11 +482,11 @@ class TestSweep1CASGuard(unittest.TestCase):
         now = time.time()
         conn.execute(
             "INSERT INTO bucket3_dynamic_exit_log "
-            "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+            "(audit_id, trade_date, ticker, household, action_type, "
             " household_nlv, underlying_spot_at_render, render_ts, staged_ts, "
             " final_status) "
             "VALUES ('sweep-cas', date('now'), 'ADBE', 'Yash_Household', "
-            " 'PEACETIME', 'CC', 261000, 250, ?, ?, 'STAGED')",
+            " 'CC', 261000, 250, ?, ?, 'STAGED')",
             (now - 1000, now - 1000),
         )
         conn.commit()
