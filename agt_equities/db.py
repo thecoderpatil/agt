@@ -38,9 +38,43 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-# Canonical DB path. All callers resolve through this.
+import os
+
+# Canonical DB path. Resolved at import time from AGT_DB_PATH env var,
+# falling back to the __file__-relative path for CI / dev environments
+# where AGT_DB_PATH is not set. Production NSSM env sets AGT_DB_PATH,
+# so the fallback is never exercised in prod.
+# Tripwire fixture monkeypatches this attribute to a sentinel path.
 _BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = Path(os.environ.get("AGT_DB_PATH", str(_BASE_DIR / "agt_desk.db")))
+DB_PATH: Path = Path(
+    os.environ.get("AGT_DB_PATH") or str(_BASE_DIR / "agt_desk.db")
+)
+
+
+def _resolve_db_path(override: str | Path | None = None) -> Path:
+    """Resolve the canonical DB path.
+
+    Resolution order:
+      1. Explicit `override` arg (tests, scripts that know what they want).
+      2. Module-level DB_PATH attribute if non-None (tripwire fixture
+         and any legacy caller that monkeypatches it).
+      3. AGT_DB_PATH env var.
+
+    Returns a Path. Raises RuntimeError only if called with no override
+    and DB_PATH is somehow None (should not occur after MR 1).
+    """
+    if override is not None:
+        return Path(override)
+    if DB_PATH is not None:
+        return Path(DB_PATH)
+    env = os.environ.get("AGT_DB_PATH", "").strip()
+    if not env:
+        raise RuntimeError(
+            "AGT_DB_PATH unset, DB_PATH module attribute is None, and no "
+            "db_path= argument supplied. This is a boot-contract violation "
+            "-- the service should have failed at assert_boot_contract()."
+        )
+    return Path(env)
 
 # Connection-level lock wait. 15 seconds covers the worst-case Flex sync
 # contention window observed in production (two-daemon WAL contention).
@@ -64,7 +98,7 @@ def get_db_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     is closed. Write transactions must use tx_immediate(conn) — never
     rely on Python sqlite3's implicit DEFERRED 'with conn:' behavior.
     """
-    target_path = db_path if db_path is not None else DB_PATH
+    target_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(str(target_path), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
@@ -90,7 +124,7 @@ def get_ro_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
         sqlite3.Connection with row_factory=Row, query_only=ON, and
         busy_timeout set.
     """
-    target_path = db_path if db_path is not None else DB_PATH
+    target_path = _resolve_db_path(db_path)
     uri = f"file:{target_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=30.0)
     conn.row_factory = sqlite3.Row

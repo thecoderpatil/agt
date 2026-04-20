@@ -28,8 +28,19 @@
 
 $ErrorActionPreference = 'Continue'
 
+if (-not $env:AGT_DB_PATH) {
+    Write-Error "AGT boot contract violated: AGT_DB_PATH unset in NSSM environment"
+    exit 2
+}
+$DB_PATH = $env:AGT_DB_PATH
+
+if (-not $env:AGT_ENV_FILE) {
+    Write-Error "AGT boot contract violated: AGT_ENV_FILE unset in NSSM environment"
+    exit 2
+}
+
 $LogPath = 'C:\AGT_Telegram_Bridge\logs\heartbeat_stale_alert.log'
-$EnvPath = 'C:\AGT_Telegram_Bridge\.env'
+$EnvPath = $env:AGT_ENV_FILE
 $PyPath  = 'C:\AGT_Telegram_Bridge\.venv\Scripts\python.exe'
 $StaleThresholdSec = 300
 $StatePath = 'C:\AGT_Telegram_Bridge\state\heartbeat_observer_state.json'
@@ -87,8 +98,8 @@ try {
     # same class of quoting bug that bit MR1.5's NSSM Invoke-Nssm -- fix is
     # the same: avoid the -c path entirely.
     $pyScript = @'
-import sqlite3
-conn = sqlite3.connect("file:C:/AGT_Telegram_Bridge/agt_desk.db?mode=ro", uri=True)
+import sqlite3, sys
+conn = sqlite3.connect("file:" + sys.argv[1].replace("\\", "/") + "?mode=ro", uri=True)
 for name in ("agt_bot", "agt_scheduler"):
     r = conn.execute(
         "SELECT CAST((julianday('now') - julianday(last_beat_utc)) * 86400 AS INT) "
@@ -102,7 +113,7 @@ for name in ("agt_bot", "agt_scheduler"):
     $pyFile = Join-Path $env:TEMP ('hb_stale_query_{0}.py' -f (Get-Random))
     Set-Content -Path $pyFile -Value $pyScript -Encoding ASCII
     try {
-        $queryOut = & $PyPath $pyFile 2>&1
+        $queryOut = & $PyPath $pyFile $DB_PATH 2>&1
     } finally {
         Remove-Item $pyFile -Force -ErrorAction SilentlyContinue
     }

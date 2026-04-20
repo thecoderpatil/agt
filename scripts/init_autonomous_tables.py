@@ -3,7 +3,8 @@ import sqlite3
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-conn = sqlite3.connect("agt_desk.db")
+from agt_equities.db import get_db_connection
+conn = get_db_connection()
 conn.execute("PRAGMA busy_timeout = 15000")
 
 from agt_equities.schema import _register_autonomous_tables

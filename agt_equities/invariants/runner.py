@@ -31,7 +31,10 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_YAML_ANCHOR = Path(__file__).resolve().parent.parent / "safety_invariants.yaml"
 DEFAULT_YAML_PATH = Path(os.environ.get("AGT_INVARIANTS_YAML", str(_DEFAULT_YAML_ANCHOR)))
-DEFAULT_DB_PATH = r"C:\AGT_Telegram_Bridge\agt_desk.db"
+DEFAULT_DB_PATH: str = (
+    os.environ.get("AGT_DB_PATH")
+    or r"C:\AGT_Telegram_Bridge\agt_desk.db"
+)
 
 
 def load_invariants(yaml_path: str | Path = DEFAULT_YAML_PATH) -> list[dict[str, Any]]:

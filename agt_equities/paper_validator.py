@@ -685,4 +685,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from agt_equities.boot import assert_boot_contract
+    assert_boot_contract()
     sys.exit(main())

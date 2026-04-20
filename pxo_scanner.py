@@ -14,6 +14,7 @@ Usage:
 """
 
 import logging
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import date as _date
@@ -30,7 +31,10 @@ logger = logging.getLogger("pxo_scanner")
 # Dynamic universe loader — reads from ticker_universe SQLite table.
 # Falls back to a hardcoded minimum set if DB is empty/missing.
 # ---------------------------------------------------------------------------
-_DB_PATH = Path(__file__).resolve().parent / "agt_desk.db"
+_DB_PATH = Path(
+    os.environ.get("AGT_DB_PATH")
+    or str(Path(__file__).resolve().parent / "agt_desk.db")
+)
 
 _FALLBACK_WATCHLIST: list[dict] = [
     {"ticker": "AAPL",  "sector": "Technology Hardware"},
@@ -332,6 +336,8 @@ def _fetch_latest_headline(ticker: str) -> str:
 # Standalone dry-run
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    from agt_equities.boot import assert_boot_contract
+    assert_boot_contract()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     watchlist = _load_scan_universe()
 

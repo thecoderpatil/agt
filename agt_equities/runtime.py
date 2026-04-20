@@ -14,6 +14,7 @@ pulling the full stack into a command-line tool.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
 from dataclasses import dataclass
@@ -26,7 +27,10 @@ from typing import Protocol, runtime_checkable
 # ``scripts/shadow_scan.py`` MUST NOT accept this as a ``db_path`` - see
 # ``NO_SHADOW_ON_PROD_DB`` in ``agt_equities/invariants/checks.py`` and the
 # runtime assert in the CLI entry point.
-PROD_DB_PATH = r"C:\AGT_Telegram_Bridge\agt_desk.db"
+PROD_DB_PATH: str = (
+    os.environ.get("AGT_DB_PATH")
+    or r"C:\AGT_Telegram_Bridge\agt_desk.db"
+)
 
 
 class RunMode(str, Enum):
