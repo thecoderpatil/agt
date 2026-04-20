@@ -108,6 +108,9 @@ def _live_ctx(staging_fn) -> RunContext:
         run_id=uuid.uuid4().hex,
         order_sink=SQLiteOrderSink(staging_fn=staging_fn),
         decision_sink=NullDecisionSink(),
+    
+        broker_mode="paper",
+        engine="csp",
     )
 
 
@@ -119,6 +122,9 @@ def _shadow_ctx() -> tuple[RunContext, CollectorOrderSink]:
         order_sink=sink,
         decision_sink=NullDecisionSink(),
         db_path="/tmp/shadow-fake.db",
+    
+        broker_mode="paper",
+        engine="csp",
     )
     return ctx, sink
 

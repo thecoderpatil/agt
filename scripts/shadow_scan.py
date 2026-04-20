@@ -138,6 +138,8 @@ def build_shadow_ctx(db_clone_path: str) -> RunContext:
         order_sink=order_sink,
         decision_sink=decision_sink,
         db_path=db_clone_path,
+        broker_mode="paper",
+        engine="csp",
     )
     if ctx.mode is not RunMode.SHADOW:
         raise RuntimeError(

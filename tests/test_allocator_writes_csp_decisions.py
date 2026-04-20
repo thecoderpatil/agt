@@ -81,6 +81,9 @@ def _make_ctx(*, run_id: str, db_path: Path) -> RunContext:
         order_sink=sink,
         decision_sink=NullDecisionSink(),
         db_path=str(db_path),
+    
+        broker_mode="paper",
+        engine="csp",
     )
 
 
@@ -155,6 +158,9 @@ def test_staged_candidate_has_gate_verdicts_in_ticket_payload(tmp_db: Path):
         order_sink=sink,
         decision_sink=NullDecisionSink(),
         db_path=str(tmp_db),
+    
+        broker_mode="paper",
+        engine="csp",
     )
     snapshots = {"Yash_Household": _make_hh_snapshot()}
 

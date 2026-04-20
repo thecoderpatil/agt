@@ -86,6 +86,9 @@ def collector_ctx():
         run_id="shadow-test",
         order_sink=CollectorOrderSink(),
         decision_sink=NullDecisionSink(),
+    
+        broker_mode="paper",
+        engine="harvest",
     )
 
 
@@ -116,6 +119,9 @@ def test_scan_live_sink_byte_identical_staging():
         run_id="live-test",
         order_sink=SQLiteOrderSink(staging_fn=_capture),
         decision_sink=NullDecisionSink(),
+    
+        broker_mode="paper",
+        engine="harvest",
     )
     pos = _make_fake_pos(ticker="AAPL", avg_cost=100.0)
     ib = _FakeIB([pos], {"AAPL": SimpleNamespace(ask=0.15)})  # 85% profit
@@ -220,6 +226,9 @@ def test_shadow_scan_harvest_engine_wired():
         run_id="wiring-test",
         order_sink=CollectorOrderSink(),
         decision_sink=NullDecisionSink(),
+    
+        broker_mode="paper",
+        engine="harvest",
     )
 
     import io, sys

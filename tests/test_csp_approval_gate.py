@@ -356,6 +356,9 @@ class TestWartimePreCheck:
             run_id="test-wartime",
             order_sink=CollectorOrderSink(),
             decision_sink=NullDecisionSink(),
+        
+            broker_mode="paper",
+            engine="csp",
         )
         candidates = [_make_candidate()]
         snapshots = self._make_wartime_snapshots()
@@ -387,6 +390,9 @@ class TestWartimePreCheck:
             run_id="test-mixed",
             order_sink=CollectorOrderSink(),
             decision_sink=NullDecisionSink(),
+        
+            broker_mode="paper",
+            engine="csp",
         )
         candidates = [_make_candidate()]
         snapshots = self._make_mixed_snapshots()
