@@ -1,3 +1,9 @@
+> **SUPERSEDED 2026-04-19 by ADR-014_RETIRE_MODE_STATE_MACHINE.md.**
+> The V2 Router defensive doctrine was anchored to the WARTIME desk mode,
+> which ADR-014 retires in full. This ADR is preserved for audit-trail
+> continuity only. The compensating controls and invariants documented here
+> remain operationally active; only the mode-state framing is retired.
+
 # ADR-005: V2 5-State Router as the Wartime Defensive Surface
 
 **Status:** ACCEPTED (out-of-band, ratified 2026-04-10)
