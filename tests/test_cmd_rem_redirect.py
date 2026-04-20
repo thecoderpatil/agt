@@ -296,20 +296,15 @@ async def test_reject_rem_gitlab_close_failure_non_fatal() -> None:
 # ---------------------------------------------------------------------------
 
 def test_commands_registered() -> None:
-    """The three /*_rem handlers are bound by bootstrap_application.
+    """The three /*_rem handlers are in COMMAND_REGISTRY.
 
-    We inspect the source of the dispatcher-binding function rather than
-    spinning up a real Application (which requires a Telegram token + bot
-    session). The goal is to detect accidental deletion.
+    Uses COMMAND_REGISTRY as the source of truth instead of source-grepping
+    telegram_bot.py. Parity between registry and actual registration is
+    enforced by tests/test_command_registry_parity.py.
     """
-    import inspect
-    import telegram_bot as tb
-    # The binder lives in a helper; grep its source.
-    # Grab the module source once.
-    src = inspect.getsource(tb)
-    assert 'CommandHandler("list_rem"' in src
-    assert 'CommandHandler("approve_rem"' in src
-    assert 'CommandHandler("reject_rem"' in src
+    from agt_equities.command_registry import COMMAND_REGISTRY
+    for cmd in ("list_rem", "approve_rem", "reject_rem"):
+        assert cmd in COMMAND_REGISTRY, f"/{cmd} missing from COMMAND_REGISTRY"
 
 
 def test_resolve_helper_existence() -> None:
