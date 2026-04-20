@@ -1,7 +1,7 @@
 """
 tests/test_phase3a.py — Unit tests for Phase 3A Stages 1-3.
 
-Covers: rule_engine, mode_engine, glide path math, desk_state_writer,
+Covers: rule_engine, glide path math, desk_state_writer,
 baseline seeds, mode gates. Zero I/O — all tests use in-memory SQLite or synthetic data.
 """
 from __future__ import annotations
@@ -25,13 +25,10 @@ from agt_equities.rule_engine import (
     evaluate_rule_8, evaluate_rule_9, evaluate_rule_10,
     evaluate_all, LEVERAGE_LIMIT,
 )
-from agt_equities.mode_engine import (
-    MODE_PEACETIME, MODE_AMBER, MODE_WARTIME,
-    LeverageHysteresisTracker, evaluate_glide_path, GlidePath,
-    compute_mode, log_mode_transition, get_current_mode, load_glide_paths,
-)
+from agt_equities.glide_path import evaluate_glide_path, GlidePath, load_glide_paths
+from agt_equities.rule_engine import LeverageHysteresisTracker
 from agt_deck.desk_state_writer import generate_desk_state, write_desk_state_atomic
-from agt_equities.seed_baselines import seed_glide_paths, seed_sector_overrides, seed_initial_mode
+from agt_equities.seed_baselines import seed_glide_paths, seed_sector_overrides
 
 
 # ---------------------------------------------------------------------------
@@ -397,72 +394,6 @@ class TestGlidePathMath(unittest.TestCase):
         self.assertEqual(status, "GREEN")
         self.assertLess(delta, 0)
 
-
-class TestComputeMode(unittest.TestCase):
-
-    def _ev(self, status):
-        return RuleEvaluation(rule_id='test', rule_name='test', household='H',
-                              ticker=None, raw_value=1.0, status=status, message='')
-
-    def test_all_green_peacetime(self):
-        evals = [self._ev("GREEN"), self._ev("GREEN"), self._ev("PENDING")]
-        mode, _, _, _ = compute_mode(evals)
-        self.assertEqual(mode, MODE_PEACETIME)
-
-    def test_any_amber_triggers_amber(self):
-        evals = [self._ev("GREEN"), self._ev("AMBER")]
-        mode, _, _, _ = compute_mode(evals)
-        self.assertEqual(mode, MODE_AMBER)
-
-    def test_any_red_triggers_wartime(self):
-        evals = [self._ev("GREEN"), self._ev("AMBER"), self._ev("RED")]
-        mode, _, _, _ = compute_mode(evals)
-        self.assertEqual(mode, MODE_WARTIME)
-
-    def test_pending_treated_as_green(self):
-        evals = [self._ev("PENDING"), self._ev("PENDING")]
-        mode, _, _, _ = compute_mode(evals)
-        self.assertEqual(mode, MODE_PEACETIME)
-
-    def test_trigger_info_returned(self):
-        evals = [self._ev("GREEN"),
-                 RuleEvaluation(rule_id='rule_11', rule_name='Lev', household='Yash',
-                                ticker=None, raw_value=1.6, status='RED', message='')]
-        mode, rule, hh, val = compute_mode(evals)
-        self.assertEqual(mode, MODE_WARTIME)
-        self.assertEqual(rule, 'rule_11')
-        self.assertEqual(hh, 'Yash')
-        self.assertAlmostEqual(val, 1.6)
-
-
-class TestModeTransitionDB(unittest.TestCase):
-
-    def setUp(self):
-        self.conn = _get_test_db()
-
-    def tearDown(self):
-        self.conn.close()
-
-    def test_log_and_read(self):
-        log_mode_transition(self.conn, 'PEACETIME', 'AMBER', 'rule_11', 'Yash', 1.55)
-        mode = get_current_mode(self.conn)
-        self.assertEqual(mode, 'AMBER')
-
-    def test_default_peacetime(self):
-        mode = get_current_mode(self.conn)
-        self.assertEqual(mode, MODE_PEACETIME)
-
-    def test_multiple_transitions(self):
-        log_mode_transition(self.conn, 'PEACETIME', 'AMBER')
-        log_mode_transition(self.conn, 'AMBER', 'WARTIME')
-        mode = get_current_mode(self.conn)
-        self.assertEqual(mode, 'WARTIME')
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Desk State Writer Tests
-# ═══════════════════════════════════════════════════════════════════════════
-
 class TestDeskStateWriter(unittest.TestCase):
 
     def test_generate_content(self):
@@ -526,16 +457,6 @@ class TestSeeds(unittest.TestCase):
         row = self.conn.execute("SELECT * FROM sector_overrides WHERE ticker='UBER'").fetchone()
         self.assertEqual(row['sector'], 'Consumer Cyclical')
 
-    def test_seed_initial_mode(self):
-        seed_initial_mode(self.conn)
-        mode = get_current_mode(self.conn)
-        self.assertEqual(mode, MODE_PEACETIME)
-
-    def test_seed_initial_mode_idempotent(self):
-        seed_initial_mode(self.conn)
-        seed_initial_mode(self.conn)
-        rows = self.conn.execute("SELECT COUNT(*) FROM mode_history").fetchone()[0]
-        self.assertEqual(rows, 1)
 
     def test_day1_green_yash_leverage(self):
         """Day 1: Yash leverage baseline 1.60 at week 0 of 4-week glide must be GREEN."""
@@ -559,145 +480,6 @@ class TestSeeds(unittest.TestCase):
         self.assertEqual(status, "GREEN",
             f"Day 1 Vikram leverage not GREEN: status={status}, expected={expected}, delta={delta}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Stage 3: Mode Gate Tests
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestModeGateLogic(unittest.TestCase):
-    """Test the _check_mode_gate logic directly (without Telegram context)."""
-
-    def test_peacetime_allows_scan(self):
-        """In PEACETIME, gate("PEACETIME") passes."""
-        # Gate logic is pure — we test the ranking directly
-        mode_rank = {"PEACETIME": 0, "AMBER": 1, "WARTIME": 2}
-        current = mode_rank["PEACETIME"]
-        allowed = mode_rank["PEACETIME"]
-        self.assertLessEqual(current, allowed)
-
-    def test_amber_blocks_scan(self):
-        """In AMBER, gate("PEACETIME") fails."""
-        mode_rank = {"PEACETIME": 0, "AMBER": 1, "WARTIME": 2}
-        current = mode_rank["AMBER"]
-        allowed = mode_rank["PEACETIME"]
-        self.assertGreater(current, allowed)
-
-    def test_amber_allows_cc(self):
-        """In AMBER, gate("AMBER") passes (CCs are exits/rolls)."""
-        mode_rank = {"PEACETIME": 0, "AMBER": 1, "WARTIME": 2}
-        current = mode_rank["AMBER"]
-        allowed = mode_rank["AMBER"]
-        self.assertLessEqual(current, allowed)
-
-    def test_wartime_blocks_cc(self):
-        """In WARTIME, gate("AMBER") fails."""
-        mode_rank = {"PEACETIME": 0, "AMBER": 1, "WARTIME": 2}
-        current = mode_rank["WARTIME"]
-        allowed = mode_rank["AMBER"]
-        self.assertGreater(current, allowed)
-
-    def test_wartime_blocks_scan(self):
-        """In WARTIME, gate("PEACETIME") fails."""
-        mode_rank = {"PEACETIME": 0, "AMBER": 1, "WARTIME": 2}
-        current = mode_rank["WARTIME"]
-        allowed = mode_rank["PEACETIME"]
-        self.assertGreater(current, allowed)
-
-    def test_peacetime_allows_cc(self):
-        """In PEACETIME, gate("AMBER") passes."""
-        mode_rank = {"PEACETIME": 0, "AMBER": 1, "WARTIME": 2}
-        current = mode_rank["PEACETIME"]
-        allowed = mode_rank["AMBER"]
-        self.assertLessEqual(current, allowed)
-
-
-class TestModeGateMessage(unittest.TestCase):
-    """Test that blocked gates return actionable user-facing messages."""
-
-    def test_blocked_message_contains_mode_name(self):
-        """Blocked message must include the current mode so Yash knows why."""
-        # Simulate: current mode is AMBER, gate requires PEACETIME
-        # We test the message construction directly
-        mode = "AMBER"
-        msg = (
-            f"\u26d4 Mode {mode}: this command is blocked.\n"
-            f"Current desk mode is {mode}. "
-            f"Use /cure to view the Cure Console for next steps."
-        )
-        self.assertIn("AMBER", msg)
-        self.assertIn("/cure", msg)
-        self.assertIn("blocked", msg)
-
-    def test_wartime_blocked_message(self):
-        mode = "WARTIME"
-        msg = (
-            f"\u26d4 Mode {mode}: this command is blocked.\n"
-            f"Current desk mode is {mode}. "
-            f"Use /cure to view the Cure Console for next steps."
-        )
-        self.assertIn("WARTIME", msg)
-        self.assertIn("/cure", msg)
-
-    def test_blocked_message_not_silent(self):
-        """Blocked path must return a non-empty message, never empty string."""
-        mode_rank = {"PEACETIME": 0, "AMBER": 1, "WARTIME": 2}
-        for mode in ["AMBER", "WARTIME"]:
-            current = mode_rank[mode]
-            allowed = mode_rank["PEACETIME"]
-            if current > allowed:
-                msg = (
-                    f"\u26d4 Mode {mode}: this command is blocked.\n"
-                    f"Current desk mode is {mode}. "
-                    f"Use /cure to view the Cure Console for next steps."
-                )
-                self.assertTrue(len(msg) > 20, f"Blocked message too short for mode {mode}")
-
-
-class TestModeTransitionFlow(unittest.TestCase):
-    """Test full mode transition flows via DB operations."""
-
-    def setUp(self):
-        self.conn = _get_test_db()
-
-    def tearDown(self):
-        self.conn.close()
-
-    def test_peacetime_to_wartime(self):
-        log_mode_transition(self.conn, 'PEACETIME', 'WARTIME', 'manual', notes='test')
-        self.assertEqual(get_current_mode(self.conn), 'WARTIME')
-
-    def test_wartime_to_peacetime(self):
-        log_mode_transition(self.conn, 'PEACETIME', 'WARTIME')
-        log_mode_transition(self.conn, 'WARTIME', 'PEACETIME', notes='audit: all clear')
-        self.assertEqual(get_current_mode(self.conn), 'PEACETIME')
-
-    def test_peacetime_to_amber_to_wartime(self):
-        log_mode_transition(self.conn, 'PEACETIME', 'AMBER', 'rule_11')
-        self.assertEqual(get_current_mode(self.conn), 'AMBER')
-        log_mode_transition(self.conn, 'AMBER', 'WARTIME', 'rule_1')
-        self.assertEqual(get_current_mode(self.conn), 'WARTIME')
-
-    def test_wartime_requires_audit_memo_concept(self):
-        """WARTIME → PEACETIME should have notes (enforced at command level, verified here)."""
-        log_mode_transition(self.conn, 'PEACETIME', 'WARTIME')
-        # Simulate revert with audit memo
-        log_mode_transition(self.conn, 'WARTIME', 'PEACETIME',
-                            notes='/declare_peacetime: leverage cured to 1.45x')
-        rows = self.conn.execute("SELECT notes FROM mode_history ORDER BY id DESC LIMIT 1").fetchone()
-        self.assertIn('cured', rows[0])
-
-    def test_transition_history_limit(self):
-        """get_recent_transitions respects limit."""
-        from agt_equities.mode_engine import get_recent_transitions
-        for i in range(10):
-            log_mode_transition(self.conn, 'A', 'B', notes=f'test_{i}')
-        recent = get_recent_transitions(self.conn, limit=3)
-        self.assertEqual(len(recent), 3)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Rule 7: Earnings Window (fail-closed)
-# ═══════════════════════════════════════════════════════════════════════════
 
 class TestRule7EarningsWindow(unittest.TestCase):
 

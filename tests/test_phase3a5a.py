@@ -564,8 +564,6 @@ class TestDay1Baseline(unittest.TestCase):
         Handoff: Vikram EL >40%, all glide-pathed REDs → AMBER via mode engine.
         At raw evaluation level with Day 1 baselines == current values → GREEN.
         """
-        from agt_equities.mode_engine import compute_mode
-
         cycles = [
             _mock_cycle('Yash_Household', 'ADBE', 4400, 445.0),
             _mock_cycle('Yash_Household', 'CRM', 200, 262.0),
@@ -618,7 +616,7 @@ class TestGlidePathTolerance(unittest.TestCase):
     """Tests for the worsened-check tolerance band in evaluate_glide_path."""
 
     def _gp(self, rule_id, baseline, target, start='2026-04-07', end='2026-12-31'):
-        from agt_equities.mode_engine import GlidePath
+        from agt_equities.glide_path import GlidePath
         return GlidePath(
             household_id='Test', rule_id=rule_id, ticker=None,
             baseline_value=baseline, target_value=target,
@@ -628,56 +626,56 @@ class TestGlidePathTolerance(unittest.TestCase):
 
     def test_tolerance_R2_within_band(self):
         """R2: actual 0.5397, baseline 0.542. Drift -0.0023 < tolerance 0.01."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_2', 0.542, 0.70)
         status, _, _ = evaluate_glide_path(gp, 0.5397, '2026-04-07')
         self.assertNotEqual(status, "RED", "Should NOT be worsened within tolerance")
 
     def test_tolerance_R2_breaches_band(self):
         """R2: actual 0.531, baseline 0.542. Drift -0.011 > tolerance 0.01."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_2', 0.542, 0.70)
         status, _, _ = evaluate_glide_path(gp, 0.531, '2026-04-07')
         self.assertEqual(status, "RED")
 
     def test_tolerance_R11_within_band(self):
         """R11: actual 2.1738, baseline 2.170. Drift +0.0038 < tolerance 0.02."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_11', 2.170, 1.50, end='2026-06-30')
         status, _, _ = evaluate_glide_path(gp, 2.1738, '2026-04-07')
         self.assertNotEqual(status, "RED", "Should NOT be worsened within tolerance")
 
     def test_tolerance_R11_breaches_band(self):
         """R11: actual 2.195, baseline 2.170. Drift +0.025 > tolerance 0.02."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_11', 2.170, 1.50, end='2026-06-30')
         status, _, _ = evaluate_glide_path(gp, 2.195, '2026-04-07')
         self.assertEqual(status, "RED")
 
     def test_tolerance_R4_within_band(self):
         """R4: actual 0.705, baseline 0.6915. Drift +0.0135 < tolerance 0.02."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_4', 0.6915, 0.55)
         status, _, _ = evaluate_glide_path(gp, 0.705, '2026-04-07')
         self.assertNotEqual(status, "RED", "Should NOT be worsened within tolerance")
 
     def test_tolerance_default_for_unknown_rule(self):
         """Unknown rule_id uses default tolerance 0.01. Drift -0.015 > 0.01."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_99', 0.5, 0.7)
         status, _, _ = evaluate_glide_path(gp, 0.485, '2026-04-07')
         self.assertEqual(status, "RED")
 
     def test_exact_baseline_not_worsened(self):
         """actual == baseline exactly -> NOT worsened."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_2', 0.542, 0.70)
         status, _, _ = evaluate_glide_path(gp, 0.542, '2026-04-07')
         self.assertNotEqual(status, "RED")
 
     def test_exact_tolerance_edge_not_worsened(self):
         """actual at exactly (baseline - tolerance) -> NOT worsened (inclusive)."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_2', 0.542, 0.70)
         # At exactly baseline - tolerance = 0.542 - 0.01 = 0.532
         status, _, _ = evaluate_glide_path(gp, 0.532, '2026-04-07')
@@ -691,7 +689,7 @@ class TestGlidePathAmberTolerance(unittest.TestCase):
     """Tests for symmetric tolerance on the AMBER (behind) check."""
 
     def _gp(self, rule_id, baseline, target, start='2026-04-07', end='2026-12-31'):
-        from agt_equities.mode_engine import GlidePath
+        from agt_equities.glide_path import GlidePath
         return GlidePath(
             household_id='Test', rule_id=rule_id, ticker=None,
             baseline_value=baseline, target_value=target,
@@ -701,7 +699,7 @@ class TestGlidePathAmberTolerance(unittest.TestCase):
 
     def test_amber_tolerance_within_band(self):
         """R11 at Day 0: actual 2.1738, expected 2.170, drift +0.0038 < tol 0.02 -> GREEN."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_11', 2.170, 1.50, end='2026-06-30')
         status, _, _ = evaluate_glide_path(gp, 2.1738, '2026-04-07')
         self.assertEqual(status, "GREEN")
@@ -709,21 +707,21 @@ class TestGlidePathAmberTolerance(unittest.TestCase):
     def test_amber_tolerance_breaches_band(self):
         """R11 at Day 0: actual 2.195 > baseline+tol=2.190 -> WORSENED -> RED.
         (WORSENED takes precedence over BEHIND per semantic contract.)"""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_11', 2.170, 1.50, end='2026-06-30')
         status, _, _ = evaluate_glide_path(gp, 2.195, '2026-04-07')
         self.assertEqual(status, "RED")
 
     def test_amber_tolerance_R2_upward(self):
         """R2 at Day 0: actual 0.5397, expected 0.542, drift -0.0023 < tol 0.01 -> GREEN."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_2', 0.542, 0.70)
         status, _, _ = evaluate_glide_path(gp, 0.5397, '2026-04-07')
         self.assertEqual(status, "GREEN")
 
     def test_amber_mid_glide_behind(self):
         """R11 at week 6 of 12: expected=1.835, actual=1.90, behind 0.065 > tol 0.02 -> AMBER."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         # 12 weeks = 84 days from 2026-04-07 -> 2026-06-30
         gp = self._gp('rule_11', 2.170, 1.50, end='2026-06-30')
         # Week 6 = 42 days from start
@@ -733,7 +731,7 @@ class TestGlidePathAmberTolerance(unittest.TestCase):
 
     def test_amber_mid_glide_on_track(self):
         """R11 at week 6: expected=1.835, actual=1.850, behind 0.015 < tol 0.02 -> GREEN."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         gp = self._gp('rule_11', 2.170, 1.50, end='2026-06-30')
         mid_date = '2026-05-19'
         status, expected, delta = evaluate_glide_path(gp, 1.850, mid_date)
@@ -741,7 +739,7 @@ class TestGlidePathAmberTolerance(unittest.TestCase):
 
     def test_precedence_worsened_over_behind(self):
         """A value that triggers WORSENED should be RED, not AMBER."""
-        from agt_equities.mode_engine import evaluate_glide_path
+        from agt_equities.glide_path import evaluate_glide_path
         # R11 baseline 2.17, tolerance 0.02. actual=2.20 > baseline+tol=2.19 -> WORSENED
         gp = self._gp('rule_11', 2.170, 1.50, end='2026-06-30')
         status, _, _ = evaluate_glide_path(gp, 2.20, '2026-04-07')

@@ -49,14 +49,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
-from agt_equities.mode_engine import MODE_PEACETIME, MODE_AMBER, MODE_WARTIME
-
 # Margin-check outcome codes persisted to pending_order_children by B5.c
 # and rendered by format_allocation_digest today.
 STATUS_APPROVED = "approved"
 STATUS_INSUFFICIENT_NLV = "insufficient_nlv"
 STATUS_INSUFFICIENT_CASH = "insufficient_cash"
-STATUS_MODE_BLOCKED = "mode_blocked"
 STATUS_NO_SNAPSHOT = "no_snapshot"
 
 
@@ -78,8 +75,8 @@ class CSPProposal:
         Total contracts across all accounts in the household.
     expiry : str
         ISO date or YYYYMMDD. Display + ticket construction.
-    mode_gate_accounts : Mapping[str, str]
-        account_id -> mode (one of MODE_*). Per-account mode lookup.
+    account_ids : list[str]
+        Accounts eligible for CSP allocation.
     margin_eligible : Mapping[str, bool]
         account_id -> True for margin account, False for cash/IRA.
         Absent or empty dict → treat all accounts as margin
@@ -95,7 +92,7 @@ class CSPProposal:
     strike: float
     contracts_requested: int
     expiry: str
-    mode_gate_accounts: Mapping[str, str]
+    account_ids: list[str]
     margin_eligible: Mapping[str, bool] = field(default_factory=dict)
     limit_price: float = 0.0
     annualized_yield: float = 0.0
@@ -235,7 +232,7 @@ def allocate_csp(
     cash_snapshot : optional, account_id -> cash_available for cash
         accounts. Absent account → 0 cash. Unused for margin accounts.
     """
-    accounts = list(proposal.mode_gate_accounts.keys())
+    accounts = list(proposal.account_ids)
 
     if not accounts or proposal.contracts_requested <= 0:
         return AllocationDigest(
@@ -260,19 +257,6 @@ def allocate_csp(
     # ---------- Phase 1: cash accounts, greedy desc ----------
     cash_accounts.sort(key=lambda a: cash_map.get(a, 0.0), reverse=True)
     for acct in cash_accounts:
-        mode = proposal.mode_gate_accounts[acct]
-        if mode == MODE_WARTIME:
-            alloc = AccountAllocation(
-                account_id=acct,
-                contracts_allocated=0,
-                margin_check_status=STATUS_MODE_BLOCKED,
-                margin_check_reason="WARTIME — LLM CSP entry blocked per 3-mode state machine",
-                available_nlv=None,
-            )
-            allocations.append(alloc)
-            dropped.append((acct, alloc.margin_check_reason))
-            continue
-
         cash = cash_map.get(acct, 0.0)
         affordable = _contracts_affordable(cash, strike)
         if remaining <= 0:
@@ -334,20 +318,7 @@ def allocate_csp(
         base_share, remainder = divmod(remaining, n_margin)
 
         for idx, acct in enumerate(margin_accounts):
-            mode = proposal.mode_gate_accounts[acct]
             pro_rata = base_share + (remainder if idx == 0 else 0)
-
-            if mode == MODE_WARTIME:
-                alloc = AccountAllocation(
-                    account_id=acct,
-                    contracts_allocated=0,
-                    margin_check_status=STATUS_MODE_BLOCKED,
-                    margin_check_reason="WARTIME — LLM CSP entry blocked per 3-mode state machine",
-                    available_nlv=nlv_map.get(acct),
-                )
-                allocations.append(alloc)
-                dropped.append((acct, alloc.margin_check_reason))
-                continue
 
             if acct not in nlv_map:
                 alloc = AccountAllocation(

@@ -1622,3 +1622,33 @@ def evaluate_defensive_rolls(
                     }
 
     return {"action": "CRITICAL_ALERT_NO_ROLL_AVAILABLE"}
+
+
+# ---------------------------------------------------------------------------
+# Rule 11 leverage hysteresis — extracted from mode_engine.py (ADR-014)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LeverageHysteresisTracker:
+    """Tracks per-household leverage breach state for hysteresis.
+
+    Once breached (≥1.50), stays breached until leverage drops below
+    release threshold (1.40). This prevents flip-flopping at the boundary.
+    """
+    breach_state: dict[str, bool]
+    breach_threshold: float = 1.50
+    release_threshold: float = 1.40
+
+    def update(self, household: str, leverage: float) -> str:
+        """Update hysteresis state and return effective status."""
+        was_breached = self.breach_state.get(household, False)
+        if leverage >= self.breach_threshold:
+            self.breach_state[household] = True
+            return "BREACHED"
+        elif was_breached and leverage >= self.release_threshold:
+            return "BREACHED"  # hysteresis zone
+        else:
+            self.breach_state[household] = False
+            if leverage >= 1.30:
+                return "AMBER"
+            return "OK"
