@@ -142,10 +142,11 @@ def test_date_now_sql_literal_removed_from_stage_source():
 
 def test_run_cc_logic_empty_discovery_returns_main_text(collector_sink):
     import telegram_bot
+    import agt_equities.position_discovery as _pd
 
     ctx = _make_shadow_ctx(collector_sink)
     with patch.object(
-        telegram_bot, "_discover_positions", new_callable=AsyncMock,
+        _pd, "discover_positions", new_callable=AsyncMock,
         return_value={"households": {}, "error": None},
     ):
         result = asyncio.run(telegram_bot._run_cc_logic(None, ctx=ctx))
@@ -156,10 +157,11 @@ def test_run_cc_logic_empty_discovery_returns_main_text(collector_sink):
 
 def test_run_cc_logic_does_not_call_to_thread_with_log_cc_cycle(collector_sink):
     import telegram_bot
+    import agt_equities.position_discovery as _pd
 
     ctx = _make_shadow_ctx(collector_sink)
     with patch.object(
-        telegram_bot, "_discover_positions", new_callable=AsyncMock,
+        _pd, "discover_positions", new_callable=AsyncMock,
         return_value={"households": {}, "error": None},
     ), patch.object(telegram_bot.asyncio, "to_thread", wraps=asyncio.to_thread) as spy:
         asyncio.run(telegram_bot._run_cc_logic(None, ctx=ctx))
@@ -230,10 +232,12 @@ class TestCCOrderSinkRouting:
             decision_sink=NullDecisionSink(),
         )
 
-        monkeypatch.setattr(
-            tb, "_discover_positions",
-            lambda *a, **kw: (_ for _ in ()).throw(Exception("no positions")),
-        )
+        import agt_equities.position_discovery as _pd
+
+        async def _raise_no_positions(*a, **kw):
+            raise Exception("no positions")
+
+        monkeypatch.setattr(_pd, "discover_positions", _raise_no_positions)
 
         try:
             await tb._run_cc_logic(None, ctx=ctx)
