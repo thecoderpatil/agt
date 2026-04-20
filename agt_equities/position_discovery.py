@@ -20,11 +20,13 @@ import math
 from contextlib import closing
 from pathlib import Path
 
-from agt_equities.config import ACCOUNT_LABELS, ACCOUNT_TO_HOUSEHOLD, EXCLUDED_TICKERS
+from agt_equities.config import ACCOUNT_LABELS, ACCOUNT_TO_HOUSEHOLD, EXCLUDED_TICKERS, HOUSEHOLD_MAP, MARGIN_ACCOUNTS
 from agt_equities.db import get_db_connection
 from agt_equities.ib_chains import get_spots_batch
 
 logger = logging.getLogger(__name__)
+
+READ_FROM_MASTER_LOG: bool = True
 
 
 _SECTOR_MAP_FALLBACK: dict[str, str] = {
