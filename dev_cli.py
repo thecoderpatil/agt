@@ -158,7 +158,16 @@ async def cmd_scan_daily(args):
 
     # ── 1. CC staging (same call as cmd_daily line 7074) ──
     try:
-        cc_result = await bot._run_cc_logic(None)
+        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+        import uuid as _uuid_cc1
+        _cc_ctx_daily = RunContext(
+            mode=RunMode.LIVE,
+            run_id=_uuid_cc1.uuid4().hex,
+            order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
+            decision_sink=NullDecisionSink(),
+        )
+        cc_result = await bot._run_cc_logic(None, ctx=_cc_ctx_daily)
         cc_text = cc_result.get("main_text", "No CC output.")
         sections.append(("COVERED CALLS", cc_text))
     except Exception as exc:
@@ -266,7 +275,16 @@ async def cmd_stage_cc(args):
     )
 
     # This is the EXACT function that /cc invokes.
-    result = await bot._run_cc_logic(hh_filter)
+    from agt_equities.runtime import RunContext, RunMode
+    from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
+    import uuid as _uuid_cc2
+    _cc_ctx_stage = RunContext(
+        mode=RunMode.LIVE,
+        run_id=_uuid_cc2.uuid4().hex,
+        order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
+        decision_sink=NullDecisionSink(),
+    )
+    result = await bot._run_cc_logic(hh_filter, ctx=_cc_ctx_stage)
 
     main_text = result.get("main_text", "")
     print(f"\n{main_text}")
