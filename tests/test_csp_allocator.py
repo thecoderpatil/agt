@@ -77,6 +77,9 @@ def _live_ctx(staging_fn=None):
         run_id=_uuid.uuid4().hex,
         order_sink=SQLiteOrderSink(staging_fn=fn),
         decision_sink=NullDecisionSink(),
+    
+        broker_mode="paper",
+        engine="csp",
     )
 
 

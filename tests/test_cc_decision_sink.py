@@ -43,6 +43,9 @@ def _make_shadow_ctx(sink):
         run_id=uuid.uuid4().hex,
         order_sink=CollectorOrderSink(),
         decision_sink=sink,
+    
+        broker_mode="paper",
+        engine="cc",
     )
 
 
@@ -207,6 +210,9 @@ class TestCCOrderSinkRouting:
             run_id=run_id,
             order_sink=collector,
             decision_sink=NullDecisionSink(),
+        
+            broker_mode="paper",
+            engine="cc",
         )
 
         fake_ticket = {
@@ -238,6 +244,9 @@ class TestCCOrderSinkRouting:
             run_id=uuid.uuid4().hex,
             order_sink=collector,
             decision_sink=NullDecisionSink(),
+        
+            broker_mode="paper",
+            engine="cc",
         )
 
         import agt_equities.position_discovery as _pd

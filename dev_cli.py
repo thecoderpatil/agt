@@ -164,6 +164,8 @@ async def cmd_scan_daily(args):
             run_id=_uuid_cc1.uuid4().hex,
             order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
             decision_sink=NullDecisionSink(),
+            broker_mode="paper" if os.environ.get("AGT_BROKER_MODE", "paper").strip().lower() != "live" else "live",
+            engine="cc",
         )
         cc_result = await bot._run_cc_logic(None, ctx=_cc_ctx_daily)
         cc_text = cc_result.get("main_text", "No CC output.")
@@ -183,6 +185,8 @@ async def cmd_scan_daily(args):
             run_id=_uuid_mr4.uuid4().hex,
             order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
             decision_sink=NullDecisionSink(),
+            broker_mode="paper" if os.environ.get("AGT_BROKER_MODE", "paper").strip().lower() != "live" else "live",
+            engine="roll",
         )
         roll_alerts = await roll_scanner.scan_and_stage_defensive_rolls(
             ib_conn,
@@ -213,6 +217,8 @@ async def cmd_scan_daily(args):
             run_id=uuid.uuid4().hex,
             order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
             decision_sink=NullDecisionSink(),
+            broker_mode="paper" if os.environ.get("AGT_BROKER_MODE", "paper").strip().lower() != "live" else "live",
+            engine="harvest",
         )
         harvest_result = await scan_csp_harvest_candidates(ib_conn, ctx=ctx)
         staged = harvest_result.get("staged", [])
@@ -281,6 +287,8 @@ async def cmd_stage_cc(args):
         run_id=_uuid_cc2.uuid4().hex,
         order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
         decision_sink=NullDecisionSink(),
+        broker_mode="paper" if os.environ.get("AGT_BROKER_MODE", "paper").strip().lower() != "live" else "live",
+        engine="cc",
     )
     result = await bot._run_cc_logic(hh_filter, ctx=_cc_ctx_stage)
 
@@ -428,6 +436,8 @@ async def _run_csp_scan_pipeline() -> str:
         run_id=_uuid.uuid4().hex,
         order_sink=SQLiteOrderSink(staging_fn=bot.append_pending_tickets),
         decision_sink=NullDecisionSink(),
+        broker_mode="paper" if os.environ.get("AGT_BROKER_MODE", "paper").strip().lower() != "live" else "live",
+        engine="csp",
     )
 
     result = run_csp_allocator(
