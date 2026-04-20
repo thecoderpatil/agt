@@ -3049,6 +3049,14 @@ CC_BID_FLOOR  = 0.03   # skip quotes below this mid
 CC_TARGET_DTE = (14, 30)
 
 
+# Operator-controlled CC engine bypass. Set to comma-separated tickers to
+# suppress CC staging for positions with a pending LIQUIDATE or manual review.
+_CC_SUPPRESS: frozenset[str] = frozenset(
+    t.strip().upper()
+    for t in os.environ.get("AGT_CC_SUPPRESS_TICKERS", "").split(",")
+    if t.strip()
+)
+
 
 # ── Rule 8 Dynamic Exit — V7 Amendments ──
 
@@ -17875,6 +17883,23 @@ async def _run_cc_logic(household_filter: str | None = None, *, ctx: "RunContext
     staged: list[dict] = []
 
     skipped: list[dict] = []
+
+    if _CC_SUPPRESS:
+        _remaining: list[dict] = []
+        for _p in cc_targets:
+            if _p["ticker"].upper() in _CC_SUPPRESS:
+                skipped.append({
+                    "ticker": _p["ticker"],
+                    "reason": "SUPPRESSED \u2014 AGT_CC_SUPPRESS_TICKERS",
+                    "household": _p["household"],
+                    "mode": _p.get("mode", ""),
+                    "spot": _p["spot_price"],
+                    "adjusted_basis": _p.get("adjusted_basis", 0),
+                    "initial_basis": _p.get("initial_basis", 0),
+                })
+            else:
+                _remaining.append(_p)
+        cc_targets = _remaining
 
 
 
