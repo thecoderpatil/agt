@@ -51,16 +51,6 @@ CREATE TABLE premium_ledger (
     shares_owned INTEGER DEFAULT 0
 );
 
-CREATE TABLE mode_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    old_mode TEXT NOT NULL,
-    new_mode TEXT NOT NULL,
-    trigger_rule TEXT,
-    trigger_household TEXT,
-    trigger_value REAL,
-    notes TEXT
-);
 """
 
 

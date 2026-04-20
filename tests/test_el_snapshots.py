@@ -25,14 +25,6 @@ def _create_tables(conn):
             account_id TEXT
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS mode_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT DEFAULT (datetime('now')),
-            old_mode TEXT NOT NULL, new_mode TEXT NOT NULL,
-            trigger_rule TEXT, trigger_household TEXT, trigger_value REAL, notes TEXT
-        )
-    """)
     conn.commit()
 
 
