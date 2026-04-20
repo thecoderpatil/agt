@@ -89,6 +89,13 @@ class RunContext:
     ``frozen=True`` is load-bearing: it prevents a caller from post-hoc
     mutating the sink pointer after the ctx is in flight, which was the
     concurrent-state-bleed failure mode the env-var approach rejected.
+
+    ``broker_mode`` is the authoritative paper/live discriminator (MR 4).
+    All approval gates use ``approval_policy`` helpers, never PAPER_MODE.
+
+    ``engine`` identifies the operational domain for per-engine policy.
+    Valid values: "csp", "cc", "roll", "harvest". Empty string = legacy
+    construction site not yet migrated (migration window only).
     """
 
     mode: RunMode
@@ -96,6 +103,9 @@ class RunContext:
     order_sink: OrderSink
     decision_sink: DecisionSink
     db_path: str | None = None
+    # MR 4: broker mode + engine discriminators
+    broker_mode: str = "paper"   # "paper" | "live"; default "paper" is safe during migration
+    engine: str = ""             # "csp" | "cc" | "roll" | "harvest"; "" = not yet migrated
 
     @property
     def is_live(self) -> bool:
@@ -104,6 +114,57 @@ class RunContext:
     @property
     def is_shadow(self) -> bool:
         return self.mode is RunMode.SHADOW
+
+    @property
+    def is_paper_broker(self) -> bool:
+        """True when broker gateway is paper (4002). Distinct from shadow mode."""
+        return self.broker_mode == "paper"
+
+
+def build_run_context(
+    *,
+    run_id: str,
+    order_sink: "OrderSink",
+    decision_sink: "DecisionSink",
+    engine: str,
+    mode: RunMode = RunMode.LIVE,
+    db_path: str | None = None,
+) -> "RunContext":
+    """Factory for RunContext. Reads AGT_BROKER_MODE as authoritative broker discriminator.
+
+    Migration fallback: if AGT_BROKER_MODE is unset, falls back to AGT_PAPER_MODE
+    (deprecated). Log DeprecationWarning on fallback. Hard-fail if AGT_BROKER_MODE
+    is set but not in {"paper", "live"}.
+    """
+    import logging as _logging
+    import os as _os
+    _logger = _logging.getLogger(__name__)
+
+    raw_broker = _os.environ.get("AGT_BROKER_MODE", "").strip().lower()
+    if raw_broker in ("paper", "live"):
+        broker_mode = raw_broker
+    elif raw_broker == "":
+        paper_flag = _os.environ.get("AGT_PAPER_MODE", "").lower() in ("1", "true", "yes")
+        broker_mode = "paper" if paper_flag else "live"
+        _logger.debug(
+            "AGT_BROKER_MODE unset — derived broker_mode=%r from AGT_PAPER_MODE. "
+            "Set AGT_BROKER_MODE explicitly to suppress this message.",
+            broker_mode,
+        )
+    else:
+        raise ValueError(
+            f"AGT_BROKER_MODE={raw_broker!r} is invalid. Must be 'paper' or 'live'."
+        )
+
+    return RunContext(
+        mode=mode,
+        run_id=run_id,
+        order_sink=order_sink,
+        decision_sink=decision_sink,
+        db_path=db_path,
+        broker_mode=broker_mode,
+        engine=engine,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -168,5 +229,6 @@ __all__ = [
     "OrderSink",
     "DecisionSink",
     "RunContext",
+    "build_run_context",
     "clone_sqlite_db_with_wal",
 ]

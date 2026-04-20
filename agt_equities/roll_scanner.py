@@ -28,6 +28,7 @@ from agt_equities.roll_engine import (
 )
 from agt_equities.config import ACCOUNT_TO_HOUSEHOLD, EXCLUDED_TICKERS
 from agt_equities.db import get_db_connection as _get_db_connection
+from agt_equities.approval_policy import needs_liquidate_approval
 
 logger = logging.getLogger("agt_bridge")
 
@@ -670,6 +671,8 @@ def _dispatch_eval_result(
 
     account_labels: dict,
 
+    ctx: "RunContext",
+
 ) -> tuple[str | None, list[dict]]:
 
     """Translate an EvalResult into (alert_line, tickets_to_stage).
@@ -814,21 +817,28 @@ def _dispatch_eval_result(
 
 
 
-    # LIQUIDATE — alert only, requires_human_approval. No auto-stage.
-
     if isinstance(result, LiquidateResult):
 
-        return (
-
+        msg = (
             f"[LIQUIDATE REQUESTED] {ticker} × {result.contracts}c / {result.shares}sh  "
-
             f"BTC@{result.btc_limit:.2f} STC@spot≈{result.stc_market_ref:.2f}  "
-
-            f"net={result.net_proceeds_per_share:.2f}/sh  — MANUAL APPROVAL REQUIRED  "
-
-            f"({result.reason})"
-
-        ), []
+            f"net={result.net_proceeds_per_share:.2f}/sh  ({result.reason})"
+        )
+        if needs_liquidate_approval(ctx):
+            # Live — page operator, do not auto-stage.
+            return msg + "  — MANUAL APPROVAL REQUIRED", []
+        else:
+            # Paper — auto-stage via ctx.order_sink (returned as ticket list to caller).
+            ticket = {
+                "action":     "BTC",
+                "sec_type":   "OPT",
+                "ticker":     ticker,
+                "contracts":  result.contracts,
+                "limit_price": result.btc_limit,
+                "engine":     "roll",
+                "reason":     result.reason,
+            }
+            return msg + "  — PAPER AUTO-STAGE", [ticket]
 
 
 
@@ -1141,6 +1151,8 @@ async def scan_and_stage_defensive_rolls(
                 result, pos, current_contract, qty, strike, exp_fmt, acct_id, ticker,
 
                 account_labels=account_labels,
+
+                ctx=ctx,
 
             )
 

@@ -62,7 +62,8 @@ def build_context(
     db_path: str = DEFAULT_DB_PATH, now_utc: datetime | None = None
 ) -> CheckContext:
     """Construct a CheckContext from environment variables + sensible defaults."""
-    paper_mode = os.environ.get("AGT_PAPER_MODE", "0") == "1"
+    _bm = os.environ.get("AGT_BROKER_MODE", "").strip().lower()
+    paper_mode = (_bm == "paper") if _bm in ("paper", "live") else (os.environ.get("AGT_PAPER_MODE", "0") == "1")
     live_accounts = frozenset(
         a.strip()
         for a in os.environ.get(

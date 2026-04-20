@@ -291,6 +291,9 @@ def _ctx_scanner():
         run_id="test-harvest",
         order_sink=CollectorOrderSink(),
         decision_sink=NullDecisionSink(),
+    
+        broker_mode="paper",
+        engine="harvest",
     )
 
 

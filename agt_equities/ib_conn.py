@@ -43,12 +43,17 @@ logger = logging.getLogger("agt_equities.ib_conn")
 
 def _resolve_default_ports() -> tuple[int, int]:
     """Return (gateway_port, tws_fallback_port) for the active mode."""
-    try:
-        from agt_equities.config import PAPER_MODE
-    except Exception:
-        PAPER_MODE = os.environ.get("PAPER_MODE", "1") == "1"
-    gateway = 4002 if PAPER_MODE else 4001
-    tws = 7497 if PAPER_MODE else 7496
+    _bm = os.environ.get("AGT_BROKER_MODE", "").strip().lower()
+    if _bm in ("paper", "live"):
+        paper = _bm == "paper"
+    else:
+        try:
+            from agt_equities.config import PAPER_MODE
+        except Exception:
+            PAPER_MODE = os.environ.get("PAPER_MODE", "1") == "1"
+        paper = PAPER_MODE
+    gateway = 4002 if paper else 4001
+    tws = 7497 if paper else 7496
     return gateway, tws
 
 

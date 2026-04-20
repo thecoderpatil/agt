@@ -53,9 +53,13 @@ load_dotenv(_env_path, override=False)
 
 
 
-# ── Sprint 1C: Paper mode flag (mirrored from telegram_bot.py:76) ──
-
-PAPER_MODE: bool = os.environ.get("AGT_PAPER_MODE", "").lower() in ("1", "true", "yes")
+# ── MR 4: PAPER_MODE derived from AGT_BROKER_MODE (authoritative), AGT_PAPER_MODE fallback.
+_broker_mode_raw = os.environ.get("AGT_BROKER_MODE", "").strip().lower()
+if _broker_mode_raw in ("paper", "live"):
+    PAPER_MODE: bool = _broker_mode_raw == "paper"
+else:
+    # Fallback: legacy AGT_PAPER_MODE (migration window)
+    PAPER_MODE = os.environ.get("AGT_PAPER_MODE", "").lower() in ("1", "true", "yes")
 
 
 

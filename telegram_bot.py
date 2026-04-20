@@ -10484,6 +10484,10 @@ async def cmd_cc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             decision_sink=SQLiteDecisionSink(_log_cc_cycle, _write_dynamic_exit_rows),
 
+            broker_mode="paper" if PAPER_MODE else "live",
+
+            engine="cc",
+
         )
 
         result = await _run_cc_logic(None, ctx=_cc_ctx)
@@ -14096,6 +14100,8 @@ async def cmd_rollcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             run_id=uuid.uuid4().hex,
             order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
             decision_sink=NullDecisionSink(),
+            broker_mode="paper" if PAPER_MODE else "live",
+            engine="roll",
         )
         alerts = await roll_scanner.scan_and_stage_defensive_rolls(
             ib_conn,
@@ -14178,6 +14184,8 @@ async def cmd_csp_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             run_id=uuid.uuid4().hex,
             order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
             decision_sink=NullDecisionSink(),
+            broker_mode="paper" if PAPER_MODE else "live",
+            engine="harvest",
         )
         result = await scan_csp_harvest_candidates(ib_conn, ctx=ctx)
 
@@ -14349,6 +14357,10 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             decision_sink=SQLiteDecisionSink(_log_cc_cycle, _write_dynamic_exit_rows),
 
+            broker_mode="paper" if PAPER_MODE else "live",
+
+            engine="cc",
+
         )
 
         cc_result = await _run_cc_logic(None, ctx=_cc_ctx)
@@ -14394,6 +14406,8 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             run_id=uuid.uuid4().hex,
             order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
             decision_sink=NullDecisionSink(),
+            broker_mode="paper" if PAPER_MODE else "live",
+            engine="roll",
         )
         roll_alerts = await roll_scanner.scan_and_stage_defensive_rolls(
             ib_conn,
@@ -14442,6 +14456,8 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             run_id=uuid.uuid4().hex,
             order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
             decision_sink=NullDecisionSink(),
+            broker_mode="paper" if PAPER_MODE else "live",
+            engine="csp",
         )
         harvest_result = await scan_csp_harvest_candidates(ib_conn, ctx=ctx)
 
@@ -18433,6 +18449,10 @@ async def _scheduled_cc(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             decision_sink=SQLiteDecisionSink(_log_cc_cycle, _write_dynamic_exit_rows),
 
+            broker_mode="paper" if PAPER_MODE else "live",
+
+            engine="cc",
+
         )
 
         result = await _run_cc_logic(household_filter=None, ctx=_cc_ctx)
@@ -18879,6 +18899,10 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
             order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
 
             decision_sink=NullDecisionSink(),
+
+            broker_mode="paper" if PAPER_MODE else "live",
+
+            engine="csp",
 
         )
 
@@ -19646,6 +19670,8 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
                 run_id=uuid.uuid4().hex,
                 order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
                 decision_sink=NullDecisionSink(),
+                broker_mode="paper" if PAPER_MODE else "live",
+                engine="csp",
             )
             csp_result = await scan_csp_harvest_candidates(ib_conn, ctx=ctx)
 
@@ -20226,6 +20252,8 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
                 run_id=uuid.uuid4().hex,
                 order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
                 decision_sink=NullDecisionSink(),
+                broker_mode="paper" if PAPER_MODE else "live",
+                engine="roll",
             )
             roll_alerts = await roll_scanner.scan_and_stage_defensive_rolls(
                 ib_conn,
@@ -21140,6 +21168,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             order_sink=_csp_order_sink,
 
             decision_sink=NullDecisionSink(),
+
+            broker_mode="paper" if PAPER_MODE else "live",
+
+            engine="csp",
 
         )
 
