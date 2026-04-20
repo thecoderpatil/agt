@@ -81,7 +81,6 @@ def _fake_hh_snapshot() -> dict:
                 "buying_power": 200_000.0,
                 "cash_available": 200_000.0,
                 "margin_eligible": True,
-                "mode": "PEACETIME",
             },
             "U22076329": {
                 "account_id": "U22076329",
@@ -90,7 +89,6 @@ def _fake_hh_snapshot() -> dict:
                 "buying_power": 0.0,
                 "cash_available": 152_000.0,
                 "margin_eligible": False,
-                "mode": "PEACETIME",
             },
         },
         "existing_positions": {},
