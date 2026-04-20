@@ -13,7 +13,7 @@ KILLED_COMMANDS = [
 ]
 
 KEPT_COMMANDS = [
-    "start", "status", "cure", "mode", "approve", "reject", "reconnect",
+    "start", "status", "cure", "approve", "reject", "reconnect",
     "recover_transmitting", "budget", "think", "deep", "clear", "vrp",
     "orders", "declare_peacetime", "halt",
 ]
