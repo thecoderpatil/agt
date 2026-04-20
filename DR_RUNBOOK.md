@@ -518,7 +518,6 @@ ATTESTED rows continue ticking toward their 10-minute TTL during the outage. If 
 Send a test message to the bot:
 ```
 /mode
-# Expected: "Current mode: PEACETIME" (or current mode)
 ```
 
 Check sweeper is running:

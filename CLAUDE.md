@@ -187,7 +187,6 @@ dispatch" is Architect's job â€” you apply them.
 - **Paper Gateway**: localhost:4002, fully autonomous execution enabled
 - **Live Gateway**: localhost:4001, **Read-Only API enforced** â€” placeOrder
   is rejected at the IB protocol layer
-- **Current mode**: WARTIME pinned
 
 Invariants you must never break:
 - `agt_equities/walker.py` is a pure function â€” never mutate

@@ -87,7 +87,7 @@
 **Each morning at market open (~9:30 ET):**
 
 **M.1** Open Cure Console on phone. Top-to-bottom triage exactly as you would in production:
-- Red Alert / WARTIME banner
+- Red Alert banner
 - Underwater Positions
 - Lifecycle Queue
 - Cure Actions
