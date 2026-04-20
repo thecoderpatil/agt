@@ -18,7 +18,6 @@ from pathlib import Path
 # Ensure we're in project root
 os.chdir(Path(__file__).resolve().parent.parent)
 
-DB_PATH = os.environ.get("AGT_DB_PATH") or str(Path(__file__).resolve().parent.parent / "agt_desk.db")
 RAILS_PATH = "_SAFETY_RAILS.md"
 
 # Hard-coded limits (mirrors _SAFETY_RAILS.md -- code is the enforcer, file is documentation)
@@ -33,10 +32,8 @@ INCIDENT_HEARTBEAT_MAX_AGE_HOURS = 8  # ADR-007 Step 5 detector staleness thresh
 
 
 def _get_conn():
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 15000")
-    return conn
+    from agt_equities.db import get_ro_connection
+    return get_ro_connection()
 
 
 def check_daily_order_limit() -> dict:
@@ -312,6 +309,8 @@ def run_all_checks() -> dict:
 
 
 if __name__ == "__main__":
+    from agt_equities.boot import assert_boot_contract
+    assert_boot_contract()
     result = run_all_checks()
     print(json.dumps(result, indent=2, default=str))
     if result["halted"]:

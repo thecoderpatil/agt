@@ -17,7 +17,10 @@ from pathlib import Path
 
 os.chdir(Path(__file__).resolve().parent.parent)
 
-DB_PATH = "agt_desk.db"
+DB_PATH = (
+    os.environ.get("AGT_DB_PATH")
+    or str(Path(__file__).resolve().parent.parent / "agt_desk.db")
+)
 
 
 def rotate(keep_days: int = 7) -> dict:
@@ -88,6 +91,8 @@ def rotate(keep_days: int = 7) -> dict:
 
 
 if __name__ == "__main__":
+    from agt_equities.boot import assert_boot_contract
+    assert_boot_contract()
     result = rotate()
     print(json.dumps(result, indent=2))
     print(f"\nRotated {result['archived']} rows, {result['remaining']} remaining")

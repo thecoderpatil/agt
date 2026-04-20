@@ -40,28 +40,32 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
-def _agt_db_isolation_tripwire(request):
+def _agt_db_isolation_tripwire(request, monkeypatch):
     """Block accidental production DB access during test session.
 
-    Per-test function-scoped autouse. Monkeypatches agt_equities.db.DB_PATH
-    to a sentinel nonexistent path for any test NOT marked with
-    @pytest.mark.agt_tripwire_exempt. Exempt tests bypass the tripwire and
-    run against whatever DB_PATH resolves to at import time (typically
-    production — hence the exemption is documented in the handoff).
+    MR 1 migration: tripwire now sets AGT_DB_PATH env var to the sentinel
+    instead of monkeypatching the module attribute. agt_equities.db uses
+    lazy env-var resolution per MR 1, so env-var patching is the natural
+    seam. Module-attribute monkeypatch still works as a secondary path
+    (see _resolve_db_path() resolution order) -- kept for belt-and-braces.
 
-    Tests that need a real DB without the exemption must pass an explicit
-    db_path= kwarg to trade_repo public functions or construct their own
-    sqlite3 connection against a fixture path.
+    Per-test function-scoped autouse. Exempt tests bypass via
+    @pytest.mark.agt_tripwire_exempt.
     """
     if request.node.get_closest_marker("agt_tripwire_exempt"):
         yield
         return
 
+    # Primary seam: env var. Matches production resolution order.
+    monkeypatch.setenv("AGT_DB_PATH", str(_TRIPWIRE_DB))
+
+    # Belt-and-braces: if agt_equities.db is importable, also set the
+    # module attribute. Handles tests that imported db.py before this
+    # fixture ran (attribute still takes precedence over env var in
+    # _resolve_db_path).
     try:
         from agt_equities import db as _agt_db
     except ImportError:
-        # agt_equities not importable — skip tripwire, let tests fail
-        # naturally with a clearer import error.
         yield
         return
 

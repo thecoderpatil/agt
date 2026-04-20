@@ -32,8 +32,6 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="repla
 # ── Ensure we're running from project root ──
 os.chdir(Path(__file__).resolve().parent)
 
-from dotenv import load_dotenv
-load_dotenv()
 
 # ── Import the production module ──
 # telegram_bot.py no longer has import-time side effects (init_db moved to
@@ -706,4 +704,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from agt_equities.boot import assert_boot_contract
+    assert_boot_contract()
     main()
