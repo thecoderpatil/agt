@@ -29,6 +29,19 @@ if (-not (Test-Path $SourcePath)) { throw "Source path missing: $SourcePath" }
 if (-not (Test-Path $current))    { throw "bridge-current missing: $current. Run Phase 2 initial seed first." }
 
 
+$CanonicalEnvFile = "C:\AGT_Runtime\state\.env"
+$CanonicalDbDir = "C:\AGT_Runtime\state"
+
+if (-not (Test-Path $CanonicalEnvFile)) {
+    Write-Error "Canonical env file missing at $CanonicalEnvFile. Create it before deploying."
+    exit 1
+}
+if (-not (Test-Path $CanonicalDbDir)) {
+    Write-Error "Canonical state dir missing at $CanonicalDbDir. Create it before deploying."
+    exit 1
+}
+
+
 
 # 1. Pre-flight DB backup (skippable for dev iterations — never skip in prod)
 
@@ -88,13 +101,6 @@ robocopy @roboArgs | Out-Null
 
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE)" }
 
-# .env is gitignored - always copy from canonical location, regardless of $SourcePath
-$envSrc = "C:\AGT_Telegram_Bridge\.env"
-if (Test-Path $envSrc) {
-    Copy-Item $envSrc (Join-Path $staging ".env") -Force
-} else {
-    throw ".env missing at canonical path $envSrc - cannot deploy without it."
-}
 
 
 

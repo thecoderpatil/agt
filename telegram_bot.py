@@ -161,13 +161,13 @@ from telegram.ext import (
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DB_PATH = BASE_DIR / "agt_desk.db"
+DB_PATH = Path(os.environ.get("AGT_DB_PATH") or str(BASE_DIR / "agt_desk.db"))
 
 
 
-_env_path = BASE_DIR / ".env"
+_env_path = Path(os.environ.get("AGT_ENV_FILE") or str(BASE_DIR / ".env"))
 
-load_dotenv(_env_path, override=True)
+load_dotenv(_env_path, override=False)
 
 
 # ADR-007 Addendum §2.1 — halt if DB path is not canonical.
@@ -23834,6 +23834,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from agt_equities.boot import assert_boot_contract
+    assert_boot_contract()
 
     main()
 

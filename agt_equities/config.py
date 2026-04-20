@@ -49,7 +49,7 @@ from dotenv import load_dotenv
 _DEFAULT_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 _env_path = Path(os.environ.get("AGT_ENV_FILE", str(_DEFAULT_ENV_PATH)))
 
-load_dotenv(_env_path, override=True)
+load_dotenv(_env_path, override=False)
 
 
 
