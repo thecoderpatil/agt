@@ -61,7 +61,6 @@
 
 | # | Item | How to verify | Expected | If fails | Auto? |
 |---|------|---------------|----------|----------|-------|
-| 1 | Desk mode | `/mode` in Telegram or `SELECT * FROM mode_history ORDER BY id DESC LIMIT 1` | PEACETIME | `/declare_peacetime <reason>` | Auto |
 | 2 | No TRANSMITTING rows | `SELECT COUNT(*) FROM bucket3_dynamic_exit_log WHERE final_status='TRANSMITTING'` | 0 | Manual investigation required | Auto |
 | 3 | No ATTESTED rows | `SELECT COUNT(*) FROM bucket3_dynamic_exit_log WHERE final_status='ATTESTED'` | 0 | Sweep or manual ABANDONED | Auto |
 | 4 | Smoke test cleanup | `SELECT audit_id FROM bucket3_dynamic_exit_log WHERE audit_id LIKE 'smoke-%'` | 0 rows | DELETE smoke test rows | Auto |

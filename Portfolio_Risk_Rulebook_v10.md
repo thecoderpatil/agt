@@ -1,3 +1,7 @@
+> **SUPERSEDED 2026-04-19 by Portfolio_Risk_Rulebook_v11.md.**
+> See ADR-014 for the mode-retirement decision. This file is
+> preserved for audit-trail continuity only.
+
 # Portfolio Risk Management Rulebook
 **AGT Equities — Pure Heitkoetter Wheel / Act 60 Chapter 2**
 **Version 10.0**

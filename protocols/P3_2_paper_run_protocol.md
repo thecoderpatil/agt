@@ -43,7 +43,7 @@
 
 5. Start bot: `boot_desk.bat`
 
-6. Telegram: `/mode` — verify PEACETIME. `/status` — verify `[PAPER]` prefix on response.
+6. Telegram: `/status` — verify `[PAPER]` prefix on response.
 
 7. Telegram: `/halt` — cancel all scheduled jq jobs (CC scan, watchdog, etc.) to isolate P3.2 from background activity. Bot stays alive, IB connection preserved.
 
@@ -96,7 +96,7 @@
 
 1. In Cure Console Lifecycle Queue, click the STAGED row to open Smart Friction modal.
 2. Complete attestation:
-   - PEACETIME flow: check all checkboxes, enter operator thesis.
+   - Standard flow: check all checkboxes, enter operator thesis.
    - Click ATTEST.
 3. Verify row transitions to ATTESTED:
    ```sql

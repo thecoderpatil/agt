@@ -1,14 +1,9 @@
 # AGT Equities — Rulebook Reference (LLM Context)
-# Condensed from Portfolio_Risk_Rulebook_v10.md
-# This is NOT the governing document — the full v10 Rulebook is authoritative.
+# Condensed from Portfolio_Risk_Rulebook_v11.md
+# This is NOT the governing document — the full v11 Rulebook is authoritative.
 
 ## Governing Principle
 Maximum income for minimum risk under Act 60 Chapter 2 (PR). Premium and gains tax-exempt; losses have no recovery value. Aggressive on premium collection, conservative on incremental risk.
-
-## Desk Mode (3-state)
-- **PEACETIME (🟢):** Normal operations.
-- **AMBER (🟡):** Blocks new CSP entries. Allows exits, rolls, defensive CCs.
-- **WARTIME (🔴):** R11 leverage breach or operator declaration. Smart Friction replaces qualitative thesis with Integer Lock (operator types exact whole-dollar realized loss to unlock STAGE).
 
 ## Rule Precedence
 1. Avoid forced broker liquidation (Rule 6) — overrides Rule 5.
@@ -59,13 +54,13 @@ Max 0.6 rolling 6-month pairwise at entry. Recalc monthly for existing pairs. Br
 Never sell shares below basis EXCEPT (all four require **Operator Attestation**):
 1. **Rule 8 Dynamic Exit** — passes Gates 1 and 2 + attestation.
 2. **Thesis Deterioration** — bearish rationale logged.
-3. **Forced Liquidation Avoidance** — Rule 6 <10% EL. WARTIME Integer Lock. Overrides R5 per precedence.
+3. **Forced Liquidation Avoidance** — Rule 6 <10% EL. Requires Operator Attestation. Overrides R5 per precedence.
 4. **Emergency Risk Event** — fraud, delisting, bankruptcy. Risk catalyst logged.
 
 Never write CCs intending forced assignment at a loss without Rule 8 + attestation. Rallies to/above basis: assignment welcomed.
 
 ## Rule 6: Vikram IND Margin Backstop
-Maintain ≥20% Current EL. Breach: freeze entries, write CCs on most concentrated, apply premium to debt. <10% EL: evaluate sale of smallest position (overrides R5, requires WARTIME Integer Lock).
+Maintain ≥20% Current EL. Breach: freeze entries, write CCs on most concentrated, apply premium to debt. <10% EL: evaluate sale of smallest position (overrides R5, requires Operator Attestation).
 
 **Severity tiers (R6 evaluator):**
 | Ratio | Status |
@@ -147,7 +142,7 @@ Math gates evaluated deterministically in Python. If math passes, Smart Friction
 
 Telegram is the final transmission remote only. After STAGE, inline `[TRANSMIT]/[CANCEL]` keyboard pushed; TRANSMIT triggers JIT re-validation of Gate 1 vs live spot before TWS routing. JIT fail blocks transmission, requires re-stage.
 
-**WARTIME bypass:** thesis stripped, replaced with Integer Lock — operator types exact whole-dollar realized loss to unlock STAGE.
+**Integer Lock:** operator types exact whole-dollar realized loss to unlock STAGE.
 
 ### Walk-Away P&L
 `Walk-Away P&L per share = Strike + Call Premium − Adjusted Cost Basis`
@@ -158,7 +153,7 @@ Telegram is the final transmission remote only. After STAGE, inline `[TRANSMIT]/
 - All orders staged via Command Deck, transmitted via Telegram JIT flow with `transmit=True` + GTC.
 - **Reserve auto-release:** G1/G2 fail or attestation declined → reserved excess shares released back to defensive CC pool.
 - `/cc` is Dynamic Exit aware: defensive CCs only on `target_shares`, excess shares reserved.
-- **WARTIME exception:** direct `STK_SELL` limit order permitted in lieu of CC-assignment when waiting creates margin risk. Still requires Integer Lock + per-order Telegram confirmation.
+- **Rule 11 leverage-breach exception:** direct `STK_SELL` limit order permitted in lieu of CC-assignment when waiting creates margin risk. Still requires Operator Attestation + per-order Telegram confirmation.
 
 ## Rule 9: Red Alert
 **Activation (any 2-of-4):**
@@ -208,3 +203,4 @@ Telegram is the final transmission remote only. After STAGE, inline `[TRANSMIT]/
 - **ADR-002:** Glide path symmetric tolerance bands (per-rule flat absolute).
 - **ADR-003:** R9 reporting-only in Phase 3A.5b; no auto mode transition until Phase 3B.
 - **ADR-004:** Smart Friction, Cure Console, deterministic gate enforcement. Operator Attestation implementation spec.
+- **ADR-014:** Mode state machine retired. WARTIME/AMBER/PEACETIME desk modes removed. Leverage gating via Rule 11 (1.50× cap, 1.40× hysteresis).
