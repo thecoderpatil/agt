@@ -302,7 +302,7 @@ def test_scanner_stages_passing_put(_ctx_scanner):
     """A short put with 80%+ profit and dte>=2 stages a BTC ticket."""
     pos = _make_fake_put_position(
         ticker="AAPL", strike=150.0,
-        expiry="20260420",  # far in future relative to 2026-04-11 (9 dte)
+        expiry="20270120",  # far in future relative to 2026-04-11 (9 dte)
         qty=1, avg_cost=100.0,  # $1.00 credit per contract
     )
     md = {"AAPL": SimpleNamespace(ask=0.15)}  # 85% profit
@@ -346,7 +346,7 @@ def test_scanner_stages_via_order_sink(_ctx_scanner):
     ShadowOrder. Validates engine=csp_harvest, run_id, and all A3 meta keys."""
     pos = _make_fake_put_position(
         ticker="NVDA", strike=800.0,
-        expiry="20260420", qty=1, avg_cost=150.0,  # $1.50 credit
+        expiry="20270120", qty=1, avg_cost=150.0,  # $1.50 credit
     )
     md = {"NVDA": SimpleNamespace(ask=0.20)}  # ~87% profit
     ib = FakeIB([pos], md)
