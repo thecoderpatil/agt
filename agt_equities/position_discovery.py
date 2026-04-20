@@ -22,8 +22,50 @@ from pathlib import Path
 
 from agt_equities.config import ACCOUNT_LABELS, ACCOUNT_TO_HOUSEHOLD, EXCLUDED_TICKERS
 from agt_equities.db import get_db_connection
+from agt_equities.ib_chains import get_spots_batch
 
 logger = logging.getLogger(__name__)
+
+
+_SECTOR_MAP_FALLBACK: dict[str, str] = {
+    "ADBE": "Software - Application",
+    "MSFT": "Software - Infrastructure",
+    "CRM":  "Software - Application",
+    "PYPL": "Software - Infrastructure",
+    "UBER": "Software - Application",
+    "QCOM": "Semiconductors",
+    "OXY":  "Oil & Gas E&P",
+    "XOM":  "Oil & Gas Integrated",
+    "CVX":  "Oil & Gas Integrated",
+    "JPM":  "Banks - Diversified",
+    "AXP":  "Credit Services",
+    "WMT":  "Discount Stores",
+    "COST": "Discount Stores",
+    "MCD":  "Restaurants",
+    "TGT":  "Discount Stores",
+    "UNH":  "Healthcare Plans",
+    "JNJ":  "Drug Manufacturers - General",
+}
+
+
+def _get_industry_groups_batch(tickers: list[str], *, db_path=None) -> dict[str, str]:
+    result = {t: "Unknown" for t in tickers}
+    if not tickers:
+        return result
+    try:
+        placeholders = ",".join("?" for _ in tickers)
+        with closing(get_db_connection(db_path)) as conn:
+            rows = conn.execute(
+                f"SELECT ticker, gics_industry_group FROM ticker_universe "
+                f"WHERE ticker IN ({placeholders})",
+                [t.upper() for t in tickers],
+            ).fetchall()
+            for row in rows:
+                if row["gics_industry_group"]:
+                    result[row["ticker"]] = str(row["gics_industry_group"])
+    except Exception as exc:
+        logger.warning("_get_industry_groups_batch failed: %s", exc)
+    return result
 
 
 async def discover_positions(
@@ -477,7 +519,7 @@ async def discover_positions(
 
     all_root_tickers = list({v["ticker"] for v in raw.values()})
 
-    ig_map = _get_industry_groups_batch(all_root_tickers)
+    ig_map = _get_industry_groups_batch(all_root_tickers, db_path=db_path)
 
     for key, rec in raw.items():
 
@@ -499,7 +541,7 @@ async def discover_positions(
 
         try:
 
-            spot_prices = await _ibkr_get_spots_batch(unique_tickers)
+            spot_prices = await get_spots_batch(ib_conn, unique_tickers)
 
         except Exception as exc:
 
