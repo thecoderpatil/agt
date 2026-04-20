@@ -288,11 +288,31 @@ def _mark_cancelled_validator(db_path: str | None, order_id: int) -> None:
 # Circuit breaker check (mirrors _pre_trade_gates Gate 0a)
 # ---------------------------------------------------------------------------
 
-def _circuit_breaker_check() -> tuple[bool, str]:
-    """Run circuit breaker. Returns (ok, reason)."""
+def _circuit_breaker_check(db_path: str | None = None) -> tuple[bool, str]:
+    """Run circuit breaker. Returns (ok, reason).
+
+    Passes db_path to the circuit breaker via AGT_DB_PATH env var so the
+    module-level path resolution uses the correct DB. The circuit_breaker
+    module reads os.environ['AGT_DB_PATH'] at import time, so we must set
+    the env var BEFORE importing it (or re-import each call via importlib).
+    """
     try:
-        from scripts.circuit_breaker import run_all_checks as _cb_run  # type: ignore[import]
-        result = _cb_run()
+        import importlib
+        import sys
+        # Set env var so circuit_breaker module resolves the right DB
+        if db_path:
+            os.environ.setdefault("AGT_DB_PATH", db_path)
+        # Force re-import if already cached (picks up new DB_PATH)
+        if "scripts.circuit_breaker" in sys.modules:
+            cb_mod = sys.modules["scripts.circuit_breaker"]
+            if db_path:
+                cb_mod.DB_PATH = db_path
+        else:
+            import scripts.circuit_breaker as cb_mod  # type: ignore[import]
+            if db_path:
+                cb_mod.DB_PATH = db_path
+
+        result = cb_mod.run_all_checks()
         if result.get("halted"):
             viols = result.get("violations", [])
             reasons = "; ".join(v.get("reason", v.get("check", "?")) for v in viols[:3])
@@ -389,7 +409,7 @@ async def _run_validator(
     stage_reached = STAGE_STAGED
 
     # ── Circuit breaker ──────────────────────────────────────────────────
-    cb_ok, cb_reason = _circuit_breaker_check()
+    cb_ok, cb_reason = _circuit_breaker_check(db_path)
     if not cb_ok:
         # Mark order staged→failed
         with closing(get_db_connection(db_path)) as conn:
@@ -641,6 +661,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     db_path = args.db_path or os.environ.get("AGT_DB_PATH") or None
+
+    # Propagate db_path to AGT_DB_PATH env var so downstream modules
+    # (circuit_breaker, db.py) pick it up via os.environ resolution.
+    if db_path:
+        os.environ["AGT_DB_PATH"] = db_path
 
     print(f"\n[validator] trigger={args.trigger}  db={db_path or '<module default>'}")
 

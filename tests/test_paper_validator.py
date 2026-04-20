@@ -221,7 +221,8 @@ class TestApprovalGateDetection:
         monkeypatch.setenv("AGT_CSP_REQUIRE_APPROVAL", "false")
         # Patch _circuit_breaker_check and IB to stop before real IB connect
         monkeypatch.setattr(
-            paper_validator, "_circuit_breaker_check", lambda: (False, "TEST_STOP_EARLY")
+            paper_validator, "_circuit_breaker_check",
+            lambda db_path=None: (False, "TEST_STOP_EARLY"),
         )
 
         result = paper_validator.run_validator(trigger="on_demand", db_path=db)
