@@ -70,7 +70,7 @@ class TestDumpRulesSmoke(unittest.TestCase):
 
         conn.execute("""CREATE TABLE bucket3_dynamic_exit_log (
             audit_id TEXT PRIMARY KEY, trade_date TEXT, ticker TEXT,
-            household TEXT, desk_mode TEXT DEFAULT 'PEACETIME',
+            household TEXT,
             action_type TEXT DEFAULT 'CC', household_nlv REAL DEFAULT 0,
             underlying_spot_at_render REAL DEFAULT 0,
             final_status TEXT DEFAULT 'STAGED',
