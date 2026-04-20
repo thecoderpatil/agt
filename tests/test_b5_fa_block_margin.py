@@ -23,12 +23,8 @@ from agt_equities.fa_block_margin import (
     CSPProposal,
     AccountAllocation,
     AllocationDigest,
-    MODE_PEACETIME,
-    MODE_AMBER,
-    MODE_WARTIME,
     STATUS_APPROVED,
     STATUS_INSUFFICIENT_NLV,
-    STATUS_MODE_BLOCKED,
     STATUS_NO_SNAPSHOT,
     STATUS_INSUFFICIENT_CASH,
     _contracts_affordable,
@@ -267,7 +263,7 @@ def _proposal(
     ticker: str = "ABC",
     strike: float = 50.0,
     contracts: int = 4,
-    accounts: dict[str, str] | None = None,
+    accounts: list[str] | None = None,
 ) -> CSPProposal:
     return CSPProposal(
         household_id="TEST",
@@ -275,7 +271,7 @@ def _proposal(
         strike=strike,
         contracts_requested=contracts,
         expiry="20260516",
-        mode_gate_accounts=accounts or {},
+        account_ids=accounts or [],
     )
 
 
@@ -284,10 +280,7 @@ class TestAllocatorCore:
         p = _proposal(
             strike=50.0,  # $5,000 per contract
             contracts=4,
-            accounts={
-                "U1": MODE_PEACETIME,
-                "U2": MODE_PEACETIME,
-            },
+            accounts=["U1", "U2"],
         )
         # Both amply funded — 2 contracts each ($10k each).
         digest = allocate_csp(
@@ -300,43 +293,12 @@ class TestAllocatorCore:
         statuses = {a.account_id: a.margin_check_status for a in digest.allocations}
         assert statuses == {"U1": STATUS_APPROVED, "U2": STATUS_APPROVED}
 
-    def test_wartime_account_blocked_inline(self):
-        """Act 60 mixed-mode: one household WARTIME, other PEACETIME."""
-        p = _proposal(
-            strike=50.0,
-            contracts=4,
-            accounts={
-                "U_PRINCIPAL_WARTIME": MODE_WARTIME,
-                "U_ADVISORY_PEACE": MODE_PEACETIME,
-            },
-        )
-        digest = allocate_csp(
-            p,
-            available_nlv_override={
-                "U_PRINCIPAL_WARTIME": 200_000.0,
-                "U_ADVISORY_PEACE": 200_000.0,
-            },
-        )
-        # WARTIME account dropped, PEACETIME gets its pro-rata share.
-        alloc = {a.account_id: a for a in digest.allocations}
-        assert alloc["U_PRINCIPAL_WARTIME"].contracts_allocated == 0
-        assert alloc["U_PRINCIPAL_WARTIME"].margin_check_status == STATUS_MODE_BLOCKED
-        assert alloc["U_ADVISORY_PEACE"].margin_check_status == STATUS_APPROVED
-        # Pro-rata: 4 / 2 = 2, remainder 0. WARTIME doesn't forfeit to peer.
-        assert alloc["U_ADVISORY_PEACE"].contracts_allocated == 2
-        assert digest.total_contracts_allocated == 2
-        assert len(digest.dropped_accounts) == 1
-
     def test_nlv_descending_traversal_and_remainder(self):
         """Remainder goes to NLV-largest. Input order shouldn't matter."""
         p = _proposal(
             strike=10.0,       # $1k per contract
             contracts=5,       # 5 / 3 = 1 base + 2 remainder to largest
-            accounts={
-                "SMALL": MODE_PEACETIME,
-                "LARGE": MODE_PEACETIME,
-                "MID":   MODE_PEACETIME,
-            },
+            accounts=["SMALL", "LARGE", "MID"],
         )
         digest = allocate_csp(
             p,
@@ -359,10 +321,7 @@ class TestAllocatorCore:
         p = _proposal(
             strike=100.0,   # $10k per contract
             contracts=4,
-            accounts={
-                "U1": MODE_PEACETIME,
-                "U2": MODE_PEACETIME,
-            },
+            accounts=["U1", "U2"],
         )
         # U1 amply funded ($100k); U2 covers only 1 of 2 pro-rata ($12k).
         digest = allocate_csp(
@@ -381,7 +340,7 @@ class TestAllocatorCore:
         p = _proposal(
             strike=1000.0,  # $100k per contract
             contracts=2,
-            accounts={"U1": MODE_PEACETIME, "U2": MODE_PEACETIME},
+            accounts=["U1", "U2"],
         )
         digest = allocate_csp(
             p,
@@ -396,7 +355,7 @@ class TestAllocatorCore:
         p = _proposal(
             strike=10.0,
             contracts=2,
-            accounts={"U_KNOWN": MODE_PEACETIME, "U_MISSING": MODE_PEACETIME},
+            accounts=["U_KNOWN", "U_MISSING"],
         )
         digest = allocate_csp(
             p,
@@ -411,30 +370,11 @@ class TestAllocatorCore:
         assert ("U_MISSING", "no recent el_snapshot in v_available_nlv") in digest.dropped_accounts
 
     def test_empty_proposal_returns_empty_digest(self):
-        p = _proposal(contracts=4, accounts={})
+        p = _proposal(contracts=4, accounts=[])
         digest = allocate_csp(p, available_nlv_override={})
         assert digest.allocations == ()
         assert digest.total_contracts_allocated == 0
         assert digest.dropped_accounts == ()
-
-    def test_amber_mode_not_wartime_blocked(self):
-        """AMBER blocks NEW CSP entries per 3-mode state machine but
-        the allocator-level gate only rejects WARTIME (AMBER gating is
-        upstream — caller decides whether to propose at all). Verify
-        allocator does not silently block AMBER."""
-        p = _proposal(
-            strike=50.0,
-            contracts=2,
-            accounts={"U_AMBER": MODE_AMBER, "U_PEACE": MODE_PEACETIME},
-        )
-        digest = allocate_csp(
-            p,
-            available_nlv_override={"U_AMBER": 100_000.0, "U_PEACE": 100_000.0},
-        )
-        by_acct = {a.account_id: a for a in digest.allocations}
-        # Both approved — allocator only hard-gates WARTIME.
-        assert by_acct["U_AMBER"].margin_check_status == STATUS_APPROVED
-        assert by_acct["U_PEACE"].margin_check_status == STATUS_APPROVED
 
     def test_integration_against_real_view(self, db_path):
         """End-to-end with the actual v_available_nlv view (no override)."""
@@ -451,7 +391,7 @@ class TestAllocatorCore:
         p = _proposal(
             strike=50.0,  # $5k per contract
             contracts=4,
-            accounts={"U1": MODE_PEACETIME, "U2": MODE_PEACETIME},
+            accounts=["U1", "U2"],
         )
         digest = allocate_csp(p, db_path=db_path)
         by_acct = {a.account_id: a for a in digest.allocations}
@@ -474,7 +414,7 @@ class TestFormatAllocationDigest:
             ticker="ABC",
             strike=50.0,
             contracts=4,
-            accounts={"U1": MODE_PEACETIME, "U2": MODE_PEACETIME},
+            accounts=["U1", "U2"],
         )
         digest = allocate_csp(
             p,
@@ -488,28 +428,11 @@ class TestFormatAllocationDigest:
         assert "Dropped:" in text
         assert "U2:" in text
 
-    def test_all_dropped_still_renders(self):
-        p = _proposal(
-            strike=1000.0,
-            contracts=2,
-            accounts={"U1": MODE_WARTIME, "U2": MODE_WARTIME},
-        )
-        digest = allocate_csp(
-            p,
-            available_nlv_override={"U1": 100_000.0, "U2": 100_000.0},
-        )
-        text = format_allocation_digest(digest)
-        assert "Allocated: 0" in text
-        assert "Dropped: 2" in text
-        assert "Approved:" not in text  # no approved section
-        assert "Dropped:" in text
-        assert "WARTIME" in text
-
     def test_all_approved_no_dropped_section(self):
         p = _proposal(
             strike=10.0,
             contracts=2,
-            accounts={"U1": MODE_PEACETIME, "U2": MODE_PEACETIME},
+            accounts=["U1", "U2"],
         )
         digest = allocate_csp(
             p,
@@ -526,7 +449,7 @@ class TestFormatAllocationDigest:
         p = _proposal(
             strike=10.0,
             contracts=2,
-            accounts={"U_MISSING": MODE_PEACETIME},
+            accounts=["U_MISSING"],
         )
         digest = allocate_csp(p, available_nlv_override={})
         # Should render cleanly — no-snapshot is a Dropped entry.
@@ -535,7 +458,7 @@ class TestFormatAllocationDigest:
         assert "no recent el_snapshot" in text
 
     def test_empty_allocations(self):
-        p = _proposal(contracts=0, accounts={})
+        p = _proposal(contracts=0, accounts=[])
         digest = allocate_csp(p, available_nlv_override={})
         text = format_allocation_digest(digest)
         # Header-only digest — still valid.
@@ -559,7 +482,7 @@ class TestCashPhase:
             strike=50.0,           # $5k per contract
             contracts_requested=4,
             expiry="20260516",
-            mode_gate_accounts={"U_IRA_BIG": MODE_PEACETIME, "U_IRA_SMALL": MODE_PEACETIME},
+            account_ids=["U_IRA_BIG", "U_IRA_SMALL"],
             margin_eligible={"U_IRA_BIG": False, "U_IRA_SMALL": False},
         )
         # BIG has $30k (6 affordable) → takes all 4. SMALL gets 0 (no remaining).
@@ -580,7 +503,7 @@ class TestCashPhase:
         p = CSPProposal(
             household_id="H1", ticker="ABC", strike=50.0,
             contracts_requested=2, expiry="20260516",
-            mode_gate_accounts={"U_EMPTY": MODE_PEACETIME},
+            account_ids=["U_EMPTY"],
             margin_eligible={"U_EMPTY": False},
         )
         digest = allocate_csp(p, cash_snapshot={"U_EMPTY": 0.0})
@@ -590,34 +513,12 @@ class TestCashPhase:
         assert digest.total_contracts_allocated == 0
         assert len(digest.dropped_accounts) == 1
 
-    def test_cash_wartime_blocked(self):
-        """WARTIME gate applies to cash accounts same as margin."""
-        p = CSPProposal(
-            household_id="H1", ticker="ABC", strike=50.0,
-            contracts_requested=2, expiry="20260516",
-            mode_gate_accounts={
-                "U_IRA_WAR": MODE_WARTIME,
-                "U_IRA_PEACE": MODE_PEACETIME,
-            },
-            margin_eligible={"U_IRA_WAR": False, "U_IRA_PEACE": False},
-        )
-        digest = allocate_csp(
-            p,
-            cash_snapshot={"U_IRA_WAR": 100_000.0, "U_IRA_PEACE": 100_000.0},
-        )
-        by_acct = {a.account_id: a for a in digest.allocations}
-        assert by_acct["U_IRA_WAR"].margin_check_status == STATUS_MODE_BLOCKED
-        assert by_acct["U_IRA_WAR"].contracts_allocated == 0
-        # Greedy: PEACE takes all 2 (no pro-rata for cash).
-        assert by_acct["U_IRA_PEACE"].contracts_allocated == 2
-        assert digest.total_contracts_allocated == 2
-
     def test_cash_no_snapshot_treated_as_zero(self):
         """Cash account with no entry in cash_snapshot → 0 cash → insufficient."""
         p = CSPProposal(
             household_id="H1", ticker="ABC", strike=50.0,
             contracts_requested=1, expiry="20260516",
-            mode_gate_accounts={"U_MISSING": MODE_PEACETIME},
+            account_ids=["U_MISSING"],
             margin_eligible={"U_MISSING": False},
         )
         digest = allocate_csp(p, cash_snapshot={})
@@ -632,11 +533,7 @@ class TestMixedCashMargin:
         p = CSPProposal(
             household_id="H1", ticker="ABC", strike=50.0,  # $5k/contract
             contracts_requested=6, expiry="20260516",
-            mode_gate_accounts={
-                "U_IRA": MODE_PEACETIME,
-                "U_M1": MODE_PEACETIME,
-                "U_M2": MODE_PEACETIME,
-            },
+            account_ids=["U_IRA", "U_M1", "U_M2"],
             margin_eligible={"U_IRA": False, "U_M1": True, "U_M2": True},
         )
         # IRA has $10k (2 contracts). Residual = 4 → 2 each for M1/M2.
@@ -660,7 +557,7 @@ class TestMixedCashMargin:
         p = CSPProposal(
             household_id="H1", ticker="ABC", strike=10.0,
             contracts_requested=3, expiry="20260516",
-            mode_gate_accounts={"U_IRA": MODE_PEACETIME, "U_M1": MODE_PEACETIME},
+            account_ids=["U_IRA", "U_M1"],
             margin_eligible={"U_IRA": False, "U_M1": True},
         )
         digest = allocate_csp(
@@ -679,11 +576,7 @@ class TestMixedCashMargin:
         p = CSPProposal(
             household_id="H1", ticker="ABC", strike=50.0,
             contracts_requested=5, expiry="20260516",
-            mode_gate_accounts={
-                "U_IRA_SMALL": MODE_PEACETIME,
-                "U_M1": MODE_PEACETIME,
-                "U_M2": MODE_PEACETIME,
-            },
+            account_ids=["U_IRA_SMALL", "U_M1", "U_M2"],
             margin_eligible={"U_IRA_SMALL": False, "U_M1": True, "U_M2": True},
         )
         # IRA covers only 1 contract ($5k). Residual=4 → 2 each M1/M2.
@@ -705,7 +598,7 @@ class TestFoldTogetherDigest:
         p = CSPProposal(
             household_id="H1", ticker="ABC", strike=50.0,
             contracts_requested=4, expiry="20260516",
-            mode_gate_accounts={"U_IRA": MODE_PEACETIME, "U_M1": MODE_PEACETIME},
+            account_ids=["U_IRA", "U_M1"],
             margin_eligible={"U_IRA": False, "U_M1": True},
         )
         digest = allocate_csp(

@@ -572,76 +572,13 @@ from agt_scheduler import use_scheduler_daemon as _use_scheduler_daemon
 
 # ---------------------------------------------------------------------------
 
-# Phase 3A: Mode engine helpers for Telegram commands
+# Phase 3A: Mode engine helpers for Telegram commands (ADR-014: _get_current_desk_mode stub)
 
 # ---------------------------------------------------------------------------
 
-
-
 def _get_current_desk_mode() -> str:
-
-    """Read current desk mode from mode_history. Returns 'PEACETIME' on any error."""
-
-    try:
-
-        from agt_equities.mode_engine import get_current_mode
-
-        with closing(_get_db_connection()) as conn:
-
-            return get_current_mode(conn)
-
-    except Exception:
-
-        return "PEACETIME"
-
-
-
-
-
-def _check_mode_gate(required_mode_max: str) -> tuple[bool, str]:
-
-    """Check if current mode allows the operation.
-
-
-
-    required_mode_max: the highest mode in which the operation is allowed.
-
-    'PEACETIME' = only allowed in peacetime
-
-    'AMBER'     = allowed in peacetime and amber (blocked in wartime)
-
-    'WARTIME'   = always allowed
-
-
-
-    Returns (allowed: bool, message: str).
-
-    """
-
-    mode = _get_current_desk_mode()
-
-    mode_rank = {"PEACETIME": 0, "AMBER": 1, "WARTIME": 2}
-
-    allowed_rank = mode_rank.get(required_mode_max, 2)
-
-    current_rank = mode_rank.get(mode, 0)
-
-
-
-    if current_rank > allowed_rank:
-
-        return False, (
-
-            f"\u26d4 Mode {mode}: this command is blocked.\n"
-
-            f"Current desk mode is {mode}. "
-
-            f"Use /cure to view the Cure Console for next steps."
-
-        )
-
-    return True, ""
-
+    """ADR-014: mode engine retired. Stub returns empty string for legacy get_desk_mode callbacks."""
+    return ""
 
 
 
@@ -1486,41 +1423,12 @@ def _paper_prefix(text: str) -> str:
 
 
 
-def _mode_prefix(text: str) -> str:
-
-    """Prepend mode badge to outbound Telegram text when WARTIME/AMBER."""
-
-    try:
-
-        with closing(_get_db_connection()) as conn:
-
-            from agt_equities.mode_engine import get_current_mode
-
-            mode = get_current_mode(conn)
-
-    except Exception:
-
-        return text
-
-    if mode == "WARTIME" and "[WARTIME]" not in text:
-
-        return f"[\U0001f6a8 WARTIME] {text}"
-
-    if mode == "AMBER" and "[AMBER]" not in text:
-
-        return f"[\u26a0\ufe0f AMBER] {text}"
-
-    return text
-
-
-
-
 
 def _format_outbound(text: str) -> str:
 
-    """Apply all outbound Telegram text formatting: paper prefix + mode prefix."""
+    """Apply all outbound Telegram text formatting: paper prefix."""
 
-    return _paper_prefix(_mode_prefix(text))
+    return _paper_prefix(text)
 
 
 
@@ -9997,7 +9905,6 @@ async def _send_command_menu(update: Update) -> None:
 
         "  /recover_transmitting \u2014 manual orphan recovery\n"
 
-        "  /declare_peacetime \u2014 revert from WARTIME/AMBER\n"
 
         "  /halt \u2014 \U0001f6d1 emergency killswitch\n"
 
@@ -13256,18 +13163,6 @@ async def _pre_trade_gates(
 
 
 
-        # Gate 1: Mode gate — WARTIME whitelist (ADR-005 R4)
-
-        mode = _get_current_desk_mode()
-
-        WARTIME_ALLOWED_SITES = ("dex", "v2_router", "legacy_approve")
-
-        if mode == "WARTIME" and site not in WARTIME_ALLOWED_SITES:
-
-            return (False, f"WARTIME blocks {site}; allowed: {WARTIME_ALLOWED_SITES}")
-
-
-
         # Gate 2: Notional ceiling ($25k cash exposure) — ADR-005 CC1
 
         sec_type = getattr(contract, "secType", None)
@@ -16241,7 +16136,7 @@ async def _stage_dynamic_exit_candidate(
 
         now_ts = time.time()
 
-        desk_mode = _get_current_desk_mode()
+        desk_mode = ""
 
         total_realized = (
 
@@ -19289,126 +19184,6 @@ async def cmd_reject_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 
-async def cmd_declare_peacetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
-    """/declare_peacetime <audit_memo> — revert from WARTIME/AMBER to PEACETIME."""
-
-    if not is_authorized(update):
-
-        return
-
-    try:
-
-        from agt_equities.mode_engine import get_current_mode, log_mode_transition, MODE_PEACETIME
-
-        memo = " ".join(context.args) if context.args else ""
-
-        with closing(_get_db_connection()) as conn:
-
-            with tx_immediate(conn):
-
-                old_mode = get_current_mode(conn)
-
-                if old_mode == MODE_PEACETIME:
-
-                    await update.message.reply_text(f"Already in PEACETIME mode.")
-
-                    return
-
-                if old_mode == "WARTIME" and not memo:
-
-                    await update.message.reply_text(
-
-                        f"\u26d4 WARTIME \u2192 PEACETIME requires an audit memo.\n"
-
-                        f"Usage: /declare_peacetime <reason why wartime conditions have cleared>"
-
-                    )
-
-                    return
-
-                log_mode_transition(conn, old_mode, MODE_PEACETIME,
-
-                                    trigger_rule="manual",
-
-                                    notes=f"/declare_peacetime: {memo}" if memo else "/declare_peacetime")
-
-        await _push_mode_transition(context.application, old_mode, MODE_PEACETIME,
-
-                                     trigger=f"Manual revert" + (f": {memo}" if memo else ""))
-
-        await update.message.reply_text(
-
-            f"\u2705 PEACETIME restored.\n"
-
-            f"Previous mode: {old_mode}\n"
-
-            + (f"Audit memo: {memo}\n" if memo else "")
-
-        )
-
-    except Exception as exc:
-
-        logger.exception("/declare_peacetime failed: %s", exc)
-
-        await update.message.reply_text(f"Failed: {exc}")
-
-
-
-
-
-async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
-    """/mode — show current desk mode and reasoning."""
-
-    if not is_authorized(update):
-
-        return
-
-    try:
-
-        from agt_equities.mode_engine import get_current_mode, get_recent_transitions
-
-        with closing(_get_db_connection()) as conn:
-
-            mode = get_current_mode(conn)
-
-            transitions = get_recent_transitions(conn, limit=3)
-
-
-
-        emoji = {"PEACETIME": "\u2705", "AMBER": "\u26a0\ufe0f", "WARTIME": "\U0001f6a8"}.get(mode, "\u2753")
-
-        lines = [f"{emoji} Current mode: {mode}"]
-
-        if transitions:
-
-            lines.append("")
-
-            lines.append("Recent transitions:")
-
-            for t in transitions:
-
-                ts = t.get("timestamp", "?")[:16]
-
-                lines.append(f"  {ts}: {t.get('old_mode')} \u2192 {t.get('new_mode')}"
-
-                             f" ({t.get('trigger_rule', '\u2014')})")
-
-                if t.get("notes"):
-
-                    lines.append(f"    {t['notes'][:80]}")
-
-        await update.message.reply_text("\n".join(lines))
-
-    except Exception as exc:
-
-        logger.exception("/mode failed: %s", exc)
-
-        await update.message.reply_text(f"Failed: {exc}")
-
-
-
 
 
 def _detect_deck_host() -> str:
@@ -19493,10 +19268,6 @@ async def cmd_cure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         deck_port = os.environ.get("AGT_DECK_PORT", "8787")
 
-        mode = _get_current_desk_mode()
-
-        emoji = {"PEACETIME": "\u2705", "AMBER": "\u26a0\ufe0f", "WARTIME": "\U0001f6a8"}.get(mode, "\u2753")
-
         url = f"http://{deck_host}:{deck_port}/cure"
 
         if deck_token:
@@ -19504,8 +19275,6 @@ async def cmd_cure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             url += f"?t={deck_token}"
 
         await update.message.reply_text(
-
-            f"{emoji} Mode: {mode}\n\n"
 
             f"Cure Console: {url}"
 
@@ -22645,187 +22414,6 @@ async def _scan_orphaned_transmitting_rows(ib_conn, app_bot):
 
 
 
-async def _pin_mode_on_startup(ib_conn=None) -> str | None:
-
-    """Cold-start mode pin: enter WARTIME on boot if leverage is elevated."""
-
-    try:
-
-        from agt_equities import trade_repo
-
-        from agt_equities.mode_engine import MODE_WARTIME, get_current_mode, log_mode_transition
-
-        from agt_equities.rule_engine import LEVERAGE_LIMIT, compute_leverage_pure
-
-        from agt_equities.state_builder import build_state
-
-
-
-        with closing(_get_db_connection()) as conn:
-
-            current_mode = get_current_mode(conn)
-
-        if current_mode == MODE_WARTIME:
-
-            logger.info("Cold-start wartime pin: already in WARTIME, no action")
-
-            return None
-
-
-
-        if ib_conn is None:
-
-            ib_conn = await ensure_ib_connected()
-
-
-
-        live_nlv: dict[str, float] = {}
-
-        try:
-
-            summary = await ib_conn.accountSummaryAsync()
-
-            for item in summary or []:
-
-                if item.account not in ACTIVE_ACCOUNTS or item.tag != "NetLiquidation":
-
-                    continue
-
-                try:
-
-                    live_nlv[item.account] = float(item.value)
-
-                except (TypeError, ValueError):
-
-                    continue
-
-        except Exception as exc:
-
-            logger.warning("Cold-start wartime pin: accountSummary failed: %s", exc)
-
-
-
-        snapshot = build_state(
-
-            db_path=str(DB_PATH),
-
-            live_nlv=live_nlv or None,
-
-        )
-
-
-
-        tickers = sorted({
-
-            c.ticker for c in snapshot.active_cycles
-
-            if c.status == "ACTIVE" and c.shares_held > 0
-
-        })
-
-        spots = await _ibkr_get_spots_batch(tickers) if tickers else {}
-
-
-
-        breaches: list[tuple[str, float]] = []
-
-        for household in snapshot.household_nav:
-
-            leverage = compute_leverage_pure(
-
-                snapshot.active_cycles,
-
-                spots,
-
-                snapshot.beta_by_symbol,
-
-                snapshot.household_nav,
-
-                household,
-
-            )
-
-            if leverage >= LEVERAGE_LIMIT:
-
-                breaches.append((household, leverage))
-
-
-
-        if not breaches:
-
-            logger.info("Cold-start wartime pin: no household at or above %.2fx", LEVERAGE_LIMIT)
-
-            return None
-
-
-
-        breach_household, breach_leverage = max(breaches, key=lambda item: item[1])
-
-        reason = "Cold-start pin: leverage >= 1.50x"
-
-
-
-        with closing(_get_db_connection()) as conn:
-
-            current_mode = get_current_mode(conn)
-
-            if current_mode == MODE_WARTIME:
-
-                logger.info("Cold-start wartime pin: already in WARTIME, no action")
-
-                return None
-
-            log_mode_transition(
-
-                conn,
-
-                current_mode,
-
-                MODE_WARTIME,
-
-                trigger_rule="cold_start_pin",
-
-                trigger_household=breach_household,
-
-                trigger_value=round(breach_leverage, 4),
-
-                notes=reason,
-
-            )
-
-
-
-        logger.warning(
-
-            "Cold-start wartime pin: %s leverage %.2fx >= %.2fx",
-
-            breach_household,
-
-            breach_leverage,
-
-            LEVERAGE_LIMIT,
-
-        )
-
-        return (
-
-            "\U0001f6a8 COLD-START WARTIME PIN\n"
-
-            f"{breach_household} leverage {breach_leverage:.2f}x >= {LEVERAGE_LIMIT:.2f}x.\n"
-
-            f"{reason}"
-
-        )
-
-    except Exception as exc:
-
-        logger.exception("Cold-start wartime pin failed: %s", exc)
-
-        return None
-
-
-
-
 
 async def post_init(app) -> None:
 
@@ -22894,22 +22482,6 @@ async def post_init(app) -> None:
     except Exception as exc:
 
         logger.error("Orphan scan failed: %s — bot continues without scan", exc)
-
-
-
-    # Priority 4: cold-start wartime pin before polling/watchdog loops
-
-    try:
-
-        alert = await _pin_mode_on_startup(ib_conn)
-
-        if alert:
-
-            await _alert_telegram(alert)
-
-    except Exception as exc:
-
-        logger.error("Cold-start wartime pin alert failed: %s — continuing", exc)
 
 
 
@@ -23756,10 +23328,6 @@ def main() -> None:
     app.add_handler(CommandHandler("approve",   cmd_approve))
 
     app.add_handler(CommandHandler("reject",    cmd_reject))
-
-    app.add_handler(CommandHandler("declare_peacetime", cmd_declare_peacetime))
-
-    app.add_handler(CommandHandler("mode",      cmd_mode))
 
     app.add_handler(CommandHandler("cure",      cmd_cure))
 
