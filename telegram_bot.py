@@ -20772,7 +20772,7 @@ async def post_init(app) -> None:
 
             ],
 
-            nssm_services=["agt_bot", "agt_scheduler"],
+            nssm_services=["agt-telegram-bot", "agt-scheduler"],
 
             logger=logger,
 

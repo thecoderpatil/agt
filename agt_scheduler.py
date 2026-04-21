@@ -777,7 +777,7 @@ async def _run() -> int:
                 Path(_state_dir) / ".env",
                 Path("C:/AGT_Telegram_Bridge/.env"),
             ],
-            nssm_services=["agt_bot", "agt_scheduler"],
+            nssm_services=["agt-telegram-bot", "agt-scheduler"],
             logger=logger,
         )
     except Exception as e:
