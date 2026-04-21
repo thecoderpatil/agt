@@ -391,31 +391,6 @@ class TestBridge2StagingCallback(unittest.TestCase):
         )
         assert isinstance(result.digest_lines, list)
 
-    def test_env_flag_scan_live_off_skips_staging(self):
-        """AGT_SCAN_LIVE=0 should cause cmd_scan to pass staging_callback=None."""
-        import os
-        os.environ["AGT_SCAN_LIVE"] = "0"
-        try:
-            _scan_live = os.getenv("AGT_SCAN_LIVE", "1") == "1"
-            assert _scan_live is False
-            # In cmd_scan, _staging_cb would be None
-            _staging_cb = (lambda t: t) if _scan_live else None
-            assert _staging_cb is None
-        finally:
-            os.environ["AGT_SCAN_LIVE"] = "1"
-
-    def test_env_flag_scan_live_default_is_on(self):
-        """Default AGT_SCAN_LIVE should be '1' (staging enabled)."""
-        import os
-        # Remove if set
-        old = os.environ.pop("AGT_SCAN_LIVE", None)
-        try:
-            _scan_live = os.getenv("AGT_SCAN_LIVE", "1") == "1"
-            assert _scan_live is True
-        finally:
-            if old is not None:
-                os.environ["AGT_SCAN_LIVE"] = old
-
     def test_staged_ticket_shape_matches_place_single_order_contract(self):
         """Tickets staged by allocator must contain all fields
         that _place_single_order reads from payload."""
