@@ -178,6 +178,7 @@ load_dotenv(_env_path, override=False)
 # ADR-007 Addendum §2.1 — halt if DB path is not canonical.
 from agt_equities.invariants.bootstrap import assert_canonical_db_path as _assert_canonical_db_path
 from agt_equities import db as _agt_db
+from agt_equities.runtime_fingerprint import capture_and_log as _capture_runtime_fingerprint
 _assert_canonical_db_path(
     resolved_path=_agt_db.DB_PATH,
     allow_override=bool(os.environ.get("AGT_BOOTSTRAP_ALLOW_OVERRIDE")),
@@ -20828,6 +20829,33 @@ async def post_init(app) -> None:
     except Exception as exc:
 
         logger.warning("broker_preflight hook failed (non-fatal): %s", exc)
+
+
+    try:
+
+        _state_dir = os.environ.get("AGT_STATE_DIR", "C:/AGT_Runtime/state")
+
+        _capture_runtime_fingerprint(
+
+            service_name="agt_bot",
+
+            dotenv_paths=[
+
+                Path(_state_dir) / ".env",
+
+                Path("C:/AGT_Telegram_Bridge/.env"),
+
+            ],
+
+            nssm_services=["agt_bot", "agt_scheduler"],
+
+            logger=logger,
+
+        )
+
+    except Exception as e:
+
+        logger.warning("runtime_fingerprint wiring soft-fail: %s", e)
 
 
 
