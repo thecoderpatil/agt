@@ -18715,26 +18715,10 @@ async def _premarket_shadow_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
-    """MR !71: Daily 9:35 AM ET — CSP entry scan + allocator staging.
+    """Daily 09:35 ET — CSP entry scan via scan_orchestrator.
 
-
-
-    Paper (PAPER_MODE + PAPER_AUTO_EXECUTE): auto-executes staged CSP rows
-
-    via _auto_execute_staged. No /approve gate.
-
-
-
-    Live: CSP rows land in /approve queue (allocator seam MR !69 uses
-
-    Telegram-digest approval_gate — separate ticket).
-
-
-
-    Shares plumbing with cmd_scan. Keeps the 6-phase screener + bridge-2
-
-    extras + CSP_GATE_REGISTRY by invoking the same pipeline helpers.
-
+    Paper + PAPER_AUTO_EXECUTE: auto-drain staged rows through IB post-scan.
+    Live: approval gated via await_csp_approval (needs_csp_approval(ctx)).
     """
 
     try:
@@ -18749,150 +18733,23 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-        # Use AGT_SCAN_LIVE=0 kill switch to disable auto-staging
+        from agt_equities.runtime import build_run_context
 
-        if os.getenv("AGT_SCAN_LIVE", "1") != "1":
-
-            logger.info("Scheduled CSP scan disabled (AGT_SCAN_LIVE=0)")
-
-            return
-
-
-
-        from pxo_scanner import _load_scan_universe, scan_csp_candidates
-
-        from agt_equities.scan_bridge import (
-
-            adapt_scanner_candidates,
-
-            build_watchlist_sector_map,
-
-            make_bridge2_extras_provider,
-
-        )
-
-        from agt_equities.csp_allocator import (
-
-            _fetch_household_buying_power_snapshot,
-
-            run_csp_allocator,
-
-        )
-
-        from agt_equities.csp_approval_gate import telegram_approval_gate as _tg_gate
-
-        from agt_equities.runtime import RunContext, RunMode
+        from agt_equities.scan_orchestrator import ScanTrigger, run_csp_scan
 
         from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
 
-        from agt_equities.scan_extras import (
-
-            fetch_earnings_map,
-
-            build_correlation_pairs,
-
-        )
-
-
-
-        watchlist = await asyncio.to_thread(_load_scan_universe)
-
-        rows = await asyncio.to_thread(scan_csp_candidates, watchlist, 10, 50)
-
-        if not rows:
-
-            logger.info("Scheduled CSP scan: no candidates from screener")
-
-            return
-
-
-
-        candidates = adapt_scanner_candidates(rows)
-
-        if not candidates:
-
-            logger.info("Scheduled CSP scan: no candidates survived adapter")
-
-            return
-
-
-
-        def _fetch_vix() -> float:
-
-            try:
-
-                hist = yf.Ticker("^VIX").history(period="1d")
-
-                if len(hist) and "Close" in hist.columns:
-
-                    return float(hist["Close"].iloc[-1])
-
-            except Exception:
-
-                pass
-
-            return 20.0
-
-        vix = await asyncio.to_thread(_fetch_vix)
+        from agt_equities.telegram_dispatch import await_csp_approval
 
 
 
         ib_conn = await ensure_ib_connected()
-        _mstats = await _query_margin_stats()
-        disco = await position_discovery.discover_positions(ib_conn, _mstats, None)
-        snapshots = await _fetch_household_buying_power_snapshot(ib_conn, disco)
 
-        if not snapshots:
-
-            logger.warning("Scheduled CSP scan: household snapshots empty")
-
-            return
+        margin_stats = await _query_margin_stats()
 
 
 
-        candidate_tickers = [c.ticker for c in candidates]
-
-        all_holding_tickers: set[str] = set()
-
-        for _hh_snap in snapshots.values():
-
-            all_holding_tickers.update(_hh_snap.get("existing_positions", {}).keys())
-
-            all_holding_tickers.update(_hh_snap.get("existing_csps", {}).keys())
-
-
-
-        earnings_map = await asyncio.to_thread(fetch_earnings_map, candidate_tickers)
-
-        correlation_pairs = await asyncio.to_thread(
-
-            build_correlation_pairs, candidate_tickers, sorted(all_holding_tickers),
-
-        )
-
-
-
-        sector_map = build_watchlist_sector_map(watchlist)
-
-        extras_provider = make_bridge2_extras_provider(
-
-            sector_map, earnings_map, correlation_pairs,
-
-        )
-
-
-
-        # ADR-008 MR 2: ctx carries the order sink. Live scheduled scan
-
-        # wires SQLiteOrderSink so ctx.order_sink.stage(tickets, ...) is
-
-        # byte-identical to the prior append_pending_tickets(tickets)
-
-        # staging path.
-
-        ctx = RunContext(
-
-            mode=RunMode.LIVE,
+        ctx = build_run_context(
 
             run_id=uuid.uuid4().hex,
 
@@ -18900,57 +18757,47 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             decision_sink=NullDecisionSink(),
 
-            broker_mode="paper" if PAPER_MODE else "live",
-
             engine="csp",
 
         )
 
-        _require_approval = (
-
-            os.environ.get("AGT_CSP_REQUIRE_APPROVAL", "false").lower() == "true"
-
-        )
-
-        _gate = _tg_gate if _require_approval else None
 
 
+        result = await run_csp_scan(
 
-        import functools as _functools
+            ScanTrigger.DAILY_AUTO,
 
-        _allocator_call = _functools.partial(
+            ctx,
 
-            run_csp_allocator,
+            ib_conn=ib_conn,
 
-            ray_candidates=candidates,
+            margin_stats=margin_stats,
 
-            snapshots=snapshots,
-
-            vix=vix,
-
-            extras_provider=extras_provider,
-
-            ctx=ctx,
-
-            approval_gate=_gate,
+            approval_dispatcher=await_csp_approval,
 
         )
 
-        result = await asyncio.to_thread(_allocator_call)
 
 
+        staged_n = result.allocation.total_staged_contracts
 
-        staged_n = result.total_staged_contracts
+        n_candidates = len(result.inputs.candidates)
 
-        digest = "\n".join(result.digest_lines or ["(no allocator output)"])
+        digest = "\n".join(
+
+            result.allocation.digest_lines or ["(no allocator output)"]
+
+        )
 
         header = (
 
-            f"\u2501\u2501 scheduled CSP scan {now_et.strftime('%Y-%m-%d %H:%M')} "
+            f"━━ scheduled CSP scan {now_et.strftime('%Y-%m-%d %H:%M')} "
 
-            f"\u2501\u2501\nCandidates: {len(candidates)} \u00b7 VIX: {vix:.1f} "
+            f"━━\n"
 
-            f"\u00b7 Staged: {staged_n}\n"
+            f"Candidates: {n_candidates} · VIX: {result.inputs.vix:.1f} "
+
+            f"· Approved: {result.approved_count} · Staged: {staged_n}\n"
 
         )
 
@@ -19038,454 +18885,6 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             logger.exception("Failed to send scheduled CSP scan error notification")
 
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# WHEEL-4 glue helpers
-
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# WHEEL-7 — CRITICAL_PAGER + LiquidateResult approval flow
-
-# ---------------------------------------------------------------------------
-
-# The V2 Router evaluator emits AlertResult(severity="CRITICAL") on cascade
-
-# exhaustion or unexpected exceptions, and LiquidateResult when a defensive
-
-# roll has no acceptable target and the cascade recommends a full position
-
-# unwind. Prior to WHEEL-7 both variants only appeared in the bundled 3:30
-
-# PM watchdog digest — no @here-style priority, no actionable keyboard.
-
-#
-
-# WHEEL-7 wires:
-
-#   * AlertResult(CRITICAL) → immediate out-of-band priority message
-
-#     (no keyboard, informational pager).
-
-#   * LiquidateResult → immediate priority message with [STAGE LIQUIDATE]
-
-#     [REJECT] inline keyboard. STAGE synthesizes two pending tickets
-
-#     (BTC calls + STC underlying), both transmit=False — operator must
-
-#     still run /approve to fire. REJECT logs and drops the event.
-
-#
-
-# Token store is in-memory, 30-minute TTL. Bot restart → token lost →
-
-# operator re-runs /rollcheck (no silent data loss).
-
-# ---------------------------------------------------------------------------
-
-
-
-_LIQ_STAGING_BY_TOKEN: dict[str, dict] = {}
-
-_LIQ_TOKEN_TTL_S = 30 * 60  # 30 minutes
-
-
-
-
-
-def _liq_gc() -> None:
-
-    """Drop expired liquidation tokens in-place."""
-
-    now = _datetime.now().timestamp()
-
-    expired = [
-
-        t for t, p in _LIQ_STAGING_BY_TOKEN.items()
-
-        if now - p.get("_created_ts", 0) > _LIQ_TOKEN_TTL_S
-
-    ]
-
-    for t in expired:
-
-        try:
-
-            del _LIQ_STAGING_BY_TOKEN[t]
-
-        except KeyError:
-
-            pass
-
-
-
-
-
-def _liq_keyboard(token: str) -> InlineKeyboardMarkup:
-
-    return InlineKeyboardMarkup([[
-
-        InlineKeyboardButton("STAGE LIQUIDATE", callback_data=f"liq:stage:{token}"),
-
-        InlineKeyboardButton("REJECT", callback_data=f"liq:reject:{token}"),
-
-    ]])
-
-
-
-
-
-def _build_liquidate_tickets(payload: dict) -> list[dict]:
-
-    """Synthesize BTC calls + STC shares tickets from a LiquidateResult payload.
-
-
-
-    Both tickets ship transmit=False so the operator must explicitly
-
-    /approve before anything hits the wire. The BTC leg uses the
-
-    evaluator's btc_limit; the STC leg is a MKT order (sized by `shares`)
-
-    to close the underlying immediately after the calls cover. Operator
-
-    can hand-edit either before approving.
-
-    """
-
-    acct_id = payload.get("account_id") or ""
-
-    acct_label = ACCOUNT_LABELS.get(acct_id, acct_id)
-
-    ticker = payload.get("ticker") or ""
-
-    contracts = int(payload.get("contracts") or 0)
-
-    shares = int(payload.get("shares") or 0)
-
-    btc_limit = float(payload.get("btc_limit") or 0.0)
-
-    strike = float(payload.get("strike") or 0.0)
-
-    expiry = payload.get("expiry") or ""
-
-
-
-    tickets: list[dict] = []
-
-    if contracts > 0 and strike > 0 and expiry:
-
-        tickets.append({
-
-            "timestamp": _datetime.now().isoformat(),
-
-            "account_id": acct_id,
-
-            "account_label": acct_label,
-
-            "ticker": ticker,
-
-            "sec_type": "OPT",
-
-            "action": "BUY",
-
-            "quantity": contracts,
-
-            "order_type": "LMT",
-
-            "limit_price": round(btc_limit, 2),
-
-            "expiry": str(expiry).replace("-", ""),
-
-            "strike": strike,
-
-            "right": "C",
-
-            "status": "staged",
-
-            "transmit": False,                       # operator /approve gate
-
-            "strategy": "WHEEL-7 Liquidate BTC",
-
-            "mode": "LIQUIDATE",
-
-            "origin": "roll_engine",
-
-            "v2_state": "LIQUIDATE",
-
-            "v2_rationale": payload.get("reason", ""),
-
-        })
-
-    if shares > 0:
-
-        tickets.append({
-
-            "timestamp": _datetime.now().isoformat(),
-
-            "account_id": acct_id,
-
-            "account_label": acct_label,
-
-            "ticker": ticker,
-
-            "sec_type": "STK",
-
-            "action": "SELL",
-
-            "quantity": shares,
-
-            "order_type": "MKT",
-
-            "status": "staged",
-
-            "transmit": False,                       # operator /approve gate
-
-            "strategy": "WHEEL-7 Liquidate STC",
-
-            "mode": "LIQUIDATE",
-
-            "origin": "roll_engine",
-
-            "v2_state": "LIQUIDATE",
-
-            "v2_rationale": payload.get("reason", ""),
-
-        })
-
-    return tickets
-
-
-
-
-
-async def _page_critical_event(bot, kind: str, payload: dict) -> None:
-
-    """Send an out-of-band priority message for a V2 Router critical event.
-
-
-
-    kind is one of 'CRITICAL' | 'LIQUIDATE'. On LIQUIDATE the payload is
-
-    stashed in _LIQ_STAGING_BY_TOKEN keyed on a short uuid4 token so the
-
-    callback handler can look it up when the operator hits STAGE/REJECT.
-
-    """
-
-    try:
-
-        _liq_gc()
-
-        if kind == "CRITICAL":
-
-            ticker = payload.get("ticker", "?")
-
-            acct = payload.get("account_id", "?")
-
-            reason = payload.get("reason", "")
-
-            text = (
-
-                "\U0001f6a8 <b>CRITICAL PAGER</b>\n"
-
-                f"Ticker: <code>{html.escape(str(ticker))}</code>\n"
-
-                f"Account: <code>{html.escape(str(acct))}</code>\n"
-
-                f"Reason: <pre>{html.escape(str(reason))}</pre>"
-
-            )
-
-            await bot.send_message(
-
-                chat_id=AUTHORIZED_USER_ID,
-
-                text=text,
-
-                parse_mode="HTML",
-
-                disable_notification=False,
-
-            )
-
-            return
-
-
-
-        if kind == "LIQUIDATE":
-
-            import uuid as _uuid
-
-            token = _uuid.uuid4().hex[:10]
-
-            payload = dict(payload)
-
-            payload["_created_ts"] = _datetime.now().timestamp()
-
-            _LIQ_STAGING_BY_TOKEN[token] = payload
-
-            ticker = payload.get("ticker", "?")
-
-            acct = payload.get("account_id", "?")
-
-            contracts = payload.get("contracts", 0)
-
-            shares = payload.get("shares", 0)
-
-            btc = payload.get("btc_limit", 0.0)
-
-            stc_ref = payload.get("stc_market_ref", 0.0)
-
-            net = payload.get("net_proceeds_per_share", 0.0)
-
-            reason = payload.get("reason", "")
-
-            text = (
-
-                "\U0001f6a8 <b>LIQUIDATE REQUEST</b>\n"
-
-                f"Ticker: <code>{html.escape(str(ticker))}</code> "
-
-                f"| Account: <code>{html.escape(str(acct))}</code>\n"
-
-                f"BTC: <code>{contracts}c @ {float(btc):.2f}</code>\n"
-
-                f"STC: <code>{shares}sh @ MKT (ref ~{float(stc_ref):.2f})</code>\n"
-
-                f"Net proceeds: <code>{float(net):.2f}/sh</code>\n"
-
-                f"Reason: <pre>{html.escape(str(reason))}</pre>"
-
-            )
-
-            # MR !71: paper autopilot. Skip the STAGE/REJECT keyboard and
-
-            # auto-stage + drain via _auto_execute_staged. Live still goes
-
-            # through the manual keyboard gate for safety.
-
-            if PAPER_MODE and PAPER_AUTO_EXECUTE:
-
-                try:
-
-                    _LIQ_STAGING_BY_TOKEN.pop(token, None)  # token unused in auto path
-
-                    tickets = _build_liquidate_tickets(payload)
-
-                    if not tickets:
-
-                        await bot.send_message(
-
-                            chat_id=AUTHORIZED_USER_ID,
-
-                            text=text + "\n\n\u26a0\ufe0f <b>PAPER</b>: no tickets synthesized (0 contracts/0 shares).",
-
-                            parse_mode="HTML",
-
-                            disable_notification=False,
-
-                        )
-
-                        return
-
-                    await asyncio.to_thread(append_pending_tickets, tickets)
-
-                    ap_placed, ap_failed, ap_lines, ap_status = await _auto_execute_staged()
-
-                    exec_msg = (
-
-                        f"[PAPER AUTO-EXEC] status={ap_status} "
-
-                        f"placed={ap_placed} failed={ap_failed}"
-
-                    )
-
-                    if ap_lines:
-
-                        exec_msg += "\n" + "\n".join(ap_lines[:10])
-
-                        if len(ap_lines) > 10:
-
-                            exec_msg += f"\n... ({len(ap_lines) - 10} more)"
-
-                    await bot.send_message(
-
-                        chat_id=AUTHORIZED_USER_ID,
-
-                        text=text + f"\n\n\u2705 <b>PAPER AUTO-EXEC</b>\n<pre>{html.escape(exec_msg)}</pre>",
-
-                        parse_mode="HTML",
-
-                        disable_notification=False,
-
-                    )
-
-                except Exception as exc:
-
-                    logger.exception("MR !71 LIQUIDATE paper autopilot failed")
-
-                    try:
-
-                        await bot.send_message(
-
-                            chat_id=AUTHORIZED_USER_ID,
-
-                            text=text + f"\n\n\u274c <b>PAPER AUTO-EXEC FAILED</b>\n<pre>{html.escape(str(exc))}</pre>",
-
-                            parse_mode="HTML",
-
-                            disable_notification=False,
-
-                        )
-
-                    except Exception:
-
-                        pass
-
-                return
-
-            # Live path: manual STAGE/REJECT keyboard
-
-            text += (
-
-                "\nSTAGE = create pending tickets (transmit=False, /approve to fire).\n"
-
-                "REJECT = drop event, position held."
-
-            )
-
-            await bot.send_message(
-
-                chat_id=AUTHORIZED_USER_ID,
-
-                text=text,
-
-                parse_mode="HTML",
-
-                reply_markup=_liq_keyboard(token),
-
-                disable_notification=False,
-
-            )
-
-            return
-
-    except Exception as exc:
-
-        logger.exception("WHEEL-7 _page_critical_event failed: %s", exc)
 
 
 
@@ -20932,7 +20331,7 @@ _OPEN_LIVE_STATES = frozenset({
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
-    """/scan — CSP entry scan. Stages allocator output for /approve."""
+    """/scan — ad-hoc CSP entry scan via scan_orchestrator."""
 
     if not is_authorized(update):
 
@@ -20946,230 +20345,29 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
 
-        # ── 1. Load watchlist + run scanner (sync, yfinance) in a thread ──
+        from agt_equities.runtime import build_run_context
 
-        from pxo_scanner import (
+        from agt_equities.scan_orchestrator import ScanTrigger, run_csp_scan
 
-            _load_scan_universe,
+        from agt_equities.sinks import NullDecisionSink, SQLiteOrderSink
 
-            scan_csp_candidates,
-
-            MIN_DTE, MAX_DTE, MIN_ANNUALIZED_ROI,
-
-        )
-
-        watchlist = await asyncio.to_thread(_load_scan_universe)
-
-        rows = await asyncio.to_thread(
-
-            scan_csp_candidates, watchlist, 10, 50,
-
-        )
+        from agt_equities.telegram_dispatch import await_csp_approval
 
 
-
-        if not rows:
-
-            await status_msg.edit_text(
-
-                "\u2139\ufe0f No CSP candidates meet Heitkoetter criteria "
-
-                f"(DTE {MIN_DTE}-{MAX_DTE}, yield \u2265 {MIN_ANNUALIZED_ROI}%)."
-
-            )
-
-            return
-
-
-
-        # ── 2. Adapt dicts -> ScanCandidate objects ──
-
-        from agt_equities.scan_bridge import (
-
-            adapt_scanner_candidates,
-
-            build_watchlist_sector_map,
-
-            make_bridge2_extras_provider,
-
-        )
-
-        candidates = adapt_scanner_candidates(rows)
-
-        if not candidates:
-
-            await status_msg.edit_text(
-
-                "\u26a0\ufe0f Scanner produced rows but none survived adapter "
-
-                "validation (missing ticker/strike/expiry/premium/ann_roi)."
-
-            )
-
-            return
-
-
-
-        # ── 3. Fetch VIX (yfinance, 20.0 fallback) ──
-
-        def _fetch_vix() -> float:
-
-            try:
-
-                hist = yf.Ticker("^VIX").history(period="1d")
-
-                if len(hist) and "Close" in hist.columns:
-
-                    return float(hist["Close"].iloc[-1])
-
-            except Exception as exc:
-
-                logger.warning("cmd_scan: VIX fetch failed: %s", exc)
-
-            return 20.0
-
-        vix = await asyncio.to_thread(_fetch_vix)
-
-
-
-        # ── 4. Discover positions + build per-household snapshots ──
 
         ib_conn = await ensure_ib_connected()
-        disco = await position_discovery.discover_positions(
-            ib_conn, await _query_margin_stats(), None
-        )
-        if disco.get("error"):
-            logger.warning("cmd_scan: discover_positions warning: %s", disco["error"])
 
-        from agt_equities.csp_allocator import (
+        margin_stats = await _query_margin_stats()
 
-            _fetch_household_buying_power_snapshot,
 
-            run_csp_allocator,
 
-        )
-
-        from agt_equities.runtime import RunContext, RunMode
-
-        from agt_equities.sinks import (
-
-            CollectorOrderSink,
-
-            NullDecisionSink,
-
-            SQLiteOrderSink,
-
-        )
-
-        snapshots = await _fetch_household_buying_power_snapshot(ib_conn, disco)
-
-        if not snapshots:
-
-            await status_msg.edit_text(
-
-                "\u26a0\ufe0f Could not build household buying-power snapshots "
-
-                "(accountSummaryAsync failed or no accounts in HOUSEHOLD_MAP)."
-
-            )
-
-            return
-
-
-
-        # ── 4b. Fetch bridge-2 extras (earnings, correlations) ──
-
-        await status_msg.edit_text("\U0001f50d Fetching earnings + correlations\u2026")
-
-        from agt_equities.scan_extras import (
-
-            fetch_earnings_map,
-
-            build_correlation_pairs,
-
-        )
-
-        candidate_tickers = [c.ticker for c in candidates]
-
-
-
-        # Collect all holding tickers across households for correlation
-
-        all_holding_tickers: set[str] = set()
-
-        for _hh_snap in snapshots.values():
-
-            all_holding_tickers.update(_hh_snap.get("existing_positions", {}).keys())
-
-            all_holding_tickers.update(_hh_snap.get("existing_csps", {}).keys())
-
-
-
-        earnings_map = await asyncio.to_thread(
-
-            fetch_earnings_map, candidate_tickers,
-
-        )
-
-        correlation_pairs = await asyncio.to_thread(
-
-            build_correlation_pairs,
-
-            candidate_tickers,
-
-            sorted(all_holding_tickers),
-
-        )
-
-
-
-        # ── 5. Build extras_provider + run allocator ──
-
-        sector_map = build_watchlist_sector_map(watchlist)
-
-        extras_provider = make_bridge2_extras_provider(
-
-            sector_map, earnings_map, correlation_pairs,
-
-        )
-
-
-
-        # B5.c-bridge-2: live staging (default) or dry-run via env flag.
-
-        # ADR-008 MR 2: dry-run is now an in-memory CollectorOrderSink so
-
-        # the allocator still sees a real OrderSink contract while no row
-
-        # lands in pending_orders. Byte-identical to pre-MR-2 behavior
-
-        # (which set staging_callback=None, skipping staging).
-
-        _scan_live = os.getenv("AGT_SCAN_LIVE", "1") == "1"
-
-        if _scan_live:
-
-            _csp_order_sink = SQLiteOrderSink(
-
-                staging_fn=append_pending_tickets,
-
-            )
-
-        else:
-
-            _csp_order_sink = CollectorOrderSink()
-
-        ctx = RunContext(
-
-            mode=RunMode.LIVE,
+        ctx = build_run_context(
 
             run_id=uuid.uuid4().hex,
 
-            order_sink=_csp_order_sink,
+            order_sink=SQLiteOrderSink(staging_fn=append_pending_tickets),
 
             decision_sink=NullDecisionSink(),
-
-            broker_mode="paper" if PAPER_MODE else "live",
 
             engine="csp",
 
@@ -21177,55 +20375,73 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-        result = run_csp_allocator(
+        result = await run_csp_scan(
 
-            ray_candidates=candidates,
+            ScanTrigger.ADHOC,
 
-            snapshots=snapshots,
+            ctx,
 
-            vix=vix,
+            ib_conn=ib_conn,
 
-            extras_provider=extras_provider,
+            margin_stats=margin_stats,
 
-            ctx=ctx,
+            approval_dispatcher=await_csp_approval,
 
         )
 
 
 
-        # ── 6. Post digest ──
+        staged_n = result.allocation.total_staged_contracts
 
-        staged_n = result.total_staged_contracts
+        n_candidates = len(result.inputs.candidates)
 
-        mode_tag = "STAGED" if _scan_live and staged_n else "dry-run"
+        if n_candidates == 0:
+
+            await status_msg.edit_text(
+
+                "ℹ️ No CSP candidates meet Heitkoetter criteria."
+
+            )
+
+            return
+
+
+
+        mode_tag = "STAGED" if staged_n else "dry-run"
 
         header = [
 
-            f"\u2501\u2501 /scan ({mode_tag}) \u2501\u2501",
+            f"━━ /scan ({mode_tag}) ━━",
 
-            f"Candidates scanned: {len(candidates)}  \u00b7  VIX: {vix:.1f}",
+            f"Candidates scanned: {n_candidates}  ·  VIX: {result.inputs.vix:.1f}",
+
+            f"Approved: {result.approved_count}/{n_candidates}"
+
+            + ("  [live gate]" if result.approval_applied else "  [auto]"),
 
             "",
 
         ]
 
-        digest = "\n".join(header + (result.digest_lines or ["(no allocator output)"]))
+        digest = "\n".join(
 
-        await status_msg.delete()
-
-        await send_text(
-
-            update,
-
-            f"<pre>{html.escape(digest)}</pre>",
+            header + (result.allocation.digest_lines or ["(no allocator output)"])
 
         )
 
-        if _scan_live and staged_n:
+        await status_msg.delete()
+
+        await send_text(update, f"<pre>{html.escape(digest)}</pre>")
+
+
+
+        if staged_n:
 
             await update.message.reply_text(
 
-                f"\u2705 {staged_n} contract(s) staged. Use /approve to review and transmit.",
+                f"✅ {staged_n} contract(s) staged. "
+
+                "Use /approve to review and transmit."
 
             )
 
@@ -21237,37 +20453,18 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         try:
 
-            await status_msg.edit_text(f"\u274c /scan failed: {exc}")
+            await status_msg.edit_text(f"❌ /scan failed: {exc}")
 
         except Exception:
 
             try:
 
-                await update.message.reply_text(f"\u274c /scan failed: {exc}")
+                await update.message.reply_text(f"❌ /scan failed: {exc}")
 
             except Exception:
 
                 pass
 
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# Shared LLM dispatcher — parameterized by model
-
-# ---------------------------------------------------------------------------
-
-_MODEL_LABELS = {
-
-    CLAUDE_MODEL_HAIKU:  ("H", "\U0001f504 Thinking\u2026"),
-
-    CLAUDE_MODEL_SONNET: ("S", "\U0001f504 Thinking (Sonnet)\u2026"),
-
-    CLAUDE_MODEL_OPUS:   ("O", "\U0001f504 Deep thinking (Opus)\u2026"),
-
-}
 
 
 
