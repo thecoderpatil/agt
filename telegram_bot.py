@@ -21600,6 +21600,40 @@ async def post_init(app) -> None:
 
 
 
+    # MR 4b: broker identity pre-flight -- fail-closed on mismatch
+
+    try:
+
+        import os as _os
+
+        from agt_equities.broker_preflight import (
+
+            BrokerIdentityMismatch,
+
+            run_broker_identity_preflight,
+
+        )
+
+        _broker_mode = _os.environ.get("AGT_BROKER_MODE", "paper")
+
+        await run_broker_identity_preflight(ib_conn, _broker_mode)
+
+    except BrokerIdentityMismatch as exc:
+
+        logger.critical(
+
+            "BROKER IDENTITY MISMATCH -- HALTING SERVICE: %s", exc
+
+        )
+
+        raise SystemExit(1) from exc
+
+    except Exception as exc:
+
+        logger.warning("broker_preflight hook failed (non-fatal): %s", exc)
+
+
+
 # ---------------------------------------------------------------------------
 
 # Beta Impl 3: ATTESTED row poller (R6 — 10s interval, idempotent delivery)
