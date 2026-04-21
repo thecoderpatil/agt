@@ -41,7 +41,11 @@
 
 ## LOCAL_SYNC
 
-Pending — will run after merge-yes.
+  fetch/reset:   done — HEAD a125687 (merge commit)
+  pip install:   no new deps
+  smoke imports: ok — agt_equities.broker_preflight imports clean
+  deploy.ps1:    exit 0 — deploy complete at 2026-04-20 20:08:36 local (-SkipBackup)
+  heartbeats:    agt_bot 00:07:58Z ok (44s) | agt_scheduler 00:07:45Z ok (57s)
 
 ## Notes
 
@@ -49,4 +53,4 @@ Pending — will run after merge-yes.
 - Both checks (static + dynamic) wrapped in try/except; dynamic failure non-fatal
 - SystemExit(1) only on BrokerIdentityMismatch — not on generic exception
 - Dispatch file archived at reports/Mr4b_broker_preflight_dispatch_20260421.md
-- Awaiting: merge-yes → LOCAL_SYNC (STANDARD tier — CRITICAL file telegram_bot.py → deploy.ps1 required)
+- LOC divergence (+203 vs +80–+130 declared): docstrings + double-spacing in telegram_bot.py
