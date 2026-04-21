@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -96,47 +95,46 @@ def _hash_env_snapshot(snap: Mapping[str, str]) -> str:
     return _sha256_short(payload)
 
 
-_APPENV_LINE = re.compile(
-    r"^\s*\S*nssm\S*\s+set\s+\S+\s+AppEnvironmentExtra\s+(.*)$",
-    re.MULTILINE | re.IGNORECASE,
-)
-_APPENV_PAIR = re.compile(r'"([^"=]+)=([^"]*)"')
 
 
-def _parse_nssm_appenv(dump_text: str) -> dict[str, str]:
-    m = _APPENV_LINE.search(dump_text)
-    if not m:
-        return {}
-    pairs = _APPENV_PAIR.findall(m.group(1))
-    return dict(sorted(pairs))
 
+def _read_nssm_appenv(service_name: str) -> dict[str, str] | None:
+    """Return parsed NSSM ``AppEnvironmentExtra`` from the Windows registry.
 
-def _read_nssm_appenv(service_name: str, *, nssm_path: str = "nssm") -> dict[str, str] | None:
-    """Return parsed NSSM ``AppEnvironmentExtra`` for service, or None on any failure.
-
-    Fail-open: unavailable nssm (CI, dev, Linux), timeout, or non-zero exit
-    all yield None and a debug log line. Never raises.
+    Reads ``HKLM\\SYSTEM\\CurrentControlSet\\Services\\<service>\\Parameters``
+    value ``AppEnvironmentExtra`` (REG_MULTI_SZ). Fail-open on:
+      - non-Windows platform (winreg ImportError)
+      - missing service or missing value (OSError/FileNotFoundError)
+      - unexpected value type
+    Returns None in every failure case; never raises.
     """
     try:
-        result = subprocess.run(
-            [nssm_path, "dump", service_name],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
-        log.debug("runtime_fingerprint: nssm dump unavailable (%s): %s", service_name, e)
+        import winreg  # Windows-only; lazy import so Linux CI works
+    except ImportError:
+        log.debug("runtime_fingerprint: winreg unavailable (non-Windows)")
         return None
-    if result.returncode != 0:
-        log.debug(
-            "runtime_fingerprint: nssm dump rc=%s stderr=%s",
-            result.returncode,
-            result.stderr[:200],
-        )
-        return None
-    return _parse_nssm_appenv(result.stdout)
 
+    key_path = rf"SYSTEM\CurrentControlSet\Services\{service_name}\Parameters"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            value, _value_type = winreg.QueryValueEx(key, "AppEnvironmentExtra")
+    except (FileNotFoundError, OSError) as e:
+        log.debug(
+            "runtime_fingerprint: registry read failed for %s: %s",
+            service_name,
+            e,
+        )
+        return None
+
+    if not isinstance(value, list):
+        return None
+
+    pairs: dict[str, str] = {}
+    for entry in value:
+        if isinstance(entry, str) and "=" in entry:
+            k, _, v = entry.partition("=")
+            pairs[k] = v
+    return dict(sorted(pairs.items()))
 
 def _git_tip(repo_root: Path) -> str | None:
     head = repo_root / ".git" / "HEAD"
