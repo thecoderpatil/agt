@@ -176,6 +176,7 @@ from agt_equities.invariants.tick import (
     _evidence_fingerprint,
     check_invariants_tick as _shared_check_invariants_tick,
 )
+from agt_equities.runtime_fingerprint import capture_and_log as _capture_runtime_fingerprint
 
 
 def _check_invariants_tick() -> None:
@@ -767,6 +768,20 @@ async def _run() -> int:
         "agt_scheduler boot: pid=%s clientId=%s threadpool=%d",
         os.getpid(), scheduler_client_id(), SCHEDULER_THREADPOOL_MAX_WORKERS,
     )
+
+    try:
+        _state_dir = os.environ.get("AGT_STATE_DIR", "C:/AGT_Runtime/state")
+        _capture_runtime_fingerprint(
+            service_name="agt_scheduler",
+            dotenv_paths=[
+                Path(_state_dir) / ".env",
+                Path("C:/AGT_Telegram_Bridge/.env"),
+            ],
+            nssm_services=["agt_bot", "agt_scheduler"],
+            logger=logger,
+        )
+    except Exception as e:
+        logger.warning("runtime_fingerprint wiring soft-fail: %s", e)
 
     # MR !90: evict any zombie agt_scheduler.py holding IBKR clientId=2
     # before opening a new IB connection. NSSM's restart of the outer
