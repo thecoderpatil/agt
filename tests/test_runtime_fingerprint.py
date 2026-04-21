@@ -10,7 +10,6 @@ from agt_equities.runtime_fingerprint import (
     SENTINEL_BEGIN,
     SENTINEL_END,
     _is_secret,
-    _parse_nssm_appenv,
     capture_and_log,
     compute_config_fingerprint,
     format_sentinel_banner,
@@ -102,23 +101,64 @@ def test_dotenv_hash_changes_with_file_contents(tmp_path):
     assert fp2.dotenv_hashes[str(env_file)] != h1
 
 
-def test_nssm_parser_extracts_key_value_pairs():
-    dump = (
-        'nssm.exe install agt_bot "C:\\Python\\python.exe"\n'
-        'nssm.exe set agt_bot AppDirectory "C:\\AGT"\n'
-        'nssm.exe set agt_bot AppEnvironmentExtra "AGT_BROKER_MODE=paper" "USE_SCHEDULER_DAEMON=1"\n'
-        'nssm.exe set agt_bot Start SERVICE_AUTO_START\n'
+
+def test_read_nssm_appenv_importerror_returns_none(monkeypatch):
+    """Non-Windows platform: winreg ImportError -> fail-open None."""
+    from agt_equities import runtime_fingerprint as rf
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "winreg":
+            raise ImportError("simulated non-Windows")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert rf._read_nssm_appenv("agt_bot") is None
+
+
+def test_read_nssm_appenv_missing_service_returns_none(monkeypatch):
+    """Windows but service-key missing: OSError -> fail-open None."""
+    from agt_equities import runtime_fingerprint as rf
+
+    fake_winreg = type("FakeWinreg", (), {})()
+    fake_winreg.HKEY_LOCAL_MACHINE = 0
+    def open_key(*a, **kw):
+        raise FileNotFoundError("no such key")
+    fake_winreg.OpenKey = open_key
+
+    import sys
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+    assert rf._read_nssm_appenv("definitely_not_a_real_service") is None
+
+
+def test_read_nssm_appenv_parses_multi_sz(monkeypatch):
+    """REG_MULTI_SZ list value -> dict[key, val] sorted."""
+    from agt_equities import runtime_fingerprint as rf
+
+    class FakeKey:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    fake_winreg = type("FakeWinreg", (), {})()
+    fake_winreg.HKEY_LOCAL_MACHINE = 0
+    fake_winreg.OpenKey = lambda *a, **kw: FakeKey()
+    fake_winreg.QueryValueEx = lambda key, name: (
+        ["USE_SCHEDULER_DAEMON=1", "AGT_BROKER_MODE=paper", "AGT_DB_PATH=/tmp/x.db"],
+        7,  # REG_MULTI_SZ
     )
-    assert _parse_nssm_appenv(dump) == {
+
+    import sys
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+    result = rf._read_nssm_appenv("agt_bot")
+    assert result == {
         "AGT_BROKER_MODE": "paper",
+        "AGT_DB_PATH": "/tmp/x.db",
         "USE_SCHEDULER_DAEMON": "1",
     }
-
-
-def test_nssm_parser_empty_when_appenv_line_missing():
-    dump = 'nssm.exe install agt_bot "C:\\Python\\python.exe"\n'
-    assert _parse_nssm_appenv(dump) == {}
-
 
 def test_nssm_absent_yields_nssm_hash_none():
     fp = compute_config_fingerprint(service_name="svc", env={}, nssm_services=[])

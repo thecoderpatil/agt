@@ -20758,6 +20758,34 @@ async def post_init(app) -> None:
 
     try:
 
+        _state_dir = os.environ.get("AGT_STATE_DIR", "C:/AGT_Runtime/state")
+
+        _capture_runtime_fingerprint(
+
+            service_name="agt_bot",
+
+            dotenv_paths=[
+
+                Path(_state_dir) / ".env",
+
+                Path("C:/AGT_Telegram_Bridge/.env"),
+
+            ],
+
+            nssm_services=["agt_bot", "agt_scheduler"],
+
+            logger=logger,
+
+        )
+
+    except Exception as e:
+
+        logger.warning("runtime_fingerprint wiring soft-fail: %s", e)
+
+
+
+    try:
+
         ib_conn = await ensure_ib_connected()
 
     except Exception as exc:
@@ -20829,33 +20857,6 @@ async def post_init(app) -> None:
     except Exception as exc:
 
         logger.warning("broker_preflight hook failed (non-fatal): %s", exc)
-
-
-    try:
-
-        _state_dir = os.environ.get("AGT_STATE_DIR", "C:/AGT_Runtime/state")
-
-        _capture_runtime_fingerprint(
-
-            service_name="agt_bot",
-
-            dotenv_paths=[
-
-                Path(_state_dir) / ".env",
-
-                Path("C:/AGT_Telegram_Bridge/.env"),
-
-            ],
-
-            nssm_services=["agt_bot", "agt_scheduler"],
-
-            logger=logger,
-
-        )
-
-    except Exception as e:
-
-        logger.warning("runtime_fingerprint wiring soft-fail: %s", e)
 
 
 
