@@ -19079,6 +19079,9 @@ async def _scheduled_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                 alerts.append(a)
 
+            if PAPER_MODE and PAPER_AUTO_EXECUTE and csp_result.get("staged"):
+                await _auto_execute_staged(ib_conn)
+
         except Exception as csp_exc:
 
             logger.warning("Watchdog CSP harvest failed: %s", csp_exc)
