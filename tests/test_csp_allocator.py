@@ -827,6 +827,7 @@ def test_route_ira_first_then_margin():
     assert all(t["account_id"] != "U21971297" for t in tickets)
 
 
+@pytest.mark.agt_tripwire_exempt
 @pytest.mark.skipif(
     not __import__("pathlib").Path(
         __import__("agt_equities.db", fromlist=["DB_PATH"]).DB_PATH
@@ -834,7 +835,12 @@ def test_route_ira_first_then_margin():
     reason="Production DB not available (CI/tripwire)",
 )
 def test_route_partial_when_household_cannot_fit_all():
-    """Request 10 contracts but combined capacity only fits 6 → returns 6."""
+    """Request 6 contracts, combined capacity exactly 6 → returns 6.
+
+    IRA fits 3 (cash_available=50K @ $15K/c) and margin fits 3 (nlv=50K).
+    Request = 6 = total capacity. Cash fills 3 (APPROVED), residual = 3
+    → margin pro_rata = 3, affordable = 3 → APPROVED → total = 6.
+    """
     hh = _fake_hh_snapshot(
         accounts={
             "U22076329": {
@@ -856,11 +862,15 @@ def test_route_partial_when_household_cannot_fit_all():
         },
     )
     cand = _fake_candidate(ticker="AAPL", strike=150.0)
-    tickets = _csp_route_to_accounts(10, hh, cand)
+    from unittest.mock import patch
+    nlv_mock = lambda ids, **kw: {a: 50_000.0 for a in ids}   # 50K → 3c @ $15K
+    with patch("agt_equities.fa_block_margin._fetch_available_nlv", side_effect=nlv_mock):
+        tickets = _csp_route_to_accounts(6, hh, cand)
     total = sum(t["quantity"] for t in tickets)
-    assert total == 6   # partial fill: all 6 that fit, not 10
+    assert total == 6   # IRA 3 + margin 3 = 6
 
 
+@pytest.mark.agt_tripwire_exempt
 @pytest.mark.skipif(
     not __import__("pathlib").Path(
         __import__("agt_equities.db", fromlist=["DB_PATH"]).DB_PATH
@@ -890,7 +900,10 @@ def test_route_spills_from_ira_to_margin_when_ira_full():
         },
     )
     cand = _fake_candidate(ticker="AAPL", strike=150.0)
-    tickets = _csp_route_to_accounts(5, hh, cand)
+    from unittest.mock import patch
+    nlv_mock = lambda ids, **kw: {a: 999_999.0 for a in ids}
+    with patch("agt_equities.fa_block_margin._fetch_available_nlv", side_effect=nlv_mock):
+        tickets = _csp_route_to_accounts(5, hh, cand)
     by_acct = {t["account_id"]: t["quantity"] for t in tickets}
     assert by_acct["U22076329"] == 2   # IRA filled first
     assert by_acct["U21971297"] == 3   # margin takes the spill
@@ -1489,6 +1502,7 @@ def test_orchestrator_skips_sub_integer_sizing():
     assert "rule_1" in result.skipped[0]["reason"]
 
 
+@pytest.mark.agt_tripwire_exempt
 @pytest.mark.skipif(
     not __import__("pathlib").Path(
         __import__("agt_equities.db", fromlist=["DB_PATH"]).DB_PATH
@@ -1498,30 +1512,27 @@ def test_orchestrator_skips_sub_integer_sizing():
 def test_orchestrator_mutates_snapshot_between_candidates():
     """Two candidates on the same household: mutation shrinks capacity.
 
-    Fixture: 1 margin account with tight buying_power. First
-    candidate consumes enough BP that the second candidate's router
-    cannot fit a single contract. Asserts the in-memory mutation is
-    visible across iterations.
+    Fixture: 1 margin account with tight hh_margin_nlv. First candidate
+    consumes enough of the VIX-scaled margin headroom that the second
+    candidate's Rule 2 gate fails (4.5K impact vs 3.5K remaining headroom).
 
-    hh_nlv=$200K (ceiling $40K, target $20K). One margin acct with
-    BP=$20K (fits exactly 1 × AAPL $150 @ $15K collateral).
-
-    Cand 1 (AAPL $150): target=$20K, c_low=1 ($15K), c_high=2 ($30K).
-      |15-20|=5, |30-20|=10 → picks 1. Route: acct fits 1 → staged 1.
-      Post-mutation BP = $20K - $15K = $5K.
-    Cand 2 (MSFT $150): sizing same → 1 contract. Route: BP=$5K <
-      $15K → max_fit=0 → no tickets → skipped with "no capacity".
+    hh_nlv=$100K, hh_margin_nlv=$40K (VIX<20 → deploy 20% → $8K budget).
+    Cand 1 (AAPL $150): new_impact=4.5K ≤ 8K → passes Rule 2.
+      Route via nlv_mock: takes 1 contract. Post-mutation hh_margin_el drops
+      from $40K to $35.5K (4.5K haircut consumed).
+    Cand 2 (MSFT $150): margin_used_pre=4.5K, headroom=3.5K < 4.5K impact
+      → Rule 2 gate blocks at Step 2 → msft_q == 0.
     """
     hh = _fake_hh_snapshot(
-        hh_nlv=200_000.0,
-        hh_margin_nlv=200_000.0,
-        hh_margin_el=200_000.0,
+        hh_nlv=100_000.0,
+        hh_margin_nlv=40_000.0,
+        hh_margin_el=40_000.0,
         accounts={
             "U21971297": {
                 "account_id": "U21971297",
-                "nlv": 200_000.0,
-                "el": 200_000.0,
-                "buying_power": 20_000.0,    # fits exactly 1 × $15K
+                "nlv": 40_000.0,
+                "el": 40_000.0,
+                "buying_power": 20_000.0,
                 "cash_available": 20_000.0,
                 "margin_eligible": True,
             },
@@ -1531,11 +1542,14 @@ def test_orchestrator_mutates_snapshot_between_candidates():
     cand_1 = _fake_candidate(ticker="AAPL", strike=150.0)
     cand_2 = _fake_candidate(ticker="MSFT", strike=150.0)
 
-    result = run_csp_allocator(
-        [cand_1, cand_2], snapshots, vix=18.0,
-        extras_provider=_empty_extras,
-        ctx=_live_ctx(None),
-    )
+    from unittest.mock import patch
+    nlv_mock = lambda ids, **kw: {a: 999_999.0 for a in ids}
+    with patch("agt_equities.fa_block_margin._fetch_available_nlv", side_effect=nlv_mock):
+        result = run_csp_allocator(
+            [cand_1, cand_2], snapshots, vix=18.0,
+            extras_provider=_empty_extras,
+            ctx=_live_ctx(None),
+        )
 
     # Group staged by ticker
     by_ticker: dict[str, int] = {}
