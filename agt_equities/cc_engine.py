@@ -150,9 +150,9 @@ def pick_cc_strike(inp: CCPickerInput) -> CCResult:
             reason="empty_chain",
         )
 
-    # Filter to strikes >= paper_basis, sort ascending.
+    # Filter to strikes >= max(paper_basis, spot): OTM-only floor.
     viable = sorted(
-        [s for s in inp.chain if s.strike >= inp.paper_basis],
+        [s for s in inp.chain if s.strike >= max(inp.paper_basis, inp.spot)],
         key=lambda s: s.strike,
     )
 
