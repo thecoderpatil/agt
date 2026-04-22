@@ -1227,7 +1227,7 @@ def _tickets_from_digest(
             "strike": float(candidate.strike),
             "expiry": candidate.expiry.replace("-", ""),
             "quantity": alloc.contracts_allocated,
-            "limit_price": float(candidate.mid),
+            "limit_price": float(candidate.bid),
             "annualized_yield": float(candidate.annualized_yield),
             "mode": "CSP_ENTRY",
             "status": "staged",
