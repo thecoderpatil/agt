@@ -18891,6 +18891,400 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+_LIQ_STAGING_BY_TOKEN: dict[str, dict] = {}
+
+_LIQ_TOKEN_TTL_S = 30 * 60  # 30 minutes
+
+
+
+
+
+def _liq_gc() -> None:
+
+    """Drop expired liquidation tokens in-place."""
+
+    now = _datetime.now().timestamp()
+
+    expired = [
+
+        t for t, p in _LIQ_STAGING_BY_TOKEN.items()
+
+        if now - p.get("_created_ts", 0) > _LIQ_TOKEN_TTL_S
+
+    ]
+
+    for t in expired:
+
+        try:
+
+            del _LIQ_STAGING_BY_TOKEN[t]
+
+        except KeyError:
+
+            pass
+
+
+
+
+
+def _liq_keyboard(token: str) -> InlineKeyboardMarkup:
+
+    return InlineKeyboardMarkup([[
+
+        InlineKeyboardButton("STAGE LIQUIDATE", callback_data=f"liq:stage:{token}"),
+
+        InlineKeyboardButton("REJECT", callback_data=f"liq:reject:{token}"),
+
+    ]])
+
+
+
+
+
+def _build_liquidate_tickets(payload: dict) -> list[dict]:
+
+    """Synthesize BTC calls + STC shares tickets from a LiquidateResult payload.
+
+
+
+    Both tickets ship transmit=False so the operator must explicitly
+
+    /approve before anything hits the wire. The BTC leg uses the
+
+    evaluator's btc_limit; the STC leg is a MKT order (sized by `shares`)
+
+    to close the underlying immediately after the calls cover. Operator
+
+    can hand-edit either before approving.
+
+    """
+
+    acct_id = payload.get("account_id") or ""
+
+    acct_label = ACCOUNT_LABELS.get(acct_id, acct_id)
+
+    ticker = payload.get("ticker") or ""
+
+    contracts = int(payload.get("contracts") or 0)
+
+    shares = int(payload.get("shares") or 0)
+
+    btc_limit = float(payload.get("btc_limit") or 0.0)
+
+    strike = float(payload.get("strike") or 0.0)
+
+    expiry = payload.get("expiry") or ""
+
+
+
+    tickets: list[dict] = []
+
+    if contracts > 0 and strike > 0 and expiry:
+
+        tickets.append({
+
+            "timestamp": _datetime.now().isoformat(),
+
+            "account_id": acct_id,
+
+            "account_label": acct_label,
+
+            "ticker": ticker,
+
+            "sec_type": "OPT",
+
+            "action": "BUY",
+
+            "quantity": contracts,
+
+            "order_type": "LMT",
+
+            "limit_price": round(btc_limit, 2),
+
+            "expiry": str(expiry).replace("-", ""),
+
+            "strike": strike,
+
+            "right": "C",
+
+            "status": "staged",
+
+            "transmit": False,                       # operator /approve gate
+
+            "strategy": "WHEEL-7 Liquidate BTC",
+
+            "mode": "LIQUIDATE",
+
+            "origin": "roll_engine",
+
+            "v2_state": "LIQUIDATE",
+
+            "v2_rationale": payload.get("reason", ""),
+
+        })
+
+    if shares > 0:
+
+        tickets.append({
+
+            "timestamp": _datetime.now().isoformat(),
+
+            "account_id": acct_id,
+
+            "account_label": acct_label,
+
+            "ticker": ticker,
+
+            "sec_type": "STK",
+
+            "action": "SELL",
+
+            "quantity": shares,
+
+            "order_type": "MKT",
+
+            "status": "staged",
+
+            "transmit": False,                       # operator /approve gate
+
+            "strategy": "WHEEL-7 Liquidate STC",
+
+            "mode": "LIQUIDATE",
+
+            "origin": "roll_engine",
+
+            "v2_state": "LIQUIDATE",
+
+            "v2_rationale": payload.get("reason", ""),
+
+        })
+
+    return tickets
+
+
+
+
+
+async def _page_critical_event(bot, kind: str, payload: dict) -> None:
+
+    """Send an out-of-band priority message for a V2 Router critical event.
+
+
+
+    kind is one of 'CRITICAL' | 'LIQUIDATE'. On LIQUIDATE the payload is
+
+    stashed in _LIQ_STAGING_BY_TOKEN keyed on a short uuid4 token so the
+
+    callback handler can look it up when the operator hits STAGE/REJECT.
+
+    """
+
+    try:
+
+        _liq_gc()
+
+        if kind == "CRITICAL":
+
+            ticker = payload.get("ticker", "?")
+
+            acct = payload.get("account_id", "?")
+
+            reason = payload.get("reason", "")
+
+            text = (
+
+                "\U0001f6a8 <b>CRITICAL PAGER</b>\n"
+
+                f"Ticker: <code>{html.escape(str(ticker))}</code>\n"
+
+                f"Account: <code>{html.escape(str(acct))}</code>\n"
+
+                f"Reason: <pre>{html.escape(str(reason))}</pre>"
+
+            )
+
+            await bot.send_message(
+
+                chat_id=AUTHORIZED_USER_ID,
+
+                text=text,
+
+                parse_mode="HTML",
+
+                disable_notification=False,
+
+            )
+
+            return
+
+
+
+        if kind == "LIQUIDATE":
+
+            import uuid as _uuid
+
+            token = _uuid.uuid4().hex[:10]
+
+            payload = dict(payload)
+
+            payload["_created_ts"] = _datetime.now().timestamp()
+
+            _LIQ_STAGING_BY_TOKEN[token] = payload
+
+            ticker = payload.get("ticker", "?")
+
+            acct = payload.get("account_id", "?")
+
+            contracts = payload.get("contracts", 0)
+
+            shares = payload.get("shares", 0)
+
+            btc = payload.get("btc_limit", 0.0)
+
+            stc_ref = payload.get("stc_market_ref", 0.0)
+
+            net = payload.get("net_proceeds_per_share", 0.0)
+
+            reason = payload.get("reason", "")
+
+            text = (
+
+                "\U0001f6a8 <b>LIQUIDATE REQUEST</b>\n"
+
+                f"Ticker: <code>{html.escape(str(ticker))}</code> "
+
+                f"| Account: <code>{html.escape(str(acct))}</code>\n"
+
+                f"BTC: <code>{contracts}c @ {float(btc):.2f}</code>\n"
+
+                f"STC: <code>{shares}sh @ MKT (ref ~{float(stc_ref):.2f})</code>\n"
+
+                f"Net proceeds: <code>{float(net):.2f}/sh</code>\n"
+
+                f"Reason: <pre>{html.escape(str(reason))}</pre>"
+
+            )
+
+            # MR !71: paper autopilot. Skip the STAGE/REJECT keyboard and
+
+            # auto-stage + drain via _auto_execute_staged. Live still goes
+
+            # through the manual keyboard gate for safety.
+
+            if PAPER_MODE and PAPER_AUTO_EXECUTE:
+
+                try:
+
+                    _LIQ_STAGING_BY_TOKEN.pop(token, None)  # token unused in auto path
+
+                    tickets = _build_liquidate_tickets(payload)
+
+                    if not tickets:
+
+                        await bot.send_message(
+
+                            chat_id=AUTHORIZED_USER_ID,
+
+                            text=text + "\n\n\u26a0\ufe0f <b>PAPER</b>: no tickets synthesized (0 contracts/0 shares).",
+
+                            parse_mode="HTML",
+
+                            disable_notification=False,
+
+                        )
+
+                        return
+
+                    await asyncio.to_thread(append_pending_tickets, tickets)
+
+                    ap_placed, ap_failed, ap_lines, ap_status = await _auto_execute_staged()
+
+                    exec_msg = (
+
+                        f"[PAPER AUTO-EXEC] status={ap_status} "
+
+                        f"placed={ap_placed} failed={ap_failed}"
+
+                    )
+
+                    if ap_lines:
+
+                        exec_msg += "\n" + "\n".join(ap_lines[:10])
+
+                        if len(ap_lines) > 10:
+
+                            exec_msg += f"\n... ({len(ap_lines) - 10} more)"
+
+                    await bot.send_message(
+
+                        chat_id=AUTHORIZED_USER_ID,
+
+                        text=text + f"\n\n\u2705 <b>PAPER AUTO-EXEC</b>\n<pre>{html.escape(exec_msg)}</pre>",
+
+                        parse_mode="HTML",
+
+                        disable_notification=False,
+
+                    )
+
+                except Exception as exc:
+
+                    logger.exception("MR !71 LIQUIDATE paper autopilot failed")
+
+                    try:
+
+                        await bot.send_message(
+
+                            chat_id=AUTHORIZED_USER_ID,
+
+                            text=text + f"\n\n\u274c <b>PAPER AUTO-EXEC FAILED</b>\n<pre>{html.escape(str(exc))}</pre>",
+
+                            parse_mode="HTML",
+
+                            disable_notification=False,
+
+                        )
+
+                    except Exception:
+
+                        pass
+
+                return
+
+            # Live path: manual STAGE/REJECT keyboard
+
+            text += (
+
+                "\nSTAGE = create pending tickets (transmit=False, /approve to fire).\n"
+
+                "REJECT = drop event, position held."
+
+            )
+
+            await bot.send_message(
+
+                chat_id=AUTHORIZED_USER_ID,
+
+                text=text,
+
+                parse_mode="HTML",
+
+                reply_markup=_liq_keyboard(token),
+
+                disable_notification=False,
+
+            )
+
+            return
+
+    except Exception as exc:
+
+        logger.exception("WHEEL-7 _page_critical_event failed: %s", exc)
+
+
+
+
+
 async def handle_liq_callback(
 
     update: Update, context: ContextTypes.DEFAULT_TYPE,
