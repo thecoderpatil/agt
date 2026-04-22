@@ -2969,7 +2969,7 @@ CC_MAX_ANN    = 130.0  # ceiling annualized %
 
 CC_BID_FLOOR  = 0.03   # skip quotes below this mid
 
-CC_TARGET_DTE = (14, 30)
+CC_TARGET_DTE = (4, 9)
 
 
 # Operator-controlled CC engine bypass. Set to comma-separated tickers to
@@ -15859,7 +15859,9 @@ async def _stage_dynamic_exit_candidate(
 
 
 
-            # Find best expiry in 14-30 DTE window, closest to 21
+            # Find best expiry within CC_TARGET_DTE window, closest to midpoint.
+            _cc_dte_min, _cc_dte_max = CC_TARGET_DTE
+            _cc_dte_mid = (_cc_dte_min + _cc_dte_max) // 2
 
             candidate_exp = None
 
@@ -15873,7 +15875,7 @@ async def _stage_dynamic_exit_candidate(
 
                     dte = (exp_date - today_d).days
 
-                    if 14 <= dte <= 30 and abs(dte - 21) < abs(candidate_dte - 21):
+                    if _cc_dte_min <= dte <= _cc_dte_max and abs(dte - _cc_dte_mid) < abs(candidate_dte - _cc_dte_mid):
 
                         candidate_exp = exp_str
 
@@ -15893,7 +15895,7 @@ async def _stage_dynamic_exit_candidate(
 
                     "excess_contracts": excess_contracts,
 
-                    "summary": f"{ticker} ({hh_short}): no viable expiry in 14-30 DTE",
+                    "summary": f"{ticker} ({hh_short}): no viable expiry in {_cc_dte_min}-{_cc_dte_max} DTE",
 
                 }
 
@@ -16704,9 +16706,9 @@ async def _walk_cc_chain(
 
 
 
-        # Anchor = smallest strike >= paper_basis (round UP).
+        # Anchor = smallest strike >= max(paper_basis, spot) — OTM floor.
 
-        viable = calls[calls["strike"] >= paper_basis].sort_values(
+        viable = calls[calls["strike"] >= max(paper_basis, spot)].sort_values(
 
             "strike", ascending=True
 
