@@ -259,7 +259,7 @@ test("6.2 CC max annualized", CC_MAX_ANN == 130.0,
      f"got {CC_MAX_ANN}")
 test("6.3 CC bid floor", CC_BID_FLOOR == 0.03,
      f"got {CC_BID_FLOOR}")
-test("6.4 CC target DTE", CC_TARGET_DTE == (14, 30),
+test("6.4 CC target DTE", CC_TARGET_DTE == (4, 9),
      f"got {CC_TARGET_DTE}")
 test("6.5 Exit target", DYNAMIC_EXIT_TARGET_PCT == 0.15,
      f"got {DYNAMIC_EXIT_TARGET_PCT}")
