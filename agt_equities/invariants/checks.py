@@ -723,7 +723,7 @@ def check_self_healing_write_path_canonical(
 
     _STALE_HEARTBEAT_S = 180
 
-    write_path = Path(agt_db.DB_PATH).resolve()
+    write_path = Path(agt_db.get_db_path()).resolve()
     canonical = Path(PROD_DB_PATH).resolve()
     if write_path != canonical:
         return [Violation(
