@@ -116,29 +116,36 @@ app.add_middleware(TokenAuthMiddleware)
 
 
 # ── VIX cache ────────────────────────────────────────────────────
-
+# Sprint 5 MR D F2-M-2: lock-guarded. GIL protects single-process dict reads
+# today; future async-uvicorn refactor with worker threads could race.
+import threading as _threading_mod
+_VIX_CACHE_LOCK = _threading_mod.Lock()
 _vix_cache: dict = {"value": None, "fetched_at": 0}
 
 def get_vix() -> float | None:
     """Fetch VIX from yfinance, cached 5 minutes."""
     now = time.time()
-    if _vix_cache["value"] is not None and now - _vix_cache["fetched_at"] < 300:
-        return _vix_cache["value"]
+    with _VIX_CACHE_LOCK:
+        if _vix_cache["value"] is not None and now - _vix_cache["fetched_at"] < 300:
+            return _vix_cache["value"]
     try:
         import yfinance as yf
         ticker = yf.Ticker("^VIX")
         val = ticker.fast_info.get("lastPrice") or ticker.info.get("regularMarketPrice")
         if val:
-            _vix_cache["value"] = float(val)
-            _vix_cache["fetched_at"] = now
+            with _VIX_CACHE_LOCK:
+                _vix_cache["value"] = float(val)
+                _vix_cache["fetched_at"] = now
             return float(val)
     except Exception as exc:
         logger.warning("VIX fetch failed: %s", exc)
-    return _vix_cache["value"]
+    with _VIX_CACHE_LOCK:
+        return _vix_cache["value"]
 
 
 # ── Spot price cache ─────────────────────────────────────────────
-
+# Sprint 5 MR D F2-M-2: lock-guarded. Same rationale as _VIX_CACHE_LOCK.
+_SPOT_CACHE_LOCK = _threading_mod.Lock()
 _spot_cache: dict = {}  # {ticker: (price, fetched_at)}
 
 def get_spots(tickers: list[str]) -> dict[str, float]:
@@ -146,12 +153,13 @@ def get_spots(tickers: list[str]) -> dict[str, float]:
     now = time.time()
     result = {}
     need_fetch = []
-    for t in tickers:
-        cached = _spot_cache.get(t)
-        if cached and now - cached[1] < 60:
-            result[t] = cached[0]
-        else:
-            need_fetch.append(t)
+    with _SPOT_CACHE_LOCK:
+        for t in tickers:
+            cached = _spot_cache.get(t)
+            if cached and now - cached[1] < 60:
+                result[t] = cached[0]
+            else:
+                need_fetch.append(t)
 
     if need_fetch:
         try:
@@ -161,14 +169,16 @@ def get_spots(tickers: list[str]) -> dict[str, float]:
                 close = data["Close"]
                 if hasattr(close, "iloc"):
                     last_row = close.iloc[-1]
-                    for t in need_fetch:
-                        try:
-                            val = float(last_row[t]) if t in last_row.index else None
-                            if val and val > 0:
-                                _spot_cache[t] = (val, now)
-                                result[t] = val
-                        except Exception:
-                            pass
+                    # Sprint 5 MR D F2-M-2: write-back under lock.
+                    with _SPOT_CACHE_LOCK:
+                        for t in need_fetch:
+                            try:
+                                val = float(last_row[t]) if t in last_row.index else None
+                                if val and val > 0:
+                                    _spot_cache[t] = (val, now)
+                                    result[t] = val
+                            except Exception:
+                                pass
         except Exception as exc:
             logger.warning("Spot fetch failed: %s", exc)
 
@@ -498,8 +508,10 @@ async def sse(request: Request):
                 }
                 yield f"event: topstrip\ndata: {json.dumps(data)}\n\n"
             except Exception as exc:
-                logger.warning("SSE update failed: %s", exc)
-                yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+                # Sprint 5 MR D F2-M-1: opaque error code to browser;
+                # full exception server-side only.
+                logger.exception("SSE update failed")
+                yield f"event: error\ndata: {json.dumps({'error': 'internal_error', 'code': 'SSE_STREAM'})}\n\n"
 
     return StreamingResponse(
         event_stream(),

@@ -82,8 +82,13 @@ def _load_scan_universe() -> list[dict]:
                 for r in rows
                 if (r["sector"] or "").strip().lower() not in excl
             ]
-    except Exception:
-        pass
+    except Exception as exc:
+        # Sprint 5 MR D F3-M-1: surface DB errors instead of silent pass.
+        logger.exception(
+            "_load_scan_universe DB read failed; falling back to hardcoded "
+            "watchlist (%d tickers). err=%s",
+            len(_FALLBACK_WATCHLIST), exc,
+        )
     return _FALLBACK_WATCHLIST
 
 
@@ -190,8 +195,14 @@ def scan_single_ticker(
 
         for exp_str, dte in valid_expirations:
             try:
-                chain = yf_ticker.option_chain(exp_str)
+                # Sprint 5 MR D F3-L-1: 5s timeout on yfinance option_chain.
+                with ThreadPoolExecutor(max_workers=1) as _ocx:
+                    _future = _ocx.submit(yf_ticker.option_chain, exp_str)
+                    chain = _future.result(timeout=5.0)
                 puts = chain.puts
+            except FuturesTimeout:
+                logger.warning("option_chain timeout for %s exp=%s (5s)", ticker, exp_str)
+                continue
             except Exception:
                 continue
 
