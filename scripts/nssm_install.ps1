@@ -61,7 +61,7 @@ NSSM settings applied to both services:
   AppStopMethodWindow      0
   AppStopMethodThreads     0
   AppExit Default          Restart
-  AppRestartDelay          30000     (30s backoff)
+  AppRestartDelay          60000     (60s backoff)
   ObjectName               $User
   Start                    SERVICE_DEMAND_START | SERVICE_AUTO_START
 
@@ -404,7 +404,7 @@ function Configure-Service {
     Set-NssmKey -Name $Name -Key "AppStopMethodThreads" -Values @("0")
 
     Set-NssmKey -Name $Name -Key "AppExit"         -Values @("Default", "Restart")
-    Set-NssmKey -Name $Name -Key "AppRestartDelay" -Values @("30000")
+    Set-NssmKey -Name $Name -Key "AppRestartDelay" -Values @("60000")
 
     if ($AllowLocalSystem) {
         # Built-in LocalSystem -- no password. NSSM accepts bare 'LocalSystem'

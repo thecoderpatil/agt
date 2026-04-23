@@ -38,6 +38,7 @@ no routing, no staging — those land in M1.2 through M1.5.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Protocol, runtime_checkable
 
 from agt_equities.config import (
@@ -45,6 +46,7 @@ from agt_equities.config import (
     CSP_ACTIVE_ACCOUNTS,
     HOUSEHOLD_MAP,
     MARGIN_ACCOUNTS,
+    is_csp_active_account,
 )
 from agt_equities.fa_block_margin import (
     AllocationDigest,
@@ -1212,16 +1214,18 @@ def _tickets_from_digest(
     candidate,
 ) -> list[dict]:
     """Convert approved AccountAllocations to M1.x ticket dicts."""
+    broker_mode = os.environ.get("AGT_BROKER_MODE", "paper")
     tickets: list[dict] = []
     for alloc in digest.allocations:
         if alloc.margin_check_status != STATUS_APPROVED:
             continue
         if alloc.contracts_allocated < 1:
             continue
-        if alloc.account_id not in CSP_ACTIVE_ACCOUNTS:
+        if not is_csp_active_account(alloc.account_id, broker_mode):
             logger.info(
-                "csp_allocator.skip_dormant account=%s reason=not_in_CSP_ACTIVE_ACCOUNTS",
+                "csp_allocator.skip_inactive account=%s mode=%s reason=not_in_CSP_ACTIVE_ACCOUNTS",
                 alloc.account_id,
+                broker_mode,
             )
             continue
         tickets.append({

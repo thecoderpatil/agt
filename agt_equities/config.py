@@ -209,3 +209,25 @@ CSP_ACTIVE_ACCOUNTS: frozenset[str] = frozenset({
     "U22076329",  # Yash Roth
     "U22388499",  # Vikram Ind
 })
+
+
+def is_csp_active_account(account_id: str, mode: str) -> bool:
+    """Return True if this account is eligible for a CSP entry.
+
+    Live mode: account must be in CSP_ACTIVE_ACCOUNTS (excludes dormant).
+    Paper mode: all accounts pass through (paper is a test sandbox; dormant
+    labeling is a live-capital concept and paper gateway accounts are
+    DU*-prefixed, not in the live-only frozenset).
+    Unknown mode strings fail closed to live semantics so a typo in
+    AGT_BROKER_MODE never opens the dormant gate in production.
+
+    Args:
+        account_id: IBKR account number (e.g. "U21971297" or "DU1234567").
+        mode: broker mode, "live" or "paper" (typically AGT_BROKER_MODE env).
+
+    Returns:
+        True if eligible for CSP entry; False otherwise.
+    """
+    if mode == "paper":
+        return True
+    return account_id in CSP_ACTIVE_ACCOUNTS
