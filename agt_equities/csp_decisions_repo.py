@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agt_equities.db import get_db_connection, get_ro_connection
+from agt_equities.db import get_db_connection, get_ro_connection, tx_immediate
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS csp_decisions (
@@ -93,22 +93,28 @@ def record_decision(
     evidence_json = json.dumps(evidence_snapshot, default=str, sort_keys=True)
 
     try:
+        # E-H-4 fix: wrap in tx_immediate (BEGIN IMMEDIATE) so the audit
+        # row is not silently rolled back under WAL contention. Bare
+        # `with conn:` (Python sqlite3 default DEFERRED) races to upgrade
+        # the lock; on rollback the audit row is lost — a compliance
+        # concern (csp_decisions is the per-candidate decision audit
+        # trail). Inner conn.commit() removed; tx_immediate is the boundary.
         with get_db_connection(db_path) as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO csp_decisions (
-                    run_id, household_id, ticker, decided_at_utc,
-                    final_outcome, gate_verdicts, evidence_snapshot,
-                    n_requested, n_sized
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id, household_id, ticker, now,
-                    final_outcome, verdicts_json, evidence_json,
-                    n_requested, n_sized,
-                ),
-            )
-            conn.commit()
+            with tx_immediate(conn):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO csp_decisions (
+                        run_id, household_id, ticker, decided_at_utc,
+                        final_outcome, gate_verdicts, evidence_snapshot,
+                        n_requested, n_sized
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id, household_id, ticker, now,
+                        final_outcome, verdicts_json, evidence_json,
+                        n_requested, n_sized,
+                    ),
+                )
     except sqlite3.Error as exc:
         # Fail-open: audit trail failure must NOT block trading decisions.
         # Log-only; allocator continues.
