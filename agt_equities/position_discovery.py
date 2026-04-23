@@ -573,9 +573,15 @@ async def discover_positions(
 
                         spot_prices[tkr] = round(spot, 2)
 
-            except Exception:
+            except Exception as exc:
 
-                pass
+                logger.warning(
+
+                    "ibkr_price_volatility fallback failed for %s: %s",
+
+                    tkr, exc,
+
+                )
 
 
 

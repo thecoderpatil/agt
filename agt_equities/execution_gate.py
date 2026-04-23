@@ -31,7 +31,20 @@ def _env_enabled() -> bool:
 
 
 def _db_enabled() -> bool:
-    """Check execution_state DB row. No row or disabled=0 means enabled."""
+    """Check execution_state DB row. No row or disabled=0 means enabled.
+
+    DEPRECATED (E-M-7 Sprint 3 MR 5): this tolerant variant fails-open on DB
+    errors. Production order-driving paths MUST use ``_db_enabled_strict()``,
+    which raises ``ControlPlaneUnreadable``. Kept only to back the
+    (also-deprecated) ``assert_execution_enabled()`` helper. The WARNING log
+    below fires on every invocation so any regression of a live-capital site
+    onto the tolerant path is visible in logs.
+    """
+    logger.warning(
+        "execution_gate._db_enabled() invoked — this is the tolerant fail-open "
+        "variant. Live-capital paths must use _db_enabled_strict(). Check the "
+        "caller and migrate to strict if this is an order-driving site."
+    )
     try:
         with closing(get_ro_connection()) as conn:
             row = conn.execute(
@@ -46,6 +59,11 @@ def _db_enabled() -> bool:
 
 def assert_execution_enabled(in_process_halted: bool = False) -> None:
     """Raises ExecutionDisabledError if any disable gate is active.
+
+    DEPRECATED (E-M-7 Sprint 3 MR 5): use ``assert_execution_enabled_strict()``
+    at all order-driving call sites. This tolerant variant fails-open on DB
+    errors and is retained only for non-order paths that need the looser
+    semantics. No production caller remains as of 2026-04-24.
 
     Args:
         in_process_halted: pass telegram_bot._HALTED at the call site.

@@ -267,19 +267,19 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     client_id = ib_connector.config.client_id
 
     def _heartbeat_job() -> None:
+        # E-M-6 (Sprint 3 MR 5): run invariants tick BEFORE heartbeat write.
+        # Prior order was self-referential — the writer validated its own
+        # freshness. Running the tick first preserves the invariant's purpose
+        # (catching stuck daemons). ADR-007 Step 4. Live capital.
+        try:
+            _check_invariants_tick()
+        except Exception:
+            logger.exception("invariant heartbeat tick failed")
         write_heartbeat(
             DAEMON_NAME,
             client_id=client_id,
             notes="ok",
         )
-        # ADR-007 Step 4: run safety invariants once per 60s tick and
-        # register any Violations as incidents. Isolated from the
-        # heartbeat write above so an invariant-path bug cannot
-        # block the liveness signal. Live capital.
-        try:
-            _check_invariants_tick()
-        except Exception:
-            logger.exception("invariant heartbeat tick failed")
 
     scheduler.add_job(
         _heartbeat_job,
