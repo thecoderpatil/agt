@@ -151,14 +151,15 @@ if (-not $SkipServiceRestart) {
 
 if (-not $SkipServiceRestart) {
 
-    $dbPath = "$CanonicalDbDir\agt_desk.db"
+    $dbPath = Join-Path $CanonicalDbDir "agt_desk.db"
 
     if (Test-Path $dbPath) {
 
-        # 5s grace so services can settle their connections
         Start-Sleep -Seconds 5
 
-        $integrityResult = & python -c "import sqlite3, sys; conn = sqlite3.connect(r'$dbPath', timeout=10); row = conn.execute('PRAGMA integrity_check').fetchone(); conn.close(); print(row[0] if row else 'none'); sys.exit(0 if row and row[0] == 'ok' else 2)"
+        $integrityScript = Join-Path $PSScriptRoot "integrity_check.py"
+
+        $integrityResult = & python $integrityScript $dbPath
 
         $integrityExit = $LASTEXITCODE
 
@@ -166,7 +167,7 @@ if (-not $SkipServiceRestart) {
 
         if ($integrityExit -ne 0) {
 
-            Write-Error "Sprint 5 MR C: integrity_check returned non-ok ($integrityResult). Deploy halted."
+            Write-Error "Sprint 5 MR C: integrity_check returned non-ok. Deploy halted."
 
             exit $integrityExit
 
@@ -174,7 +175,7 @@ if (-not $SkipServiceRestart) {
 
     } else {
 
-        Write-Warning "PRAGMA integrity_check skipped — DB path missing ($dbPath)"
+        Write-Warning "PRAGMA integrity_check skipped: DB path missing ($dbPath)"
 
     }
 

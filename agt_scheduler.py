@@ -938,9 +938,12 @@ def main() -> int:
         )
         return 0
     # ADR-007 Addendum §2.1 — halt if DB path is not canonical.
+    # Sprint 5 hotfix (post-MR-B): use get_db_path() not DB_PATH. MR B made
+    # DB_PATH None at import (lazy resolve); this call-site was missed and
+    # crashed scheduler boot with TypeError(Path(None)) on 2026-04-23 17:21.
     from agt_equities.invariants.bootstrap import assert_canonical_db_path
     from agt_equities import db as agt_db
-    assert_canonical_db_path(resolved_path=agt_db.DB_PATH)
+    assert_canonical_db_path(resolved_path=agt_db.get_db_path())
     # Register signal handlers BEFORE asyncio.run so SIGINT/SIGBREAK fire
     # cleanly during the brief pre-loop window. The asyncio in-function
     # _signal_handler in _run() takes over once the loop is established.
