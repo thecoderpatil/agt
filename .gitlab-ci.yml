@@ -74,7 +74,7 @@
 
 
 
-#     - tests/test_bridge2_extras.py tests/test_csp_allocator.py tests/test_telegram_ui/     (bridge-2 extras)
+#     - tests/test_bridge2_extras.py tests/test_csp_active_accounts.py tests/test_csp_allocator.py tests/test_telegram_ui/     (bridge-2 extras)
 
 
 

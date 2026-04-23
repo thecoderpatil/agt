@@ -31,14 +31,10 @@ def _fetchone(conn: sqlite3.Connection, sql: str, params=()):
     finally:
         cur.close()
 
-ACCOUNT_ALIAS = {
-    "U21971297": "Yash Ind",
-    "U22076329": "Yash Roth",
-    "U22076184": "Yash Trad IRA",
-    "U22388499": "Vikram",
-}
-
-from agt_equities.config import ACCOUNT_TO_HOUSEHOLD as HOUSEHOLD_MAP  # acct→hh
+from agt_equities.config import (
+    ACCOUNT_ALIAS,  # canonical source — do not redefine locally
+    ACCOUNT_TO_HOUSEHOLD as HOUSEHOLD_MAP,
+)
 
 
 def _safe(fn):
