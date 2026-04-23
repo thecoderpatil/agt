@@ -110,3 +110,46 @@ def test_unknown_mode_defaults_to_live_semantics() -> None:
     assert is_csp_active_account("U22076184", mode="") is False
     assert is_csp_active_account("U21971297", mode="live") is True
     assert is_csp_active_account("U21971297", mode="prod") is True
+
+
+# ---------- MR !205 fail-closed regression guards (E-H-2) ----------
+
+
+def test_csp_allocator_default_broker_mode_is_empty_not_paper() -> None:
+    """csp_allocator._tickets_from_digest must default to '' (fail-closed),
+    NOT 'paper' (which would silently bypass the dormant filter).
+
+    E-H-2 from opus_bug_hunt_overnight.md: MR !200 introduced a 'paper'
+    default that allowed dormant-account CSP entries on a live system
+    when AGT_BROKER_MODE was unset.
+    """
+    import inspect
+
+    from agt_equities import csp_allocator
+
+    src = inspect.getsource(csp_allocator._tickets_from_digest)
+    # The exact pattern. If anyone re-introduces "paper" as the default,
+    # this assertion fires.
+    assert 'os.environ.get("AGT_BROKER_MODE", "")' in src
+    assert 'os.environ.get("AGT_BROKER_MODE", "paper")' not in src
+
+
+def test_ib_conn_paper_fallback_uses_canonical_env_var_name() -> None:
+    """ib_conn._resolve_default_ports config-import-failure fallback must
+    read AGT_PAPER_MODE (canonical), NOT PAPER_MODE (typo), and must not
+    default to paper-truthy.
+
+    E-H-1 from opus_bug_hunt_overnight.md: prior code read
+    os.environ.get("PAPER_MODE", "1") which silently routed live launches
+    to paper port 4002 if config import failed and AGT_BROKER_MODE was
+    unset.
+    """
+    import inspect
+
+    from agt_equities import ib_conn
+
+    src = inspect.getsource(ib_conn._resolve_default_ports)
+    # Wrong pattern must not appear
+    assert 'os.environ.get("PAPER_MODE", "1")' not in src
+    # Correct env var name must appear
+    assert "AGT_PAPER_MODE" in src
