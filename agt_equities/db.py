@@ -38,43 +38,65 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-import os
-
-# Canonical DB path. Resolved at import time from AGT_DB_PATH env var,
-# falling back to the __file__-relative path for CI / dev environments
-# where AGT_DB_PATH is not set. Production NSSM env sets AGT_DB_PATH,
-# so the fallback is never exercised in prod.
-# Tripwire fixture monkeypatches this attribute to a sentinel path.
-_BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH: Path = Path(
-    os.environ.get("AGT_DB_PATH") or str(_BASE_DIR / "agt_desk.db")
-)
+# Sprint 5 MR B (E-M-4): canonical DB path, LAZY RESOLUTION.
+#
+# DB_PATH starts as None. No `__file__`-anchored fallback at import time —
+# MR 1 Sprint 3 wrapped circuit_breaker calls in asyncio.to_thread, and any
+# module-scope `Path(__file__).resolve().parent` inside a worker thread under
+# atomic-rotation deploy (`C:\AGT_Runtime\bridge-current\`) resolved to the
+# rotated snapshot, not the canonical `C:\AGT_Telegram_Bridge\`.
+#
+# Production NSSM services set AGT_DB_PATH in AppEnvironmentExtra; missing env
+# var is a hard-fail on the first DB connection. Tests either inject
+# db_path=... or set AGT_DB_PATH via monkeypatch.setenv in autouse fixtures.
+#
+# Tests that monkeypatch DB_PATH directly continue to work — module-attribute
+# resolution runs second in _resolve_db_path, after override arg but before
+# env lookup.
+DB_PATH: Path | None = None
 
 
 def _resolve_db_path(override: str | Path | None = None) -> Path:
-    """Resolve the canonical DB path.
+    """Resolve the canonical DB path (LAZY — no __file__-anchored fallback).
 
     Resolution order:
       1. Explicit `override` arg (tests, scripts that know what they want).
-      2. Module-level DB_PATH attribute if non-None (tripwire fixture
-         and any legacy caller that monkeypatches it).
-      3. AGT_DB_PATH env var.
+      2. Module-level DB_PATH attribute if non-None (tripwire fixture and any
+         legacy caller that monkeypatches it directly).
+      3. AGT_DB_PATH env var (production default).
 
-    Returns a Path. Raises RuntimeError only if called with no override
-    and DB_PATH is somehow None (should not occur after MR 1).
+    Raises RuntimeError if all three are unset. Prior behavior silently fell
+    back to a `Path(__file__).resolve().parent.parent / "agt_desk.db"` path —
+    eliminated in Sprint 5 MR B because that path resolved to different
+    locations depending on which thread / process / deploy-rotation snapshot
+    executed the import.
     """
     if override is not None:
         return Path(override)
     if DB_PATH is not None:
         return Path(DB_PATH)
     env = os.environ.get("AGT_DB_PATH", "").strip()
-    if not env:
-        raise RuntimeError(
-            "AGT_DB_PATH unset, DB_PATH module attribute is None, and no "
-            "db_path= argument supplied. This is a boot-contract violation "
-            "-- the service should have failed at assert_boot_contract()."
-        )
-    return Path(env)
+    if env:
+        return Path(env)
+    raise RuntimeError(
+        "AGT_DB_PATH unset, DB_PATH module attribute is None, and no "
+        "db_path= argument supplied. Production NSSM env must set "
+        "AGT_DB_PATH=<canonical>; tests must inject db_path=... or "
+        "monkeypatch.setenv('AGT_DB_PATH', ...) before first SUT import. "
+        "Sprint 5 MR B (E-M-4) eliminated the __file__-anchored fallback — "
+        "this is now hard-fail instead of silent-misroute."
+    )
+
+
+def get_db_path(override: str | Path | None = None) -> Path:
+    """Public accessor for the resolved DB path. Wraps `_resolve_db_path`.
+
+    Prefer `get_db_connection()` / `get_ro_connection()` when you want a
+    connection. Use `get_db_path()` only when you need the path itself
+    (e.g., boot-contract assertions, `sqlite3.connect(uri=True, ...)` URI
+    construction, logging the resolved path at startup).
+    """
+    return _resolve_db_path(override=override)
 
 # Connection-level lock wait. 15 seconds covers the worst-case Flex sync
 # contention window observed in production (two-daemon WAL contention).

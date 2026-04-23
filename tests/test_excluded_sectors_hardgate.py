@@ -56,7 +56,9 @@ def test_load_scan_universe_drops_excluded_industry_groups(tmp_path, monkeypatch
         conn.commit()
 
     import pxo_scanner
-    monkeypatch.setattr(pxo_scanner, "_DB_PATH", db)
+    # Sprint 5 MR B (E-M-4): pxo_scanner no longer has _DB_PATH; resolve lazily
+    # via _resolve_scanner_db_path(). Patch that instead.
+    monkeypatch.setattr(pxo_scanner, "_resolve_scanner_db_path", lambda: db)
     universe = pxo_scanner._load_scan_universe()
     tickers = {e["ticker"] for e in universe}
     assert "MRNA" not in tickers
@@ -89,7 +91,9 @@ def test_load_scan_universe_filter_is_case_insensitive(tmp_path, monkeypatch):
         conn.commit()
 
     import pxo_scanner
-    monkeypatch.setattr(pxo_scanner, "_DB_PATH", db)
+    # Sprint 5 MR B (E-M-4): pxo_scanner no longer has _DB_PATH; resolve lazily
+    # via _resolve_scanner_db_path(). Patch that instead.
+    monkeypatch.setattr(pxo_scanner, "_resolve_scanner_db_path", lambda: db)
     tickers = {e["ticker"] for e in pxo_scanner._load_scan_universe()}
     assert "LOWER" not in tickers
     assert "UPPER" not in tickers

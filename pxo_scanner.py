@@ -31,10 +31,13 @@ logger = logging.getLogger("pxo_scanner")
 # Dynamic universe loader — reads from ticker_universe SQLite table.
 # Falls back to a hardcoded minimum set if DB is empty/missing.
 # ---------------------------------------------------------------------------
-_DB_PATH = Path(
-    os.environ.get("AGT_DB_PATH")
-    or str(Path(__file__).resolve().parent / "agt_desk.db")
-)
+# Sprint 5 MR B (E-M-4): lazy DB-path resolution — no __file__-anchored fallback.
+# Imported from agt_equities.db so prod NSSM env is authoritative.
+from agt_equities.db import get_db_path as _get_db_path
+
+
+def _resolve_scanner_db_path() -> Path:
+    return _get_db_path()
 
 _FALLBACK_WATCHLIST: list[dict] = [
     {"ticker": "AAPL",  "sector": "Technology Hardware"},
@@ -58,7 +61,7 @@ def _load_scan_universe() -> list[dict]:
     """Load CSP scan candidates from ticker_universe table."""
     try:
         from contextlib import closing
-        with closing(sqlite3.connect(_DB_PATH, timeout=10.0)) as conn:
+        with closing(sqlite3.connect(str(_resolve_scanner_db_path()), timeout=10.0)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """SELECT ticker, gics_industry_group AS sector

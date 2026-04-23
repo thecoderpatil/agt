@@ -166,9 +166,8 @@ from telegram.ext import (
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DB_PATH = Path(os.environ.get("AGT_DB_PATH") or str(BASE_DIR / "agt_desk.db"))
-
-
+# Sprint 5 MR B (E-M-4): DB_PATH resolved lazily via agt_equities.db.get_db_path().
+# BASE_DIR retained for LOG_DIR / local .env resolution only — NOT for DB path.
 
 _env_path = Path(os.environ.get("AGT_ENV_FILE") or str(BASE_DIR / ".env"))
 
@@ -179,10 +178,14 @@ load_dotenv(_env_path, override=False)
 from agt_equities.invariants.bootstrap import assert_canonical_db_path as _assert_canonical_db_path
 from agt_equities import db as _agt_db
 from agt_equities.runtime_fingerprint import capture_and_log as _capture_runtime_fingerprint
+# Sprint 5 MR B: read resolved path via get_db_path() (lazy), not DB_PATH attr.
 _assert_canonical_db_path(
-    resolved_path=_agt_db.DB_PATH,
+    resolved_path=_agt_db.get_db_path(),
     allow_override=bool(os.environ.get("AGT_BOOTSTRAP_ALLOW_OVERRIDE")),
 )
+
+# Sprint 5 MR B: local DB_PATH bound to resolved canonical path.
+DB_PATH = _agt_db.get_db_path()
 
 
 
