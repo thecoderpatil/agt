@@ -1047,6 +1047,14 @@ def _check_and_track_tokens(input_tokens: int, output_tokens: int, model: str = 
 
     _tokens_used_today += total
 
+    # Sprint 5 MR D F1-L-1: skip DB write when pre-flight call passes (0, 0).
+    # Prior behavior inserted a zero-token row AND incremented api_calls on
+    # every incoming user message, inflating /budget report call count by one
+    # per message. The budget check itself still runs so the pre-flight still
+    # surfaces "budget exhausted" correctly.
+    if input_tokens == 0 and output_tokens == 0:
+        return _tokens_used_today <= DAILY_TOKEN_BUDGET
+
 
 
     try:
