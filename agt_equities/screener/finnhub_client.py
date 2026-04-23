@@ -68,6 +68,8 @@ DEFAULT_CALLS_PER_MINUTE = 50
 TTL_PROFILE2 = 24 * 60 * 60      # 24h — sector/country/MC change rarely
 TTL_METRIC = 24 * 60 * 60        # 24h — fundamentals refresh quarterly
 TTL_DIVIDEND2 = 24 * 60 * 60     # 24h — ex-div dates publish well in advance
+TTL_COMPANY_NEWS = 15 * 60       # 15min — news goes stale fast
+TTL_GENERAL_NEWS = 15 * 60       # 15min — same
 
 # Retry policy
 MAX_RETRIES = 3
@@ -275,6 +277,54 @@ class FinnhubClient:
             ttl=TTL_DIVIDEND2,
             endpoint="/stock/dividend2",
             params={"symbol": ticker, "from": from_date, "to": to_date},
+            allow_list_response=True,
+        )
+
+    async def get_company_news(
+        self, ticker: str, from_date: str, to_date: str,
+    ) -> list[dict] | None:
+        """Fetch /company-news — per-ticker news in date range.
+
+        Args:
+            ticker: ticker symbol
+            from_date: ISO date YYYY-MM-DD inclusive
+            to_date: ISO date YYYY-MM-DD inclusive
+
+        Returns a list of news records as Finnhub returns them. Each dict
+        has keys including: id, category, datetime (epoch seconds),
+        headline, image, related, source, summary, url. Empty list means
+        no news in window — valid, not a failure.
+
+        TTL 15min — news goes stale fast.
+        """
+        cache_key = f"{ticker}_{from_date}_{to_date}"
+        return await self._get_cached(
+            category="finnhub/company_news",
+            key=cache_key,
+            ttl=TTL_COMPANY_NEWS,
+            endpoint="/company-news",
+            params={"symbol": ticker, "from": from_date, "to": to_date},
+            allow_list_response=True,
+        )
+
+    async def get_general_news(
+        self, category: str = "general",
+    ) -> list[dict] | None:
+        """Fetch /news?category=<x> — market-wide / macro news.
+
+        Args:
+            category: one of "general", "forex", "crypto", "merger". Default
+                "general" covers the macro feed consumed by the digest.
+
+        Returns a list of news records as Finnhub returns them. Cache key
+        is the category alone since this is not ticker-specific. TTL 15min.
+        """
+        return await self._get_cached(
+            category="finnhub/general_news",
+            key=category,
+            ttl=TTL_GENERAL_NEWS,
+            endpoint="/news",
+            params={"category": category},
             allow_list_response=True,
         )
 
