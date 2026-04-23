@@ -618,6 +618,26 @@ async def _push_mode_transition(app, old_mode: str, new_mode: str,
 
 
 
+# ---------------------------------------------------------------------------
+# MR 1 (Sprint 3, 2026-04-24): sync DB helpers for asyncio.to_thread offload.
+# Factored so async callback handlers can push blocking DB work off the PTB
+# event loop. Under WAL contention (scheduler writes at 09:30-10:30 ET),
+# inline sync reads/writes could freeze the bot 1-15s. See
+# reports/telegram_approval_gate_asyncio_audit.md (Investigation B).
+# ---------------------------------------------------------------------------
+
+
+def _sync_db_read_one(sql: str, params: tuple = ()):
+    with closing(_get_db_connection()) as conn:
+        return conn.execute(sql, params).fetchone()
+
+
+def _sync_db_write(sql: str, params: tuple = ()) -> int:
+    with closing(_get_db_connection()) as conn:
+        with tx_immediate(conn):
+            return conn.execute(sql, params).rowcount
+
+
 def init_db() -> None:
 
     with closing(_get_db_connection()) as conn:
@@ -9178,7 +9198,10 @@ async def handle_orders_callback(
 
                         continue
 
-                    assert_execution_enabled_strict(in_process_halted=_HALTED)
+                    await asyncio.to_thread(
+                        assert_execution_enabled_strict,
+                        in_process_halted=_HALTED,
+                    )
 
                     ib_conn.placeOrder(target_trade.contract, target_trade.order)
 
@@ -11571,19 +11594,13 @@ async def handle_approve_callback(
 
         if action == "reject_all":
 
-            # ── WRITE phase (no await inside) ──
+            # ── WRITE phase (offloaded to thread, conn scoped inside helper) ──
 
-            with closing(_get_db_connection()) as conn:
-
-                with tx_immediate(conn):
-
-                    result = conn.execute(
-
-                        "UPDATE pending_orders SET status = 'rejected' WHERE status = 'staged'"
-
-                    )
-
-                    count = result.rowcount
+            count = await asyncio.to_thread(
+                _sync_db_write,
+                "UPDATE pending_orders SET status = 'rejected' WHERE status = 'staged'",
+                (),
+            )
 
             # ── AWAIT phase (conn released) ──
 
@@ -11673,27 +11690,20 @@ async def handle_approve_callback(
 
 
 
-        # ── WRITE phase: CAS claim single row ──
+        # ── WRITE phase: CAS claim single row (offloaded to thread) ──
 
-        with closing(_get_db_connection()) as conn:
-
-            with tx_immediate(conn):
-
-                result = conn.execute(
-
-                    "UPDATE pending_orders SET status = 'processing' "
-
-                    "WHERE id = ? AND status = 'staged'",
-
-                    (db_id,),
-
-                )
+        claimed_rowcount = await asyncio.to_thread(
+            _sync_db_write,
+            "UPDATE pending_orders SET status = 'processing' "
+            "WHERE id = ? AND status = 'staged'",
+            (db_id,),
+        )
 
 
 
         # ── AWAIT phase (conn released) ──
 
-        if result.rowcount == 0:
+        if claimed_rowcount == 0:
 
             await query.edit_message_text(
 
@@ -11707,17 +11717,13 @@ async def handle_approve_callback(
 
 
 
-        # ── READ phase: fetch claimed row ──
+        # ── READ phase: fetch claimed row (offloaded to thread) ──
 
-        with closing(_get_db_connection()) as conn:
-
-            row = conn.execute(
-
-                "SELECT id, payload FROM pending_orders WHERE id = ?",
-
-                (db_id,),
-
-            ).fetchone()
+        row = await asyncio.to_thread(
+            _sync_db_read_one,
+            "SELECT id, payload FROM pending_orders WHERE id = ?",
+            (db_id,),
+        )
 
 
 
@@ -11951,12 +11957,12 @@ async def handle_csp_approval_callback(
         return
 
     try:
-        with closing(_get_db_connection()) as conn:
-            row = conn.execute(
-                "SELECT status, approved_indices_json, candidates_json "
-                "FROM csp_pending_approval WHERE id=?",
-                (row_id,),
-            ).fetchone()
+        row = await asyncio.to_thread(
+            _sync_db_read_one,
+            "SELECT status, approved_indices_json, candidates_json "
+            "FROM csp_pending_approval WHERE id=?",
+            (row_id,),
+        )
     except Exception:
         logger.exception("handle_csp_approval_callback: DB read error row=%d", row_id)
         await query.answer("DB error.", show_alert=True)
@@ -11995,14 +12001,13 @@ async def handle_csp_approval_callback(
 
         new_json = json.dumps(sorted(approved_indices))
         try:
-            with closing(_get_db_connection()) as conn:
-                conn.execute(
-                    "UPDATE csp_pending_approval "
-                    "SET approved_indices_json=? "
-                    "WHERE id=? AND status='pending'",
-                    (new_json, row_id),
-                )
-                conn.commit()
+            await asyncio.to_thread(
+                _sync_db_write,
+                "UPDATE csp_pending_approval "
+                "SET approved_indices_json=? "
+                "WHERE id=? AND status='pending'",
+                (new_json, row_id),
+            )
         except Exception:
             logger.exception(
                 "handle_csp_approval_callback: %s update error row=%d", action, row_id
@@ -12012,19 +12017,18 @@ async def handle_csp_approval_callback(
     elif action == "csp_submit":
         new_json = json.dumps(sorted(approved_indices))
         try:
-            with closing(_get_db_connection()) as conn:
-                conn.execute(
-                    """
-                    UPDATE csp_pending_approval
-                    SET status='approved',
-                        approved_indices_json=?,
-                        resolved_at_utc=?,
-                        resolved_by='yash'
-                    WHERE id=? AND status='pending'
-                    """,
-                    (new_json, now_str, row_id),
-                )
-                conn.commit()
+            await asyncio.to_thread(
+                _sync_db_write,
+                """
+                UPDATE csp_pending_approval
+                SET status='approved',
+                    approved_indices_json=?,
+                    resolved_at_utc=?,
+                    resolved_by='yash'
+                WHERE id=? AND status='pending'
+                """,
+                (new_json, now_str, row_id),
+            )
         except Exception:
             logger.exception(
                 "handle_csp_approval_callback: submit error row=%d", row_id
@@ -12118,23 +12122,15 @@ async def handle_dex_callback(
 
     if action == "cancel":
 
-        with closing(_get_db_connection()) as conn:
+        cancel_rowcount = await asyncio.to_thread(
+            _sync_db_write,
+            "UPDATE bucket3_dynamic_exit_log "
+            "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
+            "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+            (audit_id,),
+        )
 
-            with tx_immediate(conn):
-
-                result = conn.execute(
-
-                    "UPDATE bucket3_dynamic_exit_log "
-
-                    "SET final_status = 'CANCELLED', last_updated = CURRENT_TIMESTAMP "
-
-                    "WHERE audit_id = ? AND final_status = 'ATTESTED'",
-
-                    (audit_id,),
-
-                )
-
-        if result.rowcount == 0:
+        if cancel_rowcount == 0:
 
             logger.warning("CANCEL_RACE_LOST: audit_id=%s", audit_id)
 
@@ -12190,19 +12186,14 @@ async def handle_dex_callback(
 
 
 
-    # Step 0: Fetch ATTESTED row
+    # Step 0: Fetch ATTESTED row (offloaded)
 
-    with closing(_get_db_connection()) as conn:
-
-        row = conn.execute(
-
-            "SELECT * FROM bucket3_dynamic_exit_log "
-
-            "WHERE audit_id = ? AND final_status = 'ATTESTED'",
-
-            (audit_id,),
-
-        ).fetchone()
+    row = await asyncio.to_thread(
+        _sync_db_read_one,
+        "SELECT * FROM bucket3_dynamic_exit_log "
+        "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+        (audit_id,),
+    )
 
 
 
@@ -12272,23 +12263,15 @@ async def handle_dex_callback(
 
     if not is_wartime and row["re_validation_count"] >= 3:
 
-        # Transition to DRIFT_BLOCKED terminal
+        # Transition to DRIFT_BLOCKED terminal (offloaded)
 
-        with closing(_get_db_connection()) as conn:
-
-            with tx_immediate(conn):
-
-                conn.execute(
-
-                    "UPDATE bucket3_dynamic_exit_log "
-
-                    "SET final_status = 'DRIFT_BLOCKED', last_updated = CURRENT_TIMESTAMP "
-
-                    "WHERE audit_id = ? AND final_status = 'ATTESTED'",
-
-                    (audit_id,),
-
-                )
+        await asyncio.to_thread(
+            _sync_db_write,
+            "UPDATE bucket3_dynamic_exit_log "
+            "SET final_status = 'DRIFT_BLOCKED', last_updated = CURRENT_TIMESTAMP "
+            "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+            (audit_id,),
+        )
 
         logger.warning(
 
@@ -12318,37 +12301,40 @@ async def handle_dex_callback(
 
 
 
-    # Step 2: Ticker rolling-window lockout (WARTIME bypasses per ADR-004 §4)
+    # Step 2: Ticker rolling-window lockout (WARTIME bypasses per ADR-004 §4).
+    # MR 1 Sprint 3: DB check offloaded to thread; awaits run after conn released.
 
-    with closing(_get_db_connection()) as conn:
+    def _sync_check_ticker_locked() -> bool:
+        with closing(_get_db_connection()) as conn:
+            return is_ticker_locked(conn, ticker)
 
-        if not is_wartime and is_ticker_locked(conn, ticker):
+    ticker_is_locked = await asyncio.to_thread(_sync_check_ticker_locked)
 
-            logger.warning(
+    if not is_wartime and ticker_is_locked:
 
-                "3_STRIKE_LOCKED: audit_id=%s ticker=%s source=rolling",
+        logger.warning(
 
-                audit_id, ticker,
+            "3_STRIKE_LOCKED: audit_id=%s ticker=%s source=rolling",
+
+            audit_id, ticker,
+
+        )
+
+        try:
+
+            await query.edit_message_text(
+
+                f"\u274c {ticker} locked (5-min cooldown from recent DRIFT_BLOCKED).\n"
+
+                f"Wait for cooldown to expire, then re-stage."
 
             )
 
-            try:
+        except Exception:
 
-                await query.edit_message_text(
+            pass
 
-                    f"\u274c {ticker} locked (5-min cooldown from recent DRIFT_BLOCKED).\n"
-
-                    f"Wait for cooldown to expire, then re-stage."
-
-                )
-
-            except Exception:
-
-                pass
-
-            return
-
-
+        return
 
     # Sprint 1D: Trust-tier cooldown (T0=10s, T1=5s, T2=0s)
 
@@ -12406,15 +12392,11 @@ async def handle_dex_callback(
 
 
 
-        with closing(_get_db_connection()) as conn:
-
-            recheck = conn.execute(
-
-                "SELECT final_status FROM bucket3_dynamic_exit_log WHERE audit_id = ?",
-
-                (audit_id,),
-
-            ).fetchone()
+        recheck = await asyncio.to_thread(
+            _sync_db_read_one,
+            "SELECT final_status FROM bucket3_dynamic_exit_log WHERE audit_id = ?",
+            (audit_id,),
+        )
 
         if not recheck or recheck["final_status"] != "ATTESTED":
 
@@ -12627,49 +12609,41 @@ async def handle_dex_callback(
 
 
     # Step 6: Atomic ATTESTED → TRANSMITTING lock
+    # MR 1 Sprint 3: CAS offloaded; SQL WHERE + tx_immediate preserves atomicity in helper thread.
 
     now_ts = _time_mod.time()
 
-    with closing(_get_db_connection()) as conn:
+    lock_rowcount = await asyncio.to_thread(
+        _sync_db_write,
+        "UPDATE bucket3_dynamic_exit_log "
+        "SET final_status = 'TRANSMITTING', last_updated = CURRENT_TIMESTAMP "
+        "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+        (audit_id,),
+    )
 
-        with tx_immediate(conn):
+    if lock_rowcount == 0:
 
-            lock_result = conn.execute(
+        logger.warning(
 
-                "UPDATE bucket3_dynamic_exit_log "
+            "TRANSMIT_RACE_LOST: audit_id=%s expected_status=ATTESTED",
 
-                "SET final_status = 'TRANSMITTING', last_updated = CURRENT_TIMESTAMP "
+            audit_id,
 
-                "WHERE audit_id = ? AND final_status = 'ATTESTED'",
+        )
 
-                (audit_id,),
+        try:
+
+            await query.edit_message_text(
+
+                f"\u274c Race: row already claimed by another process.\naudit_id: {audit_id[:8]}..."
 
             )
 
-        if lock_result.rowcount == 0:
+        except Exception:
 
-            logger.warning(
+            pass
 
-                "TRANSMIT_RACE_LOST: audit_id=%s expected_status=ATTESTED",
-
-                audit_id,
-
-            )
-
-            try:
-
-                await query.edit_message_text(
-
-                    f"\u274c Race: row already claimed by another process.\naudit_id: {audit_id[:8]}..."
-
-                )
-
-            except Exception:
-
-                pass
-
-            return
-
+        return
 
 
     # Step 7: Place order via IBKR
@@ -12754,7 +12728,10 @@ async def handle_dex_callback(
 
 
 
-        assert_execution_enabled_strict(in_process_halted=_HALTED)
+        await asyncio.to_thread(
+            assert_execution_enabled_strict,
+            in_process_halted=_HALTED,
+        )
 
         trade = ib_conn.placeOrder(contract, order)
 
@@ -12859,36 +12836,27 @@ async def handle_dex_callback(
 
 
     # Step 8: TRANSMITTING → TRANSMITTED (Followup #17: recovery wrapper per D7)
+    # MR 1 Sprint 3: CAS offloaded; SQL WHERE + tx_immediate preserves atomicity in helper thread.
 
     try:
 
-        with closing(_get_db_connection()) as conn:
+        step8_rowcount = await asyncio.to_thread(
+            _sync_db_write,
+            "UPDATE bucket3_dynamic_exit_log "
+            "SET final_status = 'TRANSMITTED', transmitted = 1, "
+            "    transmitted_ts = ?, ib_order_id = ?, "
+            "    last_updated = CURRENT_TIMESTAMP "
+            "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
+            (now_ts, ib_order_id, audit_id),
+        )
 
-            with tx_immediate(conn):
+        if step8_rowcount == 0:
 
-                result = conn.execute(
+            raise RuntimeError(
 
-                    "UPDATE bucket3_dynamic_exit_log "
+                f"TRANSMIT_STEP8_CAS_LOST audit_id={audit_id}"
 
-                    "SET final_status = 'TRANSMITTED', transmitted = 1, "
-
-                    "    transmitted_ts = ?, ib_order_id = ?, "
-
-                    "    last_updated = CURRENT_TIMESTAMP "
-
-                    "WHERE audit_id = ? AND final_status = 'TRANSMITTING'",
-
-                    (now_ts, ib_order_id, audit_id),
-
-                )
-
-                if result.rowcount == 0:
-
-                    raise RuntimeError(
-
-                        f"TRANSMIT_STEP8_CAS_LOST audit_id={audit_id}"
-
-                    )
+            )
 
     except Exception as exc:
 
@@ -13060,7 +13028,7 @@ async def _pre_trade_gates(
 
             from scripts.circuit_breaker import run_all_checks as _cb_run
 
-            _cb = _cb_run()
+            _cb = await asyncio.to_thread(_cb_run)
 
             if _cb.get("halted"):
 
@@ -13630,7 +13598,10 @@ async def _place_single_order(
 
 
 
-        assert_execution_enabled_strict(in_process_halted=_HALTED)
+        await asyncio.to_thread(
+            assert_execution_enabled_strict,
+            in_process_halted=_HALTED,
+        )
 
         trade = ib_conn.placeOrder(contract, order)
 
@@ -14292,13 +14263,13 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-    # MR #1: Circuit breaker pre-flight
+    # MR #1: Circuit breaker pre-flight (Sprint 3 MR 1: asyncio.to_thread offload)
 
     try:
 
         from scripts.circuit_breaker import run_all_checks as _cb_run
 
-        _cb = _cb_run()
+        _cb = await asyncio.to_thread(_cb_run)
 
         if _cb.get("halted"):
 
