@@ -43,7 +43,21 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USER_ID = os.environ.get("TELEGRAM_USER_ID", "")
 
-_VRP_DB_PATH = _BASE_DIR / "vrp_analytics.db"
+# Sprint 6 Mega-MR 6 (F3-M-2): mirror the MR !221 lazy-resolve pattern for
+# this analytics DB. Prior version used `_BASE_DIR / "vrp_analytics.db"`
+# which resolves to the rotated bridge-current snapshot under atomic
+# deploy — writes then land in the stale `bridge-previous` tree after
+# the next rotation. AGT_VRP_DB_PATH env var takes precedence; falls
+# back to the __file__-anchored path ONLY for CLI dev runs outside the
+# service context. Services should set AGT_VRP_DB_PATH in NSSM env.
+def _resolve_vrp_db_path() -> Path:
+    env = os.environ.get("AGT_VRP_DB_PATH", "").strip()
+    if env:
+        return Path(env)
+    return _BASE_DIR / "vrp_analytics.db"
+
+
+_VRP_DB_PATH = _resolve_vrp_db_path()
 
 
 # VRP thresholds

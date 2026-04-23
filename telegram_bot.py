@@ -10813,6 +10813,25 @@ async def _dispatch_to_llm(
 
             logger.warning("Hit MAX_ROUNDS (%d) in tool loop", MAX_ROUNDS)
 
+            # Sprint 6 Mega-MR 6 (F1-M-1): user-facing Telegram reply so the
+            # operator knows the loop hit the iteration cap and the LLM
+            # response is incomplete. Previously only logged — the user
+            # saw either a truncated reply or silence.
+            try:
+                await status.edit_text(
+                    f"⚠️ LLM hit max-rounds ({MAX_ROUNDS}) — "
+                    "response may be incomplete. Retry with a narrower "
+                    "prompt or use /think for multi-step reasoning."
+                )
+            except Exception:
+                try:
+                    await update.message.reply_text(
+                        f"⚠️ LLM hit max-rounds ({MAX_ROUNDS}) "
+                        "— response may be incomplete."
+                    )
+                except Exception:
+                    pass
+
 
 
         try: await status.delete()
