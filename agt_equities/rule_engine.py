@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Optional
 
-from agt_equities.config import MARGIN_ELIGIBLE_ACCOUNTS
+from agt_equities.config import MARGIN_ELIGIBLE_ACCOUNTS, VIKRAM_HOUSEHOLD
 from agt_equities.dates import et_today
 from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 
@@ -756,7 +756,7 @@ def evaluate_rule_6(ps: PortfolioState, household: str) -> RuleEvaluation:
     Uses account_el for per-account data when available, falls back to
     household_el for backward compatibility.
     """
-    if household != "Vikram_Household":
+    if household != VIKRAM_HOUSEHOLD:
         return RuleEvaluation(
             rule_id="rule_6", rule_name="Vikram EL Floor",
             household=household, ticker=None,
@@ -765,7 +765,7 @@ def evaluate_rule_6(ps: PortfolioState, household: str) -> RuleEvaluation:
         )
 
     # Sprint D: derive Vikram margin account from config (paper-aware)
-    vikram_accts = MARGIN_ELIGIBLE_ACCOUNTS.get("Vikram_Household", [])
+    vikram_accts = MARGIN_ELIGIBLE_ACCOUNTS.get(VIKRAM_HOUSEHOLD, [])
     if not vikram_accts:
         return RuleEvaluation(
             rule_id="rule_6", rule_name="Vikram EL Floor",
@@ -1455,7 +1455,7 @@ def evaluate_rule_9_composite(
     condition_b = any(ev.status == "RED" for ev in r2_evals)
 
     # Condition C: R6 softened status is RED — only for Vikram
-    if household == "Vikram_Household":
+    if household == VIKRAM_HOUSEHOLD:
         r6_evals = [
             ev for ev in softened_evals
             if ev.rule_id == "rule_6" and ev.household == household

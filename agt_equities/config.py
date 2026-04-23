@@ -63,15 +63,25 @@ else:
 
 
 
+# ── Household identifier constants (E-L-1 + E-L-2 Sprint 3 MR 8) ──
+# Canonical household names. Import these rather than hardcoding the
+# string literal at call sites to prevent drift on future household
+# renames.
+
+YASH_HOUSEHOLD = "Yash_Household"
+
+VIKRAM_HOUSEHOLD = "Vikram_Household"
+
+
 # ── Live household map (forward: household → [account_ids]) ──
 
 _LIVE_HOUSEHOLD_MAP: Dict[str, List[str]] = {
 
     # U22076184 (Trad IRA) dormant — retained for Walker historical reconstruction
 
-    "Yash_Household": ["U21971297", "U22076329", "U22076184"],
+    YASH_HOUSEHOLD: ["U21971297", "U22076329", "U22076184"],
 
-    "Vikram_Household": ["U22388499"],
+    VIKRAM_HOUSEHOLD: ["U22388499"],
 
 }
 
