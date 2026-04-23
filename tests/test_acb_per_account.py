@@ -236,39 +236,39 @@ def test_6_load_snapshot_legacy_signature_regression():
 # 7-8. V2 router integration — per-account classification
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason="Integration test — requires V2 router harness scaffolding; add in follow-up sprint")
+@pytest.mark.xfail(strict=True, reason="Integration test — requires V2 router harness scaffolding; add in follow-up sprint")
 def test_7_v2_state_1_uses_per_account_basis():
     """V2 STATE_1 ASSIGN velocity uses account-specific initial_basis."""
-    pass
+    raise NotImplementedError("V2 router harness scaffolding — follow-up sprint")
 
 
-@pytest.mark.skip(reason="Integration test — requires V2 router harness scaffolding; add in follow-up sprint")
+@pytest.mark.xfail(strict=True, reason="Integration test — requires V2 router harness scaffolding; add in follow-up sprint")
 def test_8_v2_state_3_uses_per_account_basis():
     """V2 STATE_3 DEFEND uses account-specific adjusted_basis."""
-    pass
+    raise NotImplementedError("V2 router harness scaffolding — follow-up sprint")
 
 
 # ---------------------------------------------------------------------------
 # 9-10. Same-day delta reconciliation
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason="Integration test — requires fill_log + master_log_trades fixture setup; add in follow-up sprint")
+@pytest.mark.xfail(strict=True, reason="Integration test — requires fill_log + master_log_trades fixture setup; add in follow-up sprint")
 def test_9_intraday_delta_merges_fill_log():
     """get_active_cycles_with_intraday_delta applies fill_log entries."""
-    pass
+    raise NotImplementedError("fill_log + master_log_trades fixture setup — follow-up sprint")
 
 
-@pytest.mark.skip(reason="Integration test — requires fill_log fixture setup; add in follow-up sprint")
+@pytest.mark.xfail(strict=True, reason="Integration test — requires fill_log fixture setup; add in follow-up sprint")
 def test_10_intraday_delta_idempotent_baseline():
     """With no delta rows, result matches get_active_cycles exactly."""
-    pass
+    raise NotImplementedError("fill_log fixture setup — follow-up sprint")
 
 
 # ---------------------------------------------------------------------------
 # 11. Audit column wiring (deferred per Followup #10)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason="Deferred to Followup #10 — cc_decision_log V2 router audit wiring")
+@pytest.mark.xfail(strict=True, reason="Deferred to Followup #10 — cc_decision_log V2 router audit wiring")
 def test_11_audit_columns_written():
     """V2 router writes bot_believed_adjusted_basis + basis_truth_level."""
-    pass
+    raise NotImplementedError("cc_decision_log V2 router audit wiring — Followup #10")

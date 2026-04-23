@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 INDEX_UNDERLYINGS = frozenset({'SPX', 'VIX', 'NDX', 'RUT', 'XSP'})
 
 # Cache: keyed by as_of_report_date
+# E-L-4 (Sprint 3 MR 8): lock guards the (currently read-only) cache. No
+# production writer exists today — the cache is declared but unused by
+# _run_walker_for_all, which reads fresh every call. The lock is a tripwire
+# for future writers and a no-op on the current read path.
+import threading as _threading_module
+_CYCLE_CACHE_LOCK = _threading_module.Lock()
 _cycle_cache: dict[str, list[Cycle]] = {}
 
 
@@ -54,7 +60,8 @@ def _get_db(db_path: "str | Path | None" = None) -> sqlite3.Connection:
 
 def invalidate_cache() -> None:
     """Clear the cycle cache. Called after a successful sync."""
-    _cycle_cache.clear()
+    with _CYCLE_CACHE_LOCK:
+        _cycle_cache.clear()
 
 
 def _parse_float(val) -> float:

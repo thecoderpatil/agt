@@ -46,6 +46,7 @@ from agt_equities.config import (
     CSP_ACTIVE_ACCOUNTS,
     HOUSEHOLD_MAP,
     MARGIN_ACCOUNTS,
+    VIKRAM_HOUSEHOLD,
     is_csp_active_account,
 )
 from agt_equities.fa_block_margin import (
@@ -818,7 +819,7 @@ def _csp_check_rule_6(hh, candidate, n, vix, extras) -> tuple[bool, str]:
     Generalization to 'any margin-eligible household with configured
     floor' is a post-May refactor item.
     """
-    if hh["household"] != "Vikram_Household":
+    if hh["household"] != VIKRAM_HOUSEHOLD:
         return (True, "")
     hh_margin_nlv = hh["hh_margin_nlv"]
     hh_margin_el = hh["hh_margin_el"]
