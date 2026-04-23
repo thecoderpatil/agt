@@ -1128,7 +1128,132 @@ def run_csp_allocator(
                 })
 
     result.digest_lines = _format_digest(result)
+
+    # Sprint 4 MR A: fail-soft persist of latest result for csp_digest_send scheduler job.
+    # A persistence error must NEVER block the allocation run itself.
+    try:
+        persist_latest_result(result, run_id=ctx.run_id)
+    except Exception as exc:
+        logger.warning(
+            "csp_allocator.persist_latest_result failed (non-blocking): %s", exc,
+        )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Sprint 4 MR A: csp_allocator_latest persistence for digest scheduler job.
+# See ADR-CSP_TELEGRAM_DIGEST_v1 §5 step 2 + scripts/migrate_csp_allocator_latest.py.
+# ---------------------------------------------------------------------------
+
+
+def persist_latest_result(
+    result: "AllocatorResult",
+    *,
+    run_id: str,
+    trade_date: str | None = None,
+    db_path: str | Path | None = None,
+) -> None:
+    """Serialize the most recent AllocatorResult into csp_allocator_latest (singleton id=1).
+
+    Called fail-softly at the end of run_csp_allocator. A persistence error is
+    swallowed by the caller so a DB hiccup never blocks an allocation run. The
+    scheduler's csp_digest_send job reads this row at 09:37 ET and renders the
+    digest from it.
+
+    trade_date defaults to today's UTC date. Shape of the persisted blobs is
+    intentionally permissive — the digest formatter reconstructs DigestCandidate
+    objects from the staged tickets, treating missing fields as defaults.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    td = trade_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    staged_payload = _json.dumps(_sanitize_staged_for_persist(result.staged))
+    rejected_payload = _json.dumps(_sanitize_rejected_for_persist(result))
+
+    from agt_equities.db import get_db_connection, tx_immediate
+    with get_db_connection(db_path=db_path) as conn:
+        with tx_immediate(conn):
+            conn.execute(
+                """
+                INSERT INTO csp_allocator_latest
+                    (id, run_id, trade_date, staged_json, rejected_json, created_at)
+                VALUES (1, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    trade_date = excluded.trade_date,
+                    staged_json = excluded.staged_json,
+                    rejected_json = excluded.rejected_json,
+                    created_at = excluded.created_at
+                """,
+                (run_id, td, staged_payload, rejected_payload, created),
+            )
+
+
+def load_latest_result(
+    *, db_path: str | Path | None = None,
+) -> dict | None:
+    """Read the singleton csp_allocator_latest row.
+
+    Returns a dict {run_id, trade_date, staged, rejected, created_at} on hit,
+    or None on miss / malformed row.
+    """
+    import json as _json
+    from agt_equities.db import get_db_connection
+    with get_db_connection(db_path=db_path) as conn:
+        row = conn.execute(
+            "SELECT run_id, trade_date, staged_json, rejected_json, created_at "
+            "FROM csp_allocator_latest WHERE id = 1"
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        run_id, trade_date, staged_json, rejected_json, created_at = row
+        return {
+            "run_id": run_id,
+            "trade_date": trade_date,
+            "staged": _json.loads(staged_json) if staged_json else [],
+            "rejected": _json.loads(rejected_json) if rejected_json else [],
+            "created_at": created_at,
+        }
+    except Exception as exc:
+        logger.warning("csp_allocator.load_latest_result: malformed row: %s", exc)
+        return None
+
+
+def _sanitize_staged_for_persist(tickets: list[dict]) -> list[dict]:
+    """Strip non-JSON-serializable fields (AllocationDigest objects) from tickets."""
+    out: list[dict] = []
+    for t in tickets:
+        safe = {k: v for k, v in t.items() if k != "_allocation_digest"}
+        out.append(safe)
+    return out
+
+
+def _sanitize_rejected_for_persist(result: "AllocatorResult") -> list[dict]:
+    """Collect skipped + errors into a uniform rejected-list shape for the digest."""
+    rejected: list[dict] = []
+    for s in result.skipped:
+        rejected.append({
+            "ticker": s.get("ticker"),
+            "household": s.get("household"),
+            "reason": s.get("reason", ""),
+            "kind": "skipped",
+        })
+    for e in result.errors:
+        rejected.append({
+            "ticker": e.get("ticker"),
+            "household": e.get("household"),
+            "reason": e.get("error", ""),
+            "kind": "error",
+        })
+    return rejected
+
+
+# Path import used by the persist helpers above.
+from pathlib import Path  # noqa: E402
 
 
 def _init_reasoning_entry(candidate: Any) -> dict:
