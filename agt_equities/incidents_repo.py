@@ -90,6 +90,9 @@ __all__ = [
     "mark_needs_architect",
     "mark_resolved",
     "append_rejection_reason",
+    # Sprint 6 Mega-MR 4B — ADR-013 error-budget queries
+    "count_by_tier_since",
+    "recent_tier0_tier1_since",
 ]
 
 
@@ -556,6 +559,8 @@ def register(
     observed_state: Any = None,
     desired_state: Any = None,
     confidence: float | None = None,
+    error_budget_tier: int | None = None,
+    budget_consumed_pct: float | None = None,
     db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Idempotent register.
@@ -612,21 +617,46 @@ def register(
                     ),
                 )
             else:
-                conn.execute(
-                    """
-                    INSERT INTO incidents (
-                        incident_key, invariant_id, severity, scrutiny_tier,
-                        status, detector, detected_at, last_action_at,
-                        consecutive_breaches, observed_state, desired_state,
-                        confidence
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-                    """,
-                    (
-                        incident_key, invariant_id, severity, scrutiny_tier,
-                        STATUS_OPEN, detector, now, now,
-                        observed_json, desired_json, confidence,
-                    ),
-                )
+                # Sprint 6 Mega-MR 4B: error_budget_tier + budget_consumed_pct
+                # are ADR-013 dual-ledger columns. When the caller supplies
+                # error_budget_tier, write it; otherwise rely on the
+                # column's DEFAULT 2 (observability tier). The default
+                # applies even when the migration has not yet run on this
+                # DB (ALTER ADD COLUMN with DEFAULT covers that).
+                if error_budget_tier is None and budget_consumed_pct is None:
+                    conn.execute(
+                        """
+                        INSERT INTO incidents (
+                            incident_key, invariant_id, severity, scrutiny_tier,
+                            status, detector, detected_at, last_action_at,
+                            consecutive_breaches, observed_state, desired_state,
+                            confidence
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                        """,
+                        (
+                            incident_key, invariant_id, severity, scrutiny_tier,
+                            STATUS_OPEN, detector, now, now,
+                            observed_json, desired_json, confidence,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO incidents (
+                            incident_key, invariant_id, severity, scrutiny_tier,
+                            status, detector, detected_at, last_action_at,
+                            consecutive_breaches, observed_state, desired_state,
+                            confidence, error_budget_tier, budget_consumed_pct
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            incident_key, invariant_id, severity, scrutiny_tier,
+                            STATUS_OPEN, detector, now, now,
+                            observed_json, desired_json, confidence,
+                            error_budget_tier if error_budget_tier is not None else 2,
+                            budget_consumed_pct,
+                        ),
+                    )
                 _mirror_register(
                     conn,
                     incident_key=incident_key,
@@ -957,3 +987,52 @@ def append_rejection_reason(
             conn.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Sprint 6 Mega-MR 4B — ADR-013 error-budget queries
+# ---------------------------------------------------------------------------
+
+
+def count_by_tier_since(
+    tier: int,
+    since_utc: str,
+    *,
+    db_path: str | Path | None = None,
+) -> int:
+    """Count incidents at `error_budget_tier = tier` detected since `since_utc`.
+
+    Input ``since_utc`` is ISO 8601 lower bound on ``detected_at``.
+    Used by the 72h-rolling-budget burn calculation in ADR-013 §4.
+    """
+    if tier not in (0, 1, 2):
+        raise ValueError(f"tier must be 0/1/2, got {tier!r}")
+    with get_ro_connection(db_path=db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM incidents "
+            "WHERE error_budget_tier = ? AND detected_at >= ?",
+            (int(tier), since_utc),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def recent_tier0_tier1_since(
+    since_utc: str,
+    *,
+    db_path: str | Path | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return tier-0 and tier-1 incidents detected since `since_utc`.
+
+    Ordered newest-first. Used by the observability workbench (future
+    ADR-017) and by ADR-013 canary auto-revert decision logic. Shape
+    is the same as ``get()``.
+    """
+    with get_ro_connection(db_path=db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM incidents "
+            "WHERE error_budget_tier IN (0, 1) AND detected_at >= ? "
+            "ORDER BY detected_at DESC LIMIT ?",
+            (since_utc, int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
