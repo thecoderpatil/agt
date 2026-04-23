@@ -18861,7 +18861,92 @@ async def _scheduled_csp_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+# ---------------------------------------------------------------------------
+# Sprint 4 MR A: CSP Digest scheduler job + /approve_csp_<id> + /deny_csp_<id>.
+# Fires 09:37 ET weekdays (2-min gap from csp_scan_daily at 09:35).
+# Identity approval gate held; paper auto-execution proceeds regardless.
+# ADR-CSP_TELEGRAM_DIGEST_v1 §5 step 2.
+# ---------------------------------------------------------------------------
 
+
+async def _scheduled_csp_digest_send(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily 09:37 ET — load latest allocator result, LLM-annotate, Telegram-send."""
+    try:
+        now_et = _datetime.now(ET)
+        if now_et.weekday() >= 5:
+            logger.info("csp_digest_send: skipping weekend")
+            return
+
+        import csp_digest_runner as _runner
+
+        bot_mode = os.environ.get("AGT_BROKER_MODE", "paper").strip().lower()
+        digest_mode = "LIVE" if bot_mode == "live" else "PAPER"
+
+        async def _send(text: str, keyboard: list):
+            try:
+                kwargs: dict = {"chat_id": AUTHORIZED_USER_ID, "text": _paper_prefix(text)}
+                if keyboard:
+                    kwargs["reply_markup"] = InlineKeyboardMarkup.from_dict(
+                        {"inline_keyboard": keyboard}
+                    )
+                sent = await context.bot.send_message(**kwargs)
+                return getattr(sent, "message_id", None)
+            except Exception as send_exc:
+                logger.warning("csp_digest_send: Telegram send failed: %s", send_exc)
+                return None
+
+        status = await _runner.run_csp_digest_job(
+            send_telegram=_send, mode=digest_mode,
+        )
+        logger.info("csp_digest_send: status=%s", status)
+    except Exception:
+        logger.exception("csp_digest_send: unhandled failure")
+
+
+async def cmd_approve_csp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/approve_csp_<id> — operator escape hatch for inline-keyboard approve."""
+    if not is_authorized(update):
+        return
+    text = (update.message.text if update.message else "") or ""
+    cmd_part = text.split()[0] if text.strip() else ""
+    id_str = cmd_part.replace("/approve_csp_", "").replace("/approve_csp", "").strip()
+    if not id_str.isdigit():
+        await send_reply(update, "Usage: /approve_csp_<row_id> (row_id from the digest).")
+        return
+    row_id = int(id_str)
+    ok = await asyncio.to_thread(_csp_slash_set_status, row_id, "approved")
+    flag = "✅" if ok else "❌"
+    msg = "recorded" if ok else "row not found or not pending"
+    await send_reply(update, f"{flag} /approve_csp_{row_id} — {msg}.")
+
+
+async def cmd_deny_csp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/deny_csp_<id> — operator escape hatch for inline-keyboard reject."""
+    if not is_authorized(update):
+        return
+    text = (update.message.text if update.message else "") or ""
+    cmd_part = text.split()[0] if text.strip() else ""
+    id_str = cmd_part.replace("/deny_csp_", "").replace("/deny_csp", "").strip()
+    if not id_str.isdigit():
+        await send_reply(update, "Usage: /deny_csp_<row_id> (row_id from the digest).")
+        return
+    row_id = int(id_str)
+    ok = await asyncio.to_thread(_csp_slash_set_status, row_id, "denied")
+    flag = "✅" if ok else "❌"
+    msg = "recorded" if ok else "row not found or not pending"
+    await send_reply(update, f"{flag} /deny_csp_{row_id} — {msg}.")
+
+
+def _csp_slash_set_status(row_id: int, status: str) -> bool:
+    """Flip csp_pending_approval row to approved/denied. Returns True on a single-row update."""
+    now = _datetime.now(_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rowcount = _sync_db_write(
+        "UPDATE csp_pending_approval "
+        "SET status = ?, resolved_at_utc = ?, resolved_by = 'yash_slash' "
+        "WHERE id = ? AND status = 'pending'",
+        (status, now, row_id),
+    )
+    return rowcount == 1
 
 
 _LIQ_STAGING_BY_TOKEN: dict[str, dict] = {}
@@ -22103,6 +22188,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_liq_callback, pattern=r"^liq:"))
     app.add_handler(CallbackQueryHandler(handle_csp_approval_callback, pattern=r"^csp_(?:approve|skip|submit):"))
 
+    # Sprint 4 MR A: /approve_csp_<row_id> + /deny_csp_<row_id>. CommandHandler
+    # doesn't support dynamic numeric suffixes; regex-match on the message text.
+    app.add_handler(MessageHandler(filters.Regex(r"^/approve_csp_\d+"), cmd_approve_csp))
+    app.add_handler(MessageHandler(filters.Regex(r"^/deny_csp_\d+"), cmd_deny_csp))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 
@@ -22144,6 +22234,16 @@ def main() -> None:
         )
 
         logger.info("Scheduled: csp_scan_daily at 9:35 AM ET (Mon-Fri)")
+
+        # Sprint 4 MR A: CSP Digest at 09:37 ET — 2-min gap after csp_scan_daily so
+        # the allocator lands csp_allocator_latest before we read it.
+        jq.run_daily(
+            callback=_scheduled_csp_digest_send,
+            time=_time(hour=9, minute=37, tzinfo=ET),
+            days=(1, 2, 3, 4, 5),
+            name="csp_digest_send",
+        )
+        logger.info("Scheduled: csp_digest_send at 9:37 AM ET (Mon-Fri)")
 
         jq.run_daily(
 
