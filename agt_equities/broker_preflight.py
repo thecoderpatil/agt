@@ -60,21 +60,28 @@ async def run_broker_identity_preflight(ib_conn, broker_mode: str) -> None:
         return
 
     # -- Static check: configured ACTIVE_ACCOUNTS --
+    # E-H-5 fix: do NOT downgrade a config-import failure to a logged
+    # warning. This static gate exists to catch broker/account drift
+    # WITHOUT requiring an IB round-trip; if the import that backs it
+    # fails, the gate does not exist and we fail-closed by halting boot.
     try:
         from agt_equities.config import ACTIVE_ACCOUNTS
-        mismatched_config = [
-            a for a in ACTIVE_ACCOUNTS if not a.startswith(expected_prefix)
-        ]
-        if mismatched_config:
-            raise BrokerIdentityMismatch(
-                f"AGT_BROKER_MODE={broker_mode!r} expects account prefix "
-                f"'{expected_prefix}' but ACTIVE_ACCOUNTS contains "
-                f"{mismatched_config}. Check config.py or env var."
-            )
-    except BrokerIdentityMismatch:
-        raise
     except Exception as exc:
-        logger.warning("broker_preflight: static config check failed: %s", exc)
+        raise BrokerIdentityMismatch(
+            f"broker_preflight: agt_equities.config import failed: {exc!r}. "
+            f"Cannot verify ACTIVE_ACCOUNTS against AGT_BROKER_MODE="
+            f"{broker_mode!r}. Boot halted to avoid the safety net silently "
+            f"downgrading to ib-side-only checking."
+        ) from exc
+    mismatched_config = [
+        a for a in ACTIVE_ACCOUNTS if not a.startswith(expected_prefix)
+    ]
+    if mismatched_config:
+        raise BrokerIdentityMismatch(
+            f"AGT_BROKER_MODE={broker_mode!r} expects account prefix "
+            f"'{expected_prefix}' but ACTIVE_ACCOUNTS contains "
+            f"{mismatched_config}. Check config.py or env var."
+        )
 
     # -- Dynamic check: accounts IB returned on this connection --
     try:
