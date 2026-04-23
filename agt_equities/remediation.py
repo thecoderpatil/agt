@@ -60,7 +60,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agt_equities.db import get_db_connection, get_ro_connection
+from agt_equities.db import get_db_connection, get_ro_connection, tx_immediate
 from agt_equities.incidents_repo import STATUS_AWAITING, STATUS_ARCHITECT, STATUS_MERGED, STATUS_REJECTED_ONCE, STATUS_REJECTED_PERM, STATUS_REJECTED_TWICE
 
 __all__ = [
@@ -233,7 +233,7 @@ def register_incident(
 
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             conn.execute(
                 "INSERT INTO remediation_incidents "
                 "(incident_id, first_detected, directive_source, status, updated_at) "
@@ -258,7 +258,7 @@ def mark_awaiting(
     """Record that a remediation MR has been opened for ``incident_id``."""
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             conn.execute(
                 "UPDATE remediation_incidents "
                 "SET status = ?, mr_iid = ?, branch_name = ?, "
@@ -282,7 +282,7 @@ def mark_merged(
     """Transition row to ``merged`` — called on successful /approve_rem."""
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             conn.execute(
                 "UPDATE remediation_incidents "
                 "SET status = ?, updated_at = ? WHERE incident_id = ?",
@@ -334,7 +334,7 @@ def mark_rejected(
 
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             conn.execute(
                 "UPDATE remediation_incidents "
                 "SET status = ?, rejection_reasons = ?, updated_at = ? "
@@ -358,7 +358,7 @@ def mark_architect(
     """Escalate to Architect — halts autonomous re-authoring for this id."""
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             conn.execute(
                 "UPDATE remediation_incidents "
                 "SET status = ?, architect_reason = ?, updated_at = ? "
@@ -380,7 +380,7 @@ def record_nudge(
     """Update ``last_nudged_at`` for re-nudge bookkeeping."""
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             conn.execute(
                 "UPDATE remediation_incidents "
                 "SET last_nudged_at = ?, updated_at = ? WHERE incident_id = ?",

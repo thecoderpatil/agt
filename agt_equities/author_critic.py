@@ -65,7 +65,7 @@ from pathlib import Path
 from typing import Any
 
 from agt_equities import incidents_repo
-from agt_equities.db import get_db_connection
+from agt_equities.db import get_db_connection, tx_immediate
 
 log = logging.getLogger(__name__)
 
@@ -646,7 +646,7 @@ def _write_confidence(
 ) -> None:
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             conn.execute(
                 "UPDATE incidents SET confidence = ? WHERE id = ?",
                 (float(confidence), int(incident_id)),
@@ -668,7 +668,7 @@ def _stash_author_metadata(
     """Non-destructive JSON merge into ``incidents.desired_state``."""
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             row = conn.execute(
                 "SELECT desired_state FROM incidents WHERE id = ?",
                 (int(incident_id),),
