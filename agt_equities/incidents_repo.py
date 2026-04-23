@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from agt_equities.db import get_db_connection, get_ro_connection
+from agt_equities.db import get_db_connection, get_ro_connection, tx_immediate
 
 __all__ = [
     # Status constants
@@ -593,7 +593,7 @@ def register(
     now = _utc_now()
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             existing = _active_row_for_key(conn, incident_key)
             if existing is not None:
                 conn.execute(
@@ -666,7 +666,7 @@ def _advance(
     now = _utc_now()
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             cur = conn.execute(
                 "SELECT * FROM incidents WHERE id = ?", (int(incident_id),)
             ).fetchone()
@@ -810,7 +810,7 @@ def mark_rejected(
     now = _utc_now()
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             cur = conn.execute(
                 "SELECT * FROM incidents WHERE id = ?", (int(incident_id),)
             ).fetchone()
@@ -926,7 +926,7 @@ def append_rejection_reason(
     now = _utc_now()
     conn = get_db_connection(db_path=db_path)
     try:
-        with conn:
+        with tx_immediate(conn):
             cur = conn.execute(
                 "SELECT * FROM incidents WHERE id = ?", (int(incident_id),)
             ).fetchone()
