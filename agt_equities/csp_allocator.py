@@ -1214,7 +1214,14 @@ def _tickets_from_digest(
     candidate,
 ) -> list[dict]:
     """Convert approved AccountAllocations to M1.x ticket dicts."""
-    broker_mode = os.environ.get("AGT_BROKER_MODE", "paper")
+    # Default to empty string (NOT "paper") so an unset AGT_BROKER_MODE
+    # falls into is_csp_active_account's unknown-mode-fails-closed branch
+    # instead of silently bypassing the dormant filter on live capital.
+    # Bug E-H-2 from opus_bug_hunt_overnight.md: the prior "paper" default
+    # was introduced in MR !200; on a live system with the env var unset,
+    # CSP entries on dormant accounts (e.g., U22076184 Yash Trad IRA) would
+    # have routed through the gate.
+    broker_mode = os.environ.get("AGT_BROKER_MODE", "")
     tickets: list[dict] = []
     for alloc in digest.allocations:
         if alloc.margin_check_status != STATUS_APPROVED:
