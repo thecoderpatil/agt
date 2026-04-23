@@ -131,9 +131,9 @@ def test_window_and_threads_stop_methods_disabled(script_text: str) -> None:
     assert 'Set-NssmKey -Name $Name -Key "AppStopMethodThreads" -Values @("0")' in script_text
 
 
-def test_restart_on_crash_with_30s_backoff(script_text: str) -> None:
+def test_restart_on_crash_with_60s_backoff(script_text: str) -> None:
     assert 'Set-NssmKey -Name $Name -Key "AppExit"         -Values @("Default", "Restart")' in script_text
-    assert 'Set-NssmKey -Name $Name -Key "AppRestartDelay" -Values @("30000")' in script_text
+    assert 'Set-NssmKey -Name $Name -Key "AppRestartDelay" -Values @("60000")' in script_text
 
 
 def test_log_rotation_10mb(script_text: str) -> None:
