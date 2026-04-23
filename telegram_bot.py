@@ -22261,6 +22261,32 @@ def main() -> None:
 
     if jq is not None:
 
+        # Sprint 5 MR C: reconfigure the PTB JobQueue's APScheduler BEFORE
+        # registering jobs. Evidence from today's paper day (2026-04-23):
+        # - csp_scan_daily 09:35 missed by 6.5s
+        # - csp_digest_send 09:37 missed by 6.7s
+        # - cc_daily 09:45 missed by 6.6s
+        # - bot_heartbeat (30s interval) 822 chronic 1-4s misses
+        # - cross_daemon_alerts_drain (2s interval) 742 misses
+        # Default misfire_grace_time=1 second is too tight for PTB's
+        # startup-and-initial-load window + chronic interval-job drift.
+        # Bump defaults to 60s grace + larger executor pool so post-restart
+        # cron slots don't drop and interval drift doesn't silently miss.
+        try:
+            from apscheduler.executors.pool import ThreadPoolExecutor as _APSThreadPool
+            jq.scheduler.configure(
+                job_defaults={"misfire_grace_time": 60, "coalesce": True},
+                executors={"default": _APSThreadPool(max_workers=20)},
+            )
+            logger.info(
+                "job_queue: misfire_grace_time=60s, coalesce=True, max_workers=20 (Sprint 5 MR C)"
+            )
+        except Exception as _sched_cfg_exc:
+            logger.warning(
+                "job_queue: scheduler.configure failed (%s) — defaults retained",
+                _sched_cfg_exc,
+            )
+
         jq.run_daily(
 
             callback=_scheduled_cc,
