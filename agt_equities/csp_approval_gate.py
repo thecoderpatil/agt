@@ -28,7 +28,7 @@ from typing import Any
 
 import requests
 
-from agt_equities.db import get_db_connection
+from agt_equities.db import get_db_connection, tx_immediate
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,14 @@ def _insert_pending_row(
     sent_at: datetime,
     timeout_at: datetime,
 ) -> int:
-    """Insert a new pending row. Returns the new row id."""
+    """Insert a new pending row. Returns the new row id.
+
+    NOTE: caller must wrap in tx_immediate (or equivalent) — this function
+    no longer calls conn.commit() so the outer tx boundary is the source
+    of truth. Pre-MR-207 callers used `with conn:` (DEFERRED) + this
+    inner commit; both are removed in favor of explicit tx_immediate
+    wrapping by the caller.
+    """
     cur = conn.execute(
         """
         INSERT INTO csp_pending_approval
@@ -92,16 +99,15 @@ def _insert_pending_row(
             timeout_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         ),
     )
-    conn.commit()
     return cur.lastrowid
 
 
 def _update_telegram_msg_id(conn, row_id: int, msg_id: int) -> None:
+    """Caller must wrap in tx_immediate. See _insert_pending_row note."""
     conn.execute(
         "UPDATE csp_pending_approval SET telegram_message_id=? WHERE id=?",
         (msg_id, row_id),
     )
-    conn.commit()
 
 
 def _poll_row_status(conn, row_id: int) -> dict | None:
@@ -117,6 +123,7 @@ def _poll_row_status(conn, row_id: int) -> dict | None:
 
 
 def _timeout_row(conn, row_id: int) -> None:
+    """Caller must wrap in tx_immediate. See _insert_pending_row note."""
     conn.execute(
         """
         UPDATE csp_pending_approval
@@ -127,7 +134,6 @@ def _timeout_row(conn, row_id: int) -> None:
         """,
         (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), row_id),
     )
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -236,8 +242,19 @@ def telegram_approval_gate(
     ])
 
     try:
+        # E-H-3 fix: wrap in tx_immediate (BEGIN IMMEDIATE) so the insert
+        # is not silently rolled back under WAL contention with EOD
+        # flex_sync. Bare `with conn:` (Python sqlite3 default DEFERRED)
+        # races to upgrade lock on first write; on rollback the gate
+        # would fall through to the identity-pass branch and auto-approve
+        # the entire candidate batch without showing a Telegram digest.
+        # Note: _insert_pending_row internally calls conn.commit() — that's
+        # idempotent inside the IMMEDIATE block (no harm).
         with get_db_connection(db_path) as conn:
-            row_id = _insert_pending_row(conn, run_id, candidates_serial, now_utc, timeout_at)
+            with tx_immediate(conn):
+                row_id = _insert_pending_row(
+                    conn, run_id, candidates_serial, now_utc, timeout_at,
+                )
     except Exception:
         logger.exception("csp_approval_gate: DB insert failed — identity fallback")
         return list(candidates)
@@ -248,8 +265,10 @@ def telegram_approval_gate(
 
     if msg_id is not None:
         try:
+            # E-H-3 fix: tx_immediate for the msg_id update.
             with get_db_connection(db_path) as conn:
-                _update_telegram_msg_id(conn, row_id, msg_id)
+                with tx_immediate(conn):
+                    _update_telegram_msg_id(conn, row_id, msg_id)
         except Exception as exc:
             logger.warning("csp_approval_gate: could not store message_id: %s", exc)
     else:
@@ -277,8 +296,10 @@ def telegram_approval_gate(
 
         if now_utc >= timeout_at:
             try:
+                # E-H-3 fix: tx_immediate for the timeout flip.
                 with get_db_connection(db_path) as conn:
-                    _timeout_row(conn, row_id)
+                    with tx_immediate(conn):
+                        _timeout_row(conn, row_id)
             except Exception as exc:
                 logger.warning("csp_approval_gate: timeout update failed: %s", exc)
             logger.info(

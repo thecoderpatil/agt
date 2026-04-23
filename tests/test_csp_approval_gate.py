@@ -228,6 +228,12 @@ class TestTelegramApprovalGate:
                 real_conn, "run-y", "[]",
                 now - timedelta(minutes=31), past_timeout,
             )
+            # MR !207 (E-H-3 fix): _insert_pending_row no longer calls
+            # conn.commit() internally — caller wraps in tx_immediate.
+            # Tests that bypass the wrapping helper must commit explicitly
+            # so the production tx_immediate(BEGIN IMMEDIATE) doesn't fail
+            # with "cannot start a transaction within a transaction".
+            real_conn.commit()
 
             @contextmanager
             def _fake_conn(db_path=None):
