@@ -16,6 +16,64 @@ $ErrorActionPreference = "Stop"
 
 
 
+# Sprint 6 R5: tolerate NSSM SERVICE_STOP_PENDING / SERVICE_START_PENDING
+# stderr without tripping ErrorActionPreference=Stop. NSSM emits transient
+# state-transition lines to stderr even on healthy calls; pre-R5 deploy.ps1
+# aborted mid-sequence when it hit them (2026-04-23 17:56 ET incident). Fix
+# scopes EAP=Continue around each nssm call, redirects stderr, then polls
+# `sc.exe query` for the expected service state with a 30s timeout so the
+# script hard-fails if the service genuinely never transitions.
+function Wait-ServiceState {
+    param(
+        [Parameter(Mandatory=$true)][string]$ServiceName,
+        [Parameter(Mandatory=$true)][string]$ExpectedState,
+        [int]$TimeoutSeconds = 30
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $queryOutput = sc.exe query $ServiceName 2>&1
+        $stateLine = $queryOutput | Select-String -Pattern "STATE"
+        if ($stateLine) {
+            $currentState = ($stateLine.Line -replace '.*:\s*\d+\s+', '').Trim()
+            if ($currentState -eq $ExpectedState) {
+                return $true
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+function Invoke-NssmStop {
+    param([Parameter(Mandatory=$true)][string]$ServiceName)
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        nssm stop $ServiceName 2>&1 | Out-Null
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if (-not (Wait-ServiceState -ServiceName $ServiceName -ExpectedState "STOPPED" -TimeoutSeconds 30)) {
+        throw "Sprint 6 R5: service $ServiceName failed to reach STOPPED within 30s"
+    }
+}
+
+function Invoke-NssmStart {
+    param([Parameter(Mandatory=$true)][string]$ServiceName)
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        nssm start $ServiceName 2>&1 | Out-Null
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if (-not (Wait-ServiceState -ServiceName $ServiceName -ExpectedState "RUNNING" -TimeoutSeconds 30)) {
+        throw "Sprint 6 R5: service $ServiceName failed to reach RUNNING within 30s"
+    }
+}
+
+
+
 $current  = Join-Path $RuntimeRoot "bridge-current"
 
 $staging  = Join-Path $RuntimeRoot "bridge-staging"
@@ -108,9 +166,9 @@ if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE)" }
 
 if (-not $SkipServiceRestart) {
 
-    nssm stop agt-telegram-bot | Out-Null
+    Invoke-NssmStop -ServiceName "agt-telegram-bot"
 
-    nssm stop agt-scheduler | Out-Null
+    Invoke-NssmStop -ServiceName "agt-scheduler"
 
     Start-Sleep -Seconds 3
 
@@ -132,11 +190,11 @@ Move-Item $staging $current
 
 if (-not $SkipServiceRestart) {
 
-    nssm start agt-scheduler | Out-Null
+    Invoke-NssmStart -ServiceName "agt-scheduler"
 
     Start-Sleep -Seconds 2
 
-    nssm start agt-telegram-bot | Out-Null
+    Invoke-NssmStart -ServiceName "agt-telegram-bot"
 
 }
 
