@@ -132,13 +132,23 @@ def build_scheduler() -> "AsyncIOScheduler":
     to ``max_workers=1`` which serializes every job and starves intraday
     repeating tasks under flex_sync load.
     """
+    from apscheduler.executors.asyncio import AsyncIOExecutor as _APAsyncIOExecutor
     from apscheduler.executors.pool import ThreadPoolExecutor as _APThreadPoolExecutor
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
     import pytz
 
+    # Sprint 6 R6: AsyncIOScheduler's default executor is a ThreadPoolExecutor,
+    # which cannot await coroutines. Registering `_el_snapshot_writer_job`
+    # (async def) on the default pool silently dropped the coroutine return
+    # and emitted `RuntimeWarning: coroutine was never awaited` on every
+    # 30s fire. Keep the ThreadPool for sync jobs (heartbeat_writer,
+    # orphan_sweep, attested_sweeper — blind-spot #3 concurrency) AND add
+    # an AsyncIOExecutor under the `asyncio` key so async jobs can opt in
+    # via `executor="asyncio"` on their add_job call.
     executors = {
         "default": _APThreadPoolExecutor(SCHEDULER_THREADPOOL_MAX_WORKERS),
+        "asyncio": _APAsyncIOExecutor(),
     }
     job_defaults = {
         "coalesce": True,        # don't pile up missed runs
@@ -500,6 +510,7 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
         seconds=30,
         id="el_snapshot_writer",
         name="el_snapshot_writer",
+        executor="asyncio",  # Sprint 6 R6: async coroutine must route to AsyncIOExecutor
         replace_existing=True,
     )
     registered.append("el_snapshot_writer")
