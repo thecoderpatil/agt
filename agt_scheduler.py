@@ -179,6 +179,62 @@ from agt_equities.invariants.tick import (
 from agt_equities.runtime_fingerprint import capture_and_log as _capture_runtime_fingerprint
 
 
+# ---------------------------------------------------------------------------
+# Graceful shutdown — top-level handlers registered before the asyncio loop
+# steals SIGINT/SIGBREAK. Reduces zombie risk by giving IB a chance to
+# disconnect cleanly when NSSM stops the service.
+#
+# On Windows, NSSM's AppStopMethodConsole sends CTRL+BREAK (SIGBREAK).
+# These top-level handlers cover the brief pre-asyncio-loop window;
+# once `_run()` enters the asyncio loop, its in-function handler takes
+# over and integrates with the scheduler.shutdown(wait=True) path.
+# ---------------------------------------------------------------------------
+_SHUTDOWN_IN_PROGRESS = False
+
+
+def _handle_shutdown_signal(signum, frame):  # pragma: no cover
+    """Graceful shutdown — disconnect IB, flush heartbeat, exit 0.
+
+    Registered for SIGINT and SIGBREAK (Windows) / SIGTERM (POSIX).
+    Reentrant-safe: a second signal during shutdown falls through to
+    a hard exit.
+    """
+    global _SHUTDOWN_IN_PROGRESS
+    if _SHUTDOWN_IN_PROGRESS:
+        logger.warning("agt_scheduler.shutdown_force signum=%s", signum)
+        sys.exit(1)
+    _SHUTDOWN_IN_PROGRESS = True
+    logger.info("agt_scheduler.shutdown_begin signum=%s", signum)
+    try:
+        ib = globals().get("ib")
+        if ib is not None and hasattr(ib, "disconnect"):
+            try:
+                ib.disconnect()
+                logger.info("agt_scheduler.shutdown_ib_disconnect ok")
+            except Exception as e:
+                logger.warning("agt_scheduler.shutdown_ib_disconnect_failed err=%s", e)
+    finally:
+        logger.info("agt_scheduler.shutdown_end")
+        sys.exit(0)
+
+
+def _register_shutdown_handlers() -> None:
+    """Register platform-appropriate graceful-shutdown signals.
+
+    Called once at scheduler start, BEFORE the asyncio event loop spins
+    up — signals must be registered on the main thread before the loop
+    steals them.
+    """
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+    if hasattr(signal, "SIGBREAK"):  # Windows only
+        signal.signal(signal.SIGBREAK, _handle_shutdown_signal)
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+        except (OSError, ValueError):
+            logger.info("agt_scheduler.sigterm_register_skipped")
+
+
 def _check_invariants_tick() -> None:
     """Thin wrapper over ``invariants.tick.check_invariants_tick``.
 
@@ -814,11 +870,11 @@ async def _run() -> int:
     stop_event = asyncio.Event()
 
     def _signal_handler(*_args: object) -> None:
-        logger.info("Shutdown signal received.")
+        logger.info("agt_scheduler.shutdown_begin source=asyncio_handler")
         stop_event.set()
 
     loop = asyncio.get_running_loop()
-    for sig_name in ("SIGINT", "SIGTERM"):
+    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
         sig = getattr(signal, sig_name, None)
         if sig is None:
             continue
@@ -842,7 +898,7 @@ async def _run() -> int:
             await ib_conn.disconnect()
         except Exception:
             logger.exception("ib_conn.disconnect raised")
-        logger.info("agt_scheduler exit clean.")
+        logger.info("agt_scheduler.shutdown_end exit=clean")
     return 0
 
 
@@ -859,6 +915,10 @@ def main() -> int:
     from agt_equities.invariants.bootstrap import assert_canonical_db_path
     from agt_equities import db as agt_db
     assert_canonical_db_path(resolved_path=agt_db.DB_PATH)
+    # Register signal handlers BEFORE asyncio.run so SIGINT/SIGBREAK fire
+    # cleanly during the brief pre-loop window. The asyncio in-function
+    # _signal_handler in _run() takes over once the loop is established.
+    _register_shutdown_handlers()
     return asyncio.run(_run())
 
 
