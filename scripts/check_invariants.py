@@ -45,7 +45,7 @@ def main() -> int:
 
     from agt_equities.invariants.bootstrap import assert_canonical_db_path
     from agt_equities import db as agt_db
-    target_db_path = args.db or str(agt_db.DB_PATH)
+    target_db_path = args.db or str(agt_db.get_db_path())
     assert_canonical_db_path(
         resolved_path=target_db_path,
         allow_override=args.allow_override_db_path,
