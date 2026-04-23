@@ -19,6 +19,9 @@ import pytest
 from pathlib import Path
 
 
+pytestmark = pytest.mark.sprint_a
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
