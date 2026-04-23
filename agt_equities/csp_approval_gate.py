@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,27 @@ logger = logging.getLogger(__name__)
 _TELEGRAM_API_BASE = "https://api.telegram.org"
 _APPROVAL_TIMEOUT_MINUTES = 30
 _POLL_INTERVAL_SECONDS = 5
+
+
+# E-M-2 (Sprint 3 MR 6): cancellable polling. Set _STOP_EVENT via
+# set_stop_flag() on shutdown to break any in-flight polling loop;
+# otherwise time.sleep() would hold the thread until the next 5s tick,
+# delaying clean daemon shutdown. A shutdown_hook-style caller
+# (scheduler or bot) should call set_stop_flag() on SIGTERM/SIGINT.
+_STOP_EVENT = threading.Event()
+
+
+def set_stop_flag() -> None:
+    """Signal any in-flight csp_approval_gate polling loops to exit cleanly.
+
+    Safe to call from a signal handler or a shutdown coroutine. Idempotent.
+    """
+    _STOP_EVENT.set()
+
+
+def clear_stop_flag() -> None:
+    """Reset the stop flag — used by tests and by legitimate daemon restarts."""
+    _STOP_EVENT.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +299,15 @@ def telegram_approval_gate(
         )
 
     # ── Polling loop ──
+    # E-M-2 (Sprint 3 MR 6): cancellable wait + 1-retry on transient DB miss.
     while True:
-        time.sleep(_POLL_INTERVAL_SECONDS)
+        # Cancellable wait — _STOP_EVENT.wait returns early on daemon shutdown.
+        if _STOP_EVENT.wait(timeout=_POLL_INTERVAL_SECONDS):
+            logger.warning(
+                "csp_approval_gate: stop flag set during poll for row %d — fail-closed",
+                row_id,
+            )
+            return []
         now_utc = datetime.now(timezone.utc)
         try:
             with get_db_connection(db_path) as conn:
@@ -288,8 +317,21 @@ def telegram_approval_gate(
             row = None
 
         if row is None:
-            logger.error("csp_approval_gate: row %d vanished — fail-closed", row_id)
-            return []
+            # 1-retry on transient DB miss before fail-closing.
+            # (An already-approved row briefly unreadable under WAL pressure
+            # should not cost the operator their approval.)
+            try:
+                with get_db_connection(db_path) as conn:
+                    row = _poll_row_status(conn, row_id)
+            except Exception as exc:
+                logger.warning("csp_approval_gate: poll DB error on retry: %s", exc)
+                row = None
+            if row is None:
+                logger.error(
+                    "csp_approval_gate: row %d vanished after retry — fail-closed",
+                    row_id,
+                )
+                return []
 
         if row["status"] != "pending":
             break
