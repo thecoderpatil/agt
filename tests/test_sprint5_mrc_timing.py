@@ -136,7 +136,11 @@ def test_mrc_deploy_script_has_integrity_check_hook():
 
 def test_mrc_integrity_check_runs_after_services_started():
     src = _read(REPO / "scripts" / "deploy" / "deploy.ps1")
-    start_idx = src.find("nssm start agt-telegram-bot")
+    # Sprint 6 R5: replaced raw `nssm start` with Invoke-NssmStart wrapper.
+    # Contract preserved: integrity_check still runs AFTER the start call.
+    start_idx = src.find('Invoke-NssmStart -ServiceName "agt-telegram-bot"')
+    if start_idx < 0:
+        start_idx = src.find("nssm start agt-telegram-bot")
     hook_idx = src.find("PRAGMA integrity_check")
     assert start_idx >= 0 and hook_idx > start_idx, (
         "MR C: integrity_check must run AFTER the services are started so "
