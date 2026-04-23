@@ -26,6 +26,7 @@ except ImportError as exc:  # pragma: no cover - pyyaml is required
 
 from .checks import CHECK_REGISTRY
 from .types import CheckContext, Violation
+from agt_equities.config import ACCOUNT_TO_HOUSEHOLD
 
 log = logging.getLogger(__name__)
 
@@ -64,13 +65,18 @@ def build_context(
     """Construct a CheckContext from environment variables + sensible defaults."""
     _bm = os.environ.get("AGT_BROKER_MODE", "").strip().lower()
     paper_mode = (_bm == "paper") if _bm in ("paper", "live") else (os.environ.get("AGT_PAPER_MODE", "0") == "1")
+    # E-M-1 (Sprint 3 MR 4): derive live-accounts default from config.ACCOUNT_TO_HOUSEHOLD
+    # rather than re-hardcoding. Prior hardcoded literal was a second source of truth
+    # that could drift from config.HOUSEHOLD_MAP on any account rename.
+    _live_default = ",".join(sorted(ACCOUNT_TO_HOUSEHOLD))
     live_accounts = frozenset(
         a.strip()
-        for a in os.environ.get(
-            "AGT_LIVE_ACCOUNTS", "U21971297,U22076329,U22076184,U22388499"
-        ).split(",")
+        for a in os.environ.get("AGT_LIVE_ACCOUNTS", _live_default).split(",")
         if a.strip()
     )
+    # Paper default retained until a canonical paper-household map exists in config.
+    # Punt per dispatch: "if add one, scope creeps out of this MR — in that case just
+    # leave the paper default and only de-drift the live default".
     paper_raw = os.environ.get(
         "AGT_PAPER_ACCOUNTS",
         "DUP751003:Yash_Household,DUP751004:Yash_Household,DUP751005:Vikram_Household",
