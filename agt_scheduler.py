@@ -811,6 +811,32 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("conviction_weekly")
 
+    # Sprint 4 MR B (ADR-FLEX_FRESHNESS_v1): external freshness watchdog.
+    # 18:00 ET Mon-Fri — queries master_log_sync via RO connection; if the most
+    # recent success is > threshold hours old, enqueues FLEX_SYNC_MISSED alert
+    # + writes sentinel file. If fresh, deletes the sentinel. Idempotent; no
+    # touches to prohibited flex_sync.py.
+    from agt_equities.flex_sync_watchdog import run_flex_sync_watchdog
+
+    def _flex_sync_watchdog_job() -> None:
+        try:
+            result = run_flex_sync_watchdog()
+            logger.info("flex_sync_watchdog: %s", result)
+        except Exception:
+            logger.exception("flex_sync_watchdog: unhandled failure")
+
+    scheduler.add_job(
+        _flex_sync_watchdog_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=18,
+        minute=0,
+        id="flex_sync_watchdog",
+        name="flex_sync_watchdog",
+        replace_existing=True,
+    )
+    registered.append("flex_sync_watchdog")
+
     return registered
 
 
