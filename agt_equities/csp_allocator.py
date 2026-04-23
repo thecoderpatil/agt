@@ -42,6 +42,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 
 from agt_equities.config import (
     ACCOUNT_TO_HOUSEHOLD,
+    CSP_ACTIVE_ACCOUNTS,
     HOUSEHOLD_MAP,
     MARGIN_ACCOUNTS,
 )
@@ -1216,6 +1217,12 @@ def _tickets_from_digest(
         if alloc.margin_check_status != STATUS_APPROVED:
             continue
         if alloc.contracts_allocated < 1:
+            continue
+        if alloc.account_id not in CSP_ACTIVE_ACCOUNTS:
+            logger.info(
+                "csp_allocator.skip_dormant account=%s reason=not_in_CSP_ACTIVE_ACCOUNTS",
+                alloc.account_id,
+            )
             continue
         tickets.append({
             "account_id": alloc.account_id,
