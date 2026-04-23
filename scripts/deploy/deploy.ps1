@@ -142,5 +142,45 @@ if (-not $SkipServiceRestart) {
 
 
 
+# 6. Sprint 5 MR C: PRAGMA integrity_check post-start.
+#    Sprint 4 pre-sprint gate observed a transient "database disk image is
+#    malformed" during a _check_invariants_tick probe that self-resolved on
+#    PRAGMA integrity_check. This hook catches the same class proactively —
+#    if integrity is not 'ok' after deploy, halt with non-zero exit so the
+#    operator doesn't silently ship on top of a corrupt DB.
+
+if (-not $SkipServiceRestart) {
+
+    $dbPath = "$CanonicalDbDir\agt_desk.db"
+
+    if (Test-Path $dbPath) {
+
+        # 5s grace so services can settle their connections
+        Start-Sleep -Seconds 5
+
+        $integrityResult = & python -c "import sqlite3, sys; conn = sqlite3.connect(r'$dbPath', timeout=10); row = conn.execute('PRAGMA integrity_check').fetchone(); conn.close(); print(row[0] if row else 'none'); sys.exit(0 if row and row[0] == 'ok' else 2)"
+
+        $integrityExit = $LASTEXITCODE
+
+        Write-Host "PRAGMA integrity_check: $integrityResult"
+
+        if ($integrityExit -ne 0) {
+
+            Write-Error "Sprint 5 MR C: integrity_check returned non-ok ($integrityResult). Deploy halted."
+
+            exit $integrityExit
+
+        }
+
+    } else {
+
+        Write-Warning "PRAGMA integrity_check skipped — DB path missing ($dbPath)"
+
+    }
+
+}
+
+
+
 Write-Host "Deploy complete at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'). Rollback target: $previous"
 
