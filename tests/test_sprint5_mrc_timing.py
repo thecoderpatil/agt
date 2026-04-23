@@ -8,8 +8,11 @@ reduction is an empirical test that runs on prod — the ship report captures
 tomorrow's 09:35/09:37/09:45 slot outcomes as the canary.
 
 Scope:
-  - PTB JobQueue configure path: misfire_grace_time=60, coalesce=True,
-    max_workers=20.
+  - PTB JobQueue configure path: misfire_grace_time=60, coalesce=True.
+    NOTE: MR !225 hotfix reverted MR C's ThreadPoolExecutor override
+    (it broke async JobQueue.job_callback awaits — bot_heartbeat age
+    climbed to 271s post-deploy). Executor must stay AsyncIOExecutor
+    (PTB default); only job_defaults are configured here.
   - deploy.ps1 integrity_check hook + non-zero exit on corruption.
   - Forensic evidence captured in ship report: Thursday 2026-04-23 scheduler
     daemon had 0 misfires while PTB JobQueue had 1566+ (822 bot_heartbeat +
@@ -45,8 +48,7 @@ def test_mrc_telegram_bot_job_queue_configure_block_present():
     # The configure call block
     assert "jq.scheduler.configure(" in src, (
         "Sprint 5 MR C: PTB JobQueue must be reconfigured BEFORE job "
-        "registration so misfire_grace + executor expansion apply to all "
-        "registered jobs."
+        "registration so job_defaults apply to all registered jobs."
     )
     assert '"misfire_grace_time": 60' in src, (
         "MR C: misfire_grace_time must be bumped to 60s (from default 1s)."
@@ -55,12 +57,28 @@ def test_mrc_telegram_bot_job_queue_configure_block_present():
         "MR C: coalesce=True collapses multiple missed ticks into a single "
         "fire so interval jobs don't spiral on executor recovery."
     )
-    assert "max_workers=20" in src, (
-        "MR C: executor pool expanded to 20 (from default 10) to absorb "
-        "concurrent 09:35+09:37+09:45 fires without saturation."
+
+
+def test_mrc_hotfix_no_executor_override():
+    """MR !225 regression guard: the configure call must NOT replace PTB's
+    default AsyncIOExecutor with a ThreadPoolExecutor. A thread-pool executor
+    cannot await JobQueue.job_callback coroutines; MR C's original code
+    (max_workers=20 ThreadPoolExecutor) silently broke every async job."""
+    src = _read(REPO / "telegram_bot.py")
+    # Locate the configure call and check the argument set
+    cfg_idx = src.find("jq.scheduler.configure(")
+    assert cfg_idx >= 0, "scheduler.configure block missing"
+    # Walk forward to the closing paren
+    close_idx = src.find(")", cfg_idx)
+    block = src[cfg_idx:close_idx + 1]
+    assert "executors=" not in block, (
+        "MR !225 hotfix: scheduler.configure must NOT set executors=. "
+        "PTB's default AsyncIOExecutor is required to await async job_callback "
+        "coroutines. Prior code used ThreadPoolExecutor(max_workers=20) which "
+        "silently broke bot_heartbeat (age climbed to 271s)."
     )
-    assert "from apscheduler.executors.pool import ThreadPoolExecutor" in src, (
-        "MR C: must import APScheduler's ThreadPoolExecutor (not the stdlib one)."
+    assert "ThreadPoolExecutor" not in block, (
+        "MR !225 hotfix: no ThreadPoolExecutor reference in the configure block."
     )
 
 
@@ -83,16 +101,17 @@ def test_mrc_configure_failure_does_not_crash_boot():
     does not re-raise — boot continues with defaults (stale behavior is
     preferred over boot failure)."""
     src = _read(REPO / "telegram_bot.py")
-    # Find the try/except around the configure call
+    # Find the try/except around the configure call.
+    # Hotfix MR !225 removed the ThreadPoolExecutor import, so the try: block
+    # now contains only the configure() call + logger.info.
     m = re.search(
-        r"try:\s*\n\s*from apscheduler\.executors\.pool.*?"
-        r"jq\.scheduler\.configure.*?"
+        r"try:\s*\n\s*jq\.scheduler\.configure\(.*?"
         r"except Exception as _sched_cfg_exc:",
         src, re.DOTALL,
     )
     assert m is not None, (
-        "MR C: scheduler.configure must be wrapped in try/except so a missing "
-        "apscheduler import (or version skew) doesn't abort bot boot."
+        "MR C: scheduler.configure must be wrapped in try/except so a "
+        "version-skew or internal APScheduler change doesn't abort bot boot."
     )
 
 
