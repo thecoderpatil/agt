@@ -50,7 +50,13 @@ def _resolve_default_ports() -> tuple[int, int]:
         try:
             from agt_equities.config import PAPER_MODE
         except Exception:
-            PAPER_MODE = os.environ.get("PAPER_MODE", "1") == "1"
+            # Fail-closed fallback: if config import fails AND no canonical
+            # AGT_BROKER_MODE is set, default to LIVE (paper=False) so a
+            # silent misconfiguration does not route a live launch to the
+            # paper gateway. Bug E-H-1 from opus_bug_hunt_overnight.md
+            # fixed the prior reverse-fail-closed default (wrong env var
+            # name + paper-truthy default).
+            PAPER_MODE = os.environ.get("AGT_PAPER_MODE", "").lower() in ("1", "true", "yes")
         paper = PAPER_MODE
     gateway = 4002 if paper else 4001
     tws = 7497 if paper else 7496
