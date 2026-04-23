@@ -13,6 +13,10 @@ import os
 import sqlite3
 import sys
 import time
+
+# Sprint 5 MR A F3-H-1: use tx_immediate for the two vrp_analytics.db writes —
+# prior bare `with conn:` under asyncio.to_thread was WAL silent-rollback prone.
+from agt_equities.db import tx_immediate
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -73,7 +77,8 @@ logger = logging.getLogger("vrp_veto")
 def init_vrp_db() -> None:
     """Create the vrp_daily table if it doesn't exist."""
     with closing(sqlite3.connect(str(_VRP_DB_PATH))) as conn:
-        with conn:
+        # Sprint 5 MR A F3-H-1: BEGIN IMMEDIATE, not DEFERRED.
+        with tx_immediate(conn):
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS vrp_daily (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,7 +139,8 @@ def write_vrp_results(results: list, run_type: str = "scheduled") -> None:
         ))
 
     with closing(sqlite3.connect(str(_VRP_DB_PATH))) as conn:
-        with conn:
+        # Sprint 5 MR A F3-H-1: BEGIN IMMEDIATE, not DEFERRED.
+        with tx_immediate(conn):
             conn.executemany("""
                 INSERT INTO vrp_daily (
                     run_date, run_timestamp, run_type, ticker,

@@ -64,14 +64,53 @@ def _render(template_name: str, context: dict):
 # ── Auth middleware ───────────────────────────────────────────────
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):
+    """Sprint 5 MR A F2-H-2 phase 1: accept both URL query `?t=` AND
+    `Authorization: Bearer <token>` header. Header is preferred (does not
+    appear in uvicorn access log). URL-query path still works to avoid
+    breaking the Tailscale bookmark; phase 2 will remove it once Yash
+    confirms header-auth works end-to-end and updates the bookmark.
+    """
     async def dispatch(self, request: Request, call_next):
         # Skip auth for static files
         if request.url.path.startswith("/static"):
             return await call_next(request)
-        token = request.query_params.get("t", "")
+        # Header path (preferred)
+        token = ""
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        # URL-query fallback (phase 1 — will be removed in phase 2)
+        if not token:
+            token = request.query_params.get("t", "")
         if not DECK_TOKEN or token != DECK_TOKEN:
             return Response("Unauthorized", status_code=401)
         return await call_next(request)
+
+
+class _RedactDeckTokenFilter(logging.Filter):
+    """Sprint 5 MR A F2-H-2: scrub `?t=<token>` and `&t=<token>` from any
+    log record's `args` / rendered `msg` so uvicorn access log no longer
+    writes operator auth tokens to disk. Applied to uvicorn.access logger
+    below. Does not affect header-auth requests at all.
+    """
+    import re as _re
+    _PATTERNS = [
+        _re.compile(r"([?&]t=)[^ &\"\']+", _re.IGNORECASE),
+    ]
+    def filter(self, record: logging.LogRecord) -> bool:
+        def _scrub(s: str) -> str:
+            for p in self._PATTERNS:
+                s = p.sub(r"\1<redacted>", s)
+            return s
+        if isinstance(record.args, tuple):
+            record.args = tuple(_scrub(str(a)) if isinstance(a, str) else a for a in record.args)
+        if isinstance(record.msg, str):
+            record.msg = _scrub(record.msg)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_RedactDeckTokenFilter())
+
 
 app.add_middleware(TokenAuthMiddleware)
 

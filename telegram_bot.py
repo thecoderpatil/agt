@@ -776,7 +776,11 @@ def append_pending_tickets(tickets: list[dict]) -> None:
 
         payload = dict(ticket)
 
-        payload.setdefault("status", "pending")
+        # Sprint 5 MR A F1-H-2: default to 'staged' (not 'pending') so any
+        # caller that forgets to set status lands on the canonical state
+        # machine. Historical 'pending' default was the silent-invisibility
+        # bug F1-H-2 documents.
+        payload.setdefault("status", "staged")
 
         created_at = str(payload.get("created_at") or payload.get("timestamp") or now)
 
@@ -784,7 +788,7 @@ def append_pending_tickets(tickets: list[dict]) -> None:
 
             json.dumps(payload, default=str),
 
-            str(payload.get("status", "pending")),
+            str(payload.get("status", "staged")),
 
             created_at,
 
@@ -2872,7 +2876,10 @@ async def parse_and_stage_order(text: str) -> str:
 
             "right":         leg["right"],
 
-            "status":        "pending",
+            # Sprint 5 MR A F1-H-2: write 'staged' so cmd_approve /
+            # handle_approve_callback / _auto_execute_staged (all of which
+            # filter status='staged') can actually find NL-path tickets.
+            "status":        "staged",
 
             "transmit":      False,
 
@@ -8620,15 +8627,10 @@ def _build_orders_views(data: dict) -> dict[str, str]:
 
 
 
-def _cc_confirm_keyboard(token: str) -> InlineKeyboardMarkup:
-
-    return InlineKeyboardMarkup([[
-
-        InlineKeyboardButton("CONFIRM", callback_data=f"cc:confirm:{token}"),
-
-        InlineKeyboardButton("CANCEL", callback_data=f"cc:cancel:{token}"),
-
-    ]])
+# Sprint 5 MR A F1-H-1: _cc_confirm_keyboard deleted. Rendered cc:* buttons
+# had no CallbackQueryHandler(pattern=r"^cc:") registered — dead UI. If a
+# future CC confirm flow wants to come back, it must land with the handler
+# wired from day one.
 
 
 
@@ -8794,7 +8796,7 @@ _DASHBOARD_BUTTONS = {
 
     "get_working_orders": [[
 
-            InlineKeyboardButton("Order Details", callback_data="orders_detail"),
+            InlineKeyboardButton("Order Details", callback_data="orders:detail"),
 
         ],[
 
@@ -8960,7 +8962,53 @@ async def handle_orders_callback(
 
     chat_id = update.effective_chat.id
 
-    action = (query.data or "").split(":", 1)[-1]      # refresh | match_mid | cancel_all
+    action = (query.data or "").split(":", 1)[-1]      # refresh | match_mid | cancel_all | detail
+
+
+
+    # ── Order Details (Sprint 5 MR A F1-H-3) ────────────────────────
+
+    if action == "detail":
+
+        await query.answer("Loading detail…")
+
+        try:
+
+            cache = dashboard_cache.get(chat_id) or {}
+
+            raw = cache.get("_raw_data") or {}
+
+            views = _build_orders_views(raw) if raw else {}
+
+            detail_html = views.get("orders_detail")
+
+            if not detail_html:
+
+                await query.answer(
+
+                    "No detail available — Refresh Prices first.",
+
+                    show_alert=True,
+
+                )
+
+                return
+
+            keyboard = InlineKeyboardMarkup(_DASHBOARD_BUTTONS["get_working_orders"])
+
+            await query.edit_message_text(
+
+                text=detail_html, parse_mode="HTML", reply_markup=keyboard,
+
+            )
+
+        except Exception as exc:
+
+            logger.exception("orders:detail failed")
+
+            await query.answer(f"Detail error: {exc}", show_alert=True)
+
+        return
 
 
 
@@ -9567,61 +9615,13 @@ def _build_cc_ladder_views(
 
     keyboard_rows = []
 
-    for row_offset, row in enumerate(visible_rows):
+    # Sprint 5 MR A F1-H-1: cc:select, cc:page, cc:exp, cc:confirm, cc:cancel
+    # buttons all rendered but never handled (no CallbackQueryHandler registered
+    # for r"^cc:"). Removed to stop emitting dead buttons. HTML ladder text
+    # still renders. A future CC ladder re-enable MR should wire the handler
+    # first, then re-add buttons.
 
-        strike_label = _format_strike_label(float(row["strike"]))
-
-        keyboard_rows.append([
-
-            InlineKeyboardButton(
-
-                f"Select {strike_label}C",
-
-                callback_data=f"cc:select:{expiry_index}:{strike_offset}:{row_offset}",
-
-            )
-
-        ])
-
-
-
-    if expiry.get("has_more"):
-
-        keyboard_rows.append([
-
-            InlineKeyboardButton(
-
-                "Show Next 5 Strikes ⬇️",
-
-                callback_data=f"cc:page:{expiry_index}:{strike_offset + 5}",
-
-            )
-
-        ])
-
-
-
-    if len(expirations) > 1:
-
-        other_index = 1 if expiry_index == 0 else 0
-
-        other_date = expirations[other_index].get("date", "Next")
-
-        keyboard_rows.append([
-
-            InlineKeyboardButton(
-
-                f"Switch to {other_date} Expiry 🗓️",
-
-                callback_data=f"cc:exp:{other_index}:0",
-
-            )
-
-        ])
-
-
-
-    return html_text, InlineKeyboardMarkup(keyboard_rows)
+    return html_text, InlineKeyboardMarkup([])
 
 
 

@@ -19,6 +19,7 @@ from typing import Literal, Optional
 
 from agt_equities.config import MARGIN_ELIGIBLE_ACCOUNTS, VIKRAM_HOUSEHOLD
 from agt_equities.dates import et_today
+from agt_equities.db import tx_immediate
 from agt_equities.walker import compute_walk_away_pnl as _compute_walk_away_pnl
 
 logger = logging.getLogger(__name__)
@@ -706,24 +707,28 @@ def stage_stock_sale_via_smart_friction(
 
     audit_id = str(uuid.uuid4())
     try:
-        conn.execute(
-            "INSERT INTO bucket3_dynamic_exit_log "
-            "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
-            " household_nlv, underlying_spot_at_render, "
-            " gate1_realized_loss, walk_away_pnl_per_share, "
-            " shares, limit_price, exception_type, final_status, "
-            " originating_account_id) "
-            "VALUES (?, date('now'), ?, ?, ?, 'STK_SELL', ?, ?, ?, ?, ?, ?, ?, 'STAGED',"
-            " NULL)",
-            # TODO Followup #20b: capture originating account from Cure Console form (post-paper)
-            (audit_id, ticker, household, desk_mode,
-             household_nlv, spot,
-             round(loss_total, 2),
-             round(limit_price - adjusted_cost_basis, 4),
-             shares, limit_price,
-             exception_flag.value if exception_flag else None),
-        )
-        conn.commit()
+        # Sprint 5 MR A F2-H-1: tx_immediate — prior bare conn.execute +
+        # conn.commit under DEFERRED tx was silent-rollback-prone under WAL
+        # contention (same class as E-H-3/E-H-4 and E-M-5 sweeps). Inner
+        # commit bypassed the outer try/except's rollback semantics.
+        with tx_immediate(conn):
+            conn.execute(
+                "INSERT INTO bucket3_dynamic_exit_log "
+                "(audit_id, trade_date, ticker, household, desk_mode, action_type, "
+                " household_nlv, underlying_spot_at_render, "
+                " gate1_realized_loss, walk_away_pnl_per_share, "
+                " shares, limit_price, exception_type, final_status, "
+                " originating_account_id) "
+                "VALUES (?, date('now'), ?, ?, ?, 'STK_SELL', ?, ?, ?, ?, ?, ?, ?, 'STAGED',"
+                " NULL)",
+                # TODO Followup #20b: capture originating account from Cure Console form (post-paper)
+                (audit_id, ticker, household, desk_mode,
+                 household_nlv, spot,
+                 round(loss_total, 2),
+                 round(limit_price - adjusted_cost_basis, 4),
+                 shares, limit_price,
+                 exception_flag.value if exception_flag else None),
+            )
     except Exception as exc:
         logger.error("Failed to stage STK_SELL for %s: %s", ticker, exc)
         return StageStockSaleResult(

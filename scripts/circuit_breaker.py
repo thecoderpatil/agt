@@ -15,10 +15,13 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Ensure we're in project root
-os.chdir(Path(__file__).resolve().parent.parent)
-
-RAILS_PATH = "_SAFETY_RAILS.md"
+# Sprint 5 MR A F3-H-2: removed `os.chdir(Path(__file__).resolve().parent.parent)`.
+# Module-scope os.chdir is process-global — when MR !209 Sprint 3 wrapped the
+# circuit_breaker call in asyncio.to_thread, the import-time chdir then fired
+# from a worker thread but affected EVERY thread's CWD. Verified via grep:
+# no file I/O in this module uses CWD-relative paths (get_ro_connection() uses
+# env-based DB path; RAILS_PATH is a documentation constant never opened).
+RAILS_PATH = Path(__file__).resolve().parent.parent / "_SAFETY_RAILS.md"
 
 # Hard-coded limits (mirrors _SAFETY_RAILS.md -- code is the enforcer, file is documentation)
 MAX_DAILY_ORDERS = 30
