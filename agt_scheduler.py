@@ -848,6 +848,32 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("flex_sync_watchdog")
 
+    # Sprint 6 Mega-MR 3 — zero-row suspicion watchdog. Runs 30 min after the
+    # freshness watchdog. Catches the class of failure where flex_sync
+    # completes cleanly but returns 0 rows across a multi-day window
+    # despite engine activity suggesting live trades occurred. Closes
+    # Investigation D F3 coverage gap that Sprint 4 MR !217 didn't cover.
+    from agt_equities.flex_sync_watchdog import check_zero_row_suspicion
+
+    def _flex_sync_zero_row_check_job() -> None:
+        try:
+            result = check_zero_row_suspicion()
+            logger.info("flex_sync_zero_row_check: %s", result)
+        except Exception:
+            logger.exception("flex_sync_zero_row_check: unhandled failure")
+
+    scheduler.add_job(
+        _flex_sync_zero_row_check_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=18,
+        minute=30,
+        id="flex_sync_zero_row_check",
+        name="flex_sync_zero_row_check",
+        replace_existing=True,
+    )
+    registered.append("flex_sync_zero_row_check")
+
     return registered
 
 
