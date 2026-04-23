@@ -231,3 +231,18 @@ def is_csp_active_account(account_id: str, mode: str) -> bool:
     if mode == "paper":
         return True
     return account_id in CSP_ACTIVE_ACCOUNTS
+
+
+# ============================================================================
+# CSP Digest configuration constants — ADR-CSP_TELEGRAM_DIGEST_v1.
+# Flippable to Opus via env override; budget tripwire and timeout per ADR.
+# ============================================================================
+CSP_DIGEST_LLM_MODEL: str = os.environ.get(
+    "AGT_CSP_DIGEST_LLM_MODEL", "claude-sonnet-4-6",
+)
+CSP_DIGEST_DAILY_BUDGET_USD: float = float(
+    os.environ.get("AGT_CSP_DIGEST_DAILY_BUDGET_USD", "5.0"),
+)
+CSP_DIGEST_TIMEOUT_MINUTES: int = int(
+    os.environ.get("AGT_CSP_DIGEST_TIMEOUT_MINUTES", "90"),
+)
