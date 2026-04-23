@@ -299,7 +299,24 @@ def format_alert_text(alert: dict[str, Any]) -> str:
         threshold = payload.get("threshold_hours", "?")
         return (
             f"[{severity}] flex_sync STALE: last success {last_sync} "
-            f"({age_hours}h ago, threshold {threshold}h) — run /flex_status for detail"
+            f"({age_hours}h ago, threshold {threshold}h) - run /flex_status for detail"
+        )
+
+    if kind == "FLEX_SYNC_EMPTY_SUSPICIOUS":
+        # Sprint 6 Mega-MR 3: zero-row suspicion watchdog. Fires when the
+        # last N weekday syncs ALL returned 0 rows AND either the prior
+        # rolling history had non-trivial average OR engine activity was
+        # observed during the all-zero window (pending_orders /
+        # csp_allocator_latest rows created).
+        window = payload.get("window", "?")
+        prior_mean = payload.get("prior_mean", "?")
+        pending = payload.get("pending_orders", 0)
+        allocator = payload.get("csp_allocator_latest", 0)
+        reasons = payload.get("reasons", "")
+        return (
+            f"[{severity}] flex_sync EMPTY {window} weekdays: "
+            f"prior_mean={prior_mean} pending_orders={pending} "
+            f"allocator={allocator} reasons=[{reasons}]"
         )
 
     if kind == "INCEPTION_DELTA_MISS":
