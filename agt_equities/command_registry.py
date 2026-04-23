@@ -54,4 +54,5 @@ COMMAND_REGISTRY: dict[str, CommandSpec] = {
     "reject_rem":  CommandSpec("cmd_reject_rem",   "Reject remediation action"),
     "scan":        CommandSpec("cmd_scan",         "Run scan orchestrator",
                                visible=False),
+    "flex_status": CommandSpec("cmd_flex_status",  "Flex-sync freshness status"),
 }

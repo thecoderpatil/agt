@@ -118,6 +118,7 @@ def test_register_jobs_a5e_set():
         "flex_sync_eod",
         "universe_monthly",
         "conviction_weekly",
+        "flex_sync_watchdog",  # Sprint 4 MR B (ADR-FLEX_FRESHNESS_v1)
     ]
     job_ids = {j.id for j in sched.get_jobs()}
     assert {
@@ -126,7 +127,7 @@ def test_register_jobs_a5e_set():
         "beta_cache_refresh", "beta_startup",
         "corporate_intel_refresh", "corporate_intel_startup",
         "flex_sync_eod", "universe_monthly",
-        "conviction_weekly",
+        "conviction_weekly", "flex_sync_watchdog",
     }.issubset(job_ids)
 
 

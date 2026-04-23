@@ -291,6 +291,17 @@ def format_alert_text(alert: dict[str, Any]) -> str:
         err = payload.get("error", "unknown")
         return f"[{severity}] flex_sync FAILED: {err}"
 
+    if kind == "FLEX_SYNC_MISSED":
+        # Sprint 4 MR B (ADR-FLEX_FRESHNESS_v1): external watchdog fires when
+        # the most-recent master_log_sync row is older than the threshold.
+        age_hours = payload.get("age_hours", "?")
+        last_sync = payload.get("last_sync_utc", "?")
+        threshold = payload.get("threshold_hours", "?")
+        return (
+            f"[{severity}] flex_sync STALE: last success {last_sync} "
+            f"({age_hours}h ago, threshold {threshold}h) — run /flex_status for detail"
+        )
+
     if kind == "INCEPTION_DELTA_MISS":
         # Sprint B4: fill callback could not resolve inception_delta from
         # the FA-block reader or legacy flat path after 3 retries.

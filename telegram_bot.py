@@ -18949,6 +18949,58 @@ def _csp_slash_set_status(row_id: int, status: str) -> bool:
     return rowcount == 1
 
 
+# ---------------------------------------------------------------------------
+# Sprint 4 MR B (ADR-FLEX_FRESHNESS_v1): /flex_status command. Read-only.
+# ---------------------------------------------------------------------------
+
+
+async def cmd_flex_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Render last sync timestamp, age, status, sentinel presence. No DB writes."""
+    if not is_authorized(update):
+        return
+
+    def _snapshot() -> dict:
+        from agt_equities.flex_sync_watchdog import query_latest_sync, SENTINEL_FILE, DEFAULT_STALE_THRESHOLD_HOURS
+        from datetime import datetime as _dt, timezone as _tz
+        info = query_latest_sync()
+        last = info.get("started_at")
+        age_h = None
+        if last:
+            try:
+                dt = _dt.fromisoformat(str(last).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                age_h = (_dt.now(_tz.utc) - dt).total_seconds() / 3600.0
+            except Exception:
+                age_h = None
+        return {
+            "last_sync_utc": last,
+            "status": info.get("status"),
+            "sync_id": info.get("sync_id"),
+            "age_hours": age_h,
+            "threshold_hours": DEFAULT_STALE_THRESHOLD_HOURS,
+            "sentinel_present": SENTINEL_FILE.exists(),
+            "db_error": info.get("db_error"),
+        }
+
+    snap = await asyncio.to_thread(_snapshot)
+
+    lines = ["📡 /flex_status"]
+    if snap.get("db_error"):
+        lines.append(f"DB read error: {snap['db_error']}")
+    if snap.get("last_sync_utc") is None:
+        lines.append("No master_log_sync rows yet.")
+    else:
+        age = snap["age_hours"]
+        age_str = f"{age:.1f}h" if age is not None else "unknown"
+        lines.append(f"Last sync:  {snap['last_sync_utc']}")
+        lines.append(f"Status:     {snap['status']}")
+        lines.append(f"Sync ID:    {snap['sync_id']}")
+        lines.append(f"Age:        {age_str} (threshold {snap['threshold_hours']}h)")
+    lines.append(f"Sentinel:   {'present' if snap.get('sentinel_present') else 'absent'}")
+    await send_reply(update, "\n".join(lines))
+
+
 _LIQ_STAGING_BY_TOKEN: dict[str, dict] = {}
 
 _LIQ_TOKEN_TTL_S = 30 * 60  # 30 minutes
@@ -22178,6 +22230,9 @@ def main() -> None:
     app.add_handler(CommandHandler("approve_rem", cmd_approve_rem))
 
     app.add_handler(CommandHandler("reject_rem",  cmd_reject_rem))
+
+    # Sprint 4 MR B (ADR-FLEX_FRESHNESS_v1): read-only freshness query.
+    app.add_handler(CommandHandler("flex_status", cmd_flex_status))
 
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
 
