@@ -161,24 +161,24 @@ class TestTicketsFromDigest:
         p = CSPProposal(
             household_id="H1", ticker="ABC", strike=50.0,
             contracts_requested=4, expiry="20260516",
-            account_ids=["U_OK", "U_DROP"],
-            margin_eligible={"U_OK": True, "U_DROP": True},
+            account_ids=["U21971297", "U_DROP"],
+            margin_eligible={"U21971297": True, "U_DROP": True},
         )
         import agt_equities.fa_block_margin as fam
         # U_DROP has no NLV snapshot → no_snapshot → 0 contracts, not redistributed
         digest = fam.allocate_csp(
-            p, available_nlv_override={"U_OK": 100_000.0},
+            p, available_nlv_override={"U21971297": 100_000.0},
         )
         candidate = _make_candidate(ticker="abc", strike=50.0, mid=1.25,
                                     expiry="2026-05-16", annualized_yield=42.0)
         hh = _hh_snapshot({
-            "U_OK": {"account_id": "U_OK", "margin_eligible": True},
+            "U21971297": {"account_id": "U21971297", "margin_eligible": True},
             "U_DROP": {"account_id": "U_DROP", "margin_eligible": True},
         })
         tickets = _tickets_from_digest(digest, hh, candidate)
         assert len(tickets) == 1
         t = tickets[0]
-        assert t["account_id"] == "U_OK"
+        assert t["account_id"] == "U21971297"
         # U_OK is the only approved, takes pro-rata base_share=2 (4/2=2,
         # since no-snapshot peer gets 0, not forfeited).
         assert t["quantity"] == 2

@@ -186,3 +186,26 @@ ACCOUNT_LABELS: dict[str, str] = (
     if PAPER_MODE
     else _LIVE_ACCOUNT_LABELS
 )
+
+
+# ============================================================================
+# Account display labels — canonical source of truth.
+# Consumed by agt_deck.queries, telegram_bot, csp_allocator, digest layer.
+# Do not duplicate this map anywhere; import from here.
+# ============================================================================
+ACCOUNT_ALIAS: dict[str, str] = {
+    "U21971297": "Yash Ind",
+    "U22076329": "Yash Roth",
+    "U22076184": "Yash Trad IRA",  # DORMANT — excluded from CSP entry via CSP_ACTIVE_ACCOUNTS
+    "U22388499": "Vikram Ind",
+}
+
+# Accounts eligible for new CSP entries. Excludes dormant accounts.
+# csp_allocator filters household candidates against this set before
+# handing tickets to the approval_gate. Monitoring-only accounts (CC rolls,
+# harvests, dormant positions) are NOT in this set.
+CSP_ACTIVE_ACCOUNTS: frozenset[str] = frozenset({
+    "U21971297",  # Yash Ind
+    "U22076329",  # Yash Roth
+    "U22388499",  # Vikram Ind
+})
