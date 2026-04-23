@@ -1,4 +1,4 @@
-# SQLite hot backup via VACUUM INTO — safe under WAL, does not block writers.
+# SQLite hot backup via Python sqlite3.backup() — WAL-safe, no external binary required.
 param(
     [string]$DbPath = "C:\AGT_Telegram_Bridge\agt_desk.db",
     [string]$BackupDir = "C:\AGT_Runtime\backups",
@@ -14,14 +14,12 @@ if (-not (Test-Path $BackupDir)) {
 $ts = Get-Date -Format "yyyyMMdd_HHmmss"
 $suffix = if ($Label) { "_$Label" } else { "" }
 $out = Join-Path $BackupDir "agt_desk_${ts}${suffix}.db"
-$outForwardSlash = $out.Replace('\','/')
 
-# Locate sqlite3.exe — prefer venv shim, fall back to PATH
-$sqlite = "C:\AGT_Telegram_Bridge\.venv\Scripts\sqlite3.exe"
-if (-not (Test-Path $sqlite)) { $sqlite = "sqlite3.exe" }
+$venv_python = "C:\AGT_Telegram_Bridge\.venv\Scripts\python.exe"
+$backup_script = (Resolve-Path (Join-Path $PSScriptRoot "..\backup_db.py")).Path
 
-& $sqlite $DbPath "VACUUM INTO '$outForwardSlash';"
-if ($LASTEXITCODE -ne 0) { throw "VACUUM INTO failed (exit $LASTEXITCODE)" }
+& $venv_python $backup_script $DbPath $out
+if ($LASTEXITCODE -ne 0) { throw "backup_db.py failed (exit $LASTEXITCODE)" }
 
 $size = (Get-Item $out).Length
 Write-Host "Backup OK: $out ($([math]::Round($size/1MB,2)) MB)"
