@@ -29,6 +29,17 @@ from types import SimpleNamespace
 
 import pytest
 
+
+def _prod_db_available() -> bool:
+    # Sprint 5 MR B (E-M-4): DB_PATH is None at import;
+    # use get_db_path() which raises RuntimeError if env unset.
+    # Treat env-missing as prod-DB-not-available and skip.
+    try:
+        from agt_equities.db import get_db_path
+        return get_db_path().exists()
+    except Exception:
+        return False
+
 # CI gate: Sprint A marker + explicit file list in .gitlab-ci.yml.
 pytestmark = pytest.mark.sprint_a
 
@@ -829,9 +840,7 @@ def test_route_ira_first_then_margin():
 
 @pytest.mark.agt_tripwire_exempt
 @pytest.mark.skipif(
-    not __import__("pathlib").Path(
-        __import__("agt_equities.db", fromlist=["DB_PATH"]).DB_PATH
-    ).exists(),
+    not _prod_db_available(),
     reason="Production DB not available (CI/tripwire)",
 )
 def test_route_partial_when_household_cannot_fit_all():
@@ -872,9 +881,7 @@ def test_route_partial_when_household_cannot_fit_all():
 
 @pytest.mark.agt_tripwire_exempt
 @pytest.mark.skipif(
-    not __import__("pathlib").Path(
-        __import__("agt_equities.db", fromlist=["DB_PATH"]).DB_PATH
-    ).exists(),
+    not _prod_db_available(),
     reason="Production DB not available (CI/tripwire)",
 )
 def test_route_spills_from_ira_to_margin_when_ira_full():
@@ -1504,9 +1511,7 @@ def test_orchestrator_skips_sub_integer_sizing():
 
 @pytest.mark.agt_tripwire_exempt
 @pytest.mark.skipif(
-    not __import__("pathlib").Path(
-        __import__("agt_equities.db", fromlist=["DB_PATH"]).DB_PATH
-    ).exists(),
+    not _prod_db_available(),
     reason="Production DB not available (CI/tripwire)",
 )
 def test_orchestrator_mutates_snapshot_between_candidates():

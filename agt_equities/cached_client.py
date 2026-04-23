@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agt_equities.db import DB_PATH, get_db_connection
+from agt_equities.db import get_db_connection  # DB_PATH removed in Sprint 5 MR B (E-M-4) — was unused
 
 if TYPE_CHECKING:
     import anthropic  # pragma: no cover — type only
