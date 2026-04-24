@@ -458,3 +458,61 @@ sprint_a_unit_tests:
 
 
 
+# Sprint 8 Mega-MR 5 — PSScriptAnalyzer static lint for PowerShell scripts.
+# Motivated by R3 em-dash bug in rollback.ps1 (Sprint 6 MR 1) that would
+# have been caught by static analysis. Severity=Error initial gate; Warning
+# findings surface as MR output but don't block (expandable in follow-up).
+lint-powershell:
+
+
+
+  stage: test
+
+
+
+  image: mcr.microsoft.com/powershell:latest
+
+
+
+  tags: []
+
+
+
+  before_script:
+
+
+
+    - pwsh -NoProfile -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted; Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck"
+
+
+
+  script:
+
+
+
+    - pwsh -NoProfile -Command "Invoke-ScriptAnalyzer -Path ./scripts -Recurse -Severity Error -EnableExit"
+
+
+
+  rules:
+
+
+
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+      changes:
+
+        - "**/*.ps1"
+
+        - .gitlab-ci.yml
+
+    - if: $CI_COMMIT_BRANCH == "main"
+
+      changes:
+
+        - "**/*.ps1"
+
+        - .gitlab-ci.yml
+
+
+
