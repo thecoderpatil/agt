@@ -19085,6 +19085,47 @@ async def cmd_flex_status(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await send_reply(update, "\n".join(lines))
 
 
+async def cmd_oversight_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/oversight_status — ADR-017 §9 Mega-MR C on-demand observability card.
+
+    Pulls the same snapshot + threshold flags + rendered card as the 18:35 ET
+    scheduled digest. Read-only throughout. Fail-soft on any error.
+    """
+    if not is_authorized(update):
+        return
+    try:
+        from agt_equities.observability.digest import (
+            build_observability_snapshot,
+            render_observability_card,
+        )
+        try:
+            from agt_equities.observability.thresholds import (
+                compute_threshold_flags,
+            )
+        except Exception:
+            compute_threshold_flags = None  # type: ignore[assignment]
+
+        def _build():
+            snap = build_observability_snapshot()
+            flags = None
+            if compute_threshold_flags is not None:
+                try:
+                    flags = compute_threshold_flags()
+                except Exception as _tf_exc:
+                    logger.warning("oversight_status: thresholds failed: %s", _tf_exc)
+                    flags = None
+            return render_observability_card(snap, threshold_flags=flags)
+
+        card = await asyncio.to_thread(_build)
+        await send_reply(update, card)
+    except Exception as exc:
+        logger.exception("oversight_status: unhandled failure")
+        try:
+            await send_reply(update, f"⚠️ oversight_status failed: {exc}")
+        except Exception:
+            pass
+
+
 _LIQ_STAGING_BY_TOKEN: dict[str, dict] = {}
 
 _LIQ_TOKEN_TTL_S = 30 * 60  # 30 minutes
@@ -22317,6 +22358,9 @@ def main() -> None:
 
     # Sprint 4 MR B (ADR-FLEX_FRESHNESS_v1): read-only freshness query.
     app.add_handler(CommandHandler("flex_status", cmd_flex_status))
+
+    # ADR-017 §9 Mega-MR C: on-demand observability digest.
+    app.add_handler(CommandHandler("oversight_status", cmd_oversight_status))
 
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
 

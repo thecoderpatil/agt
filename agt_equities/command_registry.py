@@ -55,4 +55,6 @@ COMMAND_REGISTRY: dict[str, CommandSpec] = {
     "scan":        CommandSpec("cmd_scan",         "Run scan orchestrator",
                                visible=False),
     "flex_status": CommandSpec("cmd_flex_status",  "Flex-sync freshness status"),
+    "oversight_status": CommandSpec(
+                   "cmd_oversight_status",         "Observability digest (ADR-017)"),
 }
