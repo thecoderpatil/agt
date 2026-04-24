@@ -778,6 +778,163 @@ def check_self_healing_write_path_canonical(
 
     return []
 
+def check_flex_sync_bot_routed_coverage_gap(
+    conn: sqlite3.Connection, ctx: CheckContext,
+) -> list[Violation]:
+    """ADR-018 Phase 2 — bot-routed trade coverage verification.
+
+    After each successful flex_sync_eod run, cross-check the bot's local
+    record of filled orders (pending_orders) against the Flex mirror of
+    broker-booked trades (master_log_trades) for the coverage date. A
+    non-empty gap indicates a bot fill that Flex didn't return —
+    the class of silent loss that ADR-018 Phase 1 catches at zero-rows
+    but wouldn't catch if Flex returns partial data.
+
+    Correspondence key (5-sec bucket):
+      (account, symbol, side, round(qty,4), round(price,4),
+       int(fill_time_epoch / 5))
+
+    Fires on the coverage date from the most recent successful
+    master_log_sync with a resolved to_date. Only tracked (live) accounts
+    are in scope; paper accounts don't generate Flex rows.
+    """
+    if not _table_exists(conn, "master_log_sync"):
+        return []
+    if not _table_exists(conn, "master_log_trades"):
+        return []
+    if not _table_exists(conn, "pending_orders"):
+        return []
+    if not ctx.live_accounts:
+        return []
+
+    # Most recent successful sync with a resolved coverage date.
+    try:
+        row = conn.execute(
+            "SELECT sync_id, to_date FROM master_log_sync "
+            "WHERE status = 'success' AND to_date IS NOT NULL "
+            "ORDER BY finished_at DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return []
+    if not row or not row["to_date"]:
+        return []
+    coverage_date = row["to_date"]  # YYYYMMDD
+    if len(coverage_date) != 8 or not coverage_date.isdigit():
+        return []
+    d_iso = f"{coverage_date[:4]}-{coverage_date[4:6]}-{coverage_date[6:8]}"
+
+    # A = pending_orders.filled on D for tracked accounts.
+    try:
+        filled_rows = conn.execute(
+            "SELECT payload, fill_time FROM pending_orders "
+            "WHERE status = 'filled' AND DATE(fill_time) = ?",
+            (d_iso,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    def _bucket_epoch(ts: str | None) -> int:
+        dt = _parse_dt(ts)
+        if not dt:
+            return 0
+        return int(dt.timestamp() // 5)
+
+    tracked = ctx.live_accounts
+    set_A: set = set()
+    for r in filled_rows:
+        p = _parse_payload(r["payload"])
+        acct = p.get("account_id") or p.get("account")
+        if acct not in tracked:
+            continue
+        try:
+            key = (
+                acct,
+                (p.get("ticker") or p.get("symbol") or "").upper(),
+                (p.get("side") or p.get("action") or "").upper(),
+                round(float(p.get("quantity") or p.get("qty") or 0), 4),
+                round(float(p.get("fill_price") or p.get("price") or 0), 4),
+                _bucket_epoch(r["fill_time"]),
+            )
+        except (TypeError, ValueError):
+            continue
+        set_A.add(key)
+    if not set_A:
+        return []
+
+    # B = master_log_trades on D for tracked accounts.
+    try:
+        flex_rows = conn.execute(
+            "SELECT account_id, symbol, buy_sell, quantity, trade_price, "
+            "date_time FROM master_log_trades WHERE trade_date = ?",
+            (coverage_date,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    def _flex_bucket(date_time: str | None) -> int:
+        # Flex format: '20260422;100736' (YYYYMMDD;HHMMSS local to account tz).
+        if not date_time or ";" not in date_time:
+            return 0
+        dpart, tpart = date_time.split(";", 1)
+        try:
+            dt = datetime(
+                int(dpart[:4]), int(dpart[4:6]), int(dpart[6:8]),
+                int(tpart[:2]) if len(tpart) >= 2 else 0,
+                int(tpart[2:4]) if len(tpart) >= 4 else 0,
+                int(tpart[4:6]) if len(tpart) >= 6 else 0,
+                tzinfo=timezone.utc,
+            )
+            return int(dt.timestamp() // 5)
+        except (ValueError, TypeError):
+            return 0
+
+    def _side_canon(bs: str | None) -> str:
+        if not bs:
+            return ""
+        bs = bs.upper()
+        # Flex "BUY"/"SELL" vs bot "BUY"/"SELL" or "BOT"/"SLD".
+        return {"BOT": "BUY", "SLD": "SELL"}.get(bs, bs)
+
+    set_B: set = set()
+    for r in flex_rows:
+        acct = r["account_id"]
+        if acct not in tracked:
+            continue
+        try:
+            key = (
+                acct,
+                (r["symbol"] or "").upper(),
+                _side_canon(r["buy_sell"]),
+                round(float(r["quantity"] or 0), 4),
+                round(float(r["trade_price"] or 0), 4),
+                _flex_bucket(r["date_time"]),
+            )
+        except (TypeError, ValueError):
+            continue
+        set_B.add(key)
+
+    gap = set_A - set_B
+    if not gap:
+        return []
+
+    return [Violation(
+        invariant_id="FLEX_SYNC_BOT_ROUTED_COVERAGE_GAP",
+        description=(
+            f"Flex missing {len(gap)} bot-routed fill(s) for coverage "
+            f"date {coverage_date} (pending_orders.filled count={len(set_A)}, "
+            f"master_log_trades count={len(set_B)})"
+        ),
+        severity="crit",
+        evidence={
+            "coverage_date": coverage_date,
+            "expected_bot_routed_count": len(set_A),
+            "actual_flex_count": len(set_B),
+            "missing_tuples": [list(t) for t in list(gap)[:20]],  # cap at 20
+            "tracked_accounts": sorted(tracked),
+        },
+    )]
+
+
 CHECK_REGISTRY: dict[str, Any] = {
     "NO_LIVE_IN_PAPER": check_no_live_in_paper,
     "NO_UNAPPROVED_LIVE_CSP": check_no_unapproved_live_csp,
@@ -791,4 +948,5 @@ CHECK_REGISTRY: dict[str, Any] = {
     "NO_LOCAL_DRIFT": check_no_local_drift,
     "NO_SHADOW_ON_PROD_DB": check_no_shadow_on_prod_db,
     "SELF_HEALING_WRITE_PATH_CANONICAL": check_self_healing_write_path_canonical,
+    "FLEX_SYNC_BOT_ROUTED_COVERAGE_GAP": check_flex_sync_bot_routed_coverage_gap,
 }

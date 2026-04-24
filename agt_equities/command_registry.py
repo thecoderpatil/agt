@@ -57,4 +57,6 @@ COMMAND_REGISTRY: dict[str, CommandSpec] = {
     "flex_status": CommandSpec("cmd_flex_status",  "Flex-sync freshness status"),
     "oversight_status": CommandSpec(
                    "cmd_oversight_status",         "Observability digest (ADR-017)"),
+    "flex_manual_reconcile": CommandSpec(
+                   "cmd_flex_manual_reconcile",    "Manual Flex backfill for a date (ADR-018 Phase 2)"),
 }
