@@ -47,17 +47,16 @@
 
 ```
 LOCAL_SYNC:
-  fetch/reset:     done
+  fetch/reset:     done (tip 53db7a1 post-Sprint-7 close)
   pip install:     no new deps
-  smoke imports:   ok  (import agt_equities.observability.digest)
-  deploy.ps1:      deferred to end-of-sprint bundled deploy
-  heartbeats:      n/a (deferred)
+  smoke imports:   ok  (agt_equities.observability.digest)
+  deploy.ps1:      exit 0 at 2026-04-23 22:51:10 ET (bundled Sprint 7 deploy — A.1+A.2+B+C)
+  heartbeats:      bot=5.4s scheduler=23.6s (pids 37728 / 36756)
 ```
 
-Sprint 7 bundles deploys at end-of-sprint: A.1+A.2+B+C ship sequentially
-on GitLab, then a single deploy.ps1 rolls all four. Heartbeats + post-deploy
-verification covered in `reports/overnight_sprint_7_rollup.md` §Deploy
-verification.
+Sprint 7 bundles deploys at end-of-sprint: A.1+A.2+B+C shipped sequentially
+on GitLab, then single deploy.ps1 rolled all four atomically. See
+`reports/overnight_sprint_7_rollup.md` §Deploy verification.
 
 ## Notes
 
