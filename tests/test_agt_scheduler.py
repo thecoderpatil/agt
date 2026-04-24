@@ -116,6 +116,7 @@ def test_register_jobs_a5e_set():
         "corporate_intel_refresh",
         "corporate_intel_startup",
         "flex_sync_eod",
+        "flex_sync_retry_poller",  # ADR-018 Phase 1 (Sprint 8 MR 1)
         "universe_monthly",
         "conviction_weekly",
         "flex_sync_watchdog",  # Sprint 4 MR B (ADR-FLEX_FRESHNESS_v1)
@@ -127,7 +128,7 @@ def test_register_jobs_a5e_set():
         "attested_sweeper", "el_snapshot_writer",
         "beta_cache_refresh", "beta_startup",
         "corporate_intel_refresh", "corporate_intel_startup",
-        "flex_sync_eod", "universe_monthly",
+        "flex_sync_eod", "flex_sync_retry_poller", "universe_monthly",
         "conviction_weekly", "flex_sync_watchdog",
         "flex_sync_zero_row_check",
     }.issubset(job_ids)
@@ -845,16 +846,16 @@ def test_a5e_corporate_intel_refresh_swallows_per_ticker_errors(monkeypatch):
 
 
 def test_a5e_flex_sync_eod_cron_trigger():
-    """flex_sync_eod must use CronTrigger at 17:00 Mon-Fri."""
+    """ADR-018 Phase 1: flex_sync_eod moved to 07:00 ET Tue-Sat (was 17:00 Mon-Fri)."""
     sched = _build_scheduler_with_jobs()
     job = sched.get_job("flex_sync_eod")
     assert job is not None, "flex_sync_eod not registered"
     from apscheduler.triggers.cron import CronTrigger
     assert isinstance(job.trigger, CronTrigger)
     fields = {f.name: str(f) for f in job.trigger.fields}
-    assert fields["hour"] == "17"
+    assert fields["hour"] == "7"
     assert fields["minute"] == "0"
-    assert fields["day_of_week"] == "mon-fri"
+    assert fields["day_of_week"] == "tue-sat"
 
 
 def test_a5e_flex_sync_eod_enqueues_digest_on_success(monkeypatch):
@@ -876,7 +877,7 @@ def test_a5e_flex_sync_eod_enqueues_digest_on_success(monkeypatch):
 
     monkeypatch.setattr(
         "agt_equities.flex_sync.run_sync",
-        lambda mode: fake_result,
+        lambda mode, **kw: fake_result,
     )
     monkeypatch.setattr(
         "agt_equities.flex_sync.SyncMode",
@@ -908,7 +909,7 @@ def test_a5e_flex_sync_eod_enqueues_failure_on_exception(monkeypatch):
 
     captured: list[dict] = []
 
-    def boom(mode):
+    def boom(mode, **kw):
         raise RuntimeError("Flex endpoint down")
 
     monkeypatch.setattr("agt_equities.flex_sync.run_sync", boom)
@@ -951,7 +952,7 @@ def test_a5e_flex_sync_eod_swallows_alert_bus_failure(monkeypatch):
 
     monkeypatch.setattr(
         "agt_equities.flex_sync.run_sync",
-        lambda mode: fake_result,
+        lambda mode, **kw: fake_result,
     )
     monkeypatch.setattr(
         "agt_equities.flex_sync.SyncMode",
@@ -987,7 +988,7 @@ def test_a5e_flex_sync_eod_warns_on_error_message(monkeypatch):
 
     monkeypatch.setattr(
         "agt_equities.flex_sync.run_sync",
-        lambda mode: fake_result,
+        lambda mode, **kw: fake_result,
     )
     monkeypatch.setattr(
         "agt_equities.flex_sync.SyncMode",
