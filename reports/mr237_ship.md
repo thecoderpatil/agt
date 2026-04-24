@@ -47,8 +47,16 @@
 
 ## LOCAL_SYNC
 
-Deferred to end-of-sprint bundled deploy — see `overnight_sprint_7_rollup.md`
-§Deploy verification.
+```
+LOCAL_SYNC:
+  fetch/reset:     done (tip 53db7a1 post-Sprint-7 close)
+  pip install:     no new deps
+  smoke imports:   ok
+  deploy.ps1:      exit 0 at 2026-04-23 22:51:10 ET (bundled A.1+A.2+B+C)
+  heartbeats:      bot=5.4s scheduler=23.6s (pids 37728 / 36756)
+```
+
+`/oversight_status` is now live; next scheduled fire Friday 2026-04-24 18:35 ET.
 
 ## Notes
 
