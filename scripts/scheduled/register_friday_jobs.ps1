@@ -41,10 +41,10 @@ foreach ($job in $Jobs) {
         exit 1
     }
 
-    # Command: run venv python with the script, cwd=C:\AGT_Telegram_Bridge.
-    # /tr expects a single string; wrap with cmd /c + quoting so Task Scheduler
-    # parses it correctly.
-    $tr = "cmd /c `"cd /d C:\AGT_Telegram_Bridge && `"$Venv`" `"$script`"`""
+    # schtasks /tr expects a single string. Each script uses absolute paths
+    # internally so we don't need to cd — invoke venv python + script directly.
+    # Wrap the two tokens in embedded double-quotes to survive schtasks parsing.
+    $tr = "`"$Venv`" `"$script`""
 
     Write-Host "Registering $name at $date $time ..."
     schtasks /create `
