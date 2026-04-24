@@ -67,7 +67,31 @@ ADR-017 §4 non-goal. Zero csp_digest imports per ADR-017 §6 prohibition.
 
 ## Deploy verification
 
-_(To be filled post-`deploy.ps1` run at end-of-sprint.)_
+- `deploy.ps1 -SourcePath C:\AGT_Telegram_Bridge\.worktrees\coder`
+  completed at **2026-04-23 22:51:10 ET** (Thursday night, ~20 hours before
+  first expected 18:35 ET scheduled fire on Friday 2026-04-24).
+- Pre-deploy VACUUM INTO backup: `C:\AGT_Runtime\backups\agt_desk_20260423_225047_pre_deploy.db`
+  (10.99 MB) — OK.
+- PRAGMA integrity_check: `ok`.
+- Atomic bridge-current rotation: complete. Rollback target at
+  `C:\AGT_Runtime\bridge-previous`.
+- Services restarted:
+  - `agt_bot` pid=37728 (first heartbeat age=5.4s post-restart)
+  - `agt_scheduler` pid=36756 (first heartbeat age=60.4s → 23.6s on recheck)
+- Smoke import verified: `agt_equities.observability.digest` +
+  `agt_equities.observability.thresholds` both load clean.
+
+### LOCAL_SYNC block
+
+```
+LOCAL_SYNC:
+  fetch/reset:     done (tip 53db7a1 post-docs close, 4 Sprint 7 MRs merged)
+  pip install:     no new deps
+  smoke imports:   ok  (observability.digest + observability.thresholds)
+  deploy.ps1:      exit 0 at 2026-04-23 22:51:10 ET
+                   agt_bot pid=37728 / agt_scheduler pid=36756
+  heartbeats:      bot=5.4s scheduler=60.4s (first post-restart) → 18.6s / 23.6s on recheck
+```
 
 ## ADR-017 Phase 2 observation window
 

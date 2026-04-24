@@ -48,7 +48,14 @@ sequential ci.yml conflicts — see Notes)
 
 ## LOCAL_SYNC
 
-Deferred to end-of-sprint bundled deploy.
+```
+LOCAL_SYNC:
+  fetch/reset:     done (tip 53db7a1 post-Sprint-7 close)
+  pip install:     no new deps
+  smoke imports:   ok  (agt_equities.observability.thresholds)
+  deploy.ps1:      exit 0 at 2026-04-23 22:51:10 ET (bundled A.1+A.2+B+C)
+  heartbeats:      bot=5.4s scheduler=23.6s (pids 37728 / 36756)
+```
 
 ## Notes
 
