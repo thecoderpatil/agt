@@ -241,5 +241,44 @@ if (-not $SkipServiceRestart) {
 
 
 
+# 7. Sprint 6 add-on: post-start service-boot smoke.
+# Runs AFTER integrity_check, BEFORE declaring deploy success. Catches
+# R1/R2/R4-class boot regressions at deploy-time against the REAL service
+# in the REAL OS environment. Auto-rolls back on smoke failure.
+
+if (-not $SkipServiceRestart) {
+
+    $smokeScript = Join-Path $PSScriptRoot "post_start_smoke.ps1"
+
+    if (Test-Path $smokeScript) {
+
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $smokeScript
+
+        $smokeExit = $LASTEXITCODE
+
+        if ($smokeExit -ne 0) {
+
+            Write-Error "post_start_smoke FAILED (exit $smokeExit). Rolling back via rollback.ps1"
+
+            $rollbackScript = Join-Path $PSScriptRoot "rollback.ps1"
+
+            if (Test-Path $rollbackScript) {
+
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $rollbackScript
+
+            }
+
+            exit 1
+
+        }
+
+    } else {
+
+        Write-Warning "post_start_smoke.ps1 missing at $smokeScript; skipping (not a deploy-blocker yet)"
+
+    }
+
+}
+
 Write-Host "Deploy complete at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'). Rollback target: $previous"
 
