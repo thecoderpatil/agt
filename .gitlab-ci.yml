@@ -50,7 +50,7 @@
 
 
 
-#     - tests/test_flex_sync_atomic.py    (A3)
+#     - tests/test_flex_sync_atomic.py tests/test_flex_sync_phase1.py    (A3)
 
 
 

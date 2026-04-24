@@ -41,10 +41,71 @@ import logging.handlers
 import os
 import signal
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agt_equities.ib_conn import IBConnConfig, IBConnector
+
+
+# ADR-018 Phase 1: US equity market holidays for the shift-schedule
+# semantic. flex_sync_eod now fires at 07:00 ET the morning AFTER a
+# trading day; this table tells us which weekdays to SKIP (holidays the
+# exchange was closed) so retry dates are correct.
+#
+# Canonical source: NYSE calendar. Covers 2026 + 2027 + early 2028 as a
+# conservative buffer; extend before end of 2027.
+_US_MARKET_HOLIDAYS_YYYYMMDD: frozenset[str] = frozenset({
+    # 2026
+    "20260101",  # New Year's Day
+    "20260119",  # MLK Day
+    "20260216",  # Presidents Day
+    "20260403",  # Good Friday
+    "20260525",  # Memorial Day
+    "20260619",  # Juneteenth
+    "20260703",  # Independence Day (observed, since 7/4 is Saturday)
+    "20260907",  # Labor Day
+    "20261126",  # Thanksgiving
+    "20261225",  # Christmas
+    # 2027
+    "20270101",  # New Year's Day
+    "20270118",  # MLK Day
+    "20270215",  # Presidents Day
+    "20270326",  # Good Friday
+    "20270531",  # Memorial Day
+    "20270618",  # Juneteenth (observed, since 6/19 is Saturday)
+    "20270705",  # Independence Day (observed, since 7/4 is Sunday)
+    "20270906",  # Labor Day
+    "20271125",  # Thanksgiving
+    "20271224",  # Christmas Eve (Christmas falls on Saturday)
+    # 2028 (partial — extend before end of 2027)
+    "20280117",  # MLK Day
+    "20280221",  # Presidents Day
+})
+
+
+def _prior_trading_day(utc_now: datetime | None = None) -> str:
+    """Return YYYYMMDD for the trading day PRIOR to utc_now's ET date.
+
+    Skips weekends and US market holidays. Used by the 07:00 ET flex_sync_eod
+    job (now running tue-sat) to resolve the date its sync should cover.
+    """
+    if utc_now is None:
+        utc_now = datetime.now(timezone.utc)
+    # Convert to ET approximation: UTC - 4h (EDT) / 5h (EST). Use -5h as
+    # conservative default; early-morning fires at 07:00 ET all fall after
+    # the midnight crossover either way.
+    et_now = utc_now - timedelta(hours=5)
+    candidate = et_now.date() - timedelta(days=1)
+    for _ in range(10):  # bounded loop — never more than a few days back
+        # weekday: Mon=0 .. Fri=4 .. Sun=6. Trading day requires Mon-Fri
+        # AND not in the holiday set.
+        ymd = candidate.strftime("%Y%m%d")
+        if candidate.weekday() < 5 and ymd not in _US_MARKET_HOLIDAYS_YYYYMMDD:
+            return ymd
+        candidate -= timedelta(days=1)
+    # Fallback if loop exhausted (shouldn't happen): return the weekday candidate
+    return candidate.strftime("%Y%m%d")
 
 if TYPE_CHECKING:  # avoid hard runtime dep until A5
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -621,27 +682,36 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("corporate_intel_startup")
 
-    # -- A5e -- flex_sync_eod (Mon-Fri 17:00 ET) ----------------------------
-    # IBKR Flex Web Service sync into master_log_* tables.  No IB API
-    # dependency (uses HTTPS Flex endpoint).  On success, enqueue
-    # FLEX_SYNC_DIGEST alert for bot-side Telegram delivery.  On failure,
-    # enqueue FLEX_SYNC_FAILURE alert (crit severity).
+    # -- A5e + ADR-018 Phase 1 -- flex_sync_eod -----------------------------
+    # IBKR Flex Web Service sync into master_log_* tables. Shifted to
+    # 07:00 ET Tue-Sat (was 17:00 ET Mon-Fri) per ADR-018 §3 Phase 1: this
+    # gives IBKR Flex overnight to post the prior trading day's data, which
+    # is what the 17:00 ET run was missing. Covers:
+    #   Tue 07:00 ET -> Mon's trades
+    #   Wed 07:00 ET -> Tue's trades
+    #   ... through Sat 07:00 ET -> Fri's trades.
+    # The Sat fire catches Friday's data; Mon is covered by Tue's fire.
     #
-    # DT Q2: flex_sync itself uses a single atomic transaction internally.
-    # The scheduler job is a thin wrapper that calls run_sync() and surfaces
-    # the result onto the cross_daemon_alerts bus.
+    # Coverage date is resolved at fire time via _prior_trading_day, which
+    # skips weekends + US holidays. Passed as from_date/to_date to run_sync
+    # so the sync is explicitly date-bounded.
 
     def _flex_sync_eod_job() -> None:
+        coverage_date = _prior_trading_day()
         try:
             from agt_equities.flex_sync import run_sync, SyncMode
-            result = run_sync(SyncMode.INCREMENTAL)
+            result = run_sync(
+                SyncMode.INCREMENTAL,
+                from_date=coverage_date,
+                to_date=coverage_date,
+            )
         except Exception as exc:
             logger.exception("flex_sync_eod: run_sync raised: %s", exc)
             try:
                 from agt_equities.alerts import enqueue_alert
                 enqueue_alert(
                     "FLEX_SYNC_FAILURE",
-                    {"error": str(exc)[:500]},
+                    {"error": str(exc)[:500], "coverage_date": coverage_date},
                     severity="crit",
                 )
             except Exception as alert_exc:
@@ -655,13 +725,18 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
             payload = {
                 "sync_id": getattr(result, "sync_id", None),
                 "mode": "INCREMENTAL",
+                "coverage_date": coverage_date,
                 "sections_processed": getattr(result, "sections_processed", 0),
                 "rows_received": getattr(result, "rows_received", 0),
                 "rows_inserted": getattr(result, "rows_inserted", 0),
+                "status": getattr(result, "status", "unknown"),
+                "needs_retry": getattr(result, "needs_retry", False),
             }
             sev = "info"
             if getattr(result, "error_message", None):
                 payload["error"] = str(result.error_message)[:500]
+                sev = "warn"
+            if getattr(result, "status", "") == "suspicious":
                 sev = "warn"
             enqueue_alert("FLEX_SYNC_DIGEST", payload, severity=sev)
         except Exception as alert_exc:
@@ -671,14 +746,91 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     scheduler.add_job(
         _flex_sync_eod_job,
         trigger="cron",
-        day_of_week="mon-fri",
-        hour=17,
+        day_of_week="tue-sat",
+        hour=7,
         minute=0,
         id="flex_sync_eod",
         name="flex_sync_eod",
         replace_existing=True,
     )
     registered.append("flex_sync_eod")
+
+    # ADR-018 Phase 1: flex_sync_retry_poller.
+    # Polls flex_sync_retry_attempts every 15 minutes for rows with
+    # scheduled_at_utc <= now AND attempted_at_utc IS NULL, invokes
+    # run_sync(from_date=D, to_date=D, retry_attempt_n=N), and stamps the
+    # attempt as resolved. Survives process restarts unlike APScheduler
+    # one-shots.
+
+    def _flex_sync_retry_poller_job() -> None:
+        try:
+            import sqlite3 as _sqlite3
+            from agt_equities.flex_sync import run_sync, SyncMode
+            from agt_equities.db import get_db_connection, tx_immediate
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with get_db_connection() as _conn:
+                rows = _conn.execute(
+                    "SELECT id, original_sync_id, coverage_date, attempt_n "
+                    "FROM flex_sync_retry_attempts "
+                    "WHERE attempted_at_utc IS NULL AND scheduled_at_utc <= ? "
+                    "ORDER BY scheduled_at_utc LIMIT 5",
+                    (now_iso,),
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                rid, orig, cov, attempt = row[0], row[1], row[2], row[3]
+                try:
+                    result = run_sync(
+                        SyncMode.INCREMENTAL,
+                        from_date=cov,
+                        to_date=cov,
+                        retry_attempt_n=int(attempt),
+                    )
+                    with get_db_connection() as _conn2:
+                        with tx_immediate(_conn2):
+                            _conn2.execute(
+                                "UPDATE flex_sync_retry_attempts SET "
+                                "attempted_at_utc=?, result=?, resolved_at_utc=?, "
+                                "rows_recovered=? WHERE id=?",
+                                (
+                                    datetime.now(timezone.utc).isoformat(),
+                                    getattr(result, "status", "unknown"),
+                                    datetime.now(timezone.utc).isoformat()
+                                    if getattr(result, "status", "") == "success"
+                                    else None,
+                                    int(getattr(result, "rows_inserted", 0)),
+                                    rid,
+                                ),
+                            )
+                    logger.info(
+                        "flex_sync_retry_poller: attempt_n=%s date=%s status=%s rows=%d",
+                        attempt, cov,
+                        getattr(result, "status", "unknown"),
+                        int(getattr(result, "rows_inserted", 0)),
+                    )
+                except Exception as retry_exc:
+                    logger.exception(
+                        "flex_sync_retry_poller: retry raised for id=%s: %s",
+                        rid, retry_exc,
+                    )
+        except _sqlite3.OperationalError as table_exc:
+            if "no such table" in str(table_exc).lower():
+                # Migration not yet applied — silent no-op.
+                return
+            logger.exception("flex_sync_retry_poller: SQLite error")
+        except Exception:
+            logger.exception("flex_sync_retry_poller: unhandled failure")
+
+    scheduler.add_job(
+        _flex_sync_retry_poller_job,
+        trigger="interval",
+        minutes=15,
+        id="flex_sync_retry_poller",
+        name="flex_sync_retry_poller",
+        replace_existing=True,
+    )
+    registered.append("flex_sync_retry_poller")
 
     # -- A5e -- universe_monthly (1st of month, 06:00 ET) ---------------------
     # Refreshes ticker_universe table from Wikipedia + yfinance.  No IB
@@ -839,8 +991,10 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     scheduler.add_job(
         _flex_sync_watchdog_job,
         trigger="cron",
-        day_of_week="mon-fri",
-        hour=18,
+        # ADR-018 Phase 1 §1a: re-timed from 18:00 Mon-Fri to 08:00 Tue-Sat
+        # to stay 1h after the new flex_sync_eod slot at 07:00 ET.
+        day_of_week="tue-sat",
+        hour=8,
         minute=0,
         id="flex_sync_watchdog",
         name="flex_sync_watchdog",
@@ -865,8 +1019,10 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     scheduler.add_job(
         _flex_sync_zero_row_check_job,
         trigger="cron",
-        day_of_week="mon-fri",
-        hour=18,
+        # ADR-018 Phase 1 §1a: re-timed from 18:30 Mon-Fri to 08:30 Tue-Sat
+        # to stay 1.5h after the new flex_sync_eod slot at 07:00 ET.
+        day_of_week="tue-sat",
+        hour=8,
         minute=30,
         id="flex_sync_zero_row_check",
         name="flex_sync_zero_row_check",
