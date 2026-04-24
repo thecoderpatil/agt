@@ -18933,6 +18933,60 @@ async def _scheduled_csp_digest_send(context: ContextTypes.DEFAULT_TYPE) -> None
         logger.exception("csp_digest_send: unhandled failure")
 
 
+async def _scheduled_oversight_digest_send(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily 18:35 ET Mon-Fri — ADR-017 §9 deterministic observability digest.
+
+    Reads snapshot + threshold flags + renders card → Telegram. No LLM.
+    Fail-soft: any exception logs + enqueues an info alert so the next
+    digest surfaces the failure.
+    """
+    try:
+        from agt_equities.observability.digest import (
+            build_observability_snapshot,
+            render_observability_card,
+        )
+        try:
+            from agt_equities.observability.thresholds import (
+                compute_threshold_flags,
+            )
+        except Exception:
+            compute_threshold_flags = None  # type: ignore[assignment]
+
+        def _build():
+            snap = build_observability_snapshot()
+            flags = None
+            if compute_threshold_flags is not None:
+                try:
+                    flags = compute_threshold_flags()
+                except Exception as _tf_exc:
+                    logger.warning("oversight_digest_send: thresholds failed: %s", _tf_exc)
+                    flags = None
+            return snap, flags
+
+        snap, flags = await asyncio.to_thread(_build)
+        card = render_observability_card(snap, threshold_flags=flags)
+        try:
+            await context.bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=card,
+                parse_mode="Markdown",
+            )
+        except Exception as send_exc:
+            logger.warning("oversight_digest_send: Telegram send failed: %s", send_exc)
+        logger.info("oversight_digest_send: ok flags=%s", len(flags) if flags else 0)
+    except Exception as exc:
+        logger.exception("oversight_digest_send: unhandled failure")
+        try:
+            from agt_equities.alerts import enqueue_alert
+            enqueue_alert(
+                "OVERSIGHT_DIGEST_FAILED",
+                {"error": str(exc)},
+                severity="info",
+            )
+        except Exception:
+            pass
+
+
 async def cmd_approve_csp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/approve_csp_<id> — operator escape hatch for inline-keyboard approve."""
     if not is_authorized(update):
@@ -22350,6 +22404,16 @@ def main() -> None:
             name="csp_digest_send",
         )
         logger.info("Scheduled: csp_digest_send at 9:37 AM ET (Mon-Fri)")
+
+        # ADR-017 §9 Mega-MR A.2 — oversight digest 18:35 ET Mon-Fri.
+        # Post flex_sync (17:00) + flex_sync_watchdog (18:00) + zero-row (18:30).
+        jq.run_daily(
+            callback=_scheduled_oversight_digest_send,
+            time=_time(hour=18, minute=35, tzinfo=ET),
+            days=(1, 2, 3, 4, 5),
+            name="oversight_digest_send",
+        )
+        logger.info("Scheduled: oversight_digest_send at 18:35 ET (Mon-Fri) — America/New_York")
 
         jq.run_daily(
 
