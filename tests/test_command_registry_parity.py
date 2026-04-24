@@ -20,7 +20,7 @@ pytestmark = pytest.mark.sprint_a
 
 _BOT_PATH = Path(__file__).parent.parent / "telegram_bot.py"
 
-_EXPECTED_COUNT = 26  # update when adding/removing commands (Sprint 7 MR C: +oversight_status)
+_EXPECTED_COUNT = 27  # update when adding/removing commands (Sprint 8 MR 2: +flex_manual_reconcile)
 
 
 def _get_registered_commands() -> set[str]:

@@ -19085,6 +19085,119 @@ async def cmd_flex_status(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await send_reply(update, "\n".join(lines))
 
 
+async def cmd_flex_manual_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/flex_manual_reconcile YYYYMMDD — ADR-018 Phase 2 operator escape hatch.
+
+    Runs `scripts/flex_backfill_live_trades.py --from D --to D` in a
+    worker thread (keeps the PTB event loop free), reports row counts
+    before/after, and dumps subprocess evidence to
+    `reports/flex_manual_reconcile_<D>.md`.
+    """
+    if not is_authorized(update):
+        return
+    args = getattr(context, "args", []) or []
+    if not args or not (args[0].isdigit() and len(args[0]) == 8):
+        try:
+            await send_reply(
+                update,
+                "Usage: /flex_manual_reconcile YYYYMMDD (e.g. /flex_manual_reconcile 20260427)",
+            )
+        except Exception:
+            pass
+        return
+    date_str = args[0]
+    try:
+        await send_reply(update, f"🔄 Flex manual reconcile starting for {date_str}...")
+    except Exception:
+        pass
+
+    def _run() -> dict:
+        import os as _os
+        import subprocess as _subprocess
+        import sqlite3 as _sqlite3
+        from pathlib import Path as _Path
+
+        repo = _Path(__file__).resolve().parent
+        script = repo / "scripts" / "flex_backfill_live_trades.py"
+        db_path = _os.environ.get("AGT_DB_PATH", str(repo / "agt_desk.db"))
+
+        # Count rows before.
+        try:
+            with _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as c:
+                before = c.execute(
+                    "SELECT COUNT(*) FROM master_log_trades WHERE trade_date = ?",
+                    (date_str,),
+                ).fetchone()[0]
+        except Exception:
+            before = None
+
+        env = {**_os.environ, "AGT_DB_PATH": db_path}
+        proc = _subprocess.run(
+            ["python", str(script), "--from", date_str, "--to", date_str],
+            capture_output=True, text=True, timeout=600, env=env, cwd=str(repo),
+        )
+
+        # Count rows after.
+        try:
+            with _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as c:
+                after = c.execute(
+                    "SELECT COUNT(*) FROM master_log_trades WHERE trade_date = ?",
+                    (date_str,),
+                ).fetchone()[0]
+        except Exception:
+            after = None
+
+        # Evidence dump.
+        report_dir = repo / "reports"
+        try:
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report_path = report_dir / f"flex_manual_reconcile_{date_str}.md"
+            body = (
+                f"# Manual Flex Reconcile — {date_str}\n\n"
+                f"**Invoked:** {datetime.now(timezone.utc).isoformat()} UTC\n\n"
+                f"**DB:** `{db_path}`\n\n"
+                f"**master_log_trades count before:** {before}\n"
+                f"**master_log_trades count after:** {after}\n"
+                f"**delta:** {None if (before is None or after is None) else after - before}\n\n"
+                f"**subprocess exit:** {proc.returncode}\n\n"
+                f"## stdout\n```\n{proc.stdout}\n```\n\n"
+                f"## stderr\n```\n{proc.stderr}\n```\n"
+            )
+            report_path.write_text(body, encoding="utf-8")
+        except Exception:
+            report_path = None
+
+        return {
+            "rc": proc.returncode,
+            "before": before,
+            "after": after,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "report_path": str(report_path) if report_path else None,
+        }
+
+    try:
+        res = await asyncio.to_thread(_run)
+        delta = (
+            (res["after"] - res["before"])
+            if res["before"] is not None and res["after"] is not None
+            else None
+        )
+        msg = (
+            f"{'✅' if res['rc'] == 0 else '⚠️'} Flex manual reconcile for {date_str}\n"
+            f"before={res['before']} after={res['after']} delta={delta}\n"
+            f"exit={res['rc']}\n"
+            f"report: {res['report_path']}"
+        )
+        await send_reply(update, msg)
+    except Exception as exc:
+        logger.exception("flex_manual_reconcile unhandled failure")
+        try:
+            await send_reply(update, f"⚠️ flex_manual_reconcile failed: {exc}")
+        except Exception:
+            pass
+
+
 async def cmd_oversight_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/oversight_status — ADR-017 §9 Mega-MR C on-demand observability card.
 
@@ -22361,6 +22474,8 @@ def main() -> None:
 
     # ADR-017 §9 Mega-MR C: on-demand observability digest.
     app.add_handler(CommandHandler("oversight_status", cmd_oversight_status))
+
+    app.add_handler(CommandHandler("flex_manual_reconcile", cmd_flex_manual_reconcile))
 
     app.add_handler(CallbackQueryHandler(handle_orders_callback, pattern=r"^orders:"))
 
