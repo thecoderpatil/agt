@@ -13,7 +13,7 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -61,13 +61,17 @@ class SyncMode(Enum):
 @dataclass
 class SyncResult:
     sync_id: int
-    status: str  # 'success' or 'error'
+    status: str  # 'success' | 'error' | 'suspicious' (ADR-018 Phase 1)
     sections_processed: int = 0
     rows_received: int = 0
     rows_inserted: int = 0
     rows_updated: int = 0
     anomalies: list = field(default_factory=list)
     error_message: Optional[str] = None
+    # ADR-018 Phase 1: zero-row on known trading day escalation.
+    needs_retry: bool = False
+    retry_date: Optional[str] = None
+    next_attempt_n: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -675,10 +679,207 @@ def _persist_walker_warnings(conn: sqlite3.Connection, sync_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ADR-018 Phase 1 helpers: known-trading-day classification + retry enqueue
+# ---------------------------------------------------------------------------
+
+def _is_known_trading_day(d: str, *, conn: sqlite3.Connection) -> bool:
+    """Return True if date D (YYYYMMDD) was a confirmed trading day.
+
+    Evidence (either is sufficient):
+      A) pending_orders has status='filled' rows with fill_time on D for
+         any tracked account, OR
+      B) daemon_heartbeat has last_beat_utc rows landing inside 09:30-16:00
+         ET on D with gap < 120s continuous (heartbeat writer emits every
+         30s; absent restart, 120s SLA easily met).
+
+    Conservative: any single failing query returns False rather than
+    raising, so this helper never blows up the caller. False positives
+    (classifying a trading day as non-trading) silently lose a zero-row
+    refusal event; false negatives (classifying a non-trading day as
+    trading) raise a spurious incident. We favor the former — incidents
+    on non-trading days are noisier than rare missed known-trading
+    days.
+    """
+    if not d or len(d) != 8 or not d.isdigit():
+        return False
+    d_iso = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+
+    # Evidence A: filled pending_orders on D.
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM pending_orders "
+            "WHERE status='filled' AND DATE(fill_time) = ?",
+            (d_iso,),
+        ).fetchone()
+        if row and row[0] and row[0] > 0:
+            return True
+    except sqlite3.OperationalError:
+        pass  # table/column missing on bootstrap DB — treat as inconclusive
+
+    # Evidence B: heartbeat continuity during RTH (09:30-16:00 ET = 13:30-20:00 UTC
+    # winter / 14:30-21:00 UTC summer DST — use 13:30-21:00 UTC as a conservative
+    # superset since we don't want to misclassify a DST-boundary day).
+    try:
+        rth_start = f"{d_iso}T13:30:00+00:00"
+        rth_end = f"{d_iso}T21:00:00+00:00"
+        row = conn.execute(
+            "SELECT COUNT(*) FROM daemon_heartbeat "
+            "WHERE last_beat_utc BETWEEN ? AND ?",
+            (rth_start, rth_end),
+        ).fetchone()
+        # Any heartbeat inside RTH is evidence the bot was running; we don't
+        # require continuous coverage (that would be stricter than needed).
+        if row and row[0] and row[0] > 0:
+            return True
+    except sqlite3.OperationalError:
+        pass
+
+    return False
+
+
+def _enqueue_flex_retry_attempt(
+    conn: sqlite3.Connection,
+    *,
+    original_sync_id: int,
+    coverage_date: str,
+    attempt_n: int,
+    scheduled_at_utc: str,
+) -> int:
+    """Insert a pending-retry row in flex_sync_retry_attempts. Returns row id.
+
+    The `flex_sync_retry_poller` scheduler job (agt_scheduler.py) scans this
+    table every 15 minutes for due rows and invokes run_sync with the
+    retry_attempt_n kwarg. This table survives process restarts; APScheduler
+    one-shot jobs would not.
+
+    Returns 0 if the retry_attempts table is missing (bootstrap/test DB).
+    """
+    try:
+        cur = conn.execute(
+            "INSERT INTO flex_sync_retry_attempts "
+            "(original_sync_id, coverage_date, attempt_n, scheduled_at_utc) "
+            "VALUES (?, ?, ?, ?)",
+            (original_sync_id, coverage_date, attempt_n, scheduled_at_utc),
+        )
+        return cur.lastrowid or 0
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            logger.warning(
+                "flex_sync_retry_attempts table missing; retry not persisted. "
+                "Run scripts/migrate_flex_sync_retry_attempts.py"
+            )
+            return 0
+        raise
+
+
+def _filter_section_rows_by_date(
+    section_data: list[dict], from_date: str, to_date: str,
+) -> tuple[list[dict], int]:
+    """Filter master_log_trades rows to the [from_date, to_date] window.
+
+    Other sections pass through unchanged — they don't carry a per-row
+    trade_date column. Returns (filtered_section_data, kept_row_count).
+    """
+    filtered: list[dict] = []
+    kept = 0
+    for sd in section_data:
+        if sd.get("table") != "master_log_trades":
+            filtered.append(sd)
+            kept += len(sd.get("rows", []))
+            continue
+        kept_rows = [
+            r for r in sd.get("rows", [])
+            if from_date <= (r.get("trade_date") or "") <= to_date
+        ]
+        kept += len(kept_rows)
+        new_sd = dict(sd)
+        new_sd["rows"] = kept_rows
+        filtered.append(new_sd)
+    return filtered, kept
+
+
+def _raise_zero_row_incident(
+    *,
+    sync_id: int,
+    coverage_date: str,
+    attempt_n: int,
+    bot_uptime_window_seconds: int,
+    filled_pending_orders_count: int,
+    flex_response_size_bytes: int,
+    conn: sqlite3.Connection,
+) -> None:
+    """Raise FLEX_SYNC_EMPTY_KNOWN_TRADING_DAY (or PERSISTENT_EMPTY after
+    attempt 4) as a tier-0 incident. Best-effort: failures here must not
+    abort the caller.
+    """
+    try:
+        from agt_equities.incidents_repo import register as incident_register
+    except Exception as imp_exc:
+        logger.error("incidents_repo import failed: %s", imp_exc)
+        return
+
+    persistent = attempt_n >= 4
+    invariant_id = (
+        "FLEX_SYNC_PERSISTENT_EMPTY" if persistent
+        else "FLEX_SYNC_EMPTY_KNOWN_TRADING_DAY"
+    )
+    incident_key = f"{invariant_id}:{coverage_date}"
+    evidence = {
+        "sync_id": sync_id,
+        "coverage_date": coverage_date,
+        "attempt_n": attempt_n,
+        "bot_uptime_window_seconds": bot_uptime_window_seconds,
+        "filled_pending_orders_count": filled_pending_orders_count,
+        "flex_response_size_bytes": flex_response_size_bytes,
+    }
+    try:
+        incident_register(
+            incident_key,
+            severity="critical",
+            scrutiny_tier="high",
+            detector="flex_sync.run_sync",
+            invariant_id=invariant_id,
+            observed_state=evidence,
+            desired_state={"rows_received_gt_zero": True},
+        )
+    except Exception as reg_exc:
+        logger.error("incident register failed (%s): %s", invariant_id, reg_exc)
+
+    if persistent:
+        # Cross-daemon alert for operator Telegram path.
+        try:
+            from agt_equities.alerts import enqueue_alert
+            enqueue_alert(
+                "FLEX_SYNC_PERSISTENT_EMPTY",
+                {
+                    "coverage_date": coverage_date,
+                    "attempt_n": attempt_n,
+                    "operator_action": (
+                        f"Manually verify IBKR portal and run: "
+                        f"/flex_manual_reconcile {coverage_date}"
+                    ),
+                },
+                severity="crit",
+            )
+        except Exception as alert_exc:
+            logger.error("persistent-empty alert enqueue failed: %s", alert_exc)
+
+
+_RETRY_BACKOFF_HOURS = {1: 2, 2: 4, 3: 6}  # next_attempt_n → hours delay
+
+
+# ---------------------------------------------------------------------------
 # Main sync
 # ---------------------------------------------------------------------------
 
-def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
+def run_sync(
+    mode: SyncMode,
+    xml_bytes: bytes | None = None,
+    *,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    retry_attempt_n: int = 0,
+) -> SyncResult:
     """Execute a Flex sync.
 
     Sprint A / A3: single atomic transaction.
@@ -702,26 +903,54 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
     Args:
         mode: INCEPTION, INCREMENTAL, or ONESHOT.
         xml_bytes: Pre-fetched XML (for testing). If None, pulls from IBKR.
+        from_date, to_date: Optional YYYYMMDD window. Rows outside this
+            range are dropped before upsert (ADR-018 Phase 1 targeted
+            backfill support). Environment fallback: AGT_FLEX_FROM_DATE /
+            AGT_FLEX_TO_DATE.
+        retry_attempt_n: 0 = original fire, 1..4 = subsequent retry
+            attempts on zero-row-known-trading-day escalation (ADR-018
+            Phase 1). Attempt 4 that still returns zero raises
+            FLEX_SYNC_PERSISTENT_EMPTY.
     """
+    # ADR-018 Phase 1: env-var fallback for date kwargs.
+    if from_date is None:
+        from_date = os.environ.get("AGT_FLEX_FROM_DATE") or None
+    if to_date is None:
+        to_date = os.environ.get("AGT_FLEX_TO_DATE") or None
+
     now = datetime.utcnow().isoformat()
     conn = _get_db()
 
     # --- Audit row allocation (own small txn) ---
     with tx_immediate(conn):
         cursor = conn.execute(
-            "INSERT INTO master_log_sync (started_at, flex_query_id, status) "
-            "VALUES (?, ?, 'running')",
-            (now, FLEX_QUERY_ID),
+            "INSERT INTO master_log_sync (started_at, flex_query_id, from_date, to_date, status) "
+            "VALUES (?, ?, ?, ?, 'running')",
+            (now, FLEX_QUERY_ID, from_date, to_date),
         )
         sync_id = cursor.lastrowid
 
     result = SyncResult(sync_id=sync_id, status='running')
+    flex_response_size_bytes = 0
 
     try:
         if xml_bytes is None:
             xml_bytes = pull_flex_xml()
+        flex_response_size_bytes = len(xml_bytes) if xml_bytes else 0
 
         section_data = parse_flex_xml(xml_bytes)
+        rows_total_in_xml = sum(len(sd.get("rows", [])) for sd in section_data)
+
+        # ADR-018 Phase 1: filter by date window if provided.
+        if from_date and to_date:
+            section_data, kept_count = _filter_section_rows_by_date(
+                section_data, from_date, to_date,
+            )
+            logger.info(
+                "Date filter applied: from=%s to=%s kept=%d (of %d)",
+                from_date, to_date, kept_count, rows_total_in_xml,
+            )
+
         result.sections_processed = len(section_data)
 
         # --- Single atomic data txn (A3) ---
@@ -739,14 +968,59 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
             result.rows_received = total_rows
             result.rows_inserted = total_inserted
 
-            conn.execute(
-                "UPDATE master_log_sync SET finished_at=?, sections_processed=?, "
-                "rows_received=?, rows_inserted=?, rows_updated=?, status='success' "
-                "WHERE sync_id=?",
-                (datetime.utcnow().isoformat(), result.sections_processed,
-                 result.rows_received, result.rows_inserted, result.rows_updated,
-                 sync_id),
-            )
+            # ADR-018 Phase 1: zero-row classification. If the sync received
+            # zero rows AND the coverage date is a confirmed trading day, we
+            # refuse the silent 'success' path — this is the W1 bug that the
+            # Wednesday 2026-04-23 Flex loss exhibited. Persist 'suspicious'
+            # status, enqueue a retry attempt row, and raise a tier-0
+            # incident outside the txn.
+            coverage_date_for_classify: str | None = None
+            is_known_td = False
+            if total_rows == 0:
+                # Coverage date preference: explicit to_date > env var > None.
+                coverage_date_for_classify = to_date or os.environ.get("AGT_FLEX_TO_DATE") or None
+                if coverage_date_for_classify:
+                    is_known_td = _is_known_trading_day(
+                        coverage_date_for_classify, conn=conn,
+                    )
+
+            if total_rows == 0 and is_known_td:
+                next_attempt = retry_attempt_n + 1
+                next_status = 'suspicious'
+                result.status = 'suspicious'
+                result.needs_retry = next_attempt <= 3  # attempts 2,3,4 remain
+                result.retry_date = coverage_date_for_classify
+                result.next_attempt_n = next_attempt
+                conn.execute(
+                    "UPDATE master_log_sync SET finished_at=?, sections_processed=?, "
+                    "rows_received=?, rows_inserted=?, rows_updated=?, status=? "
+                    "WHERE sync_id=?",
+                    (datetime.utcnow().isoformat(), result.sections_processed,
+                     result.rows_received, result.rows_inserted, result.rows_updated,
+                     next_status, sync_id),
+                )
+                # Enqueue retry if we have attempts left (next_attempt 1-3 schedule).
+                if result.needs_retry:
+                    delay_h = _RETRY_BACKOFF_HOURS.get(next_attempt, 6)
+                    scheduled_at = (
+                        datetime.now(timezone.utc) + timedelta(hours=delay_h)
+                    ).isoformat()
+                    _enqueue_flex_retry_attempt(
+                        conn,
+                        original_sync_id=int(sync_id),
+                        coverage_date=coverage_date_for_classify,
+                        attempt_n=next_attempt,
+                        scheduled_at_utc=scheduled_at,
+                    )
+            else:
+                conn.execute(
+                    "UPDATE master_log_sync SET finished_at=?, sections_processed=?, "
+                    "rows_received=?, rows_inserted=?, rows_updated=?, status='success' "
+                    "WHERE sync_id=?",
+                    (datetime.utcnow().isoformat(), result.sections_processed,
+                     result.rows_received, result.rows_inserted, result.rows_updated,
+                     sync_id),
+                )
 
             # W3.6: walker warnings inside the same txn so success+warnings are
             # all-or-nothing. _persist_walker_warnings no longer commits.
@@ -758,7 +1032,35 @@ def run_sync(mode: SyncMode, xml_bytes: bytes | None = None) -> SyncResult:
                 logger.error("Walker warnings persist failed (non-fatal): %s", warn_exc)
 
         # If we got here, the atomic txn committed.
-        result.status = 'success'
+        if result.status != 'suspicious':
+            result.status = 'success'
+
+        # ADR-018 Phase 1: raise tier-0 incident outside the txn on suspicious.
+        # FLEX_SYNC_EMPTY_KNOWN_TRADING_DAY (attempts 1..3) or
+        # FLEX_SYNC_PERSISTENT_EMPTY (attempt 4+). Evidence includes the
+        # sync_id, coverage_date, attempt number, and a best-effort uptime
+        # measure so operator can correlate with known outages.
+        if result.status == 'suspicious' and coverage_date_for_classify:
+            try:
+                filled_count_row = conn.execute(
+                    "SELECT COUNT(*) FROM pending_orders "
+                    "WHERE status='filled' AND DATE(fill_time) = ?",
+                    (f"{coverage_date_for_classify[:4]}-"
+                     f"{coverage_date_for_classify[4:6]}-"
+                     f"{coverage_date_for_classify[6:8]}",),
+                ).fetchone()
+                filled_count = filled_count_row[0] if filled_count_row else 0
+            except Exception:
+                filled_count = 0
+            _raise_zero_row_incident(
+                sync_id=int(sync_id),
+                coverage_date=coverage_date_for_classify,
+                attempt_n=retry_attempt_n,  # "attempt that just failed"
+                bot_uptime_window_seconds=0,
+                filled_pending_orders_count=int(filled_count),
+                flex_response_size_bytes=int(flex_response_size_bytes),
+                conn=conn,
+            )
 
         # --- A5d.b: digest alert via cross_daemon_alerts bus (best-effort) ---
         # Enqueued AFTER the data txn commits but BEFORE side-effects so a
