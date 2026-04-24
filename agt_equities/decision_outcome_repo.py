@@ -7,6 +7,9 @@ Three stage lifecycle per row:
      point `fill_outcome_json` and `reconciliation_delta_json` are both
      NULL (outcome hasn't happened yet).
 
+     Sprint 8 MR 3 (DR B6): also writes config_hash, triggering_rule_id,
+     kill_switch_invocation_ref for forensic correlation.
+
   2. `update_fill_outcome`: IB fill callback lands OR paper-auto-exec
      simulated fill lands. Writes fill_outcome_json + updated_at.
      `reconciliation_delta_json` still NULL (we don't yet have the
@@ -25,6 +28,7 @@ All writes use `tx_immediate` per the db.py WAL discipline.
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,8 +37,15 @@ from typing import Any
 from agt_equities.db import get_db_connection, get_ro_connection, tx_immediate
 
 
+logger = logging.getLogger(__name__)
+
 _VALID_ENGINES = {"exit", "roll", "harvest", "entry"}
 _VALID_CANARY_STEPS = {"paper", "canary_1", "canary_2", "canary_3", "live"}
+
+# Sprint 8 MR 3 (DR B6): new required-ish fields; callers must supply.
+# Legacy callers get a log.warning-once-per-day + 'caller_did_not_provide'.
+_CALLER_OMIT_SENTINEL = "caller_did_not_provide"
+_warning_state: dict[str, str] = {}  # {"last_warned_utc_date": "YYYY-MM-DD"}
 
 
 def _utc_now_iso() -> str:
@@ -43,6 +54,20 @@ def _utc_now_iso() -> str:
 
 def _dumps(obj: Any) -> str:
     return json.dumps(obj, default=str, sort_keys=True)
+
+
+def _warn_omitted_once_per_day(missing: list[str]) -> None:
+    """log.warning at most once per UTC date when caller omits required fields."""
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    if _warning_state.get("last_warned_utc_date") == today_iso:
+        return
+    _warning_state["last_warned_utc_date"] = today_iso
+    logger.warning(
+        "decision_outcome_repo.record_fire: caller omitted required fields %s; "
+        "writing sentinel %r. Update callers to pass these explicitly "
+        "(Sprint 8 MR 3 / DR B6).",
+        missing, _CALLER_OMIT_SENTINEL,
+    )
 
 
 def record_fire(
@@ -55,16 +80,40 @@ def record_fire(
     household: str,
     gate_snapshot: dict[str, Any],
     inputs: dict[str, Any],
+    config_hash: str | None = None,
+    triggering_rule_id: str | None = None,
+    kill_switch_invocation_ref: str | None = None,
     db_path: str | Path | None = None,
 ) -> None:
     """Record a new engine-fire row. Idempotent on `decision_id`
-    (UNIQUE constraint; INSERT OR IGNORE)."""
+    (UNIQUE constraint; INSERT OR IGNORE).
+
+    Sprint 8 MR 3 (DR B6):
+      - config_hash: fingerprint of engine config at decision time (hex,
+        typically sha256[:16]). Required. Omission → 'caller_did_not_provide'
+        + log.warning once per UTC day.
+      - triggering_rule_id: invariant_id or policy name that caused the
+        decision. Required. Same omission fallback.
+      - kill_switch_invocation_ref: link to kill_switch_events.id if a
+        kill switch was active at decision time. Optional — NULL allowed.
+    """
     if engine not in _VALID_ENGINES:
         raise ValueError(f"engine must be one of {_VALID_ENGINES}, got {engine!r}")
     if canary_step not in _VALID_CANARY_STEPS:
         raise ValueError(
             f"canary_step must be one of {_VALID_CANARY_STEPS}, got {canary_step!r}"
         )
+
+    missing: list[str] = []
+    if config_hash is None:
+        missing.append("config_hash")
+        config_hash = _CALLER_OMIT_SENTINEL
+    if triggering_rule_id is None:
+        missing.append("triggering_rule_id")
+        triggering_rule_id = _CALLER_OMIT_SENTINEL
+    if missing:
+        _warn_omitted_once_per_day(missing)
+
     ts = fire_timestamp_utc or _utc_now_iso()
     with closing(get_db_connection(db_path=db_path)) as conn:
         with tx_immediate(conn):
@@ -72,13 +121,15 @@ def record_fire(
                 """
                 INSERT OR IGNORE INTO decision_outcomes (
                     decision_id, engine, canary_step, fire_timestamp_utc,
-                    account_id, household, gate_snapshot_json, inputs_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    account_id, household, gate_snapshot_json, inputs_json,
+                    config_hash, triggering_rule_id, kill_switch_invocation_ref
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     decision_id, engine, canary_step, ts,
                     account_id, household,
                     _dumps(gate_snapshot), _dumps(inputs),
+                    config_hash, triggering_rule_id, kill_switch_invocation_ref,
                 ),
             )
 

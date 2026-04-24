@@ -13,6 +13,9 @@ pytestmark = pytest.mark.sprint_a
 def _seed_schema(db: Path) -> None:
     from scripts.migrate_decision_outcomes import run as migrate
     migrate(db_path=db)
+    # Sprint 8 MR 3 (DR B6): apply tightening so new columns exist.
+    from scripts.migrate_decision_outcomes_tightening import run as tighten
+    tighten(db_path=db)
 
 
 @pytest.fixture
