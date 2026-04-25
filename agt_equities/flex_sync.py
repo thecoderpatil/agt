@@ -686,8 +686,8 @@ def _is_known_trading_day(d: str, *, conn: sqlite3.Connection) -> bool:
     """Return True if date D (YYYYMMDD) was a confirmed trading day.
 
     Evidence (either is sufficient):
-      A) pending_orders has status='filled' rows with fill_time on D for
-         any tracked account, OR
+      A) pending_orders has status IN ('filled', 'partially_filled')
+         rows with fill_time on D for any tracked account, OR
       B) daemon_heartbeat has last_beat_utc rows landing inside 09:30-16:00
          ET on D with gap < 120s continuous (heartbeat writer emits every
          30s; absent restart, 120s SLA easily met).
@@ -708,7 +708,7 @@ def _is_known_trading_day(d: str, *, conn: sqlite3.Connection) -> bool:
     try:
         row = conn.execute(
             "SELECT COUNT(*) FROM pending_orders "
-            "WHERE status='filled' AND DATE(fill_time) = ?",
+            "WHERE status IN ('filled', 'partially_filled') AND DATE(fill_time) = ?",
             (d_iso,),
         ).fetchone()
         if row and row[0] and row[0] > 0:
@@ -1044,7 +1044,7 @@ def run_sync(
             try:
                 filled_count_row = conn.execute(
                     "SELECT COUNT(*) FROM pending_orders "
-                    "WHERE status='filled' AND DATE(fill_time) = ?",
+                    "WHERE status IN ('filled', 'partially_filled') AND DATE(fill_time) = ?",
                     (f"{coverage_date_for_classify[:4]}-"
                      f"{coverage_date_for_classify[4:6]}-"
                      f"{coverage_date_for_classify[6:8]}",),
