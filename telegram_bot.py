@@ -13302,7 +13302,63 @@ async def _place_single_order(
 
         ib_conn = await ensure_ib_connected()
 
+        # ADR-020 §B pre-gateway freshness check — runs after IB connected,
+        # before placeOrder. Fail-closed: any veto moves order to superseded.
+        from agt_equities.risk.staging_invariants import (
+            check_mode_match as _chk_mode,
+            evaluate_strike_freshness as _chk_freshness,
+        )
+        _broker_mode_now = "paper" if PAPER_MODE else "live"
+        _mode_result = _chk_mode(payload=payload, current_broker_mode=_broker_mode_now)
+        if not _mode_result.passed:
+            with closing(_get_db_connection()) as _veto_conn:
+                with tx_immediate(_veto_conn):
+                    from agt_equities.order_state import append_status as _app_st
+                    _veto_conn.execute(
+                        "UPDATE pending_orders SET status = 'superseded' WHERE id = ?",
+                        (db_id,),
+                    )
+                    _app_st(_veto_conn, db_id, "superseded", "mode_mismatch", _mode_result.evidence)
+            try:
+                from agt_equities.alerts import enqueue_alert as _enq
+                _enq("MODE_MISMATCH_VETO", {"order_id": db_id, "ticker": ticker, **_mode_result.evidence})
+            except Exception:
+                pass
+            return False, f"#{db_id} {ticker} — STRIKE_FRESHNESS_VETO: mode_mismatch"
 
+        _spot_now: float | None = None
+        try:
+            _spot_now = await _ibkr_get_spot(ticker)
+        except Exception as _spot_exc:
+            logger.warning("ADR-020 spot fetch failed for #%d %s: %s", db_id, ticker, _spot_exc)
+
+        _fresh_result = _chk_freshness(payload=payload, spot_now=_spot_now)
+        if not _fresh_result.passed:
+            with closing(_get_db_connection()) as _veto_conn:
+                with tx_immediate(_veto_conn):
+                    from agt_equities.order_state import append_status as _app_st
+                    _veto_conn.execute(
+                        "UPDATE pending_orders SET status = 'superseded' WHERE id = ?",
+                        (db_id,),
+                    )
+                    _app_st(_veto_conn, db_id, "superseded",
+                            _fresh_result.reason or "stale_strike", _fresh_result.evidence)
+            try:
+                from agt_equities.alerts import enqueue_alert as _enq
+                _enq("STRIKE_FRESHNESS_VETO", {"order_id": db_id, "ticker": ticker, **_fresh_result.evidence})
+            except Exception:
+                pass
+            return False, f"#{db_id} {ticker} — STRIKE_FRESHNESS_VETO: {_fresh_result.reason}"
+
+        # All freshness gates passed — enrich payload with submission evidence
+        if _spot_now is not None:
+            payload["spot_at_submission"] = _spot_now
+        payload["submitted_at_utc"] = _datetime.now(_timezone.utc).isoformat()
+        payload["gate_verdicts"] = {
+            "mode_match": True,
+            "strike_freshness": True,
+            "spot_now_available": _spot_now is not None,
+        }
 
         expiry_fmt = expiry.replace("-", "")
 
