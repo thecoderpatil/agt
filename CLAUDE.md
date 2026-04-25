@@ -361,7 +361,7 @@ NOTES:
 
 - `HANDOFF_ARCHITECT_latest.md` â€” most recent architect handoff
 - `TRIPWIRE_EXEMPT_REGISTRY.md` â€” DB-pollution exemptions
-- `Portfolio_Risk_Rulebook_v10.md` â€” canonical rule definitions
+- `Portfolio_Risk_Rulebook_v11.md` â€” canonical rule definitions
 - `docs/adr/ADR-007_SELF_HEALING_LOOP.md` â€” autonomous pipeline architecture
 - `docs/adr/ADR-008_SHADOW_SCAN.md` â€” OrderSink + RunContext + DecisionSink
 - `.claude-cowork-notes.md` â€” session state (Architect writes, you read)

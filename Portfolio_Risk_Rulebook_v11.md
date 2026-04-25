@@ -1,18 +1,25 @@
-> **DEPRECATED 2026-04-25.** Superseded by Portfolio_Risk_Rulebook_v11.md. v10 is retained for historical reference only — DO NOT cite v10 for current operational decisions. See v11 for the current ruleset, including Rule 2-A (Cash Account Deployment Governor) which authorizes Roth IRA cash-secured CSPs.
-
----
-
-> **SUPERSEDED 2026-04-19 by Portfolio_Risk_Rulebook_v11.md.**
-> See ADR-014 for the mode-retirement decision. This file is
-> preserved for audit-trail continuity only.
-
 # Portfolio Risk Management Rulebook
 **AGT Equities — Pure Heitkoetter Wheel / Act 60 Chapter 2**
-**Version 10.0**
+**Version 11.0**
+
+**Status:** RATIFIED 2026-04-25 (CCO sign-off). Effective immediately.
 
 **Governing principle:** The objective is the **maximum income for the minimum risk taken** — not the maximum income possible. This portfolio operates under Act 60 Chapter 2 (Puerto Rico) and is managed on the assumption that **the account holder maintains bona fide Puerto Rico residency and that all relevant income is treated as Puerto Rico-source for applicable tax purposes.** Under this framework, options premium and capital gains are tax-exempt. Since gains are tax-exempt, there is no incentive to take excess risk to compensate for tax drag. Losses have limited-to-zero tax-recovery value under the Act 60 structure. The asymmetry is strong: be aggressive about collecting premium on sound structures, conservative about taking on incremental risk. Tax treatment is conditional and may vary by sourcing, residency status, holding period, and transaction type; tax counsel review is required for any decision justified primarily by tax status.
 
 ---
+
+## Changelog (v10 → v11)
+
+- **Rule 2 measurement clause amended.** Roth NLV remains excluded from the margin EL numerator and the margin NLV denominator (unchanged). Added cross-reference to new Rule 2-A which governs Roth cash deployment.
+- **Rule 2-A introduced.** Cash Account Deployment Governor. Mirrors Rule 2 structure (VIX-keyed table, retain/deploy split, contrarian premium-selling rationale) but applies to cash-secured CSPs in the Roth IRA. Maximum deployment capped at 90% of Roth cash at VIX ≥40 — last 10% is the retirement bunker (structural floor, not unlocked at any VIX level).
+- **CSP Operating Procedure (Rule 7) amended.** Removed the v10 blanket prohibition on Roth CSP activity. Added explicit cash-secured eligibility language with cross-reference to Rule 2-A.
+- **Appendix C account map updated.** Roth IRA row: CSP-Eligible flips to "Yes (cash-secured only — see Rule 2-A)". Margin-Eligible remains "No."
+- **Compliance Checklists (Monday Morning + Mid-Week) appended** with Rule 2-A line items.
+
+No changes to Rules 1, 3, 4, 5, 6, 8, 9, 10, 11, or Appendices A, B, D.
+
+---
+
 
 ## Changelog (v9 → v10)
 
@@ -101,11 +108,88 @@ A minimum percentage of total portfolio excess liquidity must be **retained as a
 
 **Scope:** Applies to total portfolio deployment across margin-eligible accounts. If current EL is below the required minimum, no new positions may be added until EL recovers through premium accumulation, margin relief, or position assignment at/above cost basis.
 
-**Measurement:** IBKR Current Excess Liquidity (see Definitions), measured across **margin-eligible accounts only** (Individual + Vikram IND). Roth IRA net liquidation value is excluded from BOTH the EL numerator AND the NLV denominator because IRA accounts cannot deploy margin or sell naked CSPs. See ADR-001 for full denominator methodology rationale. VIX is checked at time of order entry.
+**Measurement:** IBKR Current Excess Liquidity (see Definitions), measured across **margin-eligible accounts only** (Individual + Vikram IND). Roth IRA net liquidation value is excluded from BOTH the EL numerator AND the NLV denominator because IRA accounts cannot deploy margin. Roth cash-secured CSP deployment is governed independently by **Rule 2-A: Cash Account Deployment Governor**. See ADR-001 for full margin denominator methodology rationale. VIX is checked at time of order entry for both Rule 2 and Rule 2-A.
 
 **Design rationale:** A contrarian premium-selling rule. When VIX is elevated and premium is richest, more capital is freed for deployment. When VIX is low and premium is thin, capital is conserved. The 60% deployment cap and 40% retain floor at VIX 40+ ensure the portfolio can absorb a 25% market decline without forced liquidation risk.
 
 ---
+
+## Rule 2-A: Cash Account Deployment Governor (Roth IRA)
+
+A minimum percentage of Roth IRA cash balance must be **retained as a
+cash bunker** at all times. Higher VIX = lower reserve requirement =
+more capital available for cash-secured CSP deployment when implied
+volatility is richest. Maximum cash deployment is capped at 90%
+of Roth cash at VIX ≥40 — the last 10% of Roth cash is the retirement
+bunker and may not be deployed under any condition (structural floor,
+not unlocked at any VIX level).
+
+| VIX Level | Min Cash to Retain | Max Cash Deployable |
+|-----------|--------------------|---------------------|
+| < 20      | 50%                | 50%                 |
+| 20 – 25   | 40%                | 60%                 |
+| 25 – 30   | 30%                | 70%                 |
+| 30 – 40   | 20%                | 80%                 |
+| ≥ 40      | 10%                | 90% (hard cap)      |
+
+**Scope:** Applies to cash-secured CSP deployment in the Roth IRA only
+(account `U22076329`). Roth assignment positions (shares + covered
+calls under Rule 7) are governed by the same Wheel framework as
+margin accounts; Rule 2-A applies only to NEW CSP entry sizing.
+
+**Measurement:**
+- **Roth Cash Balance** = IBKR Settled Cash + Available Funds for the
+  Roth account (excludes unsettled premium and pending CSP collateral).
+- **Roth Cash Deployed** = sum of (strike × 100 × open contracts)
+  across all open cash-secured CSPs in the Roth account.
+- **Roth Deployment %** = Roth Cash Deployed ÷ Roth Cash Balance.
+- VIX is checked at time of CSP entry order. If a new CSP would push
+  Roth Deployment % above the VIX-keyed Max Cash Deployable, the
+  order is rejected at the allocator (no new entries until either
+  Roth cash recovers via premium accumulation / assignment, or VIX
+  shifts to a higher band).
+
+**Design rationale:** Mirrors the contrarian premium-selling logic of
+Rule 2 (higher VIX = richer premium = more deployment) but anchored at
+a 10% retirement-bunker floor rather than Rule 2's 40% margin-survival
+floor. Two structural reasons for the looser retain floor: (1) Roth
+positions are cash-secured, so there is no margin-call cliff to
+defend — the only loss vector is mark-to-market drawdown on assigned
+shares, which is bounded and recoverable through Wheel mechanics.
+(2) Roth capital is contributed under annual statutory caps — every
+dollar parked in cash is a dollar of foregone tax-advantaged compound
+growth. The 90% deployment ceiling at VIX ≥40 reflects the asymmetry
+between margin accounts (where forced liquidation is the dominant
+tail risk) and cash accounts (where the dominant cost is opportunity
+loss from idle capital). The 10% retirement bunker is structural and
+never unlocks at any VIX level.
+
+**Interaction with Rule 11 (Gross Beta-Weighted Leverage):** Rule 11
+applies at the household level using gross beta-weighted leverage
+across all positions including Roth. A Rule 11 breach (≥1.50x)
+freezes new CSP staging across all accounts including Roth,
+overriding any Rule 2-A headroom. Rule 2-A is necessary but not
+sufficient — both must clear for a Roth CSP to stage.
+
+**Interaction with Rule 6 (Vikram IND Margin Backstop):** None. Rule
+6 applies to margin accounts only.
+
+**Interaction with Rule 1 (Single-Name Concentration):** Concentration
+limits apply at the household level inclusive of Roth positions.
+Roth is not exempt from Rule 1.
+
+**Eligibility for Cash-Secured CSPs in Roth:**
+- Same name eligibility as Rule 7 CSP Operating Procedure (assignment
+  must be welcome on the underlying).
+- Same 30%/130% framework (Rule 7).
+- Same Rule 1 sector-concentration discipline.
+- Cash-secured collateralization is enforced at allocator time:
+  Roth Cash Available must equal or exceed (strike × 100 × contracts)
+  for the candidate before staging. Margin/leverage is structurally
+  prohibited on the IBKR Roth account regardless of rulebook state.
+
+---
+
 
 ## Rule 3: Sector Concentration
 
@@ -292,7 +376,7 @@ Upon announcement of a corporate action (merger, spin-off, special dividend, ten
 
 ### CSP Operating Procedure (New Names Only)
 
-**Roth IRA restriction:** Naked CSPs are not permitted in the Roth IRA. All CSP activity occurs in the Individual or Vikram IND accounts.
+**Roth IRA — cash-secured CSPs only:** All CSPs in the Roth IRA are cash-secured (strike × 100 × contracts ≤ available Roth cash) — naked positions are structurally impossible because the Roth account is not margin-enabled. Roth CSP entry is governed by Rule 2-A (Cash Account Deployment Governor). Roth Wheel positions (shares + covered calls) follow the standard Rule 7 framework. Margin-eligible CSP deployment continues to occur in the Individual and Vikram IND accounts under Rule 2.
 
 CSPs are sold only on names where assignment is welcome. The 30%/130% framework applies identically.
 
@@ -580,6 +664,8 @@ where beta is the trailing 6-month beta vs SPY for each underlying.
 ## Compliance Checklist — Monday Morning
 
 - [ ] VIX level → determine minimum EL requirement (Rule 2)
+- [ ] VIX level → determine Rule 2-A minimum cash retention for Roth IRA (separate from Rule 2 margin EL minimum)
+- [ ] Roth IRA Cash Available + Cash Deployed → confirm Roth Deployment % is below Rule 2-A maximum
 - [ ] Household NLV → recalculate each position as % of total
 - [ ] Per-account Current EL → compare to VIX-required floor (Rule 2) and Vikram IND 20% backstop (Rule 6)
 - [ ] Red Alert status → check activation/deactivation criteria (Rule 9)
@@ -604,6 +690,7 @@ where beta is the trailing 6-month beta vs SPY for each underlying.
 - [ ] Extended-DTE calls within 8% of short strike: close immediately
 - [ ] Assignment events since Monday: confirm status, update premium ledger
 - [ ] Dynamic Exit assignments settled: evaluate freed capital for CSP deployment
+- [ ] Roth IRA: Rule 2-A deployment % within VIX-keyed band (re-check if VIX has shifted by ≥5 points since Monday)
 
 ---
 
@@ -628,12 +715,12 @@ where beta is the trailing 6-month beta vs SPY for each underlying.
 
 ## Appendix C: Account Map
 
-| Account | Type | Margin-Eligible | CSP-Eligible | Notes |
-|---|---|---|---|---|
-| Individual (U21971297) | Personal Brokerage | Yes | Yes | Primary margin account |
-| Vikram IND (U22388499) | Brother Brokerage | Yes | Yes | Rule 6 backstop applies |
-| Roth IRA (U22076329) | Retirement | No | No | Shares + CCs only |
-| Trad IRA (U22076184) | Retirement | No | No | Dormant |
+| Account | Type | Margin-Eligible | CSP-Eligible | Governing Rule | Notes |
+|---|---|---|---|---|---|
+| Individual (U21971297) | Personal Brokerage | Yes | Yes | Rule 2 | Primary margin account |
+| Vikram IND (U22388499) | Brother Brokerage | Yes | Yes | Rule 2 + Rule 6 | Rule 6 backstop applies |
+| Roth IRA (U22076329) | Retirement | No | Yes (cash-secured only) | Rule 2-A | Cash-secured CSPs + shares + CCs. No margin, no naked positions structurally possible. |
+| Trad IRA (U22076184) | Retirement | No | No | — | Dormant — excluded from CSP entry via CSP_ACTIVE_ACCOUNTS config |
 
 ## Appendix D: Commands
 
@@ -719,3 +806,7 @@ The following ADRs govern implementation details that affect rule semantics. The
 ---
 
 *This document is the governing charter for AGT Equities. Review quarterly or after any material change in portfolio composition, tax status, or market regime.*
+
+---
+
+*Document version 11. Supersedes v10 (DEPRECATED 2026-04-25).*
