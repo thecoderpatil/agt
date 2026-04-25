@@ -105,6 +105,31 @@ print('HEARTBEAT_OK')
     Write-Warning "post_start_smoke: DB missing at $DbPath; skipping heartbeat check"
 }
 
+# 2.5. NSSM env-var contract.
+# Verify USE_SCHEDULER_DAEMON=1 is in both services' AppEnvironmentExtra as
+# separate REG_MULTI_SZ entries. Collapsed single-entry = vars not injected.
+$nssmsvcNames = @("agt-telegram-bot", "agt-scheduler")
+foreach ($svcName in $nssmsvcNames) {
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName\Parameters"
+    if (-not (Test-Path $regPath)) {
+        [void]$findings.Add("nssm_env: registry path not found svc=$svcName")
+        continue
+    }
+    $prop = Get-ItemProperty -Path $regPath -Name "AppEnvironmentExtra" -ErrorAction SilentlyContinue
+    if (-not $prop) {
+        [void]$findings.Add("nssm_env: AppEnvironmentExtra missing svc=$svcName")
+        continue
+    }
+    $entries = @($prop.AppEnvironmentExtra)
+    if ($entries.Count -lt 2) {
+        [void]$findings.Add("nssm_env: AppEnvironmentExtra collapsed (count=$($entries.Count)) svc=$svcName")
+    }
+    $hasFlag = $false
+    foreach ($e in $entries) { if ($e -eq "USE_SCHEDULER_DAEMON=1") { $hasFlag = $true } }
+    if (-not $hasFlag) {
+        [void]$findings.Add("nssm_env: USE_SCHEDULER_DAEMON=1 missing svc=$svcName")
+    }
+}
 # 3. Outcome.
 if ($findings.Count -eq 0 -and $heartbeatFailures.Count -eq 0) {
     Write-Host "smoke=pass files_scanned=$($logFiles.Count) patterns_checked=$($failPatterns.Count)"
