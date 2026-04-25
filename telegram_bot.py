@@ -3994,9 +3994,9 @@ def _r5_on_exec_details(trade, fill):
 
         exec_id_str = getattr(exec_id, 'execId', '') if exec_id else ''
 
-        fill_price = getattr(exec_id, 'price', 0) if exec_id else 0
+        fill_price = getattr(exec_id, 'avgPrice', 0) if exec_id else 0
 
-        fill_qty = getattr(exec_id, 'shares', 0) if exec_id else 0
+        fill_qty = getattr(exec_id, 'cumQty', 0) if exec_id else 0
 
         fill_time = str(getattr(exec_id, 'time', '')) if exec_id else ''
 
