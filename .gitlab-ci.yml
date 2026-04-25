@@ -366,6 +366,10 @@ variables:
 
 
 
+  AGT_DB_PATH: "C:\\GitLab-Runner\\test_data\\agt_desk.db"
+
+
+
 
 
 
