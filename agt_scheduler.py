@@ -1029,6 +1029,28 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
         replace_existing=True,
     )
     registered.append("flex_sync_zero_row_check")
+    # Phase A piece 3 — terminal-state sweeper at 16:30 ET.
+    def _terminal_state_sweeper_job() -> None:
+        from agt_equities.order_lifecycle import sweep_terminal_states
+        try:
+            result = sweep_terminal_states()
+            logger.info(
+                "terminal_state_sweeper: swept=%d, by_class=%s, errors=%d",
+                result.swept_count, result.by_classification, result.error_count,
+            )
+        except Exception as exc:
+            logger.exception("terminal_state_sweeper failed: %s", exc)
+
+    scheduler.add_job(
+        _terminal_state_sweeper_job,
+        trigger="cron",
+        hour=16,
+        minute=30,
+        id="terminal_state_sweeper",
+        name="Terminal-state sweeper (Phase A piece 3)",
+        replace_existing=True,
+    )
+    registered.append("terminal_state_sweeper")
 
     return registered
 
