@@ -1485,6 +1485,17 @@ def _process_one(
     # append_pending_tickets positionally - byte-identical to the prior
     # direct callback path. Shadow mode: CollectorOrderSink.stage buffers
     # ShadowOrder entries in memory and never touches pending_orders.
+
+    # ADR-020 ticket contract — staging evidence written before order_sink.stage()
+    # so append_pending_tickets serialization captures it into pending_orders.payload.
+    from datetime import datetime, timezone as _tz
+    _staged_at_iso = datetime.now(_tz.utc).isoformat()
+    for _t in tickets:
+        _t["spot_at_staging"] = float(candidate.current_price) if candidate.current_price else None
+        _t["premium_at_staging"] = float(candidate.mid) if candidate.mid else None
+        _t["staged_at_utc"] = _staged_at_iso
+        _t["broker_mode_at_staging"] = ctx.broker_mode
+
     try:
         ctx.order_sink.stage(
             tickets,
