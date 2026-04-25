@@ -98,3 +98,99 @@ def evaluate_strike_freshness(
         passed=True,
         evidence={"drift_pct": round(drift * 100, 4)},
     )
+
+QUOTE_FRESHNESS_DRIFT_THRESHOLD = 0.10  # 10% premium drift → refresh
+QUOTE_FLOOR_PCT_OF_STAGED = 0.20        # if refreshed premium < 20% of staged,
+                                         # veto instead of refresh — dead market
+QUOTE_ABSOLUTE_FLOOR = 0.05             # never refresh below $0.05 absolute
+
+
+def evaluate_quote_freshness(
+    *,
+    payload: dict,
+    premium_now: Optional[float],
+    drift_threshold: float = QUOTE_FRESHNESS_DRIFT_THRESHOLD,
+) -> FreshnessResult:
+    """Veto if premium has collapsed; refresh if drifted within band.
+
+    Per ADR-020 §B invariant 4. Returns:
+      - passed=True {legacy_row: True} if payload missing premium_at_staging.
+      - passed=False reason="freshness_check_unavailable" if premium_now None.
+      - passed=False reason="stale_quote" if premium_now < floor (effectively
+        dead market — refreshing would still not fill).
+      - passed=True with evidence including suggested refreshed_limit_price
+        when drift exceeds threshold but premium is still above floor.
+      - passed=True with no refresh suggestion when drift is within band.
+    """
+    premium_at_staging = payload.get("premium_at_staging")
+    if premium_at_staging is None:
+        return FreshnessResult(passed=True, evidence={"legacy_row": True})
+    if premium_now is None:
+        return FreshnessResult(
+            passed=False,
+            reason="freshness_check_unavailable",
+            evidence={"premium_at_staging": premium_at_staging, "premium_now": None},
+        )
+    try:
+        premium_at_staging = float(premium_at_staging)
+        premium_now = float(premium_now)
+    except (TypeError, ValueError) as exc:
+        return FreshnessResult(
+            passed=False,
+            reason="freshness_check_unavailable",
+            evidence={"compute_error": str(exc)},
+        )
+
+    floor = max(
+        QUOTE_ABSOLUTE_FLOOR,
+        premium_at_staging * QUOTE_FLOOR_PCT_OF_STAGED,
+    )
+    if premium_now < floor:
+        return FreshnessResult(
+            passed=False,
+            reason="stale_quote",
+            evidence={
+                "premium_at_staging": premium_at_staging,
+                "premium_now": premium_now,
+                "floor": floor,
+                "collapse_pct": round(
+                    (premium_at_staging - premium_now) / premium_at_staging * 100, 4
+                ),
+            },
+        )
+
+    drift = abs(premium_now - premium_at_staging) / premium_at_staging
+    if drift > drift_threshold:
+        return FreshnessResult(
+            passed=True,
+            evidence={
+                "drift_pct": round(drift * 100, 4),
+                "refresh_suggested": True,
+                "refreshed_limit_price": premium_now,
+                "premium_at_staging": premium_at_staging,
+                "premium_now": premium_now,
+            },
+        )
+
+    return FreshnessResult(
+        passed=True,
+        evidence={
+            "drift_pct": round(drift * 100, 4),
+            "refresh_suggested": False,
+        },
+    )
+
+
+def refresh_limit_price(
+    *,
+    original_limit: float,
+    freshness_evidence: dict,
+) -> float:
+    """Apply a freshness-suggested refresh to the limit price, or return original.
+
+    Pure function, no side effects. Caller decides when to invoke.
+    """
+    if freshness_evidence.get("refresh_suggested"):
+        return float(freshness_evidence["refreshed_limit_price"])
+    return float(original_limit)
+
