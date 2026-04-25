@@ -108,14 +108,15 @@ def db_path(tmp_path):
 
 
 def test_record_llm_call_writes_row(db_path):
+    now = datetime(2026, 4, 23, 12, 0, tzinfo=timezone.utc)
     record_llm_call(
         db_path,
-        timestamp_utc=datetime(2026, 4, 23, 12, 0, tzinfo=timezone.utc),
+        timestamp_utc=now,
         run_id="r1", call_site="csp_digest", model="claude-sonnet-4-6",
         input_tokens=2000, cached_input_tokens=0, output_tokens=300,
         cost_usd=0.0105, status="ok",
     )
-    cost = daily_cost_usd(db_path)
+    cost = daily_cost_usd(db_path, now_utc=now)
     assert cost == pytest.approx(0.0105, rel=1e-6)
 
 
@@ -159,6 +160,7 @@ def test_generate_commentary_aborts_on_budget_exceeded(db_path):
     out = asyncio.run(generate_commentary(
         "user payload", run_id="r1", db_path=db_path,
         anthropic_factory=factory,
+        now_utc=now,
     ))
     assert out == {}
     assert factory_called["n"] == 0  # never called Anthropic
