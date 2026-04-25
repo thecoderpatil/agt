@@ -13359,6 +13359,38 @@ async def _place_single_order(
             "strike_freshness": True,
             "spot_now_available": _spot_now is not None,
         }
+        # ADR-020 §B invariant 4 — quote freshness + limit refresh
+        from agt_equities.risk.staging_invariants import (
+            evaluate_quote_freshness as _chk_qfresh, refresh_limit_price as _refresh_limit,
+        )
+        _premium_now: float | None = None
+        try:
+            _premium_now = await _ibkr_get_option_bid(ticker, strike, expiry, right)
+        except Exception as _prem_exc:
+            logger.warning("ADR-020 quote fetch failed for #%d %s: %s", db_id, ticker, _prem_exc)
+        _qfresh = _chk_qfresh(payload=payload, premium_now=_premium_now)
+        if not _qfresh.passed:
+            with closing(_get_db_connection()) as _veto_conn:
+                with tx_immediate(_veto_conn):
+                    from agt_equities.order_state import append_status as _app_st
+                    _veto_conn.execute(
+                        "UPDATE pending_orders SET status = 'superseded' WHERE id = ?",
+                        (db_id,),
+                    )
+                    _app_st(_veto_conn, db_id, "superseded",
+                            _qfresh.reason or "stale_quote", _qfresh.evidence)
+            try:
+                from agt_equities.alerts import enqueue_alert as _enq
+                _enq("QUOTE_FRESHNESS_VETO", {"order_id": db_id, "ticker": ticker, **_qfresh.evidence})
+            except Exception:
+                pass
+            return False, f"#{db_id} {ticker} — QUOTE_FRESHNESS_VETO: {_qfresh.reason}"
+        final_limit = _refresh_limit(
+            original_limit=payload["limit_price"], freshness_evidence=_qfresh.evidence,
+        )
+        payload["limit_price_at_submission"] = final_limit
+        payload["gate_verdicts"]["quote_freshness"] = True
+        bid = final_limit
 
         expiry_fmt = expiry.replace("-", "")
 
