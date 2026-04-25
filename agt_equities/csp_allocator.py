@@ -1491,7 +1491,8 @@ def _process_one(
     from datetime import datetime, timezone as _tz
     _staged_at_iso = datetime.now(_tz.utc).isoformat()
     for _t in tickets:
-        _t["spot_at_staging"] = float(candidate.current_price) if candidate.current_price else None
+        _cp = getattr(candidate, "current_price", None)
+        _t["spot_at_staging"] = float(_cp) if _cp else None
         _t["premium_at_staging"] = float(candidate.mid) if candidate.mid else None
         _t["staged_at_utc"] = _staged_at_iso
         _t["broker_mode_at_staging"] = ctx.broker_mode
