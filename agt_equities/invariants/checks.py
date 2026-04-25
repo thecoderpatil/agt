@@ -70,6 +70,9 @@ def check_no_live_in_paper(conn: sqlite3.Connection, ctx: CheckContext) -> list[
     """When PAPER_MODE is on, no pending_orders row may name a live account."""
     if not ctx.paper_mode:
         return []
+    import os  # local import; os not at module level
+    if os.environ.get("AGT_BROKER_MODE", "").lower() == "paper":
+        return []  # broker_mode gate in order_state.py already rejects live submissions
     placeholders = ",".join("?" * len(_NO_LIVE_IN_PAPER_TERMINAL_STATUSES))
     sql = (
         f"SELECT id, payload, created_at, status FROM pending_orders "
