@@ -141,6 +141,7 @@ async def generate_commentary(
     input_token_cap: int = DEFAULT_INPUT_TOKEN_CAP,
     call_site: str = DEFAULT_CALL_SITE,
     anthropic_factory=None,
+    now_utc: datetime | None = None,
 ) -> dict[str, DigestCommentary]:
     """Call Anthropic with all 8 safeguards. Return commentary keyed by ticker.
 
@@ -154,7 +155,7 @@ async def generate_commentary(
     optional in test environments.
     """
     if db_path is not None:
-        spent = daily_cost_usd(db_path, call_site=call_site)
+        spent = daily_cost_usd(db_path, call_site=call_site, now_utc=now_utc)
         if spent >= daily_budget_usd:
             logger.warning(
                 "csp_digest.llm_budget_exceeded spent=%.4f budget=%.2f",
@@ -162,7 +163,7 @@ async def generate_commentary(
             )
             record_llm_call(
                 db_path,
-                timestamp_utc=datetime.now(timezone.utc),
+                timestamp_utc=now_utc or datetime.now(timezone.utc),
                 run_id=run_id, call_site=call_site, model=model,
                 input_tokens=0, cached_input_tokens=0, output_tokens=0,
                 cost_usd=0.0, status="budget_exceeded",
@@ -216,7 +217,7 @@ async def generate_commentary(
             if db_path is not None:
                 record_llm_call(
                     db_path,
-                    timestamp_utc=datetime.now(timezone.utc),
+                    timestamp_utc=now_utc or datetime.now(timezone.utc),
                     run_id=run_id, call_site=call_site, model=model,
                     input_tokens=input_tok, cached_input_tokens=cached_input_tok,
                     output_tokens=output_tok, cost_usd=cost, status="ok",
@@ -240,7 +241,7 @@ async def generate_commentary(
     if db_path is not None:
         record_llm_call(
             db_path,
-            timestamp_utc=datetime.now(timezone.utc),
+            timestamp_utc=now_utc or datetime.now(timezone.utc),
             run_id=run_id, call_site=call_site, model=model,
             input_tokens=0, cached_input_tokens=0, output_tokens=0,
             cost_usd=0.0, status=status,
