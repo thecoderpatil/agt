@@ -69,6 +69,7 @@ class ScanCandidate:
     headline: str = ""
     sector: str = "Unknown"
     delta: float = 0.0
+    current_price: float = 0.0
     household_id: str = ""
 
 
@@ -103,6 +104,8 @@ def adapt_scanner_candidates(rows: list[dict]) -> list[ScanCandidate]:
             delta = abs(float(raw_delta)) if raw_delta is not None else 0.0
         except (TypeError, ValueError):
             delta = 0.0
+        _cp_raw = row.get("current_price") or row.get("underlying_price")
+        current_price = float(_cp_raw) if _cp_raw is not None else 0.0
         out.append(
             ScanCandidate(
                 ticker=ticker,
@@ -116,6 +119,7 @@ def adapt_scanner_candidates(rows: list[dict]) -> list[ScanCandidate]:
                 headline=str(row.get("headline", "") or ""),
                 sector=str(row.get("sector", "Unknown") or "Unknown"),
                 delta=delta,
+                current_price=current_price,
             )
         )
     return out
