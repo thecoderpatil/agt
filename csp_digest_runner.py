@@ -282,6 +282,7 @@ async def run_csp_digest_job(
                 run_id=latest.get("run_id") or f"digest:{trade_date}",
                 db_path=db_path,
                 anthropic_factory=factory,
+                now_utc=now_utc,
             )
         except Exception as exc:
             # generate_commentary itself should never raise; defensive belt.
