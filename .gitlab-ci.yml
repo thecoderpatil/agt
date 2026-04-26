@@ -1,2 +1,1059 @@
-job1:
-  script: echo hello
+# GitLab CI for AGT Equities â€” Decoupling Sprint A targeted runner.
+
+
+
+
+
+
+
+#
+
+
+
+
+
+
+
+# Why this exists:
+
+
+
+
+
+
+
+#   The Linux sandbox we use for Cowork Architect work has Windows-mount
+
+
+
+
+
+
+
+#   permission quirks (chmod 700 .pyc files we can't unlink, intermittent
+
+
+
+
+
+
+
+#   .git/*.lock issues). Running pytest in a clean container sidesteps the
+
+
+
+
+
+
+
+#   whole class of issue and gives us reproducible green/red signal.
+
+
+
+
+
+
+
+#
+
+
+
+
+
+
+
+# Scope today (A1..A4):
+
+
+
+
+
+
+
+#   Targeted run of the Sprint A unit tests only:
+
+
+
+
+
+
+
+#     - tests/test_ib_conn.py             (A1)
+
+
+
+
+
+
+
+#     - tests/test_agt_scheduler.py       (A1, A2)
+
+
+
+
+
+
+
+#     - tests/test_health.py              (A2)
+
+
+
+
+
+
+
+#     - tests/test_flex_sync_atomic.py tests/test_flex_sync_phase1.py    (A3)
+
+
+
+
+
+
+
+#     - tests/test_a4_init_db_lazy.py     (A4)
+
+
+
+
+
+
+
+#     - tests/test_alerts.py              (A5b)
+
+
+
+
+
+
+
+#     - tests/test_a5d_consumer_wired.py  (A5d)
+
+
+
+
+
+
+
+#     - tests/test_a5dc_dead_buffer_removed.py (A5d.c)
+
+
+
+
+
+
+
+#     - tests/test_b5c_scan_bridge.py    (B5.c-bridge-1)
+
+
+
+
+
+
+
+#     - tests/test_bridge2_extras.py tests/test_csp_active_accounts.py tests/test_csp_allocator.py tests/test_telegram_ui/     (bridge-2 extras)
+
+#     - tests/test_paper_validator.py tests/test_post_init_heartbeat_gate.py     (sprint_a coverage closure 2026-04-23 MR !201)
+
+#     - tests/test_news_adapters.py     (MR !202 news overlay infrastructure)
+
+#     - tests/test_news_aggregator.py     (MR !203 news overlay EDGAR + aggregator + cache)
+
+#     - tests/test_csp_digest_*.py     (MR !204 CSP digest scaffolding — formatter, llm, approval)
+
+
+
+
+
+
+
+#
+
+
+
+
+
+
+
+# Why not the full 975 baseline yet:
+
+
+
+
+
+
+
+#   The full suite has 5 known pre-existing failures (4x test_margin_logic
+
+
+
+
+
+
+
+#   async config, 1x test_phase3a R7) that block CI green. We'll broaden
+
+
+
+
+
+
+
+#   to the full baseline in a follow-up after FU-ASYNCIO-CONFIG lands.
+
+
+
+
+
+
+
+#
+
+
+
+
+
+
+
+# Post-A3 compute-efficiency batch #1 (infra/ci-efficiency-batch-1):
+
+
+
+
+
+
+
+#   * Dependency versions live in requirements-ci.txt (single source of
+
+
+
+
+
+
+
+#     truth, cache-key input).
+
+
+
+
+
+
+
+#   * pip downloads are cached under $CI_PROJECT_DIR/.cache/pip keyed on
+
+
+
+
+
+
+
+#     the requirements-ci.txt hash. First run on a branch = Cache miss,
+
+
+
+
+
+
+
+#     subsequent pushes = Cache restored + pip install in seconds.
+
+
+
+
+
+
+
+#   * Test collection pairs the `sprint_a` pytest marker with an explicit
+
+
+
+
+
+
+
+#     file list. The marker is the semantic gate (adding a new test inside
+
+
+
+
+
+
+
+#     these files takes the decorator and nothing else); the file list
+
+
+
+
+
+
+
+#     scopes collection so unrelated tests/*.py files â€” which pull heavy
+
+
+
+
+
+
+
+#     deps (telegram, fastapi, full project stack) that are NOT in
+
+
+
+
+
+
+
+#     requirements-ci.txt â€” don't bomb import-time collection. Adding a
+
+
+
+
+
+
+
+#     new Sprint A *file* = one-line CI edit; adding a new Sprint A
+
+
+
+
+
+
+
+#     *test* inside an existing file = zero CI edits.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -------------------------------------------------------------------
+
+
+
+
+
+
+
+# Compute-minute discipline â€” workflow:rules
+
+
+
+
+
+
+
+# -------------------------------------------------------------------
+
+
+
+
+
+
+
+# Problem (observed 2026-04-16): 337 pipelines in 6 days burned the free
+
+
+
+
+
+
+
+# tier 400-minute quota. 26% of runs were duplicates â€” a branch push with
+
+
+
+
+
+
+
+# an open MR triggered BOTH a branch pipeline AND a merge_request_event
+
+
+
+
+
+
+
+# pipeline for the same SHA.
+
+
+
+
+
+
+
+#
+
+
+
+
+
+
+
+# Fix: only run ONE pipeline per code state.
+
+
+
+
+
+
+
+#   - If an MR is open for the branch â†’ MR event pipeline runs, branch
+
+
+
+
+
+
+
+#     push pipeline is skipped (dedup).
+
+
+
+
+
+
+
+#   - If no MR is open yet â†’ branch push pipeline runs (lets pre-MR smoke
+
+
+
+
+
+
+
+#     tests still run on feature branches).
+
+
+
+
+
+
+
+#   - main gets its own pipeline on push (post-merge canonical signal).
+
+
+
+
+
+
+
+#
+
+
+
+
+
+
+
+# Also: commits with `[skip ci]` in the message are honored by GitLab and
+
+
+
+
+
+
+
+# consume zero minutes â€” use for docs/notes/memory-only changes.
+
+
+
+
+
+
+
+workflow:
+
+
+
+
+
+
+
+  rules:
+
+
+
+
+
+
+
+    # Merge-request event pipelines always run
+
+
+
+
+
+
+
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+
+
+
+
+
+
+    # Skip branch-push pipeline when an MR is already open for the branch
+
+
+
+
+
+
+
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+
+
+
+
+
+
+
+      when: never
+
+
+
+
+
+
+
+    # main post-merge pipeline (canonical signal after squash-merge)
+
+
+
+
+
+
+
+    - if: $CI_COMMIT_BRANCH == "main"
+
+
+
+
+
+
+
+    # Feature-branch first push (before MR exists)
+
+
+
+
+
+
+
+    - if: $CI_COMMIT_BRANCH
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+stages:
+
+
+
+
+
+
+
+  - test
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+default:
+
+
+
+
+
+
+
+  tags:
+
+
+
+
+
+
+
+    - agt-windows
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+variables:
+
+
+
+
+
+
+
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+
+
+
+
+
+
+  SECRET_DETECTION_DISABLED: "true"
+
+
+
+
+
+
+
+  PYTHONDONTWRITEBYTECODE: "1"
+
+
+
+
+
+
+
+  PYTHONUNBUFFERED: "1"
+
+
+
+
+
+
+
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+
+
+
+
+
+
+  # telegram_bot.py reads these at import time. Fakes are sufficient for
+
+
+
+
+
+
+
+  # test collection + live-import â€” no network calls occur in sprint_a tests.
+
+
+
+
+
+
+
+  TELEGRAM_BOT_TOKEN: "ci_fake_bot_token_not_used"
+
+
+
+
+
+
+
+  TELEGRAM_USER_ID: "0"
+
+
+
+
+
+
+
+  ANTHROPIC_API_KEY: "ci_fake_anthropic_key_not_used"
+
+
+
+
+
+
+
+  FINNHUB_API_KEY: "ci_fake_finnhub_key_not_used"
+
+
+
+
+
+
+
+  # Obs.1: skip boot assertion on CI runner (module-level check in telegram_bot.py).
+
+
+
+
+
+
+
+  AGT_BOOTSTRAP_ALLOW_OVERRIDE: '1'
+
+
+
+
+
+
+
+  AGT_DB_PATH: "C:\\GitLab-Runner\\test_data\\agt_desk.db"
+  # Phase A piece 4 containment toggles.
+  # Set AGT_CI_ACL_ENFORCED=true in config.toml after running ci_acl_apply.ps1.
+  AGT_CI_ACL_ENFORCED: "false"
+  # Override sensitive-window CI block (emergency use only, logged).
+  AGT_CI_OUTSIDE_HOURS_OVERRIDE: "false"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+.python_setup: &python_setup
+
+
+
+
+
+
+
+  image: python:3.12-slim
+
+
+
+
+
+
+
+  cache:
+
+
+
+
+
+
+
+    key:
+
+
+
+
+
+
+
+      files:
+
+
+
+
+
+
+
+        - requirements-ci.txt
+
+
+
+
+
+
+
+      prefix: "${CI_COMMIT_REF_SLUG}"
+
+
+
+
+
+
+
+    paths:
+
+
+
+
+
+
+
+      - .cache/pip/
+
+
+
+
+
+
+
+  before_script:
+
+
+
+
+
+
+
+    - python -V
+
+
+
+
+
+
+
+    - pip install -r requirements-ci.txt
+    # Phase A piece 4 -- CI containment contract preflight
+    - python scripts/ci_window_check.py
+    - python scripts/ci_containment_assert.py
+    - python scripts/ci_db_canary.py
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+sprint_a_unit_tests:
+
+
+
+
+
+
+
+  <<: *python_setup
+
+
+
+
+
+
+
+  stage: test
+
+
+
+
+
+
+
+  script:
+
+
+
+
+
+
+
+    - pytest -v --tb=short -m sprint_a tests/test_ib_conn.py tests/test_agt_scheduler.py tests/test_health.py tests/test_flex_sync_atomic.py tests/test_a5e_atomic_cutover.py tests/test_b1_pending_order_children_schema.py tests/test_b2_cc_fill_permid_retry.py tests/test_b3_children_writer.py tests/test_b4_fa_block_reader.py tests/test_b5_fa_block_margin.py tests/test_b5b_m1x_integration.py tests/test_b5c_scan_bridge.py tests/test_inception_delta_fill.py tests/test_a4_init_db_lazy.py tests/test_alerts.py tests/test_conviction.py tests/test_a5d_consumer_wired.py tests/test_a5dc_dead_buffer_removed.py tests/test_roll_engine.py tests/test_fill_log_schema.py tests/test_b_fill_log_composite_pk.py tests/test_bridge2_extras.py tests/test_csp_allocator.py tests/test_telegram_ui/ tests/test_breaker_status_filter.py tests/test_paper_auto_execute.py tests/test_invariants.py tests/test_incidents_repo.py tests/test_invariants_heartbeat.py tests/test_invariants_tick.py tests/test_cmd_rem_redirect.py tests/test_incidents_digest.py tests/test_circuit_breaker_heartbeat.py tests/test_author_critic.py tests/test_nssm_install_script.py tests/test_mr84_bundle.py tests/test_requirements_runtime.py tests/test_mr85_invariant_hygiene.py tests/test_mr86_zombie_venv_launcher.py tests/test_incidents_authorable_gate.py tests/test_shadow_scan_telegram_emit.py tests/test_csp_approval_gate.py tests/test_cc_decision_sink.py tests/test_hydrate_timeout.py tests/test_import_sys_singleton_lock.py tests/test_ib_trades_hydrate_on_reconnect.py tests/test_shadow_scan_plumbing.py tests/test_csp_allocator_shadow_mode.py tests/test_excluded_sectors_hardgate.py tests/test_csp_decisions_repo.py tests/test_allocator_writes_csp_decisions.py tests/test_ib_order_builder.py tests/test_urgency_policy.py tests/test_urgency_routing_integration.py tests/test_csp_harvest.py tests/test_precommit_loc_gate.py tests/test_csp_harvest_shadow_mode.py tests/test_csp_allocator_dedup_guard.py tests/test_mr110_autoresolve_sweep.py tests/test_roll_scanner_shadow_mode.py tests/test_roll_scanner_extract.py tests/test_incidents_dual_ledger.py tests/test_decisions_repo.py tests/test_no_shutil_copy_db.py tests/test_promotion_gates.py tests/test_paper_baseline.py tests/test_bates_fft.py tests/test_cached_client.py tests/test_no_raw_anthropic_imports.py tests/test_nightly_smoke.py tests/test_file_anchor_overrides.py tests/test_resource_path_overrides.py tests/test_bootstrap_canonical.py tests/test_self_healing_write_path.py tests/test_premarket_shadow_scan.py tests/test_boot_contract.py tests/test_control_plane_strict.py tests/test_command_registry_parity.py tests/test_position_discovery.py tests/test_approval_policy.py tests/test_broker_preflight.py tests/test_scan_orchestrator.py tests/test_runtime_fingerprint.py tests/test_csp_active_accounts.py tests/test_paper_validator.py tests/test_post_init_heartbeat_gate.py tests/test_news_adapters.py tests/test_news_aggregator.py tests/test_csp_digest_formatter.py tests/test_csp_digest_llm.py tests/test_csp_digest_approval.py tests/test_telegram_async_offload.py tests/test_csp_digest_wiring.py tests/test_flex_sync_watchdog.py tests/test_invf_high_bundle.py tests/test_db_path_lazy_resolve.py tests/test_sprint5_mrc_timing.py tests/test_sprint5_mrd_bundle.py tests/test_sprint5_r4_invariants_lazy_db.py tests/test_sprint6_r1_agt_scheduler_boot_lazy_db.py tests/test_sprint6_r2_telegram_bot_jobqueue_async.py tests/test_sprint6_r3_deploy_script_parse.py tests/test_post_start_smoke_parse.py tests/test_sprint6_r4_db_path_no_direct_module_reads.py tests/test_sprint6_r5_deploy_nssm_stop_tolerance.py tests/test_sprint6_r6_el_snapshot_writer_async_executor.py tests/test_flex_sync_zero_row_watchdog.py tests/test_decision_outcome_repo.py tests/test_incidents_error_budget.py tests/test_engine_state.py tests/test_pregateway_skeleton.py tests/test_promotion_gates_paper_baseline.py tests/test_sprint6_backlog_sweep.py tests/test_cmd_oversight_status.py tests/test_cmd_flex_manual_reconcile.py tests/test_flex_coverage_invariant.py tests/test_observability_thresholds.py tests/test_oversight_digest_scheduled.py tests/test_observability_digest.py tests/test_known_trading_day_partial_fill.py tests/test_no_live_in_paper_paper_suppress.py tests/test_fill_qty_cumulative.py tests/test_strike_freshness.py tests/test_quote_freshness.py tests/test_terminal_state_sweeper.py tests/test_ci_containment.py
+
+
+
+
+
+
+
+  rules:
+
+
+
+
+
+
+
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+
+
+
+
+
+
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+
+
+
+
+
+
+    - if: $CI_COMMIT_BRANCH == "main"
+
+
+
+
+
+
+
+# Sprint 8 Mega-MR 5 — PSScriptAnalyzer static lint for PowerShell scripts.
+
+# Motivated by R3 em-dash bug in rollback.ps1 (Sprint 6 MR 1) that would
+
+# have been caught by static analysis. Severity=Error initial gate; Warning
+
+# findings surface as MR output but don't block (expandable in follow-up).
+
+lint-powershell:
+
+
+
+
+
+
+
+  stage: test
+
+
+
+
+
+
+
+  image: mcr.microsoft.com/powershell:latest
+
+
+
+
+
+
+
+  tags: []
+
+
+
+
+
+
+
+  before_script:
+
+
+
+
+
+
+
+    # PSScriptAnalyzer >= 1.23 requires PowerShell Core >= 7.4.6; the default
+
+    # image ships 7.4.2. Pin to 1.22.0 for compatibility. Remove pin once
+
+    # image upgrades to >= 7.4.6.
+
+    - pwsh -NoProfile -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted; Install-Module PSScriptAnalyzer -RequiredVersion 1.22.0 -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck"
+
+
+
+
+
+
+
+  script:
+
+
+
+
+
+
+
+    - pwsh -NoProfile -Command "Invoke-ScriptAnalyzer -Path ./scripts -Recurse -Severity Error -EnableExit"
+
+
+
+
+
+
+
+  rules:
+
+
+
+
+
+
+
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+
+
+      changes:
+
+
+
+        - "**/*.ps1"
+
+
+
+        - .gitlab-ci.yml
+
+
+
+    - if: $CI_COMMIT_BRANCH == "main"
+
+
+
+      changes:
+
+
+
+        - "**/*.ps1"
+
+
+
+        - .gitlab-ci.yml
+
+
+
+
+
+
+
