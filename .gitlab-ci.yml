@@ -736,8 +736,8 @@ variables:
 
   AGT_DB_PATH: "C:\\GitLab-Runner\\test_data\\agt_desk.db"
   # Phase A piece 4 containment toggles.
-  # Set AGT_CI_ACL_ENFORCED=true in config.toml after running ci_acl_apply.ps1.
-  AGT_CI_ACL_ENFORCED: "false"
+  # Gate 2 complete: ACL enforced on C:\AGT_Runtime\state (Option 1, MR !266).
+  AGT_CI_ACL_ENFORCED: "true"
   # Override sensitive-window CI block (emergency use only, logged).
   AGT_CI_OUTSIDE_HOURS_OVERRIDE: "false"
 
