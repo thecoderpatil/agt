@@ -129,7 +129,7 @@ def sweep_terminal_states(
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
 
-    from agt_equities.db import get_db_connection
+    from agt_equities.db import get_db_connection, tx_immediate
     conn = get_db_connection(db_path=db_path)
 
     result_classifications: dict[str, int] = {}
@@ -170,22 +170,22 @@ def sweep_terminal_states(
                     skipped += 1
                     continue
                 terminal_state, reason, evidence = classification
-                _apply_sweep(
-                    conn,
-                    order_id=row["id"],
-                    from_status=row["status"],
-                    to_status=terminal_state,
-                    reason=reason,
-                    evidence=evidence,
-                    now_utc=now_utc,
-                )
+                with tx_immediate(conn):
+                    _apply_sweep(
+                        conn,
+                        order_id=row["id"],
+                        from_status=row["status"],
+                        to_status=terminal_state,
+                        reason=reason,
+                        evidence=evidence,
+                        now_utc=now_utc,
+                    )
                 swept_count += 1
                 result_classifications[reason] = result_classifications.get(reason, 0) + 1
             except Exception as exc:
                 error_count += 1
                 errors.append(f"id={row.get('id')}: {exc}")
                 logger.exception("Sweep failed for order id=%s: %s", row.get("id"), exc)
-        conn.commit()
     finally:
         conn.close()
 

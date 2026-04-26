@@ -18,7 +18,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agt_equities.db import get_db_connection, get_ro_connection
+from agt_equities.db import get_db_connection, get_ro_connection, tx_immediate
 
 
 logger = logging.getLogger("agt_equities.health")
@@ -54,34 +54,34 @@ def write_heartbeat(
     now = _utcnow_iso()
     try:
         with closing(get_db_connection(db_path=db_path)) as conn:
-            conn.execute(
-                """
-                INSERT INTO daemon_heartbeat
-                    (daemon_name, last_beat_utc, pid, client_id, notes)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(daemon_name) DO UPDATE SET
-                    last_beat_utc = excluded.last_beat_utc,
-                    pid           = excluded.pid,
-                    client_id     = excluded.client_id,
-                    notes         = excluded.notes
-                """,
-                (daemon_name, now, pid, client_id, notes),
-            )
-            # Phase B Foundation: double-write to daemon_heartbeat_samples for
-            # retrospective gap analysis. Wrapped in try/except so a missing
-            # samples table (pre-migration) cannot crash the heartbeat path.
-            try:
+            with tx_immediate(conn):
                 conn.execute(
                     """
-                    INSERT INTO daemon_heartbeat_samples
-                        (daemon_name, beat_utc, pid, client_id, notes)
+                    INSERT INTO daemon_heartbeat
+                        (daemon_name, last_beat_utc, pid, client_id, notes)
                     VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(daemon_name) DO UPDATE SET
+                        last_beat_utc = excluded.last_beat_utc,
+                        pid           = excluded.pid,
+                        client_id     = excluded.client_id,
+                        notes         = excluded.notes
                     """,
                     (daemon_name, now, pid, client_id, notes),
                 )
-            except sqlite3.OperationalError as inner:
-                logger.warning("daemon_heartbeat_samples write skipped: %s", inner)
-            conn.commit()
+                # Phase B Foundation: double-write to daemon_heartbeat_samples for
+                # retrospective gap analysis. Wrapped in try/except so a missing
+                # samples table (pre-migration) cannot crash the heartbeat path.
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO daemon_heartbeat_samples
+                            (daemon_name, beat_utc, pid, client_id, notes)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (daemon_name, now, pid, client_id, notes),
+                    )
+                except sqlite3.OperationalError as inner:
+                    logger.warning("daemon_heartbeat_samples write skipped: %s", inner)
     except Exception as exc:
         # Heartbeat failure must not crash the daemon; just log loudly.
         logger.exception("write_heartbeat(%s) failed: %s", daemon_name, exc)
