@@ -1109,6 +1109,50 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
         )
         registered.append("phase_b_proof_preview")
 
+    # Sprint 13: daemon_heartbeat_samples 30-day rolling archive.
+    # Runs Sunday 03:00 ET -- low-traffic window. Archives rows older than 30
+    # days into daemon_heartbeat_samples_archive (created by
+    # migrate_heartbeat_samples_archive.py), then deletes them from the main
+    # table. Single tx_immediate ensures INSERT-archive + DELETE are atomic.
+    def _heartbeat_archive_job() -> None:
+        from contextlib import closing
+        from agt_equities.db import get_db_connection, tx_immediate
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat(timespec="seconds")
+        try:
+            with closing(get_db_connection()) as conn:
+                with tx_immediate(conn):
+                    conn.execute(
+                        "INSERT INTO daemon_heartbeat_samples_archive "
+                        "(daemon_name, beat_utc, pid, client_id, notes) "
+                        "SELECT daemon_name, beat_utc, pid, client_id, notes "
+                        "FROM daemon_heartbeat_samples WHERE beat_utc < ?",
+                        (cutoff,),
+                    )
+                    result = conn.execute(
+                        "DELETE FROM daemon_heartbeat_samples WHERE beat_utc < ?",
+                        (cutoff,),
+                    )
+                    logger.info(
+                        "heartbeat_archive: archived+deleted %d rows older than %s",
+                        result.rowcount, cutoff,
+                    )
+        except Exception as exc:
+            logger.error("heartbeat_archive_job error: %s", exc)
+
+    scheduler.add_job(
+        _heartbeat_archive_job,
+        trigger="cron",
+        day_of_week="sun",
+        hour=3,
+        minute=0,
+        id="heartbeat_archive",
+        name="heartbeat_archive",
+        replace_existing=True,
+    )
+    registered.append("heartbeat_archive")
+
     return registered
 
 

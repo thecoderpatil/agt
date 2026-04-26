@@ -43,6 +43,7 @@ class FileExpectation:
     tolerance: int = 10
     required_symbols: list[str] = field(default_factory=list)
     required_sentinels: list[str] = field(default_factory=list)
+    id_strings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -94,6 +95,7 @@ def parse_dispatch_expectation(dispatch_path: Path) -> Expectation:
             tolerance=int(spec.get("tolerance", 10)),
             required_symbols=list(spec.get("required_symbols", []) or []),
             required_sentinels=list(spec.get("required_sentinels", []) or []),
+            id_strings=list(spec.get("id_strings", []) or []),
         )
 
     shrinking: dict[str, ShrinkingClause] = {}
@@ -141,6 +143,9 @@ def collect_top_level_symbols(source: str) -> set[str]:
             for tgt in node.targets:
                 if isinstance(tgt, ast.Name):
                     names.add(tgt.id)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
     return names
 
 
@@ -193,6 +198,13 @@ def evaluate_file(
     if missing_sent:
         failures.append(
             f"[{exp.path}] required sentinels not found in file: {missing_sent}"
+        )
+
+    # id_strings -- scheduler job ids not capturable by AST walker
+    missing_ids = [s for s in exp.id_strings if s not in new_text]
+    if missing_ids:
+        failures.append(
+            f"[{exp.path}] required id_strings not found in file: {missing_ids}"
         )
 
     return failures
