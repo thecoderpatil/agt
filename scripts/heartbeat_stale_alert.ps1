@@ -33,7 +33,7 @@ if (-not $env:AGT_DB_PATH) {
     exit 2
 }
 $DB_PATH = $env:AGT_DB_PATH
-# Resolve symlink if present — SQLite WAL derives from the literal open-path, not the target.
+# Resolve symlink if present - SQLite WAL derives from the literal open-path, not the target.
 $_symTarget = (Get-Item $DB_PATH -ErrorAction SilentlyContinue).Target
 if ($_symTarget) { $DB_PATH = $_symTarget }
 
