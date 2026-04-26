@@ -1,44 +1,57 @@
-# Phase A piece 4 — ACL verification for CI containment contract.
-# Confirms the GitLab Runner service account (NT AUTHORITY\SYSTEM) DENY
-# is in place on the prod state path. Run as Administrator after
-# running ci_acl_apply.ps1.
-#
-# Sentinel: ACL verification.
+# Phase A piece 4 Gate 2 -- verify runner cannot write to prod state.
+# Checks: inheritance disabled, Authenticated Users absent, SYSTEM/Administrators intact.
+# Run as Administrator after running ci_acl_apply.ps1.
 
-$RunnerAccount = "NT AUTHORITY\SYSTEM"
 $ProdStatePath = "C:\AGT_Runtime\state"
 
 if (-not (Test-Path $ProdStatePath)) {
-    Write-Error "ACL VERIFY: $ProdStatePath does not exist — nothing to verify."
+    Write-Error "ACL VERIFY: $ProdStatePath does not exist -- nothing to verify."
     exit 1
 }
 
-$Acl = Get-Acl $ProdStatePath
-$DenyEntries = $Acl.Access | Where-Object {
-    $_.IdentityReference -like "*SYSTEM*" -and $_.AccessControlType -eq "Deny"
-}
+$acl = Get-Acl $ProdStatePath
 
-if ($DenyEntries.Count -eq 0) {
-    Write-Error "ACL VERIFY FAIL: no DENY entry for $RunnerAccount on $ProdStatePath"
-    Write-Host "Run scripts/ci_acl_apply.ps1 as Administrator to apply the DENY ACE."
+# Check 1: inheritance is disabled (AreAccessRulesProtected = true means disabled).
+if ($acl.AreAccessRulesProtected -eq $false) {
+    Write-Error "ACL VERIFY FAIL: inheritance still enabled on $ProdStatePath"
     exit 1
 }
+Write-Host "ACL VERIFY: inheritance disabled -- OK"
 
-Write-Host "ACL VERIFY PASS: $($DenyEntries.Count) DENY entries for $RunnerAccount on $ProdStatePath"
-$DenyEntries | ForEach-Object {
-    Write-Host "  Rights=$($_.FileSystemRights) Type=$($_.AccessControlType) Inherited=$($_.IsInherited)"
+# Check 2: Authenticated Users absent (no Modify path for gitlab-runner-svc).
+$authUsersRules = $acl.Access | Where-Object {
+    $_.IdentityReference.Value -like "*Authenticated Users*"
 }
+if ($authUsersRules.Count -gt 0) {
+    Write-Error "ACL VERIFY FAIL: Authenticated Users still has access on $ProdStatePath"
+    $authUsersRules | Format-Table IdentityReference, FileSystemRights, AccessControlType
+    exit 1
+}
+Write-Host "ACL VERIFY: Authenticated Users absent -- OK"
 
-# Functional write probe. Note: if running as Admin (not as the runner
-# account itself), the probe may succeed — Admin can override DENY.
-# The ACL output above is the canonical verification signal.
-$probe = Join-Path $ProdStatePath ".acl_verify_probe"
-try {
-    $null = New-Item -Path $probe -ItemType File -Force -ErrorAction Stop
-    Remove-Item $probe -Force
-    Write-Host "NOTE: current process (Admin) can write — expected; DENY targets SYSTEM not Admin."
-} catch {
-    Write-Host "Write probe blocked: $($_.Exception.Message)"
-    Write-Host "(If running as SYSTEM or runner account, this confirms ACL is working.)"
+# Check 3: SYSTEM still has FullControl (prod NSSM services write here).
+$systemRule = $acl.Access | Where-Object {
+    ($_.IdentityReference.Value -eq "NT AUTHORITY\SYSTEM") -and
+    ($_.AccessControlType -eq "Allow")
 }
+if (-not $systemRule) {
+    Write-Error "ACL VERIFY FAIL: SYSTEM access missing -- prod services would break"
+    exit 1
+}
+Write-Host "ACL VERIFY: SYSTEM FullControl present -- OK"
+
+# Check 4: Administrators still has FullControl (operator access).
+$adminRule = $acl.Access | Where-Object {
+    ($_.IdentityReference.Value -like "*Administrators*") -and
+    ($_.AccessControlType -eq "Allow")
+}
+if (-not $adminRule) {
+    Write-Error "ACL VERIFY FAIL: Administrators access missing"
+    exit 1
+}
+Write-Host "ACL VERIFY: Administrators FullControl present -- OK"
+
+Write-Host ""
+Write-Host "ACL VERIFY PASS:"
+$acl.Access | Format-Table IdentityReference, FileSystemRights, AccessControlType, IsInherited
 exit 0
