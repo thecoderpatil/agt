@@ -124,6 +124,7 @@ def get_db_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(target_path), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
+    conn.execute("PRAGMA wal_autocheckpoint = 200;")
     return conn
 
 
