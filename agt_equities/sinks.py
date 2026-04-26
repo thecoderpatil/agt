@@ -97,12 +97,30 @@ class SQLiteOrderSink:
     ) -> None:
         """Forward tickets to the production staging function.
 
-        The default adapter simply calls ``staging_fn(tickets)`` and lets
-        the caller supply a lambda when a richer signature is needed.
+        Phase B Foundation: enrich each ticket with engine/run_id and the
+        broker_mode_at_staging / spot_at_staging / premium_at_staging /
+        gate_verdicts fields supplied via meta, plus a staged_at_utc
+        timestamp. setdefault preserves any caller-supplied values.
         """
         if not tickets:
             return
-        self._staging_fn(tickets)
+        meta_ = dict(meta or {})
+        enriched: list[dict] = []
+        for t in tickets:
+            e = dict(t)
+            e.setdefault("engine", engine)
+            e.setdefault("run_id", run_id)
+            if "broker_mode" in meta_:
+                e.setdefault("broker_mode_at_staging", meta_["broker_mode"])
+            if "spot_at_staging" in meta_:
+                e.setdefault("spot_at_staging", meta_["spot_at_staging"])
+            if "premium_at_staging" in meta_:
+                e.setdefault("premium_at_staging", meta_["premium_at_staging"])
+            if "gate_verdicts" in meta_:
+                e.setdefault("gate_verdicts", meta_["gate_verdicts"])
+            e.setdefault("staged_at_utc", _utc_now_iso())
+            enriched.append(e)
+        self._staging_fn(enriched)
 
 
 class CollectorOrderSink:

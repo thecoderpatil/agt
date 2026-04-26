@@ -787,6 +787,9 @@ def append_pending_tickets(tickets: list[dict]) -> None:
 
         created_at = str(payload.get("created_at") or payload.get("timestamp") or now)
 
+        gv = payload.get("gate_verdicts")
+        gv_json = json.dumps(gv, default=str) if gv is not None else None
+
         rows.append((
 
             json.dumps(payload, default=str),
@@ -794,6 +797,14 @@ def append_pending_tickets(tickets: list[dict]) -> None:
             str(payload.get("status", "staged")),
 
             created_at,
+
+            payload.get("engine"),
+            payload.get("run_id"),
+            payload.get("broker_mode_at_staging"),
+            payload.get("staged_at_utc"),
+            payload.get("spot_at_staging"),
+            payload.get("premium_at_staging"),
+            gv_json,
 
         ))
 
@@ -807,9 +818,12 @@ def append_pending_tickets(tickets: list[dict]) -> None:
 
                 """
 
-                INSERT INTO pending_orders (payload, status, created_at)
-
-                VALUES (?, ?, ?)
+                INSERT INTO pending_orders (
+                    payload, status, created_at,
+                    engine, run_id, broker_mode_at_staging, staged_at_utc,
+                    spot_at_staging, premium_at_staging, gate_verdicts
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 
                 """,
 
@@ -4143,6 +4157,20 @@ def _r5_on_exec_details(trade, fill):
                     (float(fill_price), int(float(fill_qty)), fill_time, order_id),
 
                 )
+
+                # Phase B Foundation: capture FIRST IB-ack timestamp via
+                # COALESCE so subsequent fills don't overwrite the initial
+                # ack we received from this exec-details callback. Wrapped
+                # in try/except so test DBs (or pre-migration prod) without
+                # the acked_at_utc column don't roll back the fill UPDATE.
+                try:
+                    acked_iso = _datetime.now(_timezone.utc).isoformat()
+                    conn.execute(
+                        "UPDATE pending_orders SET acked_at_utc = COALESCE(acked_at_utc, ?) WHERE id = ?",
+                        (acked_iso, order_id),
+                    )
+                except sqlite3.OperationalError as inner:
+                    logger.warning("acked_at_utc COALESCE skipped: %s", inner)
 
 
 
@@ -11632,6 +11660,20 @@ async def handle_approve_callback(
                 (),
             )
 
+            # Phase B Foundation: append-only operator ledger entry.
+            try:
+                from agt_equities.order_lifecycle.operator_ledger import safe_record_intervention
+                safe_record_intervention(
+                    operator_user_id=str(user_id) if user_id is not None else None,
+                    kind="reject",
+                    target_table="pending_orders",
+                    target_id=None,
+                    after_state={"rowcount": int(count)},
+                    reason="reject_all callback",
+                )
+            except Exception:
+                logger.exception("operator_ledger record_intervention failed (reject_all)")
+
             # ── AWAIT phase (conn released) ──
 
             await query.edit_message_text(
@@ -11744,6 +11786,21 @@ async def handle_approve_callback(
             return
 
         claimed_ids = [db_id]
+
+        # Phase B Foundation: append-only operator ledger entry.
+        try:
+            from agt_equities.order_lifecycle.operator_ledger import safe_record_intervention
+            safe_record_intervention(
+                operator_user_id=str(user_id) if user_id is not None else None,
+                kind="approve",
+                target_table="pending_orders",
+                target_id=int(db_id),
+                before_state={"status": "staged"},
+                after_state={"status": "processing"},
+                reason="single-order approve callback",
+            )
+        except Exception:
+            logger.exception("operator_ledger record_intervention failed (approve)")
 
 
 
@@ -13735,7 +13792,21 @@ async def _place_single_order(
 
             with tx_immediate(conn):
 
-                from agt_equities.order_state import append_status
+                from agt_equities.order_state import append_status, update_submission_evidence
+
+                # Phase B Foundation: persist ADR-020 submission evidence
+                # (timestamp, spot, limit, gate verdicts) to first-class
+                # columns alongside the IB id update. payload was enriched
+                # in-place above with submitted_at_utc / spot_at_submission /
+                # limit_price_at_submission / gate_verdicts.
+                update_submission_evidence(
+                    conn,
+                    db_id,
+                    submitted_at_utc=str(payload.get("submitted_at_utc") or ""),
+                    spot_at_submission=payload.get("spot_at_submission"),
+                    limit_price_at_submission=payload.get("limit_price_at_submission"),
+                    gate_verdicts=payload.get("gate_verdicts"),
+                )
 
                 conn.execute(
 
@@ -13945,6 +14016,13 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
             with tx_immediate(conn):
 
+                # Phase B Foundation: capture before-state for ledger.
+                staged_ids = [
+                    int(r[0]) for r in conn.execute(
+                        "SELECT id FROM pending_orders WHERE status = 'staged'"
+                    ).fetchall()
+                ]
+
                 result = conn.execute(
 
                     "UPDATE pending_orders SET status = 'rejected' WHERE status = 'staged'"
@@ -13952,6 +14030,24 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
 
                 count = result.rowcount
+
+        # Phase B Foundation: append-only operator ledger entry.
+        try:
+            from agt_equities.order_lifecycle.operator_ledger import safe_record_intervention
+            tg_user = update.effective_user
+            tg_user_id = str(tg_user.id) if tg_user is not None else None
+            for oid in staged_ids:
+                safe_record_intervention(
+                    operator_user_id=tg_user_id,
+                    kind="reject",
+                    target_table="pending_orders",
+                    target_id=oid,
+                    before_state={"status": "staged"},
+                    after_state={"status": "rejected"},
+                    reason="cmd_reject bulk reject",
+                )
+        except Exception:
+            logger.exception("operator_ledger record_intervention failed (cmd_reject)")
 
 
 
@@ -19271,6 +19367,23 @@ async def cmd_flex_manual_reconcile(update: Update, context: ContextTypes.DEFAUL
             if res["before"] is not None and res["after"] is not None
             else None
         )
+        # Phase B Foundation: append-only operator ledger entry.
+        try:
+            from agt_equities.order_lifecycle.operator_ledger import safe_record_intervention
+            tg_user = update.effective_user
+            tg_user_id = str(tg_user.id) if tg_user is not None else None
+            safe_record_intervention(
+                operator_user_id=tg_user_id,
+                kind="flex_manual_reconcile",
+                target_table="master_log_trades",
+                target_id=None,
+                before_state={"row_count": res.get("before")},
+                after_state={"row_count": res.get("after"), "delta": delta},
+                reason=f"trade_date={date_str} exit={res['rc']}",
+                notes=res.get("report_path"),
+            )
+        except Exception:
+            logger.exception("operator_ledger record_intervention failed (flex_manual_reconcile)")
         msg = (
             f"{'✅' if res['rc'] == 0 else '⚠️'} Flex manual reconcile for {date_str}\n"
             f"before={res['before']} after={res['after']} delta={delta}\n"
@@ -20906,6 +21019,25 @@ async def cmd_recover_transmitting(
                          new_status, ib_order_id_arg),
 
                     )
+
+        # Phase B Foundation: append-only operator ledger entry alongside
+        # the existing recovery_audit_log write. recovery_audit_log is
+        # preserved (RIA compliance audit clarity); operator_interventions
+        # is the cross-surface unified ledger consumed by proof-report.
+        if row is not None and row["final_status"] == "TRANSMITTING":
+            try:
+                from agt_equities.order_lifecycle.operator_ledger import safe_record_intervention
+                safe_record_intervention(
+                    operator_user_id=str(operator_id),
+                    kind="recover_transmitting",
+                    target_table="bucket3_dynamic_exit_log",
+                    target_id=None,
+                    before_state={"final_status": "TRANSMITTING"},
+                    after_state={"final_status": new_status, "ib_order_id_provided": ib_order_id_arg},
+                    reason=f"audit_id={audit_id} action={action}",
+                )
+            except Exception:
+                logger.exception("operator_ledger record_intervention failed (recover_transmitting)")
 
 
 

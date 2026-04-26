@@ -1594,6 +1594,20 @@ def _extend_pending_orders(conn) -> None:
         ("fill_commission", "REAL"),
         ("fill_time", "TEXT"),
         ("last_ib_status", "TEXT"),
+        # Phase B Foundation: ADR-020 contract evidence + observability columns.
+        # Mirrors scripts/migrate_phase_b_foundation.py NEW_COLUMNS so test
+        # fixtures using register_operational_tables get the same shape as prod.
+        ("engine", "TEXT"),
+        ("run_id", "TEXT"),
+        ("broker_mode_at_staging", "TEXT"),
+        ("staged_at_utc", "TEXT"),
+        ("spot_at_staging", "REAL"),
+        ("premium_at_staging", "REAL"),
+        ("submitted_at_utc", "TEXT"),
+        ("spot_at_submission", "REAL"),
+        ("limit_price_at_submission", "REAL"),
+        ("acked_at_utc", "TEXT"),
+        ("gate_verdicts", "TEXT"),
     ]
     for col_name, col_type in extensions:
         if col_name not in existing:

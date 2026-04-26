@@ -150,7 +150,14 @@ class TestLiveCtxForwardsTickets:
         assert len(result.staged) >= 1, result.skipped
         # staging_fn got exactly one list-of-tickets call per staged batch
         assert len(captured) == 1
-        assert captured[0] == result.staged
+        # Phase B Foundation: SQLiteOrderSink.stage() enriches each ticket
+        # with engine/run_id/staged_at_utc before forwarding. captured[0]
+        # therefore contains those keys while result.staged carries
+        # _allocation_digest (added by orchestrator AFTER stage()). Assert
+        # batch length + presence of the sink-injected fields.
+        assert len(captured[0]) == len(result.staged)
+        assert all(t.get("engine") == "csp_allocator" for t in captured[0])
+        assert all(t.get("run_id") for t in captured[0])
 
     def test_live_ctx_no_error_on_staging_fn_raise(self):
         def boom(tickets):
