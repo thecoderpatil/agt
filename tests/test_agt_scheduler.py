@@ -124,6 +124,7 @@ def test_register_jobs_a5e_set():
         "terminal_state_sweeper",  # ADR-020 Phase A piece 3
         "phase_b_proof_final",  # Sprint 11 Phase B Foundation
         "phase_b_proof_preview",  # Sprint 11 Phase B Foundation
+        "heartbeat_archive",  # Sprint 13 30-day retention
     ]
     job_ids = {j.id for j in sched.get_jobs()}
     assert {
@@ -137,6 +138,7 @@ def test_register_jobs_a5e_set():
         "terminal_state_sweeper",
         "phase_b_proof_final",
         "phase_b_proof_preview",
+        "heartbeat_archive",
     }.issubset(job_ids)
 
 
