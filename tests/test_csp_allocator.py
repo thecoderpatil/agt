@@ -1389,9 +1389,19 @@ def test_orchestrator_passes_tickets_to_staging_callback():
         ctx=_live_ctx(captured.append),
     )
     assert len(captured) == 1
-    assert captured[0] == result.staged
+    # Phase B Foundation: SQLiteOrderSink.stage() now enriches each ticket
+    # with engine/run_id/staged_at_utc before forwarding to the staging
+    # callback, so captured[0] dicts diverge from result.staged dicts on
+    # exactly those keys plus _allocation_digest (which is added by the
+    # orchestrator AFTER stage() returns). Assert structural equivalence
+    # on the user-facing fields and presence of the sink-injected ones.
+    assert len(captured[0]) == len(result.staged)
     assert all(
         t["ticker"] == "AAPL" and t["mode"] == "CSP_ENTRY"
+        for t in captured[0]
+    )
+    assert all(
+        t.get("engine") == "csp_allocator" and t.get("run_id")
         for t in captured[0]
     )
 
