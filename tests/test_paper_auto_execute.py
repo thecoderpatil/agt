@@ -65,6 +65,7 @@ def staged_db(tmp_path, monkeypatch):
     conn.close()
 
     import agt_equities.db as dbmod
+    monkeypatch.setenv("AGT_DB_PATH", str(db_path))
     monkeypatch.setattr(dbmod, "DB_PATH", db_path, raising=False)
     return db_path
 
@@ -86,12 +87,12 @@ def empty_db(tmp_path, monkeypatch):
     conn.close()
 
     import agt_equities.db as dbmod
+    monkeypatch.setenv("AGT_DB_PATH", str(db_path))
     monkeypatch.setattr(dbmod, "DB_PATH", db_path, raising=False)
     return db_path
 
 
 @pytest.mark.sprint_a
-@pytest.mark.agt_tripwire_exempt  # explicit temp DB via monkeypatched DB_PATH
 @pytest.mark.asyncio
 async def test_auto_execute_no_staged_returns_none(empty_db):
     """No staged rows -> status='none', placed=0, failed=0."""
@@ -104,7 +105,6 @@ async def test_auto_execute_no_staged_returns_none(empty_db):
 
 
 @pytest.mark.sprint_a
-@pytest.mark.agt_tripwire_exempt
 @pytest.mark.asyncio
 async def test_auto_execute_happy_path_places_all(staged_db):
     """Both staged rows place successfully -> status='ok', placed=2."""
@@ -135,7 +135,6 @@ async def test_auto_execute_happy_path_places_all(staged_db):
 
 
 @pytest.mark.sprint_a
-@pytest.mark.agt_tripwire_exempt
 @pytest.mark.asyncio
 async def test_auto_execute_ib_fail_reverts(staged_db):
     """IB connection failure -> status='ib_fail', claimed rows reverted to staged."""
@@ -161,7 +160,6 @@ async def test_auto_execute_ib_fail_reverts(staged_db):
 
 
 @pytest.mark.sprint_a
-@pytest.mark.agt_tripwire_exempt
 @pytest.mark.asyncio
 async def test_auto_execute_race_lost_returns_race(staged_db):
     """If another process claims rows before our CAS, status='race'."""
@@ -182,7 +180,6 @@ async def test_auto_execute_race_lost_returns_race(staged_db):
 
 
 @pytest.mark.sprint_a
-@pytest.mark.agt_tripwire_exempt
 def test_paper_auto_execute_flag_defaults_on_when_paper():
     """PAPER_AUTO_EXECUTE should be True when PAPER_MODE=True and flag unset/!=0."""
     import telegram_bot as tb
@@ -196,7 +193,6 @@ def test_paper_auto_execute_flag_defaults_on_when_paper():
 
 
 @pytest.mark.sprint_a
-@pytest.mark.agt_tripwire_exempt
 @pytest.mark.asyncio
 async def test_auto_execute_partial_failure(staged_db):
     """One order succeeds, one fails -> status='ok', placed=1, failed=1."""
