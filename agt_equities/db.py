@@ -209,6 +209,6 @@ def init_pragmas(conn: sqlite3.Connection) -> None:
     """
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
-    conn.execute("PRAGMA wal_autocheckpoint=4000;")
+    conn.execute("PRAGMA wal_autocheckpoint=200;")
     # busy_timeout is set per-connection by get_db_connection(),
     # not here — it does not persist in the DB file header.

@@ -280,5 +280,19 @@ if (-not $SkipServiceRestart) {
 
 }
 
+# Step 8: Assert machine-level AGT_DB_PATH is the canonical real path.
+# Regression guard: if AGT_DB_PATH points at the symlink, the heartbeat alert
+# task (runs as SYSTEM, inherits machine env) fires false HEARTBEAT_STALE every
+# ~30 min (WAL split — see contention_source_recon_20260426.md).
+# Non-fatal: warn loudly but do not abort deploy.
+$_canonDbPath = Join-Path $CanonicalDbDir "agt_desk.db"
+$_machineDbPath = [System.Environment]::GetEnvironmentVariable("AGT_DB_PATH", "Machine")
+if ($_machineDbPath -ne $_canonDbPath) {
+    Write-Warning "AGT_DB_PATH machine env='$_machineDbPath'; expected='$_canonDbPath'"
+    Write-Warning "Run: [System.Environment]::SetEnvironmentVariable('AGT_DB_PATH','$_canonDbPath','Machine')"
+} else {
+    Write-Host "AGT_DB_PATH machine env: OK"
+}
+
 Write-Host "Deploy complete at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'). Rollback target: $previous"
 
