@@ -844,7 +844,7 @@ variables:
 
 
     - pip install -r requirements-ci.txt
-    # Phase A piece 4 â CI containment contract preflight
+    # Phase A piece 4 -- CI containment contract preflight
     - python scripts/ci_window_check.py
     - python scripts/ci_containment_assert.py
     - python scripts/ci_db_canary.py
