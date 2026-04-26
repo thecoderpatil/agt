@@ -1,14 +1,2 @@
-# Minimal smoke test
-stages:
-  - test
-
-sprint_a_unit_tests:
-  stage: test
-  tags:
-    - agt-windows
-  script:
-    - echo "smoke"
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "push"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == "main"
+job1:
+  script: echo hello
