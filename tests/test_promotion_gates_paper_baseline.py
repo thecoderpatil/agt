@@ -33,7 +33,7 @@ from agt_equities.promotion_gates import (
     load_config,
 )
 
-pytestmark = [pytest.mark.sprint_a, pytest.mark.agt_tripwire_exempt]
+pytestmark = [pytest.mark.sprint_a]
 
 
 def _prod_db_path() -> Path | None:

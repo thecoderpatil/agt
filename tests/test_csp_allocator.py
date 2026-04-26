@@ -838,7 +838,6 @@ def test_route_ira_first_then_margin():
     assert all(t["account_id"] != "U21971297" for t in tickets)
 
 
-@pytest.mark.agt_tripwire_exempt
 @pytest.mark.skipif(
     not _prod_db_available(),
     reason="Production DB not available (CI/tripwire)",
@@ -879,7 +878,6 @@ def test_route_partial_when_household_cannot_fit_all():
     assert total == 6   # IRA 3 + margin 3 = 6
 
 
-@pytest.mark.agt_tripwire_exempt
 @pytest.mark.skipif(
     not _prod_db_available(),
     reason="Production DB not available (CI/tripwire)",
@@ -1509,7 +1507,6 @@ def test_orchestrator_skips_sub_integer_sizing():
     assert "rule_1" in result.skipped[0]["reason"]
 
 
-@pytest.mark.agt_tripwire_exempt
 @pytest.mark.skipif(
     not _prod_db_available(),
     reason="Production DB not available (CI/tripwire)",
