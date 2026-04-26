@@ -418,6 +418,7 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
         from agt_equities.rule_engine import sweep_stale_dynamic_exit_stages
         try:
             with closing(get_db_connection()) as conn:
+                conn.execute("BEGIN IMMEDIATE;")  # acquire write lock upfront; prevents DEFERRED contention with heartbeat writers
                 result = sweep_stale_dynamic_exit_stages(conn)
                 swept = result.get("swept", 0)
                 att_swept = result.get("attested_swept", 0)
