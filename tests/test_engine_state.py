@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.sprint_a, pytest.mark.agt_tripwire_exempt]
+pytestmark = [pytest.mark.sprint_a]
 
 
 @pytest.fixture

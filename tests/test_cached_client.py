@@ -20,7 +20,7 @@ from agt_equities.cached_client import (
     _ensure_schema,
 )
 
-pytestmark = [pytest.mark.sprint_a, pytest.mark.agt_tripwire_exempt]
+pytestmark = [pytest.mark.sprint_a]
 
 
 # --- Fake SDK fixture --------------------------------------------------------
