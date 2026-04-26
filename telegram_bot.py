@@ -4160,12 +4160,17 @@ def _r5_on_exec_details(trade, fill):
 
                 # Phase B Foundation: capture FIRST IB-ack timestamp via
                 # COALESCE so subsequent fills don't overwrite the initial
-                # ack we received from this exec-details callback.
-                acked_iso = _datetime.now(_timezone.utc).isoformat()
-                conn.execute(
-                    "UPDATE pending_orders SET acked_at_utc = COALESCE(acked_at_utc, ?) WHERE id = ?",
-                    (acked_iso, order_id),
-                )
+                # ack we received from this exec-details callback. Wrapped
+                # in try/except so test DBs (or pre-migration prod) without
+                # the acked_at_utc column don't roll back the fill UPDATE.
+                try:
+                    acked_iso = _datetime.now(_timezone.utc).isoformat()
+                    conn.execute(
+                        "UPDATE pending_orders SET acked_at_utc = COALESCE(acked_at_utc, ?) WHERE id = ?",
+                        (acked_iso, order_id),
+                    )
+                except sqlite3.OperationalError as inner:
+                    logger.warning("acked_at_utc COALESCE skipped: %s", inner)
 
 
 
