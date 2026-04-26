@@ -1052,6 +1052,62 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("terminal_state_sweeper")
 
+    # Phase B Foundation -- daily proof-report cron jobs.
+    # Final (next-morning, counts toward 14): 07:30 ET Tue-Sat. Preview
+    # (same-day, non-counting): 17:15 ET Mon-Fri. Both honor
+    # AGT_PHASE_B_PROOF_REPORT_ENABLED (default on) and skip emission via
+    # is_trading_day for Sat/Sun/holidays.
+    if os.environ.get("AGT_PHASE_B_PROOF_REPORT_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        from agt_equities.market_calendar import is_trading_day  # noqa: F401
+
+        def _phase_b_proof_final_job() -> None:
+            try:
+                from agt_equities.order_lifecycle.proof_report import run_for_today_et
+                report = run_for_today_et(is_preview=False, output_dir=Path("reports"))
+                if report is not None:
+                    logger.info(
+                        "phase_b_proof_final: verdict=%s date=%s",
+                        report.verdict, report.report_date_et,
+                    )
+            except Exception:
+                logger.exception("phase_b_proof_final failed")
+
+        scheduler.add_job(
+            _phase_b_proof_final_job,
+            trigger="cron",
+            day_of_week="tue-sat",
+            hour=7,
+            minute=30,
+            id="phase_b_proof_final",
+            name="Phase B proof-report (final)",
+            replace_existing=True,
+        )
+        registered.append("phase_b_proof_final")
+
+        def _phase_b_proof_preview_job() -> None:
+            try:
+                from agt_equities.order_lifecycle.proof_report import run_for_today_et
+                report = run_for_today_et(is_preview=True, output_dir=Path("reports"))
+                if report is not None:
+                    logger.info(
+                        "phase_b_proof_preview: verdict=%s date=%s",
+                        report.verdict, report.report_date_et,
+                    )
+            except Exception:
+                logger.exception("phase_b_proof_preview failed")
+
+        scheduler.add_job(
+            _phase_b_proof_preview_job,
+            trigger="cron",
+            day_of_week="mon-fri",
+            hour=17,
+            minute=15,
+            id="phase_b_proof_preview",
+            name="Phase B proof-report (preview, non-counting)",
+            replace_existing=True,
+        )
+        registered.append("phase_b_proof_preview")
+
     return registered
 
 

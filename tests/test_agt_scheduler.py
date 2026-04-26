@@ -122,6 +122,8 @@ def test_register_jobs_a5e_set():
         "flex_sync_watchdog",  # Sprint 4 MR B (ADR-FLEX_FRESHNESS_v1)
         "flex_sync_zero_row_check",  # Sprint 6 Mega-MR 3 (Investigation D F3)
         "terminal_state_sweeper",  # ADR-020 Phase A piece 3
+        "phase_b_proof_final",  # Sprint 11 Phase B Foundation
+        "phase_b_proof_preview",  # Sprint 11 Phase B Foundation
     ]
     job_ids = {j.id for j in sched.get_jobs()}
     assert {
@@ -133,6 +135,8 @@ def test_register_jobs_a5e_set():
         "conviction_weekly", "flex_sync_watchdog",
         "flex_sync_zero_row_check",
         "terminal_state_sweeper",
+        "phase_b_proof_final",
+        "phase_b_proof_preview",
     }.issubset(job_ids)
 
 

@@ -351,3 +351,38 @@ def update_child_ib_ids(
         tuple(params),
     )
     return True
+
+
+# ---------------------------------------------------------------------------
+# Phase B Foundation -- ADR-020 submission-evidence helper.
+# ---------------------------------------------------------------------------
+
+def update_submission_evidence(
+    conn: sqlite3.Connection,
+    pending_order_id: int,
+    *,
+    submitted_at_utc: str,
+    spot_at_submission: float | None = None,
+    limit_price_at_submission: float | None = None,
+    gate_verdicts: dict | None = None,
+) -> None:
+    """Persist ADR-020 submission-evidence fields to pending_orders.
+
+    Called from _place_single_order around the time of placeOrder(). Writes
+    the canonical first-class columns. Semantics: submitted_at_utc is the
+    timestamp around placeOrder(), NOT IB ack. acked_at_utc is populated
+    separately from the exec-details handler with COALESCE so the FIRST
+    callback time is preserved across subsequent fills.
+    """
+    gv_json = json.dumps(gate_verdicts) if gate_verdicts is not None else None
+    conn.execute(
+        """
+        UPDATE pending_orders
+           SET submitted_at_utc = ?,
+               spot_at_submission = ?,
+               limit_price_at_submission = ?,
+               gate_verdicts = ?
+         WHERE id = ?
+        """,
+        (submitted_at_utc, spot_at_submission, limit_price_at_submission, gv_json, pending_order_id),
+    )
