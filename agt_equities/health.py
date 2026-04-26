@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,20 @@ def write_heartbeat(
                 """,
                 (daemon_name, now, pid, client_id, notes),
             )
+            # Phase B Foundation: double-write to daemon_heartbeat_samples for
+            # retrospective gap analysis. Wrapped in try/except so a missing
+            # samples table (pre-migration) cannot crash the heartbeat path.
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO daemon_heartbeat_samples
+                        (daemon_name, beat_utc, pid, client_id, notes)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (daemon_name, now, pid, client_id, notes),
+                )
+            except sqlite3.OperationalError as inner:
+                logger.warning("daemon_heartbeat_samples write skipped: %s", inner)
             conn.commit()
     except Exception as exc:
         # Heartbeat failure must not crash the daemon; just log loudly.
