@@ -54,6 +54,14 @@ foreach ($lf in $logFiles) {
     $lines = Get-Content -LiteralPath $lf -Tail 300 -ErrorAction SilentlyContinue
     if (-not $lines) { continue }
     foreach ($line in $lines) {
+        # Skip lines whose leading timestamp predates this deploy's stabilize window.
+        # Format: "2026-04-27T20:48:22.068" or "2026-04-27 20:48:22" etc.
+        if ($line -match '^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})') {
+            try {
+                $lineTs = [datetime]::Parse($Matches[1])
+                if ($lineTs -lt $cutoff) { continue }
+            } catch { }
+        }
         foreach ($pat in $failPatterns) {
             if ($line -match $pat) {
                 [void]$findings.Add("match=${pat} file=$($lf) line=$($line.Substring(0, [Math]::Min($line.Length, 240)))")
