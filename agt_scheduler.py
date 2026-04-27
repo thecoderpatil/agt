@@ -971,6 +971,7 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
         minute=0,
         id="conviction_weekly",
         name="conviction_weekly",
+        executor="asyncio",
         replace_existing=True,
     )
     registered.append("conviction_weekly")
