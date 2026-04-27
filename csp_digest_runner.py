@@ -91,7 +91,7 @@ def build_digest_payload(
             ticker=str(t.get("ticker", "?")),
             strike=float(t.get("strike") or 0.0),
             expiry=str(t.get("expiry") or ""),
-            premium_dollars=float(t.get("premium_dollars") or (t.get("mid", 0) * 100)),
+            premium_dollars=float(t.get("premium_dollars") or (t.get("limit_price", 0) * 100) or (t.get("mid", 0) * 100)),
             premium_pct=float(t.get("premium_pct") or 0.0),
             ray_pct=float(t.get("annualized_yield") or t.get("ray_pct") or 0.0),
             delta=float(t.get("delta") or 0.0),
