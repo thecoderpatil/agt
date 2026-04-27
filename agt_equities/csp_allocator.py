@@ -1375,6 +1375,10 @@ def _tickets_from_digest(
             "annualized_yield": float(candidate.annualized_yield),
             "mode": "CSP_ENTRY",
             "status": "staged",
+            "delta": float(getattr(candidate, "delta", 0.0) or 0.0),
+            "inception_delta": float(getattr(candidate, "delta", 0.0) or 0.0),
+            "otm_pct": float(getattr(candidate, "otm_pct", 0.0) or 0.0),
+            "spot": float(getattr(candidate, "current_price", 0.0) or 0.0),
         })
     return tickets
 
