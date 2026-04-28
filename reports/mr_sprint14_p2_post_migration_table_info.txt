@@ -1,0 +1,11 @@
+{
+  "migrated_at_utc": "2026-04-28T20:52:28.931576+00:00",
+  "backup": "C:\\AGT_Telegram_Bridge\\backups\\agt_desk_20260428_205228_pre_p2_approval_gate.db",
+  "integrity_pre": "ok",
+  "integrity_post": "ok",
+  "cta_table_created": true,
+  "oi_check_extended": true,
+  "oi_rows_migrated": 0,
+  "cta_ddl": "CREATE TABLE csp_ticker_approvals (\n    id              INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id          TEXT NOT NULL,\n    ticker          TEXT NOT NULL,\n    status          TEXT NOT NULL DEFAULT 'pending'\n                    CHECK(status IN ('pending','approved','rejected',\n                                     'timeout_approved','timeout_rejected')),\n    created_at_utc  TEXT NOT NULL,\n    resolved_at_utc TEXT,\n    resolved_by     TEXT,\n    timeout_at_utc  TEXT NOT NULL\n)",
+  "oi_ddl": "CREATE TABLE \"operator_interventions\" (\n    id               INTEGER PRIMARY KEY AUTOINCREMENT,\n    occurred_at_utc  TEXT NOT NULL,\n    operator_user_id TEXT,\n    kind             TEXT NOT NULL CHECK(kind IN ('reject','reject_rem','approve','recover_transmitting','flex_manual_reconcile','halt','direct_sql','manual_terminal','restart_during_market','csp_ticker_approve','csp_ticker_reject','csp_timeout_auto_approve','csp_timeout_auto_reject')),\n    target_table     TEXT,\n    target_id        INTEGER,\n    before_state     TEXT,\n    after_state      TEXT,\n    reason           TEXT,\n    notes            TEXT\n)"
+}
