@@ -4172,6 +4172,26 @@ def _r5_on_exec_details(trade, fill):
                 except sqlite3.OperationalError as inner:
                     logger.warning("acked_at_utc COALESCE skipped: %s", inner)
 
+                # Promote partially_filled -> filled when cumulative fill reaches ordered qty.
+                # IB paper engine omits the final Filled callback after PartiallyFilled sequence.
+                if new_status == OrderStatus.PARTIALLY_FILLED and fill_qty:
+                    try:
+                        _qty_row = conn.execute(
+                            "SELECT json_extract(payload, '$.quantity') "
+                            "FROM pending_orders WHERE id = ?",
+                            (order_id,),
+                        ).fetchone()
+                        _ordered_qty = int(float(_qty_row[0])) if _qty_row and _qty_row[0] else 0
+                        if _ordered_qty and int(float(fill_qty)) >= _ordered_qty:
+                            append_status(
+                                conn, order_id, OrderStatus.FILLED,
+                                'full_fill_promotion',
+                                {"cumulative_fill_qty": int(float(fill_qty)),
+                                 "ordered_qty": _ordered_qty},
+                            )
+                    except (ValueError, TypeError):
+                        pass
+
 
 
     except Exception as exc:

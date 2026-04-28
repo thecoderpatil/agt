@@ -132,7 +132,7 @@ def _count_pending_in_window(
         ).fetchone()[0]
         eligible = conn.execute(
             "SELECT COUNT(*) FROM pending_orders WHERE created_at >= ? AND created_at < ? "
-            "AND created_at >= ?",
+            "AND staged_at_utc IS NOT NULL AND staged_at_utc >= ?",
             (start_iso, end_iso, migration_iso),
         ).fetchone()[0]
         return int(total), int(total - eligible), int(eligible)
@@ -150,7 +150,7 @@ def _terminal_count(conn: sqlite3.Connection, start_iso: str, end_iso: str, migr
     ).format(", ".join("?" for _ in TERMINAL_STATES))
     params: list[Any] = [start_iso, end_iso, *sorted(TERMINAL_STATES)]
     if migration_iso:
-        base += "AND created_at >= ?"
+        base += "AND staged_at_utc IS NOT NULL AND staged_at_utc >= ?"
         params.append(migration_iso)
     return int(conn.execute(base, tuple(params)).fetchone()[0])
 
@@ -199,7 +199,8 @@ def _missing_audit_evidence_count(
         return 0
     sql = (
         "SELECT COUNT(*) FROM pending_orders "
-        "WHERE created_at >= ? AND created_at < ? AND created_at >= ? "
+        "WHERE created_at >= ? AND created_at < ? "
+        "AND staged_at_utc IS NOT NULL AND staged_at_utc >= ? "
         "AND status IN ({}) "
         "AND (engine IS NULL OR run_id IS NULL OR gate_verdicts IS NULL)"
     ).format(", ".join("?" for _ in TERMINAL_STATES))
@@ -287,7 +288,7 @@ def _engine_activity(
     base_where = "created_at >= ? AND created_at < ?"
     params: list[Any] = [start_iso, end_iso]
     if migration_iso:
-        base_where += " AND created_at >= ?"
+        base_where += " AND staged_at_utc IS NOT NULL AND staged_at_utc >= ?"
         params.append(migration_iso)
     staged = int(conn.execute(
         f"SELECT COUNT(*) FROM pending_orders WHERE {base_where}", tuple(params)
@@ -310,7 +311,7 @@ def _g3_g4_telemetry(conn: sqlite3.Connection, start_iso: str, end_iso: str, mig
     base_where = "created_at >= ? AND created_at < ?"
     params: list[Any] = [start_iso, end_iso]
     if migration_iso:
-        base_where += " AND created_at >= ?"
+        base_where += " AND staged_at_utc IS NOT NULL AND staged_at_utc >= ?"
         params.append(migration_iso)
     sample_rows = conn.execute(
         f"SELECT engine, status, gate_verdicts FROM pending_orders WHERE {base_where}",
