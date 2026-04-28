@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 SOFT_DEP_MAX_AGE_MINUTES = 30
 DEFAULT_TIMEOUT_MINUTES = 90
+CSP_TICKER_APPROVAL_TIMEOUT_MINUTES = 30
 _DIGEST_FIRED_ROW_TOKEN = "digest"
 
 
@@ -82,7 +83,12 @@ def build_digest_payload(
 
     staged = latest.get("staged", []) or []
     candidates: list[DigestCandidate] = []
+    _seen_tickers: set[str] = set()
     for rank, t in enumerate(staged, start=1):
+        _t_key = str(t.get("ticker", "?"))
+        if _t_key in _seen_tickers:
+            continue
+        _seen_tickers.add(_t_key)
         # Staged tickets carry per-account (account_id, contracts); project to label form.
         per_account_raw = t.get("per_account") or [(t.get("account_id", ""), t.get("quantity", 0))]
         per_account = [(str(a), int(n or 0)) for (a, n) in per_account_raw]
@@ -183,6 +189,31 @@ def _record_digest_fired(
                 ),
             )
             return cur.lastrowid or 0
+
+
+def _record_live_ticker_approvals(
+    *,
+    run_id: str,
+    tickers: list[str],
+    now: datetime,
+    timeout_minutes: int = CSP_TICKER_APPROVAL_TIMEOUT_MINUTES,
+    db_path: str | Path | None = None,
+) -> None:
+    """Insert per-ticker pending approval rows for live-mode digests.
+
+    INSERT OR IGNORE — idempotent on replay (UNIQUE idx_cta_run_ticker).
+    """
+    now_iso = now.isoformat(timespec="seconds")
+    timeout_iso = (now + timedelta(minutes=timeout_minutes)).isoformat(timespec="seconds")
+    with get_db_connection(db_path=db_path) as conn:
+        with tx_immediate(conn):
+            for ticker in tickers:
+                conn.execute(
+                    "INSERT OR IGNORE INTO csp_ticker_approvals "
+                    "(run_id, ticker, status, created_at_utc, timeout_at_utc) "
+                    "VALUES (?, ?, 'pending', ?, ?)",
+                    (run_id, ticker, now_iso, timeout_iso),
+                )
 
 
 async def run_csp_digest_job(
@@ -308,10 +339,23 @@ async def run_csp_digest_job(
         timeout_at=now + timedelta(minutes=DEFAULT_TIMEOUT_MINUTES),
         telegram_message_id=msg_id, db_path=db_path,
     )
+    # Live mode: insert per-ticker pending approval rows (30-min timeout).
+    # Paper mode: no gate rows — paper auto-executed at 09:35 ET.
+    effective_run_id = latest.get("run_id") or f"digest:{trade_date}"
+    if mode == "LIVE" and payload.candidates:
+        try:
+            _record_live_ticker_approvals(
+                run_id=effective_run_id,
+                tickers=[c.ticker for c in payload.candidates],
+                now=now,
+                db_path=db_path,
+            )
+        except Exception as exc:
+            logger.error("csp_digest_job: _record_live_ticker_approvals failed: %s", exc)
     return {
         "fired": True,
         "reason": "ok" if msg_id is not None else "send_failed",
-        "run_id": latest.get("run_id"),
+        "run_id": effective_run_id,
         "count": candidate_count,
         "telegram_message_id": msg_id,
     }

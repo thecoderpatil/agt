@@ -44,7 +44,22 @@ def staged_db(tmp_path, monkeypatch):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             status TEXT NOT NULL,
             payload TEXT NOT NULL,
+            engine TEXT,
+            run_id TEXT,
+            broker_mode_at_staging TEXT,
             created_ts TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE csp_ticker_approvals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at_utc TEXT NOT NULL,
+            timeout_at_utc TEXT NOT NULL,
+            resolved_at_utc TEXT,
+            resolved_by TEXT
         )
     """)
     row1 = {
@@ -80,7 +95,22 @@ def empty_db(tmp_path, monkeypatch):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             status TEXT NOT NULL,
             payload TEXT NOT NULL,
+            engine TEXT,
+            run_id TEXT,
+            broker_mode_at_staging TEXT,
             created_ts TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE csp_ticker_approvals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at_utc TEXT NOT NULL,
+            timeout_at_utc TEXT NOT NULL,
+            resolved_at_utc TEXT,
+            resolved_by TEXT
         )
     """)
     conn.commit()

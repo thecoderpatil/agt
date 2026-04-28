@@ -125,6 +125,7 @@ def test_register_jobs_a5e_set():
         "phase_b_proof_final",  # Sprint 11 Phase B Foundation
         "phase_b_proof_preview",  # Sprint 11 Phase B Foundation
         "heartbeat_archive",  # Sprint 13 30-day retention
+        "csp_timeout_sweeper",  # Sprint 14 P2 approval gate timeout sweeper
     ]
     job_ids = {j.id for j in sched.get_jobs()}
     assert {
@@ -139,6 +140,7 @@ def test_register_jobs_a5e_set():
         "phase_b_proof_final",
         "phase_b_proof_preview",
         "heartbeat_archive",
+        "csp_timeout_sweeper",
     }.issubset(job_ids)
 
 

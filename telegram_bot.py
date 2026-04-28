@@ -11452,7 +11452,20 @@ async def _auto_execute_staged(
 
             r["id"] for r in conn.execute(
 
-                "SELECT id FROM pending_orders WHERE status = 'staged' ORDER BY id"
+                # Sprint 14 P2: CSP live-mode rows gate on csp_ticker_approvals.
+                # Non-CSP and paper-mode rows pass through unconditionally.
+                # Live CSP rows only execute when status='approved'|'timeout_approved'.
+                "SELECT p.id FROM pending_orders p "
+                "LEFT JOIN csp_ticker_approvals cta "
+                "    ON cta.run_id = p.run_id "
+                "    AND cta.ticker = json_extract(p.payload, '$.ticker') "
+                "WHERE p.status = 'staged' "
+                "  AND ("
+                "      p.engine IS NULL OR p.engine != 'csp' "
+                "      OR COALESCE(p.broker_mode_at_staging, 'live') = 'paper' "
+                "      OR cta.status IN ('approved', 'timeout_approved')"
+                "  ) "
+                "ORDER BY p.id"
 
             ).fetchall()
 
@@ -12135,6 +12148,121 @@ async def handle_csp_approval_callback(
 
     else:
         await query.answer("Unknown action.", show_alert=True)
+
+
+async def handle_csp_ticker_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Sprint 14 P2: per-ticker CSP approval gate button taps.
+
+    callback_data format:
+      cta_approve:{run_id}:{ticker}   -- approve this ticker
+      cta_reject:{run_id}:{ticker}    -- reject this ticker
+      cta_approve_all:{run_id}        -- approve all pending tickers for run
+      cta_reject_all:{run_id}         -- reject all pending tickers for run
+    """
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    user_id = query.from_user.id if query.from_user else None
+    if user_id != AUTHORIZED_USER_ID:
+        await query.answer("Unauthorized.", show_alert=True)
+        return
+
+    parts = query.data.split(":")
+    action = parts[0]  # cta_approve | cta_reject | cta_approve_all | cta_reject_all
+
+    try:
+        run_id = parts[1]
+    except IndexError:
+        await query.answer("Bad callback data.", show_alert=True)
+        return
+
+    is_approve = "approve" in action
+    is_all = action.endswith("_all")
+    ticker = parts[2] if (not is_all and len(parts) > 2) else None
+
+    now_iso = _datetime.now(_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_status = "approved" if is_approve else "rejected"
+    kind = "csp_ticker_approve" if is_approve else "csp_ticker_reject"
+    user_id_str = str(user_id)
+
+    def _update_approvals() -> tuple[int, list[str]]:
+        with closing(_get_db_connection()) as conn:
+            with tx_immediate(conn):
+                if is_all:
+                    rows = conn.execute(
+                        "SELECT ticker FROM csp_ticker_approvals "
+                        "WHERE run_id = ? AND status = 'pending'",
+                        (run_id,),
+                    ).fetchall()
+                    tickers = [r["ticker"] for r in rows]
+                else:
+                    tickers = [ticker]
+                swept = 0
+                done: list[str] = []
+                for t in tickers:
+                    cur = conn.execute(
+                        "UPDATE csp_ticker_approvals "
+                        "SET status=?, resolved_at_utc=?, resolved_by=? "
+                        "WHERE run_id=? AND ticker=? AND status='pending'",
+                        (new_status, now_iso, user_id_str, run_id, t),
+                    )
+                    if cur.rowcount > 0:
+                        swept += 1
+                        done.append(t)
+                        conn.execute(
+                            "INSERT INTO operator_interventions "
+                            "(occurred_at_utc, operator_user_id, kind, "
+                            " target_table, before_state, after_state, notes) "
+                            "VALUES (?, ?, ?, 'csp_ticker_approvals', "
+                            "'pending', ?, ?)",
+                            (now_iso, user_id_str, kind, new_status,
+                             f"run_id={run_id} ticker={t}"),
+                        )
+                return swept, done
+
+    try:
+        updated, done_tickers = await asyncio.to_thread(_update_approvals)
+    except Exception:
+        logger.exception("handle_csp_ticker_callback: DB error run=%s", run_id)
+        await query.answer("DB error.", show_alert=True)
+        return
+
+    if updated == 0:
+        # No pending row — either paper mode (no gate rows) or already resolved.
+        await query.answer(
+            "No pending gate entry — already resolved or paper mode.",
+            show_alert=False,
+        )
+        return
+
+    if is_all:
+        label = f"{'✅' if is_approve else '❌'} {'Approved' if is_approve else 'Rejected'} {updated} tickers"
+    else:
+        label = f"{'✅' if is_approve else '❌'} {'Approved' if is_approve else 'Rejected'} {ticker}"
+    await query.answer(label)
+
+    # Q7: immediate execute on tap for approved tickers.
+    if is_approve and done_tickers:
+        try:
+            placed, failed, lines, status = await _auto_execute_staged()
+            if status not in ("none", "race"):
+                exec_msg = f"[CSP EXEC] {label}\nplaced={placed} failed={failed}"
+                if lines:
+                    exec_msg += "\n" + "\n".join(lines[:5])
+                    if len(lines) > 5:
+                        exec_msg += f"\n… ({len(lines) - 5} more)"
+                await context.bot.send_message(
+                    chat_id=AUTHORIZED_USER_ID,
+                    text=f"<pre>{html.escape(exec_msg)}</pre>",
+                    parse_mode="HTML",
+                )
+        except Exception:
+            logger.exception(
+                "handle_csp_ticker_callback: auto-execute failed after approve"
+            )
 
 
 async def handle_dex_callback(
@@ -22718,6 +22846,8 @@ def main() -> None:
 
     app.add_handler(CallbackQueryHandler(handle_liq_callback, pattern=r"^liq:"))
     app.add_handler(CallbackQueryHandler(handle_csp_approval_callback, pattern=r"^csp_(?:approve|skip|submit):"))
+    # Sprint 14 P2: per-ticker cta_ approval gate (replaces csp_approve: prefix).
+    app.add_handler(CallbackQueryHandler(handle_csp_ticker_callback, pattern=r"^cta_(?:approve|reject)(?:_all)?:"))
 
     # Sprint 4 MR A: /approve_csp_<row_id> + /deny_csp_<row_id>. CommandHandler
     # doesn't support dynamic numeric suffixes; regex-match on the message text.
