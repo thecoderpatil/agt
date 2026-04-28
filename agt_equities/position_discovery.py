@@ -563,7 +563,9 @@ async def discover_positions(
 
                 from agt_equities.providers.ibkr_price_volatility import IBKRPriceVolatilityProvider
 
-                _prov = IBKRPriceVolatilityProvider(ib, market_data_mode="delayed")
+                _prov = IBKRPriceVolatilityProvider(ib_conn, market_data_mode="delayed")
+
+                tkr = "<unknown>"
 
                 for tkr in missed:
 
