@@ -1154,6 +1154,62 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
     )
     registered.append("heartbeat_archive")
 
+    # Sprint 14 P2: CSP per-ticker approval gate timeout sweeper.
+    # Fires 10:10 ET Mon-Fri — 33 min after earliest 09:37 digest timeout window.
+    # AGT_CSP_TIMEOUT_DEFAULT: "auto_approve" (paper) or "auto_reject" (live default).
+    def _csp_timeout_sweeper_job() -> None:
+        from contextlib import closing
+        from agt_equities.db import get_db_connection, tx_immediate
+        default = os.environ.get("AGT_CSP_TIMEOUT_DEFAULT", "auto_reject").strip().lower()
+        new_status = "timeout_approved" if default == "auto_approve" else "timeout_rejected"
+        kind = "csp_timeout_auto_approve" if default == "auto_approve" else "csp_timeout_auto_reject"
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            with closing(get_db_connection()) as conn:
+                with tx_immediate(conn):
+                    rows = conn.execute(
+                        "SELECT id, run_id, ticker FROM csp_ticker_approvals "
+                        "WHERE status = 'pending' AND timeout_at_utc < ?",
+                        (now_iso,),
+                    ).fetchall()
+                    swept = 0
+                    for row in rows:
+                        cur = conn.execute(
+                            "UPDATE csp_ticker_approvals "
+                            "SET status=?, resolved_at_utc=?, "
+                            "    resolved_by='timeout_sweeper' "
+                            "WHERE id=? AND status='pending'",
+                            (new_status, now_iso, row["id"]),
+                        )
+                        if cur.rowcount > 0:
+                            swept += 1
+                            conn.execute(
+                                "INSERT INTO operator_interventions "
+                                "(occurred_at_utc, operator_user_id, kind, "
+                                " target_table, before_state, after_state, notes) "
+                                "VALUES (?, 'agt_scheduler', ?, "
+                                "'csp_ticker_approvals', 'pending', ?, ?)",
+                                (now_iso, kind, new_status,
+                                 f"run_id={row['run_id']} ticker={row['ticker']}"),
+                            )
+            logger.info(
+                "csp_timeout_sweeper: swept=%d default=%s", swept, default,
+            )
+        except Exception as exc:
+            logger.error("csp_timeout_sweeper error: %s", exc)
+
+    scheduler.add_job(
+        _csp_timeout_sweeper_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=10,
+        minute=10,
+        id="csp_timeout_sweeper",
+        name="csp_timeout_sweeper",
+        replace_existing=True,
+    )
+    registered.append("csp_timeout_sweeper")
+
     return registered
 
 

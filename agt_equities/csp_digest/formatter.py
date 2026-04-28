@@ -147,27 +147,27 @@ def build_inline_keyboard(payload: DigestPayload, *, run_id: str) -> list[list[d
     Returns a nested list-of-list of dicts compatible with
     python-telegram-bot's InlineKeyboardButton.from_dict.
 
-    Paper mode returns an empty list — paper auto-executes; the digest
-    card displays `📄 Paper mode — executed automatically` instead.
+    Both LIVE and PAPER modes emit cta_ buttons. Paper buttons provide an
+    operator audit trail via handle_csp_ticker_callback; the handler
+    short-circuits gracefully when no csp_ticker_approvals row exists
+    (paper never inserts gate rows — auto-execution happens at 09:35 ET).
     """
-    if payload.mode != "LIVE":
-        return []
     rows: list[list[dict]] = []
     for cand in payload.candidates:
         rows.append([
             {
                 "text": f"✅ Approve {cand.ticker}",
-                "callback_data": f"csp_approve:{run_id}:{cand.ticker}",
+                "callback_data": f"cta_approve:{run_id}:{cand.ticker}",
             },
             {
                 "text": f"❌ Reject {cand.ticker}",
-                "callback_data": f"csp_reject:{run_id}:{cand.ticker}",
+                "callback_data": f"cta_reject:{run_id}:{cand.ticker}",
             },
         ])
     rows.append([
         {"text": "✅ Approve ALL",
-         "callback_data": f"csp_approve_all:{run_id}"},
+         "callback_data": f"cta_approve_all:{run_id}"},
         {"text": "❌ Reject ALL",
-         "callback_data": f"csp_reject_all:{run_id}"},
+         "callback_data": f"cta_reject_all:{run_id}"},
     ])
     return rows

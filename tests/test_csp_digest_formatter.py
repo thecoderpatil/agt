@@ -254,11 +254,14 @@ def test_keyboard_live_mode_returns_per_ticker_rows_plus_all_row():
     assert len(kb) == 3  # 2 ticker rows + ALL row
     assert kb[0][0]["text"] == "✅ Approve DELL"
     assert kb[0][1]["text"] == "❌ Reject DELL"
-    assert kb[0][0]["callback_data"] == "csp_approve:run-001:DELL"
-    assert kb[2][0]["callback_data"] == "csp_approve_all:run-001"
+    assert kb[0][0]["callback_data"] == "cta_approve:run-001:DELL"
+    assert kb[2][0]["callback_data"] == "cta_approve_all:run-001"
 
 
-def test_keyboard_paper_mode_returns_empty():
+def test_keyboard_paper_mode_returns_cta_buttons():
+    """Paper mode now emits cta_ buttons for operator audit trail."""
     p = _payload([_candidate(1, "DELL")], mode="PAPER")
     kb = build_inline_keyboard(p, run_id="x")
-    assert kb == []
+    assert len(kb) == 2  # 1 ticker row + ALL row
+    assert kb[0][0]["callback_data"] == "cta_approve:x:DELL"
+    assert kb[1][0]["callback_data"] == "cta_approve_all:x"
