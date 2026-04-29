@@ -475,7 +475,7 @@ def test_all_manifest_ids_have_registered_check():
 
 
 def test_build_context_reads_env(monkeypatch):
-    monkeypatch.setenv("AGT_PAPER_MODE", "1")
+    monkeypatch.setenv("AGT_BROKER_MODE", "paper")
     monkeypatch.setenv("AGT_LIVE_ACCOUNTS", "U12345,U67890")
     monkeypatch.setenv("AGT_EXPECTED_DAEMONS", "agt_bot,agt_scheduler")
     c = build_context(db_path=":memory:")
