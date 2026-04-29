@@ -44,8 +44,17 @@ files:
     net: -20
     tolerance: 4
     required_sentinels: ["def _flex_sync_eod_job"]
+  tests/test_agt_scheduler.py:
+    added: 4
+    removed: 12
+    net: -8
+    tolerance: 4
+    required_sentinels: ["assert len(captured) == 0"]
 shrinking:
   - file: agt_scheduler.py
     reason: "Delete success-path FLEX_SYNC_DIGEST enqueue block (owned by flex_sync.run_sync)"
     expected_net: -20
+  - file: tests/test_agt_scheduler.py
+    reason: "Remove FLEX_SYNC_DIGEST assertions — scheduler no longer enqueues on success path"
+    expected_net: -8
 ```
