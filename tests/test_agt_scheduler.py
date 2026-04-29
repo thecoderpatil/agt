@@ -869,7 +869,7 @@ def test_a5e_flex_sync_eod_cron_trigger():
 
 
 def test_a5e_flex_sync_eod_enqueues_digest_on_success(monkeypatch):
-    """On successful run_sync, flex_sync_eod must enqueue FLEX_SYNC_DIGEST."""
+    """On successful run_sync, scheduler must NOT enqueue FLEX_SYNC_DIGEST (owned by flex_sync.run_sync())."""
     import types
 
     captured: list[dict] = []
@@ -904,13 +904,7 @@ def test_a5e_flex_sync_eod_enqueues_digest_on_success(monkeypatch):
     job = sched.get_job("flex_sync_eod")
     job.func()
 
-    assert len(captured) == 1
-    rec = captured[0]
-    assert rec["kind"] == "FLEX_SYNC_DIGEST"
-    assert rec["severity"] == "info"
-    assert rec["payload"]["sync_id"] == "test-123"
-    assert rec["payload"]["rows_received"] == 42
-    assert rec["payload"]["rows_inserted"] == 10
+    assert len(captured) == 0
 
 
 def test_a5e_flex_sync_eod_enqueues_failure_on_exception(monkeypatch):
@@ -980,7 +974,7 @@ def test_a5e_flex_sync_eod_swallows_alert_bus_failure(monkeypatch):
 
 
 def test_a5e_flex_sync_eod_warns_on_error_message(monkeypatch):
-    """If run_sync returns with error_message, severity must be warn not info."""
+    """If run_sync returns with error_message, scheduler must still NOT enqueue FLEX_SYNC_DIGEST (owned by flex_sync.run_sync())."""
     import types
 
     captured: list[dict] = []
@@ -1015,9 +1009,7 @@ def test_a5e_flex_sync_eod_warns_on_error_message(monkeypatch):
     job = sched.get_job("flex_sync_eod")
     job.func()
 
-    assert len(captured) == 1
-    assert captured[0]["severity"] == "warn"
-    assert "parse errors" in captured[0]["payload"]["error"]
+    assert len(captured) == 0
 
 # ---------------------------------------------------------------------------
 # A5e -- universe_monthly migration tests
