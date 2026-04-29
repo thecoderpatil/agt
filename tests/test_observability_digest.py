@@ -145,10 +145,10 @@ def test_promotion_gates_g1_g3_g4_rendered_as_not_yet_instrumented(patch_sources
     card = render_observability_card(snap)
     # G1 / G3 / G4 must be "not yet instrumented" regardless of upstream status.
     for gate in ("entry.G1", "entry.G3", "entry.G4", "exit.G1", "exit.G3", "exit.G4"):
-        assert f"`{gate}` — not yet instrumented" in card, f"missing {gate}"
+        assert f"<code>{gate}</code> — not yet instrumented" in card, f"missing {gate}"
     # G2 / G5 render actual status (green in fixture).
-    assert "✅ `entry.G2` green" in card
-    assert "✅ `exit.G5` green" in card
+    assert "✅ <code>entry.G2</code> green" in card
+    assert "✅ <code>exit.G5</code> green" in card
 
 
 def test_snapshot_fail_soft_on_broken_source(monkeypatch):
@@ -182,3 +182,64 @@ def test_snapshot_fail_soft_on_broken_source(monkeypatch):
     assert snap.heartbeats_error is None
     assert snap.flex_error is None
     assert snap.promotion_error is None
+
+
+def test_underscore_invariant_name_renders_verbatim():
+    """Regression: NO_UNAPPROVED_LIVE_CSP must render with underscores intact.
+
+    Bug 2 (Sprint 14 P5): parse_mode="Markdown" caused Telegram to treat
+    underscores as italic delimiters, fragmenting the name into broken pieces.
+    Under HTML mode the name is wrapped in <code>...</code> and underscores are
+    preserved literally.
+    """
+    snap = ObservabilitySnapshot(
+        generated_at_utc=datetime(2026, 4, 29, 7, 30, tzinfo=timezone.utc),
+        architect_only=[{
+            "invariant_id": "NO_UNAPPROVED_LIVE_CSP",
+            "scrutiny_tier": "architect_only",
+            "status": "open",
+            "consecutive_breaches": 4108,
+        }],
+        architect_only_error=None,
+        authorable=[],
+        authorable_error=None,
+        heartbeats=[],
+        heartbeats_error=None,
+        flex=None,
+        flex_error=None,
+        promotion=[],
+        promotion_error=None,
+    )
+    card = render_observability_card(snap)
+    assert "<code>NO_UNAPPROVED_LIVE_CSP</code>" in card, (
+        "Invariant name with underscores must be wrapped in <code>; "
+        "underscores must not be consumed as Markdown italic delimiters"
+    )
+    assert "breaches=4108" in card
+
+
+def test_html_escape_applied_to_exception_strings():
+    """html.escape must sanitise section_error strings containing HTML chars.
+
+    Ensures exception messages with <, >, & are not rendered as raw HTML tags
+    in the Telegram card.
+    """
+    snap = ObservabilitySnapshot(
+        generated_at_utc=datetime(2026, 4, 29, 7, 30, tzinfo=timezone.utc),
+        architect_only=[],
+        architect_only_error="<script>alert(1)</script>",
+        authorable=[],
+        authorable_error=None,
+        heartbeats=[],
+        heartbeats_error=None,
+        flex=None,
+        flex_error="db error: table 'x' doesn't exist & pool exhausted",
+        promotion=[],
+        promotion_error=None,
+    )
+    card = render_observability_card(snap)
+    assert "&lt;script&gt;" in card, "< must be escaped to &lt;"
+    assert "<script>" not in card.replace("&lt;script&gt;", ""), (
+        "Raw <script> tag must not appear in HTML output"
+    )
+    assert "&amp;" in card or "pool exhausted" in card

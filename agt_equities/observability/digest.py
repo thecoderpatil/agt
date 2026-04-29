@@ -20,6 +20,7 @@ Consumers:
 from __future__ import annotations
 
 import dataclasses
+import html
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -246,28 +247,28 @@ def _fmt_incident(row: dict[str, Any]) -> str:
     breaches = row.get("consecutive_breaches") or 0
     status = row.get("status") or "?"
     tier = row.get("scrutiny_tier") or "?"
-    return f"- `{inv}` tier={tier} status={status} breaches={breaches}"
+    return f"- <code>{html.escape(inv)}</code> tier={html.escape(tier)} status={html.escape(status)} breaches={breaches}"
 
 
 def _fmt_heartbeat(hb: HeartbeatStatus) -> str:
     icon = {"fresh": "✅", "warn": "⚠️", "stale": "❌"}[hb.status]
     age = f"{hb.age_seconds:.0f}s" if hb.age_seconds is not None else "unknown"
-    return f"- {icon} `{hb.daemon_name}` age={age}"
+    return f"- {icon} <code>{html.escape(hb.daemon_name)}</code> age={age}"
 
 
 def _fmt_flex(flex: FlexStatus) -> list[str]:
     lines: list[str] = []
     last = flex.last_sync_utc.isoformat() if flex.last_sync_utc else "never"
-    lines.append(f"- last sync: `{last}` status={flex.status or '?'} sync_id={flex.sync_id}")
+    lines.append(f"- last sync: <code>{last}</code> status={html.escape(flex.status or '?')} sync_id={flex.sync_id}")
     lines.append(f"- stale: {'⚠️' if flex.stale else '✅'}  zero-row suspicion: {'⚠️' if flex.zero_row_suspicion else '✅'}")
     return lines
 
 
 def _fmt_promotion(row: PromotionGateRow) -> str:
     if row.status == "not yet instrumented":
-        return f"- `{row.engine}.{row.gate_id}` — not yet instrumented"
+        return f"- <code>{html.escape(row.engine)}.{html.escape(row.gate_id)}</code> — not yet instrumented"
     icon = {"green": "✅", "red": "❌", "insufficient_data": "⏳"}.get(row.status, "•")
-    return f"- {icon} `{row.engine}.{row.gate_id}` {row.status} — {row.message}"
+    return f"- {icon} <code>{html.escape(row.engine)}.{html.escape(row.gate_id)}</code> {html.escape(row.status)} — {html.escape(row.message)}"
 
 
 def render_observability_card(
@@ -275,73 +276,73 @@ def render_observability_card(
     *,
     threshold_flags: list[Any] | None = None,
 ) -> str:
-    """Render the five-section Telegram card. Returns markdown string."""
+    """Render the five-section Telegram card. Returns HTML string."""
     lines: list[str] = []
     ts = snapshot.generated_at_utc.strftime("%Y-%m-%d %H:%M UTC")
-    lines.append(f"*🛰 Oversight digest* — {ts}")
+    lines.append(f"<b>🛰 Oversight digest</b> — {ts}")
     lines.append("")
 
     # 1. Architect-only
-    lines.append("*🚨 Architect-only incidents*")
+    lines.append("<b>🚨 Architect-only incidents</b>")
     if snapshot.architect_only_error:
-        lines.append(f"⚠️ section failed: {snapshot.architect_only_error}")
+        lines.append(f"⚠️ section failed: {html.escape(snapshot.architect_only_error)}")
     elif not snapshot.architect_only:
-        lines.append("_none_")
+        lines.append("<i>none</i>")
     else:
         for row in snapshot.architect_only[:20]:
             lines.append(_fmt_incident(row))
         if len(snapshot.architect_only) > 20:
-            lines.append(f"_…and {len(snapshot.architect_only) - 20} more_")
+            lines.append(f"<i>…and {len(snapshot.architect_only) - 20} more</i>")
     lines.append("")
 
     # 2. Authorable + threshold flags
-    lines.append("*📊 Authorable incidents*")
+    lines.append("<b>📊 Authorable incidents</b>")
     if snapshot.authorable_error:
-        lines.append(f"⚠️ section failed: {snapshot.authorable_error}")
+        lines.append(f"⚠️ section failed: {html.escape(snapshot.authorable_error)}")
     elif not snapshot.authorable:
-        lines.append("_none_")
+        lines.append("<i>none</i>")
     else:
         for row in snapshot.authorable[:20]:
             lines.append(_fmt_incident(row))
         if len(snapshot.authorable) > 20:
-            lines.append(f"_…and {len(snapshot.authorable) - 20} more_")
+            lines.append(f"<i>…and {len(snapshot.authorable) - 20} more</i>")
     if threshold_flags:
         lines.append("")
-        lines.append("_threshold flags:_")
+        lines.append("<i>threshold flags:</i>")
         for flag in threshold_flags[:20]:
             kind = getattr(flag, "kind", "?")
             msg = getattr(flag, "message", str(flag))
-            lines.append(f"  • [{kind}] {msg}")
+            lines.append(f"  • [{html.escape(kind)}] {html.escape(msg)}")
     lines.append("")
 
     # 3. Heartbeats
-    lines.append("*💓 Heartbeats*")
+    lines.append("<b>💓 Heartbeats</b>")
     if snapshot.heartbeats_error:
-        lines.append(f"⚠️ section failed: {snapshot.heartbeats_error}")
+        lines.append(f"⚠️ section failed: {html.escape(snapshot.heartbeats_error)}")
     elif not snapshot.heartbeats:
-        lines.append("_no heartbeat rows_")
+        lines.append("<i>no heartbeat rows</i>")
     else:
         for hb in snapshot.heartbeats:
             lines.append(_fmt_heartbeat(hb))
     lines.append("")
 
     # 4. Flex
-    lines.append("*📥 Flex sync*")
+    lines.append("<b>📥 Flex sync</b>")
     if snapshot.flex_error:
-        lines.append(f"⚠️ section failed: {snapshot.flex_error}")
+        lines.append(f"⚠️ section failed: {html.escape(snapshot.flex_error)}")
     elif snapshot.flex is None:
-        lines.append("_no flex snapshot_")
+        lines.append("<i>no flex snapshot</i>")
     else:
         for ln in _fmt_flex(snapshot.flex):
             lines.append(ln)
     lines.append("")
 
     # 5. Promotion gates
-    lines.append("*🚦 Promotion-gate blockers*")
+    lines.append("<b>🚦 Promotion-gate blockers</b>")
     if snapshot.promotion_error:
-        lines.append(f"⚠️ section failed: {snapshot.promotion_error}")
+        lines.append(f"⚠️ section failed: {html.escape(snapshot.promotion_error)}")
     elif not snapshot.promotion:
-        lines.append("_no gate rows_")
+        lines.append("<i>no gate rows</i>")
     else:
         for row in snapshot.promotion:
             lines.append(_fmt_promotion(row))

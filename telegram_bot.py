@@ -19302,7 +19302,7 @@ async def _scheduled_oversight_digest_send(context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.send_message(
                 chat_id=AUTHORIZED_USER_ID,
                 text=card,
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
         except Exception as send_exc:
             logger.warning("oversight_digest_send: Telegram send failed: %s", send_exc)
