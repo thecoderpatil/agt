@@ -81,7 +81,7 @@ class TestV2StateRouter(unittest.TestCase):
         self.assertEqual(
             alerts,
             [
-                "━━ V2 Router [mode=PEACETIME] ━━",
+                "━━ V2 Router ━━",
                 "[HARVEST] PYPL Capital dead. Staging BTC.",
             ],
         )
@@ -150,7 +150,7 @@ class TestV2StateRouter(unittest.TestCase):
         self.assertEqual(
             alerts,
             [
-                "━━ V2 Router [mode=PEACETIME] ━━",
+                "━━ V2 Router ━━",
                 "[HARVEST] AAPL Capital dead. Staging BTC.",
             ],
         )
@@ -224,7 +224,7 @@ class TestV2StateRouter(unittest.TestCase):
         self.assertEqual(
             alerts,
             [
-                "━━ V2 Router [mode=PEACETIME] ━━",
+                "━━ V2 Router ━━",
                 "[HARVEST] ADBE Capital dead. Staging BTC.",
             ],
         )
@@ -308,7 +308,7 @@ class TestV2StateRouter(unittest.TestCase):
         self.assertEqual(
             alerts,
             [
-                "━━ V2 Router [mode=PEACETIME] ━━",
+                "━━ V2 Router ━━",
                 "[DEFEND] AAPL EV-Accretive Roll staged.",
             ],
         )

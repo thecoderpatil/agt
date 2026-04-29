@@ -50,6 +50,18 @@ def ctx() -> CheckContext:
 
 
 @pytest.fixture
+def ctx_live() -> CheckContext:
+    return CheckContext(
+        now_utc=NOW,
+        db_path=":memory:",
+        paper_mode=False,
+        live_accounts=frozenset({"U21971297", "U22076329"}),
+        paper_accounts=frozenset(),
+        expected_daemons=frozenset({"agt_bot"}),
+    )
+
+
+@pytest.fixture
 def conn() -> sqlite3.Connection:
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
@@ -137,27 +149,34 @@ def test_no_live_in_paper_off_when_live_mode(conn):
 
 
 # --- 2. NO_UNAPPROVED_LIVE_CSP --------------------------------------------------
-def test_no_unapproved_live_csp_trip(conn, ctx):
+def test_no_unapproved_live_csp_trip(conn, ctx_live):
     _insert_order(conn, id=1, status="sent", account_id="U21971297", ticker="AAPL")
-    vios = check_no_unapproved_live_csp(conn, ctx)
+    vios = check_no_unapproved_live_csp(conn, ctx_live)
     assert len(vios) == 1
     assert vios[0].severity == "critical"
 
 
-def test_no_unapproved_live_csp_pass_with_approval(conn, ctx):
+def test_no_unapproved_live_csp_pass_with_approval(conn, ctx_live):
     _insert_order(conn, id=1, status="sent", account_id="U21971297",
                   ticker="AAPL", approval_ref="tg:msg:12345")
-    assert check_no_unapproved_live_csp(conn, ctx) == []
+    assert check_no_unapproved_live_csp(conn, ctx_live) == []
 
 
 def test_no_unapproved_live_csp_ignores_paper(conn, ctx):
+    # Paper mode short-circuits the check (P5a, MR !280).
     _insert_order(conn, id=1, status="sent", account_id="DUP751003", ticker="AAPL")
     assert check_no_unapproved_live_csp(conn, ctx) == []
 
 
-def test_no_unapproved_live_csp_ignores_non_csp_mode(conn, ctx):
+def test_no_unapproved_live_csp_ignores_non_csp_mode(conn, ctx_live):
     _insert_order(conn, id=1, status="sent", account_id="U21971297",
                   ticker="AAPL", mode="MODE_2_HARVEST")
+    assert check_no_unapproved_live_csp(conn, ctx_live) == []
+
+
+def test_no_unapproved_live_csp_skips_in_paper_mode(conn, ctx):
+    """Paper mode short-circuits even when row carries a live account_id and no approval_ref."""
+    _insert_order(conn, id=1, status="sent", account_id="U21971297", ticker="AAPL")
     assert check_no_unapproved_live_csp(conn, ctx) == []
 
 

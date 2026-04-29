@@ -958,9 +958,9 @@ async def scan_and_stage_defensive_rolls(
 
         )
 
-        alerts.append(f"━━ V2 Router [mode={header_ctx.mode}] ━━")
+        alerts.append("━━ V2 Router ━━")
 
-        logger.info("V2 router (WHEEL-4): scan starting in mode=%s", header_ctx.mode)
+        logger.info("V2 router (WHEEL-4): scan starting")
 
 
 

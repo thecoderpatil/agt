@@ -721,28 +721,8 @@ def register_jobs(scheduler: "AsyncIOScheduler", ib_connector: IBConnector) -> l
                 )
             return
 
-        try:
-            from agt_equities.alerts import enqueue_alert
-            payload = {
-                "sync_id": getattr(result, "sync_id", None),
-                "mode": "INCREMENTAL",
-                "coverage_date": coverage_date,
-                "sections_processed": getattr(result, "sections_processed", 0),
-                "rows_received": getattr(result, "rows_received", 0),
-                "rows_inserted": getattr(result, "rows_inserted", 0),
-                "status": getattr(result, "status", "unknown"),
-                "needs_retry": getattr(result, "needs_retry", False),
-            }
-            sev = "info"
-            if getattr(result, "error_message", None):
-                payload["error"] = str(result.error_message)[:500]
-                sev = "warn"
-            if getattr(result, "status", "") == "suspicious":
-                sev = "warn"
-            enqueue_alert("FLEX_SYNC_DIGEST", payload, severity=sev)
-        except Exception as alert_exc:
-            # Sync already committed; alert-bus failure is best-effort.
-            logger.error("flex_sync_eod: alert enqueue failed: %s", alert_exc)
+        # FLEX_SYNC_DIGEST enqueue is owned by flex_sync.run_sync() (P5a, MR !280).
+        # Scheduler wrapper retains FLEX_SYNC_FAILURE in the except branch above.
 
     scheduler.add_job(
         _flex_sync_eod_job,

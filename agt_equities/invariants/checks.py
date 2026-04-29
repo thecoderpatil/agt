@@ -107,6 +107,8 @@ def check_no_unapproved_live_csp(
     conn: sqlite3.Connection, ctx: CheckContext
 ) -> list[Violation]:
     """Live CSP orders must carry payload.approval_ref from the Telegram gate."""
+    if ctx.paper_mode:
+        return []
     rows = conn.execute(
         "SELECT id, status, payload FROM pending_orders "
         "WHERE status IN ('sent','partially_filled','filled','processing','staged')"
